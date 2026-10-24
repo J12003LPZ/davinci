@@ -48,7 +48,7 @@ pub mod tools_task;
 pub mod workflow;
 pub mod worktree;
 
-pub use bus::{RuntimeBus, RuntimeDecision, RuntimeSubscriber};
+pub use bus::{DurableError, RuntimeBus, RuntimeDecision, RuntimeSubscriber};
 pub use cache::{
     hash_system_prompt, hash_system_prompt_with_manifest, hash_tool_names, CacheIdentity,
     CacheMissReason,
@@ -720,7 +720,7 @@ impl RuntimeHandle {
             .rehydrate_from_events(events)
             .map_err(|e| format!("task registry rehydration failed: {e}"))?;
         self.mailbox.rehydrate_from_events(events);
-        self.team.rehydrate_results(events);
+        self.team.rehydrate_results(&self.mailbox, events);
         Ok(())
     }
 }

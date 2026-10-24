@@ -19,6 +19,8 @@ pub(super) struct Start {
     pub restart: crate::jobs::managed::RestartPolicy,
     #[serde(default)]
     pub ports: Vec<u16>,
+    #[serde(default)]
+    pub exclusive_workspace: bool,
 }
 
 pub(super) fn resolve(

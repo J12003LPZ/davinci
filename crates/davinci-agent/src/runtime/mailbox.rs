@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use super::bus::RuntimeBus;
+use super::bus::{DurableError, RuntimeBus};
 use super::events::{AgentState, RuntimeEvent, RuntimeEventEnvelope};
 use super::ids::{AgentId, RunId};
 use super::registry::RuntimeRegistry;
@@ -105,6 +105,10 @@ pub enum MailboxError {
     DuplicateMessage(Uuid),
     #[error("the message could not be recorded: {0}")]
     NotRecorded(String),
+    #[error(
+        "the message may have been recorded ({0}); its id stays reserved, do not resend it under a new id"
+    )]
+    Indeterminate(String),
     #[error("failed to wake agent {0}: {1}")]
     WakeError(AgentId, String),
     #[error("mailbox queue full for agent {0}")]
@@ -180,7 +184,7 @@ impl AgentMailbox {
         run_id: RunId,
         agent: Option<AgentId>,
         payload: RuntimeEvent,
-    ) -> Result<(), String> {
+    ) -> Result<(), DurableError> {
         let Some(bus) = &self.bus else {
             return Ok(());
         };
@@ -298,7 +302,25 @@ impl AgentMailbox {
                 message: message.clone(),
             },
         )
-        .map_err(MailboxError::NotRecorded)
+        .map_err(|error| match error {
+            DurableError::Refused(reason) => MailboxError::NotRecorded(reason),
+            DurableError::Indeterminate(reason) => MailboxError::Indeterminate(reason),
+        })
+    }
+
+    /// Park a receipt as `unknown`: the record may be in the log, so the id
+    /// stays reserved and the message is neither published nor retried.
+    fn note_unknown(&self, receipt: SteeringReceipt, reason: &str) {
+        if let Ok(mut receipts) = self.steering_receipts.write() {
+            receipts.insert(
+                receipt.message_id,
+                SteeringReceipt {
+                    state: "unknown".to_string(),
+                    reason: Some(reason.to_string()),
+                    ..receipt
+                },
+            );
+        }
     }
 
     /// Send a message to an agent. Rejects messages to terminal agents or duplicates.
@@ -365,14 +387,17 @@ impl AgentMailbox {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        // 3. Persist undelivered message to mailbox queue before acknowledging
+        // 3. Capacity. Every sender holds the lifecycle lock and a drain only
+        // shrinks the queue, so the room found here is still there at the push.
         {
-            let mut queues = self
+            let queues = self
                 .queues
-                .write()
+                .read()
                 .map_err(|_| MailboxError::WakeError(message.to, "mailbox lock poisoned".into()))?;
-            let q = queues.entry(message.to).or_default();
-            if q.len() >= MAX_QUEUE_CAPACITY {
+            if queues
+                .get(&message.to)
+                .is_some_and(|q| q.len() >= MAX_QUEUE_CAPACITY)
+            {
                 if let Ok(mut receipts) = self.steering_receipts.write() {
                     receipts.insert(
                         message.id,
@@ -390,6 +415,48 @@ impl AgentMailbox {
                 self.release_message_id(&message.id);
                 return Err(MailboxError::QueueFull(message.to));
             }
+        }
+
+        // 4. Acceptance requires the same durable queue record as host
+        // steering, written before the message is visible or its recipient
+        // wakes: a refused record leaves nothing to take back.
+        if let Err(error) = self.announce_durably(
+            message.run_id,
+            Some(message.from),
+            RuntimeEvent::AgentMessageQueued {
+                to: message.to,
+                message_id: message.id,
+                message: Some(message.clone()),
+            },
+        ) {
+            return Err(match error {
+                DurableError::Refused(reason) => {
+                    self.release_message_id(&message.id);
+                    MailboxError::NotRecorded(reason)
+                }
+                DurableError::Indeterminate(reason) => {
+                    self.note_unknown(
+                        SteeringReceipt {
+                            message_id: message.id,
+                            agent_id: message.to,
+                            generation: gen,
+                            state: String::new(),
+                            applies_after_boundary: true,
+                            reason: None,
+                        },
+                        "durable_outcome_unknown",
+                    );
+                    MailboxError::Indeterminate(reason)
+                }
+            });
+        }
+
+        // 5. Make the message visible to the recipient.
+        {
+            let mut queues = self
+                .queues
+                .write()
+                .map_err(|_| MailboxError::WakeError(message.to, "mailbox lock poisoned".into()))?;
             if let Ok(mut receipts) = self.steering_receipts.write() {
                 receipts.insert(
                     message.id,
@@ -403,43 +470,27 @@ impl AgentMailbox {
                     },
                 );
             }
-            q.push_back(message.clone());
+            queues
+                .entry(message.to)
+                .or_default()
+                .push_back(message.clone());
         }
         self.notify_waiters();
 
-        // 4. Wake up recipient if idle. A failed wake withdraws the message
+        // 6. Wake up recipient if idle. A failed wake withdraws the message
         // and frees its ID, so an error always means nothing was accepted and
         // the caller may retry (WOR-91).
         if should_wake {
             if let Some(registry) = &self.registry {
                 if let Err(error) = self.wake(registry, message.to) {
-                    self.withdraw(&message.to, &message.id, "wake_failed");
+                    if let Err(unrecorded) = self.withdraw(&message.to, &message.id, "wake_failed")
+                    {
+                        return Err(MailboxError::Indeterminate(unrecorded.to_string()));
+                    }
                     self.release_message_id(&message.id);
                     return Err(MailboxError::WakeError(message.to, error));
                 }
             }
-        }
-
-        // Acceptance requires the same durable queue record as host steering.
-        if let Err(reason) = self.announce_durably(
-            message.run_id,
-            Some(message.from),
-            RuntimeEvent::AgentMessageQueued {
-                to: message.to,
-                message_id: message.id,
-                message: Some(message.clone()),
-            },
-        ) {
-            if let Ok(mut queues) = self.queues.write() {
-                if let Some(queue) = queues.get_mut(&message.to) {
-                    queue.retain(|queued| queued.id != message.id);
-                }
-            }
-            if let Ok(mut receipts) = self.steering_receipts.write() {
-                receipts.remove(&message.id);
-            }
-            self.release_message_id(&message.id);
-            return Err(MailboxError::NotRecorded(reason));
         }
 
         Ok(())
@@ -541,14 +592,18 @@ impl AgentMailbox {
             reason: None,
         };
 
-        // Check queue capacity
+        // Capacity. Every sender holds the lifecycle lock and a drain only
+        // shrinks the queue, so the room found here is still there at the push.
         {
-            let mut queues = self
+            let queues = self
                 .queues
-                .write()
+                .read()
                 .map_err(|_| MailboxError::WakeError(to, "lock poisoned".into()))?;
-            let q = queues.entry(to).or_default();
-            if q.len() >= MAX_QUEUE_CAPACITY {
+            if queues
+                .get(&to)
+                .is_some_and(|q| q.len() >= MAX_QUEUE_CAPACITY)
+            {
+                drop(queues);
                 let receipt = SteeringReceipt {
                     message_id: msg_id,
                     agent_id: to,
@@ -562,52 +617,56 @@ impl AgentMailbox {
                 }
                 return Err(MailboxError::QueueFull(to));
             }
-            // The receipt exists before the message can be drained, so a
-            // drain always finds it and it never regresses to queued (WOR-86).
-            if let Ok(mut receipts) = self.steering_receipts.write() {
-                receipts.insert(msg_id, receipt.clone());
-            }
-            q.push_back(msg.clone());
         }
+
+        // Same order as `send`: the acceptance is written to the runtime log
+        // before the message is visible or its recipient wakes. Without the
+        // record a restart forgot every steering message, and a refused record
+        // leaves nothing to take back.
+        if let Err(error) = self.announce_durably(
+            run_id,
+            None,
+            RuntimeEvent::AgentMessageQueued {
+                to,
+                message_id: msg_id,
+                message: Some(msg.clone()),
+            },
+        ) {
+            return Err(match error {
+                DurableError::Refused(reason) => MailboxError::NotRecorded(reason),
+                DurableError::Indeterminate(reason) => {
+                    self.note_unknown(receipt, "durable_outcome_unknown");
+                    MailboxError::Indeterminate(reason)
+                }
+            });
+        }
+
+        // The receipt exists before the message can be drained, so a drain
+        // always finds it and it never regresses to queued (WOR-86).
+        if let Ok(mut receipts) = self.steering_receipts.write() {
+            receipts.insert(msg_id, receipt.clone());
+        }
+        self.queues
+            .write()
+            .map_err(|_| MailboxError::WakeError(to, "lock poisoned".into()))?
+            .entry(to)
+            .or_default()
+            .push_back(msg);
         self.notify_waiters();
 
-        // Same contract as `send`: a failed wake withdraws the message, so an
-        // error always means nothing was accepted (WOR-88, WOR-91).
+        // A failed wake withdraws the message (WOR-88, WOR-91).
         if let Some(registry) = &self.registry {
             if registry
                 .get(&to)
                 .is_some_and(|record| record.state == AgentState::Idle)
             {
                 if let Err(error) = self.wake(registry, to) {
-                    self.withdraw(&to, &msg_id, "wake_failed");
+                    if let Err(unrecorded) = self.withdraw(&to, &msg_id, "wake_failed") {
+                        return Err(MailboxError::Indeterminate(unrecorded.to_string()));
+                    }
                     return Err(MailboxError::WakeError(to, error));
                 }
             }
-        }
-
-        // The acceptance is announced (and so written to the runtime log)
-        // before the caller can show "queued": without this event a restart
-        // forgot every steering message.
-        if let Err(reason) = self.announce_durably(
-            run_id,
-            None,
-            RuntimeEvent::AgentMessageQueued {
-                to,
-                message_id: msg_id,
-                message: Some(msg),
-            },
-        ) {
-            // Not written, so not accepted: take it back out, forget the
-            // receipt, and let the same id be sent again.
-            if let Ok(mut queues) = self.queues.write() {
-                if let Some(queue) = queues.get_mut(&to) {
-                    queue.retain(|queued| queued.id != msg_id);
-                }
-            }
-            if let Ok(mut receipts) = self.steering_receipts.write() {
-                receipts.remove(&msg_id);
-            }
-            return Err(MailboxError::NotRecorded(reason));
         }
 
         Ok(receipt)
@@ -752,13 +811,39 @@ impl AgentMailbox {
 
     /// Remove a still-queued message and reject its receipt. The caller holds
     /// the lifecycle lock, so the message cannot have been drained meanwhile.
-    fn withdraw(&self, to: &AgentId, message_id: &Uuid, reason: &str) {
+    /// The rejection must reach the journal: when it does not, replay would
+    /// still see the message queued, so the receipt becomes `unknown` and the
+    /// caller keeps the id reserved.
+    fn withdraw(&self, to: &AgentId, message_id: &Uuid, reason: &str) -> Result<(), DurableError> {
         if let Ok(mut queues) = self.queues.write() {
             if let Some(queue) = queues.get_mut(to) {
                 queue.retain(|message| &message.id != message_id);
             }
         }
-        self.mark_rejected(message_id, reason);
+        let recorded = self.announce_durably(
+            self.run_of(to),
+            Some(*to),
+            RuntimeEvent::AgentMessageRejected {
+                to: *to,
+                message_id: *message_id,
+                reason: reason.to_string(),
+            },
+        );
+        if let Ok(mut receipts) = self.steering_receipts.write() {
+            if let Some(receipt) = receipts.get_mut(message_id) {
+                match &recorded {
+                    Ok(()) => {
+                        receipt.state = "rejected".to_string();
+                        receipt.reason = Some(reason.to_string());
+                    }
+                    Err(_) => {
+                        receipt.state = "unknown".to_string();
+                        receipt.reason = Some("withdrawal_not_recorded".to_string());
+                    }
+                }
+            }
+        }
+        recorded
     }
 
     /// Drain up to `limit` messages for the given agent ID.
@@ -898,7 +983,16 @@ impl AgentMailbox {
                     message,
                 } => {
                     seen.insert(*message_id);
-                    if !messages.contains_key(message_id) {
+                    // A rejected id is reopened by a later queue record: an id
+                    // is only released for reuse when it was not accepted, so
+                    // an accepted message is never queued twice.
+                    let reopened = messages
+                        .get(message_id)
+                        .is_some_and(|entry| entry.state == "rejected");
+                    if reopened {
+                        order.retain(|id| id != message_id);
+                    }
+                    if reopened || !messages.contains_key(message_id) {
                         order.push(*message_id);
                         messages.insert(
                             *message_id,
@@ -934,6 +1028,17 @@ impl AgentMailbox {
                     }
                 }
                 _ => {}
+            }
+        }
+        // A failed wake freed its id for a retry; a restart keeps that, unless
+        // memory already holds a live receipt for the id: an older rejection
+        // must not release an id that was accepted since.
+        for (id, entry) in &messages {
+            if entry.state == "rejected"
+                && entry.reason.as_deref() == Some("wake_failed")
+                && self.live_steering_receipt(id, &entry.to).is_none()
+            {
+                seen.remove(id);
             }
         }
         drop(seen);
@@ -1015,7 +1120,7 @@ impl AgentMailbox {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::bus::{RuntimeDecision, RuntimeSubscriber};
+    use crate::runtime::bus::{DurableError, RuntimeDecision, RuntimeSubscriber};
     use crate::runtime::events::AgentKind;
     use crate::runtime::events::AgentRecord;
     use std::path::PathBuf;
@@ -1592,6 +1697,10 @@ mod tests {
     #[derive(Default)]
     struct FlakyLog {
         fail: std::sync::atomic::AtomicBool,
+        /// A failure reports `Indeterminate` instead of `Refused`.
+        unknown: std::sync::atomic::AtomicBool,
+        /// Only rejection records fail.
+        fail_rejections_only: std::sync::atomic::AtomicBool,
         kept: Mutex<Vec<RuntimeEventEnvelope>>,
     }
 
@@ -1601,12 +1710,23 @@ mod tests {
             RuntimeDecision::Continue
         }
 
-        fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), String> {
-            if self.fail.load(Ordering::SeqCst) {
-                return Err("injected log failure".into());
+        fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), DurableError> {
+            let applies = !self.fail_rejections_only.load(Ordering::SeqCst)
+                || matches!(event.payload, RuntimeEvent::AgentMessageRejected { .. });
+            if applies && self.fail.load(Ordering::SeqCst) {
+                let reason = "injected log failure".to_string();
+                return Err(if self.unknown.load(Ordering::SeqCst) {
+                    DurableError::Indeterminate(reason)
+                } else {
+                    DurableError::Refused(reason)
+                });
             }
             self.on_event(event);
             Ok(())
+        }
+
+        fn is_journal(&self) -> bool {
+            true
         }
     }
 
@@ -1674,7 +1794,7 @@ mod tests {
             fn on_event(&self, _event: &RuntimeEventEnvelope) -> RuntimeDecision {
                 RuntimeDecision::Continue
             }
-            fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), String> {
+            fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), DurableError> {
                 if matches!(event.payload, RuntimeEvent::AgentMessageDelivered { .. }) {
                     let mailbox = self.mailbox.lock().unwrap().clone().unwrap();
                     let agent = self.agent;
@@ -1686,6 +1806,9 @@ mod tests {
                     return Err("injected log failure".into());
                 }
                 Ok(())
+            }
+            fn is_journal(&self) -> bool {
+                true
             }
         }
         let bus = RuntimeBus::new();
@@ -1750,7 +1873,7 @@ mod tests {
             fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
                 self.inner.on_event(event)
             }
-            fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), String> {
+            fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), DurableError> {
                 if !matches!(event.payload, RuntimeEvent::AgentMessageDelivered { .. }) {
                     return self.inner.record_durably(event);
                 }
@@ -1760,6 +1883,9 @@ mod tests {
                 }
                 self.allowed.store(left - 1, Ordering::SeqCst);
                 self.inner.record_durably(event)
+            }
+            fn is_journal(&self) -> bool {
+                true
             }
         }
         let bus = RuntimeBus::new();
@@ -1849,6 +1975,115 @@ mod tests {
         mailbox.send(message.clone()).unwrap();
         assert_eq!(mailbox.pending_count(&agent), 1);
         assert_eq!(registry.get(&agent).unwrap().state, AgentState::Running);
+    }
+
+    fn idle_flaky_mailbox() -> (AgentMailbox, Arc<FlakyLog>, RuntimeRegistry, AgentId, RunId) {
+        let (mailbox, log, registry, agent, run) = flaky_mailbox();
+        registry.transition(agent, AgentState::Idle).unwrap();
+        (mailbox, log, registry, agent, run)
+    }
+
+    /// A queued record that may have been written is neither published nor
+    /// woken, and its id stays reserved so a resend cannot double-deliver.
+    #[test]
+    fn an_indeterminate_queued_record_keeps_the_id_reserved_and_wakes_nobody() {
+        let (mailbox, log, registry, agent, run) = idle_flaky_mailbox();
+        log.fail.store(true, Ordering::SeqCst);
+        log.unknown.store(true, Ordering::SeqCst);
+
+        let message = AgentMessage::new(run, AgentId::new(), agent, "maybe recorded");
+        let error = mailbox.send(message.clone()).unwrap_err();
+        assert!(matches!(error, MailboxError::Indeterminate(_)), "{error:?}");
+        assert_eq!(mailbox.pending_count(&agent), 0);
+        assert_eq!(registry.get(&agent).unwrap().state, AgentState::Idle);
+        let receipt = mailbox.get_steering_receipt(&message.id).unwrap();
+        assert_eq!(receipt.state, "unknown");
+        assert_eq!(receipt.reason.as_deref(), Some("durable_outcome_unknown"));
+
+        log.fail.store(false, Ordering::SeqCst);
+        assert_eq!(
+            mailbox.send(message).unwrap_err(),
+            MailboxError::DuplicateMessage(receipt.message_id)
+        );
+
+        log.fail.store(true, Ordering::SeqCst);
+        let steer_id = Uuid::now_v7();
+        let error = mailbox
+            .send_steer_with_id(steer_id, agent, 1, "steer".into(), false)
+            .unwrap_err();
+        assert!(matches!(error, MailboxError::Indeterminate(_)), "{error:?}");
+        assert_eq!(mailbox.pending_count(&agent), 0);
+        assert_eq!(
+            mailbox.get_steering_receipt(&steer_id).unwrap().state,
+            "unknown"
+        );
+    }
+
+    /// A wake failure whose withdrawal cannot be journalled leaves the queued
+    /// record standing on replay, so the id stays reserved.
+    #[test]
+    fn an_unrecorded_withdrawal_keeps_the_id_reserved() {
+        let (mailbox, log, registry, agent, run) = idle_flaky_mailbox();
+        log.fail_rejections_only.store(true, Ordering::SeqCst);
+        log.fail.store(true, Ordering::SeqCst);
+
+        let message = AgentMessage::new(run, AgentId::new(), agent, "wake me");
+        FAIL_WAKE.with(|fail| fail.set(true));
+        let error = mailbox.send(message.clone()).unwrap_err();
+        FAIL_WAKE.with(|fail| fail.set(false));
+        assert!(matches!(error, MailboxError::Indeterminate(_)), "{error:?}");
+        assert_eq!(mailbox.pending_count(&agent), 0);
+        assert_eq!(registry.get(&agent).unwrap().state, AgentState::Idle);
+        let receipt = mailbox.get_steering_receipt(&message.id).unwrap();
+        assert_eq!(receipt.state, "unknown");
+        assert_eq!(receipt.reason.as_deref(), Some("withdrawal_not_recorded"));
+
+        log.fail.store(false, Ordering::SeqCst);
+        assert_eq!(
+            mailbox.send(message.clone()).unwrap_err(),
+            MailboxError::DuplicateMessage(message.id)
+        );
+    }
+
+    /// Replaying an old `wake_failed` rejection must not release an id that
+    /// was accepted since: a resend would queue the message twice.
+    #[test]
+    fn an_old_wake_rejection_does_not_release_an_accepted_id() {
+        let registry = RuntimeRegistry::new();
+        let mailbox = AgentMailbox::new().with_registry(registry.clone());
+        let run = RunId::new();
+        let agent = AgentId::new();
+        registry
+            .register_agent(make_test_record(agent, run, AgentState::Running))
+            .unwrap();
+        let message = AgentMessage::new(run, AgentId::new(), agent, "accepted");
+        mailbox.send(message.clone()).unwrap();
+
+        let event =
+            |sequence, payload| RuntimeEventEnvelope::new(sequence, run, None, None, None, payload);
+        mailbox.rehydrate_from_events(&[
+            event(
+                1,
+                RuntimeEvent::AgentMessageQueued {
+                    to: agent,
+                    message_id: message.id,
+                    message: Some(message.clone()),
+                },
+            ),
+            event(
+                2,
+                RuntimeEvent::AgentMessageRejected {
+                    to: agent,
+                    message_id: message.id,
+                    reason: "wake_failed".into(),
+                },
+            ),
+        ]);
+        assert!(matches!(
+            mailbox.send(message),
+            Err(MailboxError::DuplicateMessage(_))
+        ));
+        assert_eq!(mailbox.pending_count(&agent), 1);
     }
 
     /// WOR-88: a failed wake withdraws the steering message, rejects its

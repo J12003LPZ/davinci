@@ -20,6 +20,10 @@ pub enum RuntimeLogError {
     UnsupportedSchemaVersion { found: u16, supported: u16 },
     #[error("Corrupt record on line {line}: {reason}")]
     CorruptRecord { line: usize, reason: String },
+    /// The append failed and the bytes it wrote could not be rolled back, so
+    /// the record may be in the log.
+    #[error("append outcome unknown, the record may be in the log: {0}")]
+    OutcomeUnknown(std::io::Error),
 }
 
 /// Derive the sidecar runtime log path for a given session file path.
@@ -41,6 +45,13 @@ pub fn runtime_log_path(session_path: &Path) -> PathBuf {
 pub struct RuntimeLogWriter {
     path: PathBuf,
     file: File,
+    /// Set when a failed append could not be rolled back; the tail may hold an
+    /// ambiguous record, so every later append is refused.
+    failed: bool,
+    #[cfg(test)]
+    fail_sync_once: bool,
+    #[cfg(test)]
+    fail_rollback_once: bool,
 }
 
 impl RuntimeLogWriter {
@@ -51,18 +62,65 @@ impl RuntimeLogWriter {
         }
         davinci_sys::fs::truncate_torn_tail(&path)?;
         let file = davinci_sys::fs::open_append_private(&path)?;
-        Ok(Self { path, file })
+        Ok(Self {
+            path,
+            file,
+            failed: false,
+            #[cfg(test)]
+            fail_sync_once: false,
+            #[cfg(test)]
+            fail_rollback_once: false,
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Append one record durably. An `Err` means the record is not in the log:
+    /// bytes written before a failed write or sync are truncated away. If that
+    /// rollback fails the record may be in the log, the error is
+    /// `OutcomeUnknown`, and the writer refuses all later appends.
     pub fn append<T: serde::Serialize>(&mut self, record: &T) -> Result<(), RuntimeLogError> {
+        if self.failed {
+            return Err(std::io::Error::other(
+                "runtime log writer is failed after an unrecoverable append error",
+            )
+            .into());
+        }
         let line = serde_json::to_string(record)?;
+        let start = self.file.metadata()?.len();
+        match self.write_and_sync(&line) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if self.rollback(start).is_err() {
+                    self.failed = true;
+                    return Err(RuntimeLogError::OutcomeUnknown(error));
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    fn write_and_sync(&mut self, line: &str) -> std::io::Result<()> {
         writeln!(self.file, "{line}")?;
-        self.file.sync_data()?;
-        Ok(())
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_sync_once) {
+            return Err(std::io::Error::other("injected sync failure"));
+        }
+        self.file.sync_data()
+    }
+
+    /// The append handle cannot truncate on every platform, so use a separate
+    /// write handle.
+    fn rollback(&mut self, len: u64) -> std::io::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_rollback_once) {
+            return Err(std::io::Error::other("injected rollback failure"));
+        }
+        let file = std::fs::OpenOptions::new().write(true).open(&self.path)?;
+        file.set_len(len)?;
+        file.sync_data()
     }
 }
 
@@ -325,6 +383,49 @@ mod tests {
             .unwrap();
         let rows: Vec<serde_json::Value> = read_runtime_log(&path).unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn failed_sync_rolls_back_the_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.runtime.jsonl");
+        let mut writer = RuntimeLogWriter::open(&path).unwrap();
+        writer
+            .append(&serde_json::json!({"schema_version": 1, "a": 1}))
+            .unwrap();
+        let len = fs::metadata(&path).unwrap().len();
+        writer.fail_sync_once = true;
+        writer
+            .append(&serde_json::json!({"schema_version": 1, "a": 2}))
+            .unwrap_err();
+        assert_eq!(fs::metadata(&path).unwrap().len(), len);
+        let rows: Vec<serde_json::Value> = read_runtime_log(&path).unwrap();
+        assert_eq!(rows.len(), 1);
+        writer
+            .append(&serde_json::json!({"schema_version": 1, "a": 3}))
+            .unwrap();
+        let rows: Vec<serde_json::Value> = read_runtime_log(&path).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn failed_rollback_is_outcome_unknown_and_later_appends_are_refused() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.runtime.jsonl");
+        let mut writer = RuntimeLogWriter::open(&path).unwrap();
+        writer.fail_sync_once = true;
+        writer.fail_rollback_once = true;
+        let error = writer
+            .append(&serde_json::json!({"schema_version": 1, "a": 1}))
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeLogError::OutcomeUnknown(_)),
+            "{error}"
+        );
+        let error = writer
+            .append(&serde_json::json!({"schema_version": 1, "a": 2}))
+            .unwrap_err();
+        assert!(matches!(error, RuntimeLogError::Io(_)), "{error}");
     }
 
     #[test]

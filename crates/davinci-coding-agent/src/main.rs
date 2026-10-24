@@ -2512,7 +2512,7 @@ fn build_worker_agent(
     cwd: &Path,
     mcp: &davinci_agent::McpRegistry,
     req: &davinci_agent::SubagentRequest,
-) -> Result<(Agent, bool), String> {
+) -> Result<Agent, String> {
     let effective_cwd = req.worktree_path.as_deref().unwrap_or(cwd);
     let settings = load_merged_settings(&default_agent_dir(), effective_cwd);
     let trusted = is_trusted(&settings, effective_cwd, parsed.project_trust_override);
@@ -2731,14 +2731,7 @@ fn build_worker_agent(
             progress.observe(event)
         })));
     }
-    let shared_writer = req.worktree_path.is_none()
-        && matches!(
-            child_mode,
-            davinci_agent::PermissionMode::Edits
-                | davinci_agent::PermissionMode::Auto
-                | davinci_agent::PermissionMode::AlwaysApprove
-        );
-    Ok((child, shared_writer))
+    Ok(child)
 }
 
 /// Permission mode for a worker without an explicit profile mode: the
@@ -2780,43 +2773,10 @@ fn run_nested_subagent(
     mcp: &davinci_agent::McpRegistry,
     req: &davinci_agent::SubagentRequest,
 ) -> Result<String, String> {
-    let (mut child, shared_writer) = build_worker_agent(parsed, cwd, mcp, req)?;
-    let team = req.runtime.as_ref().map(|runtime| runtime.team.clone());
-    // One shared-workspace writer at a time across the whole session. A
-    // worker takes the lease at its first mutating call and keeps it until
-    // its turn ends, so read-only work still runs in parallel.
-    let write_lease: Arc<Mutex<Option<davinci_agent::runtime::team::SharedWriteLease>>> =
-        Arc::default();
-    if let (Some(team), true) = (&team, shared_writer) {
-        let team = team.clone();
-        let lease = write_lease.clone();
-        let token = req.cancellation_token.clone();
-        child.pre_tool = Some(davinci_agent::PreToolHook(Arc::new(move |name, _| {
-            if matches!(
-                davinci_agent::tool_class(name),
-                davinci_agent::ToolClass::Read | davinci_agent::ToolClass::Network
-            ) {
-                return None;
-            }
-            let mut held = lease.lock().unwrap_or_else(|e| e.into_inner());
-            if held.is_none() {
-                match team.acquire_shared_write(token.as_ref()) {
-                    Some(acquired) => *held = Some(acquired),
-                    None => {
-                        return Some(
-                            "worker cancelled while waiting for the shared workspace".into(),
-                        )
-                    }
-                }
-            }
-            None
-        })));
-    }
-    let mut turn = |prompt: &str| {
-        let result = run_worker_turn(parsed, &mut child, prompt);
-        write_lease.lock().unwrap_or_else(|e| e.into_inner()).take();
-        result
-    };
+    let mut child = build_worker_agent(parsed, cwd, mcp, req)?;
+    // Shared-workspace write ownership is taken per mutating call by the
+    // turn's dispatch (`turn.rs`), the same path as the lead's own calls.
+    let mut turn = |prompt: &str| run_worker_turn(parsed, &mut child, prompt);
     if req.mode == davinci_agent::AgentSpawnMode::Teammate {
         let runtime = req
             .runtime

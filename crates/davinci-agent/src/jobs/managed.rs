@@ -13,6 +13,7 @@ use super::{
     supervisor::{ProcessConfig, ProcessEvent, ProcessExit, Supervisor, SupervisorCommand},
     Job, JobBook, JobStatus, OutputBuffer, Shared, LIVE_JOBS,
 };
+use crate::runtime::team::SharedWriteError;
 pub use restarts::{Provenance, RestartCheck, RestartPolicy, StartOptions};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -389,6 +390,9 @@ impl ManagedOwner {
             self.0.scope.id,
             &self.0.scope.workspace,
             &options,
+            // `shared_workspace` is not serialized, so ownership mode is keyed
+            // explicitly: an owned and an unowned start never reuse each other.
+            options.shared_workspace.is_some(),
         ))
         .map_err(|_| "invalid command identity")?;
         let key = format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(identity)));
@@ -493,8 +497,10 @@ impl ManagedOwner {
         if abort.load(Ordering::SeqCst) {
             return Err("process startup cancelled".into());
         }
-        // Reuse has already been reconciled. Only a new process needs to wait
-        // for ownership, and it waits outside the process-book locks.
+        // Reuse has already been reconciled. Only an `exclusive_workspace`
+        // start of a new process takes ownership, and it waits for a dispatch
+        // holder outside the process-book locks. A background job holder is
+        // reported at once.
         let shared_write = options
             .shared_workspace
             .as_ref()
@@ -502,15 +508,24 @@ impl ManagedOwner {
                 runtime
                     .team
                     .acquire_shared_write(Some(&runtime.cancellation_token))
-                    .ok_or_else(|| {
-                        "process startup cancelled while waiting for shared workspace".to_string()
+                    .map_err(|error| match error {
+                        SharedWriteError::Cancelled => {
+                            "process startup cancelled while waiting for shared workspace".into()
+                        }
+                        SharedWriteError::Busy(reason) => reason,
                     })
             })
             .transpose()?;
-        validate()?;
+        if shared_write.is_some() {
+            validate()?;
+        }
+        let lease_label = std::iter::once(config.executable.display().to_string())
+            .chain(config.argv.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(" ");
         let shared = Arc::new(Shared {
             status: Mutex::new(JobStatus::Running),
-            workspace_write: Mutex::new((false, shared_write)),
+            workspace_write: Mutex::new((false, None)),
             output: Mutex::new(OutputBuffer::default()),
             child: Mutex::new(None),
             stdin: Mutex::new(None),
@@ -579,6 +594,18 @@ impl ManagedOwner {
             announced: false,
             seen: false,
         });
+        if let Some(lease) = shared_write {
+            // A process that already exited has released its claim: dropping
+            // the lease frees the workspace again.
+            let mut write = shared
+                .workspace_write
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !write.0 {
+                lease.hand_to_job(id, &lease_label);
+                write.1 = Some(lease);
+            }
+        }
         if record.options.restart.max_restarts > 0 {
             restarts::supervise(
                 Arc::downgrade(&self.0.scope),

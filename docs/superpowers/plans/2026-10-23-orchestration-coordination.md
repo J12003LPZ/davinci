@@ -12,7 +12,7 @@
 
 - Preserve unrelated working changes and the lead checkout.
 - No live provider requests are required for regression coverage.
-- Cancellation must release writer ownership; background processes must retain it until exit.
+- Cancellation must release writer ownership; background shell jobs retain it until exit, managed `process_start` services do not.
 - Missing handoffs, Git conflicts and persistence failures must stop unsafe completion.
 - Stable message IDs and structured partial receipts must permit reconciliation without duplicate work.
 

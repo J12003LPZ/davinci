@@ -20,6 +20,8 @@ pub struct StartOptions {
     pub counters: Arc<crate::SharedCounters>,
     #[serde(skip)]
     pub provenance: Provenance,
+    /// Set only for `exclusive_workspace` starts: the process holds the shared
+    /// workspace write lease until it exits.
     #[serde(skip)]
     pub shared_workspace: Option<crate::RuntimeHandle>,
 }

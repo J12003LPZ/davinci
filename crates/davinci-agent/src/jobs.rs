@@ -157,6 +157,7 @@ impl Job {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if !write.0 {
+            lease.hand_to_job(self.id, &self.command);
             write.1 = Some(lease);
         }
     }

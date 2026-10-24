@@ -4623,7 +4623,7 @@ fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
         max_turns: Some(100),
         ..Default::default()
     };
-    let (child, _) = build_worker_agent(
+    let child = build_worker_agent(
         &parsed,
         dir.path(),
         &davinci_agent::McpRegistry::default(),
@@ -4639,7 +4639,7 @@ fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
         worktree_path: Some(isolated.path().to_path_buf()),
         ..req.clone()
     };
-    let (isolated_child, _) = build_worker_agent(
+    let isolated_child = build_worker_agent(
         &parsed,
         dir.path(),
         &davinci_agent::McpRegistry::default(),
@@ -4675,7 +4675,7 @@ fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
             worktree_path: Some(dir.path().to_path_buf()),
             ..req.clone()
         };
-        let (child, shared_writer) = build_worker_agent(
+        let child = build_worker_agent(
             &parsed,
             dir.path(),
             &davinci_agent::McpRegistry::default(),
@@ -4683,10 +4683,6 @@ fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
         )
         .unwrap();
         assert_eq!(child.permission_mode(), expected, "parent {parent:?}");
-        assert!(
-            !shared_writer,
-            "a worktree worker never holds the shared lock"
-        );
     }
 }
 
@@ -4719,7 +4715,7 @@ fn delegated_worker_does_not_exceed_parent_permission() {
                 worktree_path: worktree.clone(),
                 ..Default::default()
             };
-            let (child, _) = build_worker_agent(
+            let child = build_worker_agent(
                 &parsed,
                 dir.path(),
                 &davinci_agent::McpRegistry::default(),
@@ -4761,7 +4757,7 @@ fn auto_worker_shell_runs_recognized_checks_and_refuses_the_rest() {
         worktree_path: Some(dir.path().to_path_buf()),
         ..Default::default()
     };
-    let (child, _) = build_worker_agent(
+    let child = build_worker_agent(
         &parsed,
         dir.path(),
         &davinci_agent::McpRegistry::default(),
@@ -4806,26 +4802,22 @@ fn shared_workers_and_inheriting_profiles_follow_the_parent_mode() {
         ..Default::default()
     };
     for agent in [None, Some("scout".to_string())] {
-        for (parent, expected, writer) in [
+        for (parent, expected) in [
             (
                 davinci_agent::PermissionMode::ReadOnly,
                 davinci_agent::PermissionMode::ReadOnly,
-                false,
             ),
             (
                 davinci_agent::PermissionMode::Ask,
                 davinci_agent::PermissionMode::Ask,
-                false,
             ),
             (
                 davinci_agent::PermissionMode::Edits,
                 davinci_agent::PermissionMode::Edits,
-                true,
             ),
             (
                 davinci_agent::PermissionMode::Auto,
                 davinci_agent::PermissionMode::Auto,
-                true,
             ),
         ] {
             let req = davinci_agent::SubagentRequest {
@@ -4835,7 +4827,7 @@ fn shared_workers_and_inheriting_profiles_follow_the_parent_mode() {
                 parent_permission_mode: Some(parent),
                 ..Default::default()
             };
-            let (child, shared_writer) = build_worker_agent(
+            let child = build_worker_agent(
                 &parsed,
                 dir.path(),
                 &davinci_agent::McpRegistry::default(),
@@ -4847,7 +4839,6 @@ fn shared_workers_and_inheriting_profiles_follow_the_parent_mode() {
                 expected,
                 "{agent:?} under {parent:?}"
             );
-            assert_eq!(shared_writer, writer, "{agent:?} under {parent:?}");
             assert!(child.tools.contains(&"edit".into()));
         }
     }
@@ -4905,7 +4896,7 @@ fn worker_host_rebinds_sandbox_and_supervisor_to_effective_worktree() {
         ..Default::default()
     };
 
-    let (worker, shared_writer) = build_worker_agent(
+    let worker = build_worker_agent(
         &parsed,
         &parent,
         &davinci_agent::McpRegistry::default(),
@@ -4913,7 +4904,6 @@ fn worker_host_rebinds_sandbox_and_supervisor_to_effective_worktree() {
     )
     .unwrap();
 
-    assert!(!shared_writer);
     let worker_spec = worker
         .tool_context
         .sandbox
@@ -5032,7 +5022,7 @@ fn worker_host_feeds_its_own_events_into_the_leads_progress() {
         progress: Some(reporter.clone()),
         ..Default::default()
     };
-    let (child, _) = build_worker_agent(
+    let child = build_worker_agent(
         &parsed,
         dir.path(),
         &davinci_agent::McpRegistry::default(),

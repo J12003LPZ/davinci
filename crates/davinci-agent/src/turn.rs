@@ -2925,16 +2925,20 @@ Issue the call again if it is still needed.";
                                 .team
                                 .acquire_shared_write(Some(&runtime.cancellation_token))
                             {
-                                Some(lease) => Some(lease),
-                                None => {
-                                    return crate::ToolResult {
-                                        content:
+                                Ok(lease) => Some(lease),
+                                Err(error) => return crate::ToolResult {
+                                    content: match error {
+                                        crate::runtime::team::SharedWriteError::Cancelled => {
                                             "Cancelled while waiting for shared workspace writer"
-                                                .into(),
-                                        is_error: true,
-                                        details: None,
-                                    }
-                                }
+                                                .into()
+                                        }
+                                        crate::runtime::team::SharedWriteError::Busy(reason) => {
+                                            reason
+                                        }
+                                    },
+                                    is_error: true,
+                                    details: None,
+                                },
                             }
                         }
                     } else {
@@ -6637,9 +6641,9 @@ mod tests {
                 ],
             });
         let command = if cfg!(windows) {
-            "Start-Sleep -Milliseconds 250; Set-Content -LiteralPath delayed.txt -Value done"
+            "Start-Sleep -Milliseconds 1000; Set-Content -LiteralPath delayed.txt -Value done"
         } else {
-            "sleep 0.25; printf done > delayed.txt"
+            "sleep 1; printf done > delayed.txt"
         };
         let args = json!({"command":command,"background":true});
         assert!(matches!(
@@ -6648,18 +6652,34 @@ mod tests {
         ));
         let result = agent.run_prepared_call(root.path(), "background", "exec_command", &args, 0);
         assert!(!result.is_error, "{}", result.content);
-        let token = runtime.cancellation_token.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let watchdog = std::thread::spawn(move || {
-            if rx.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
-                token.cancel();
-            }
-        });
-        let next_writer = runtime
+        let started = std::time::Instant::now();
+        let busy = runtime
             .team
-            .acquire_shared_write(Some(&runtime.cancellation_token));
-        tx.send(()).ok();
-        watchdog.join().unwrap();
+            .acquire_shared_write(Some(&runtime.cancellation_token))
+            .err()
+            .expect("a background job holds the lease");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "busy must not wait"
+        );
+        let crate::runtime::team::SharedWriteError::Busy(reason) = busy else {
+            panic!("expected a busy error");
+        };
+        assert!(
+            reason.contains("background job") && reason.contains("job_kill"),
+            "{reason}"
+        );
+        assert!(reason.contains(&command[..20]), "{reason}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let next_writer = loop {
+            match runtime.team.acquire_shared_write(None) {
+                Ok(lease) => break Some(lease),
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(_) => break None,
+            }
+        };
         assert!(
             next_writer.is_some(),
             "background job never released its lease"
@@ -6725,6 +6745,55 @@ mod tests {
         assert!(!bypassed, "mutation bypassed shared writer lease");
         assert!(result.is_error);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn shared_workspace_worker_completes_mutating_calls_and_frees_the_lease_after_each() {
+        let root = tempdir().unwrap();
+        let runtime = crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        );
+        runtime.ensure_lead_registered("mock", "mock", root.path());
+        let probe = runtime.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let path = root.path().to_path_buf();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut agent = Agent::new("shared worker").with_runtime(runtime);
+            agent.tools = vec!["fixture_mutation".into()];
+            agent.permissions = Arc::new(crate::PermissionState::new(
+                crate::PermissionPolicy::new(crate::PermissionMode::AlwaysApprove),
+            ));
+            agent.custom_tool_executor = Some(crate::CustomToolExecutor::new(move |_, _, _| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::ToolResult {
+                    content: "edited".into(),
+                    is_error: false,
+                    details: None,
+                })
+            }));
+            for id in ["first", "second"] {
+                let args = json!({"call": id});
+                assert!(matches!(
+                    agent.prepare_tool_call(&path, id, "fixture_mutation", &args, 0),
+                    Preparation::Ready { .. }
+                ));
+                let result = agent.run_prepared_call(&path, id, "fixture_mutation", &args, 0);
+                assert!(!result.is_error, "{}", result.content);
+            }
+            done_tx.send(()).ok();
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a shared-workspace worker deadlocked on its own write lease");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            probe.team.acquire_shared_write(None).is_ok(),
+            "the worker kept the lease after its calls"
+        );
     }
 
     #[test]

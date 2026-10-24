@@ -6,8 +6,9 @@
 //! (https://code.claude.com/docs/en/agent-teams): teammates persist, go idle,
 //! wake on a message, and report every finished turn to the lead.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use super::cancellation::CancellationToken;
@@ -29,11 +30,55 @@ pub struct TeamRoster {
 struct RosterInner {
     root: Mutex<Option<CancellationToken>>,
     members: RwLock<HashMap<AgentId, CancellationToken>>,
-    shared_write: Mutex<bool>,
+    shared_write: Mutex<WriteHolder>,
     shared_write_released: Condvar,
     /// Reports each worker has saved for the lead.
     reports: Mutex<HashMap<AgentId, u64>>,
-    results: Mutex<HashMap<AgentId, Vec<AgentMessage>>>,
+    results: Mutex<HashMap<AgentId, WorkerResults>>,
+    /// Orders workers by their latest result for window eviction.
+    result_clock: AtomicU64,
+}
+
+/// Results kept in memory per worker.
+const RESULT_WINDOW: usize = 50;
+
+/// Workers whose result windows are kept in memory.
+const RESULT_WORKERS: usize = 64;
+
+/// Pending notifications one `retry_results` call attempts.
+const RETRY_BATCH: usize = 10;
+
+#[derive(Default)]
+struct WorkerResults {
+    total: usize,
+    /// The newest `RESULT_WINDOW` results, oldest first.
+    recent: VecDeque<AgentMessage>,
+    /// Results the lead has not been confirmed to hold yet. They stay until
+    /// the notification is queued, delivered, applied, or retired.
+    pending: Vec<AgentMessage>,
+    /// `RosterInner::result_clock` at this worker's latest result.
+    last: u64,
+}
+
+/// One page of a worker's results, newest first. `offset` is the requested
+/// offset clamped to the retained window.
+#[derive(Default)]
+pub struct ResultPage {
+    pub total: usize,
+    pub offset: usize,
+    pub retained: usize,
+    pub items: Vec<AgentMessage>,
+}
+
+fn notification_confirmed(mailbox: &super::mailbox::AgentMailbox, message: &AgentMessage) -> bool {
+    mailbox.get_steering_receipt(&message.id).is_some_and(|r| {
+        // `unknown` was delivered before a restart and may have been
+        // applied: it is retired, never resent.
+        matches!(
+            r.state.as_str(),
+            "queued" | "delivered" | "applied" | "unknown"
+        )
+    })
 }
 
 impl TeamRoster {
@@ -103,26 +148,82 @@ impl TeamRoster {
             .or_default() += 1;
     }
 
-    /// Results survive roster removal and can be discovered after a missed notification.
-    pub fn worker_results(&self, agent: &AgentId) -> Vec<AgentMessage> {
-        self.inner
-            .results
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(agent)
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    fn keep_result(&self, message: AgentMessage) {
-        let mut results = self.inner.results.lock().unwrap_or_else(|e| e.into_inner());
-        let reports = results.entry(message.from).or_default();
-        if !reports.iter().any(|r| r.id == message.id) {
-            reports.push(message);
+    /// A worker's results, newest first, from the recent window. They survive
+    /// roster removal and can be discovered after a missed notification; older
+    /// ones stay in the journal (`AgentResultRecorded`).
+    pub fn result_page(&self, agent: &AgentId, offset: usize, limit: usize) -> ResultPage {
+        let results = self.inner.results.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(kept) = results.get(agent) else {
+            return ResultPage::default();
+        };
+        let retained = kept.recent.len();
+        let offset = offset.min(retained);
+        ResultPage {
+            total: kept.total,
+            offset,
+            retained,
+            items: kept
+                .recent
+                .iter()
+                .rev()
+                .skip(offset)
+                .take(limit)
+                .cloned()
+                .collect(),
         }
     }
 
-    pub fn rehydrate_results(&self, events: &[super::events::RuntimeEventEnvelope]) {
+    pub(crate) fn keep_result(&self, message: AgentMessage, pending: bool) {
+        let mut results = self.inner.results.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = results.entry(message.from).or_default();
+        if kept
+            .recent
+            .iter()
+            .chain(&kept.pending)
+            .any(|r| r.id == message.id)
+        {
+            return;
+        }
+        kept.total += 1;
+        kept.last = self.inner.result_clock.fetch_add(1, Ordering::Relaxed);
+        if kept.recent.len() == RESULT_WINDOW {
+            kept.recent.pop_front();
+        }
+        kept.recent.push_back(message.clone());
+        if pending {
+            kept.pending.push(message);
+        }
+        // Past the cap, the worker with the oldest latest result loses its
+        // window and total. Its pending notifications stay, and its records
+        // remain in the journal.
+        while results
+            .values()
+            .filter(|kept| !kept.recent.is_empty())
+            .count()
+            > RESULT_WORKERS
+        {
+            let Some(oldest) = results
+                .iter()
+                .filter(|(_, kept)| !kept.recent.is_empty())
+                .min_by_key(|(_, kept)| kept.last)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            let evicted = results.get_mut(&oldest).expect("selected above");
+            evicted.recent.clear();
+            evicted.total = 0;
+            if evicted.pending.is_empty() {
+                results.remove(&oldest);
+            }
+        }
+    }
+
+    pub fn rehydrate_results(
+        &self,
+        mailbox: &super::mailbox::AgentMailbox,
+        events: &[super::events::RuntimeEventEnvelope],
+    ) {
         self.inner
             .results
             .lock()
@@ -130,13 +231,15 @@ impl TeamRoster {
             .clear();
         for event in events {
             if let super::events::RuntimeEvent::AgentResultRecorded { message } = &event.payload {
-                self.keep_result(message.clone());
+                self.keep_result(message.clone(), !notification_confirmed(mailbox, message));
             }
         }
     }
 
     /// Reconcile stable IDs before retrying notifications. Status inspection is
     /// also the recovery path when a full lead queue becomes available again.
+    /// Only results not yet confirmed to the lead are looked at, a bounded
+    /// batch per call, and a full lead queue ends the attempt.
     pub fn retry_results(&self, runtime: &RuntimeHandle) {
         let messages: Vec<_> = self
             .inner
@@ -144,19 +247,50 @@ impl TeamRoster {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .flatten()
+            .flat_map(|kept| &kept.pending)
             .filter(|m| m.to == runtime.agent_id)
+            .take(RETRY_BATCH)
             .cloned()
             .collect();
+        let mut confirmed = HashSet::new();
         for message in messages {
-            if runtime
-                .mailbox
-                .get_steering_receipt(&message.id)
-                .is_some_and(|r| matches!(r.state.as_str(), "queued" | "delivered" | "applied"))
-            {
+            let id = message.id;
+            if notification_confirmed(&runtime.mailbox, &message) {
+                confirmed.insert(id);
                 continue;
             }
-            let _ = runtime.mailbox.send(message);
+            let sent = runtime.mailbox.send(message.clone());
+            match sent {
+                Ok(()) => {
+                    confirmed.insert(id);
+                }
+                // The id may only be reserved by a first send still in flight:
+                // retire it only once the mailbox holds a receipt for it.
+                Err(super::mailbox::MailboxError::DuplicateMessage(_))
+                    if notification_confirmed(&runtime.mailbox, &message) =>
+                {
+                    confirmed.insert(id);
+                }
+                Err(super::mailbox::MailboxError::QueueFull(_)) => break,
+                Err(_) => {}
+            }
+        }
+        self.settle_pending(&confirmed);
+    }
+
+    /// Drop notifications that no longer need a resend.
+    fn settle_pending(&self, ids: &HashSet<uuid::Uuid>) {
+        if ids.is_empty() {
+            return;
+        }
+        for kept in self
+            .inner
+            .results
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values_mut()
+        {
+            kept.pending.retain(|m| !ids.contains(&m.id));
         }
     }
 
@@ -194,11 +328,13 @@ impl TeamRoster {
     /// Exclusive ownership of the shared workspace for writing, so at most
     /// one shared-workspace mutation runs at a time. Lead and worker dispatch
     /// hold it through capture, execution and effect recording; read-only
-    /// work never waits for it. Returns `None` once `token` is cancelled.
+    /// work never waits for it. A dispatch holder is waited for; a background
+    /// job holder is bounded by the job but not by the caller, so that is
+    /// reported at once instead of blocking.
     pub fn acquire_shared_write(
         &self,
         token: Option<&CancellationToken>,
-    ) -> Option<SharedWriteLease> {
+    ) -> Result<SharedWriteLease, SharedWriteError> {
         let mut held = self
             .inner
             .shared_write
@@ -206,13 +342,21 @@ impl TeamRoster {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
             if token.is_some_and(CancellationToken::is_cancelled) {
-                return None;
+                return Err(SharedWriteError::Cancelled);
             }
-            if !*held {
-                *held = true;
-                return Some(SharedWriteLease {
-                    roster: self.clone(),
-                });
+            match &*held {
+                WriteHolder::Free => {
+                    *held = WriteHolder::Dispatch;
+                    return Ok(SharedWriteLease {
+                        roster: self.clone(),
+                    });
+                }
+                WriteHolder::Job { id, label } => {
+                    return Err(SharedWriteError::Busy(format!(
+                        "shared workspace is held by background job {id} (`{label}`) until it exits; wait for it or stop it with job_kill"
+                    )));
+                }
+                WriteHolder::Dispatch => {}
             }
             held = self
                 .inner
@@ -224,9 +368,46 @@ impl TeamRoster {
     }
 }
 
+#[derive(Default)]
+enum WriteHolder {
+    #[default]
+    Free,
+    Dispatch,
+    Job {
+        id: u32,
+        label: String,
+    },
+}
+
+/// Why the shared workspace was not acquired.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SharedWriteError {
+    Cancelled,
+    /// A background job holds it; the text says which and how to proceed.
+    Busy(String),
+}
+
 /// Held shared-workspace write ownership; released on drop.
 pub struct SharedWriteLease {
     roster: TeamRoster,
+}
+
+impl SharedWriteLease {
+    /// The lease outlives the dispatch that took it: record the background
+    /// job it now belongs to so other writers fail fast instead of waiting.
+    pub(crate) fn hand_to_job(&self, id: u32, command: &str) {
+        let label: String = command
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(60)
+            .collect();
+        *self
+            .roster
+            .inner
+            .shared_write
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = WriteHolder::Job { id, label };
+    }
 }
 
 impl Drop for SharedWriteLease {
@@ -236,7 +417,7 @@ impl Drop for SharedWriteLease {
             .inner
             .shared_write
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = WriteHolder::Free;
         self.roster.inner.shared_write_released.notify_all();
     }
 }
@@ -401,10 +582,19 @@ pub fn report_status_to_lead(
         );
         return false;
     }
-    worker.team.keep_result(message.clone());
+    worker.team.keep_result(message.clone(), true);
     worker.team.note_report(worker.agent_id);
+    let id = message.id;
     match worker.mailbox.send(message) {
-        Ok(_) => {}
+        Ok(_) => worker.team.settle_pending(&HashSet::from([id])),
+        // Resending after an unknown outcome is unsafe, so it settles too.
+        Err(error @ super::mailbox::MailboxError::Indeterminate(_)) => {
+            worker.team.settle_pending(&HashSet::from([id]));
+            worker.registry.set_failure_reason(
+                worker.agent_id,
+                format!("result saved; notification to lead unconfirmed: {error}"),
+            );
+        }
         Err(error) => worker.registry.set_failure_reason(
             worker.agent_id,
             format!("result saved; notification to lead pending: {error}"),
@@ -658,7 +848,25 @@ mod tests {
         let _lease = roster.acquire_shared_write(None).unwrap();
         let token = CancellationToken::new();
         token.cancel();
-        assert!(roster.acquire_shared_write(Some(&token)).is_none());
+        assert_eq!(
+            roster.acquire_shared_write(Some(&token)).err(),
+            Some(SharedWriteError::Cancelled)
+        );
+    }
+
+    #[test]
+    fn lease_handed_to_a_background_job_reports_busy_without_waiting() {
+        let roster = TeamRoster::default();
+        let lease = roster.acquire_shared_write(None).unwrap();
+        lease.hand_to_job(7, "npm run build");
+        let started = std::time::Instant::now();
+        let Err(SharedWriteError::Busy(reason)) = roster.acquire_shared_write(None) else {
+            panic!("a job-held lease must report busy");
+        };
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(reason.contains("background job 7") && reason.contains("`npm run build`"));
+        drop(lease);
+        assert!(roster.acquire_shared_write(None).is_ok());
     }
 
     #[test]
@@ -667,7 +875,7 @@ mod tests {
         let lease = roster.acquire_shared_write(None).unwrap();
         let waiter = {
             let roster = roster.clone();
-            std::thread::spawn(move || roster.acquire_shared_write(None).is_some())
+            std::thread::spawn(move || roster.acquire_shared_write(None).is_ok())
         };
         std::thread::sleep(Duration::from_millis(50));
         assert!(!waiter.is_finished(), "a second writer waits");
@@ -778,6 +986,138 @@ mod tests {
         let token = lead.team.admit(id);
         let worker = lead.for_worker(id, Some(token)).unwrap();
         (lead, worker)
+    }
+
+    #[test]
+    fn result_windows_are_bounded_across_workers_and_keep_pending_notifications() {
+        let (lead, _) = team_pair();
+        let workers: Vec<_> = (0..=RESULT_WORKERS).map(|_| AgentId::new()).collect();
+        for (n, worker) in workers.iter().enumerate() {
+            let message = AgentMessage::new(lead.run_id, *worker, lead.agent_id, "done");
+            // Only the oldest worker has an unconfirmed notification.
+            lead.team.keep_result(message, n == 0);
+        }
+        let evicted = lead.team.result_page(&workers[0], 0, usize::MAX);
+        assert_eq!((evicted.total, evicted.items.len()), (0, 0));
+        let kept = lead.team.result_page(&workers[1], 0, usize::MAX);
+        assert_eq!((kept.total, kept.items.len()), (1, 1));
+        let results = lead.team.inner.results.lock().unwrap();
+        assert_eq!(results[&workers[0]].pending.len(), 1, "pending survives");
+        assert_eq!(
+            results.values().filter(|k| !k.recent.is_empty()).count(),
+            RESULT_WORKERS
+        );
+        assert_eq!(results.len(), RESULT_WORKERS + 1, "only pending is kept");
+    }
+
+    #[test]
+    fn result_history_is_windowed_and_retry_only_resends_pending_results() {
+        let (lead, worker) = team_pair();
+        let results: Vec<_> = (0..60)
+            .map(|n| {
+                AgentMessage::new(lead.run_id, worker.agent_id, lead.agent_id, format!("r{n}"))
+            })
+            .collect();
+        for message in &results {
+            lead.team.keep_result(message.clone(), true);
+        }
+        let page = lead.team.result_page(&worker.agent_id, 0, usize::MAX);
+        assert_eq!(page.total, 60);
+        assert_eq!(page.items.len(), RESULT_WINDOW);
+        assert_eq!(page.items[0].content, "r59");
+        assert_eq!(page.items[RESULT_WINDOW - 1].content, "r10");
+
+        // The lead already holds the first 55 (delivered); five are unsent.
+        for message in &results[..55] {
+            lead.mailbox.send(message.clone()).unwrap();
+        }
+        assert_eq!(lead.mailbox.drain(lead.agent_id, 100).len(), 55);
+        let pending = |team: &TeamRoster| {
+            team.inner.results.lock().unwrap()[&worker.agent_id]
+                .pending
+                .len()
+        };
+        assert_eq!(
+            pending(&lead.team),
+            60,
+            "unresolved notifications are never evicted"
+        );
+        lead.team.retry_results(&lead);
+        assert_eq!(
+            pending(&lead.team),
+            60 - RETRY_BATCH,
+            "one retry looks at a bounded batch"
+        );
+        for _ in 0..5 {
+            lead.team.retry_results(&lead);
+        }
+        assert_eq!(lead.mailbox.pending_count(&lead.agent_id), 5);
+        assert_eq!(
+            pending(&lead.team),
+            0,
+            "confirmed results leave the pending set"
+        );
+        lead.team.retry_results(&lead);
+        assert_eq!(lead.mailbox.pending_count(&lead.agent_id), 5);
+
+        // A result the lead may already have applied (`unknown`) is retired,
+        // never resent; one whose id is held as rejected stays pending.
+        let unknown = AgentMessage::new(lead.run_id, worker.agent_id, lead.agent_id, "unknown");
+        let duplicate = AgentMessage::new(lead.run_id, worker.agent_id, lead.agent_id, "dup");
+        let event = |sequence, payload| {
+            crate::runtime::RuntimeEventEnvelope::new(
+                sequence,
+                lead.run_id,
+                None,
+                None,
+                None,
+                payload,
+            )
+        };
+        let to = lead.agent_id;
+        lead.mailbox.rehydrate_from_events(&[
+            event(
+                1,
+                crate::runtime::RuntimeEvent::AgentMessageQueued {
+                    to,
+                    message_id: unknown.id,
+                    message: Some(unknown.clone()),
+                },
+            ),
+            event(
+                2,
+                crate::runtime::RuntimeEvent::AgentMessageDelivered {
+                    to,
+                    message_id: unknown.id,
+                },
+            ),
+            event(
+                3,
+                crate::runtime::RuntimeEvent::AgentMessageQueued {
+                    to,
+                    message_id: duplicate.id,
+                    message: Some(duplicate.clone()),
+                },
+            ),
+            event(
+                4,
+                crate::runtime::RuntimeEvent::AgentMessageRejected {
+                    to,
+                    message_id: duplicate.id,
+                    reason: "cancelled".into(),
+                },
+            ),
+        ]);
+        lead.team.keep_result(unknown, true);
+        lead.team.keep_result(duplicate, true);
+        assert_eq!(pending(&lead.team), 2);
+        lead.team.retry_results(&lead);
+        assert_eq!(
+            pending(&lead.team),
+            1,
+            "an id reserved without a live receipt may be an in-flight first send"
+        );
+        assert_eq!(lead.mailbox.pending_count(&lead.agent_id), 5);
     }
 
     #[test]
@@ -1045,12 +1385,18 @@ mod tests {
             fn on_event(&self, _: &RuntimeEventEnvelope) -> RuntimeDecision {
                 RuntimeDecision::Continue
             }
-            fn record_durably(&self, e: &RuntimeEventEnvelope) -> Result<(), String> {
+            fn record_durably(
+                &self,
+                e: &RuntimeEventEnvelope,
+            ) -> Result<(), crate::runtime::DurableError> {
                 if matches!(e.payload, RuntimeEvent::AgentMessageDelivered { .. }) {
                     Err("injected delivery failure".into())
                 } else {
                     Ok(())
                 }
+            }
+            fn is_journal(&self) -> bool {
+                true
             }
         }
         let (lead, worker) = team_pair();
@@ -1085,12 +1431,18 @@ mod tests {
             fn on_event(&self, _: &RuntimeEventEnvelope) -> RuntimeDecision {
                 RuntimeDecision::Continue
             }
-            fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), String> {
+            fn record_durably(
+                &self,
+                event: &RuntimeEventEnvelope,
+            ) -> Result<(), crate::runtime::DurableError> {
                 if matches!(event.payload, RuntimeEvent::AgentResultRecorded { .. }) {
                     Err("injected result journal failure".into())
                 } else {
                     Ok(())
                 }
+            }
+            fn is_journal(&self) -> bool {
+                true
             }
         }
         let (lead, worker) = team_pair();
@@ -1110,7 +1462,18 @@ mod tests {
             .unwrap()
             .contains("result could not be saved"));
         assert_eq!(lead.mailbox.pending_count(&lead.agent_id), 0);
-        assert!(lead.team.worker_results(&worker.agent_id).is_empty());
+        assert_eq!(lead.team.result_page(&worker.agent_id, 0, 5).total, 0);
+    }
+
+    #[test]
+    fn an_accepted_report_leaves_nothing_pending() {
+        let (lead, worker) = team_pair();
+        assert!(report_to_lead(&worker, &Ok("done".into()), None));
+        assert_eq!(lead.mailbox.pending_count(&lead.agent_id), 1);
+        let results = lead.team.inner.results.lock().unwrap();
+        let kept = &results[&worker.agent_id];
+        assert!(kept.pending.is_empty(), "the lead queue holds it");
+        assert_eq!(kept.recent.len(), 1, "status still shows it");
     }
 
     #[test]
@@ -1187,5 +1550,43 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn session_restore_brings_back_results_the_lead_never_received() {
+        let (lead, worker) = team_pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let session = davinci_session::JsonlSession::create(tmp.path(), "fixture", None).unwrap();
+        let log = davinci_session::runtime_log_path(&session.path);
+        lead.bus.subscribe_session(Arc::new(
+            super::super::session::RuntimeLogSubscriber::open(&log).unwrap(),
+        ));
+        lead.emit_observe(super::super::RuntimeEvent::AgentStarted {
+            record: lead.registry.get(&lead.agent_id).unwrap(),
+        });
+        lead.emit_observe(super::super::RuntimeEvent::AgentStarted {
+            record: lead.registry.get(&worker.agent_id).unwrap(),
+        });
+        for _ in 0..super::super::mailbox::MAX_QUEUE_CAPACITY {
+            worker.send_message(lead.agent_id, "fill").unwrap();
+        }
+        report_to_lead(&worker, &Ok("unique worker result".into()), None);
+        drop((lead, worker.clone()));
+
+        // The production activation path, as a new process takes it.
+        let reopened = davinci_session::JsonlSession::open(&session.path).unwrap();
+        let fresh = super::super::RuntimeHandle::new(
+            crate::RunId::new(),
+            AgentId::new(),
+            super::super::RuntimeBus::new(),
+        );
+        let restored = super::super::session::restore_session_runtime(fresh, &reopened).unwrap();
+        let page = restored.team.result_page(&worker.agent_id, 0, 5);
+        assert_eq!(page.total, 1);
+        assert!(page.items[0].content.contains("unique worker result"));
+        let pending = restored.team.inner.results.lock().unwrap()[&worker.agent_id]
+            .pending
+            .len();
+        assert_eq!(pending, 1, "the lead queue still cannot take it");
     }
 }
