@@ -135,6 +135,16 @@ pub fn bind_unix(path: &str) -> Result<BoundUnixListener, ServerError> {
 }
 
 pub fn bind_unix_with(options: UnixListenerOptions) -> Result<BoundUnixListener, ServerError> {
+    bind_unix_with_chmod(options, |path, mode| {
+        fs::set_permissions(path, Permissions::from_mode(mode))
+    })
+}
+
+/// `chmod` is a parameter so a test can make the permission change fail.
+fn bind_unix_with_chmod(
+    options: UnixListenerOptions,
+    chmod: impl Fn(&Path, u32) -> std::io::Result<()>,
+) -> Result<BoundUnixListener, ServerError> {
     let public_path = PathBuf::from(&options.path);
     let owned = owned_bind_path(&options.path);
     let owned_str = owned.to_string_lossy().into_owned();
@@ -153,17 +163,10 @@ pub fn bind_unix_with(options: UnixListenerOptions) -> Result<BoundUnixListener,
     remove_stale_socket(&public_path)?;
     remove_stale_socket(&owned)?;
     let listener = UnixListener::bind(&owned).map_err(|err| ServerError::Io(err.to_string()))?;
-    let stats = fs::symlink_metadata(&owned).map_err(|err| ServerError::Io(err.to_string()))?;
-    if !stats.file_type().is_socket() {
-        return Err(ServerError::Io(format!(
-            "Unix listener path is not a socket after binding: {}",
-            owned.display()
-        )));
-    }
-    let socket_identity = Some((stats.dev(), stats.ino()));
-    if owned.exists() {
-        fs::hard_link(&owned, &public_path).map_err(|err| ServerError::Io(err.to_string()))?;
-        let _ = fs::set_permissions(&public_path, Permissions::from_mode(options.mode));
+    let mut published = Published::default();
+    if let Err(error) = publish_socket(&owned, &public_path, options.mode, &chmod, &mut published) {
+        discard_unpublished(&owned, &public_path, &published);
+        return Err(error);
     }
     Ok(BoundUnixListener {
         listener: Some(listener),
@@ -172,9 +175,88 @@ pub fn bind_unix_with(options: UnixListenerOptions) -> Result<BoundUnixListener,
         mode: options.mode,
         max_pending_bytes: options.max_pending_bytes,
         graceful_close_timeout_ms: options.graceful_close_timeout_ms,
-        socket_identity,
+        socket_identity: published.identity,
         closed: false,
     })
+}
+
+/// What `publish_socket` has created so far, for cleanup after a failure.
+#[derive(Default)]
+struct Published {
+    identity: Option<(u64, u64)>,
+    linked: bool,
+}
+
+/// Applies the mode to the private socket before it is reachable from the
+/// public path, then links it and checks that the public path is the same
+/// socket with exactly that mode. A hard link shares the inode, so the mode
+/// set here is the mode clients see.
+fn publish_socket(
+    owned: &Path,
+    public: &Path,
+    mode: u32,
+    chmod: &impl Fn(&Path, u32) -> std::io::Result<()>,
+    published: &mut Published,
+) -> Result<(), ServerError> {
+    let stats = fs::symlink_metadata(owned).map_err(|err| ServerError::Io(err.to_string()))?;
+    if !stats.file_type().is_socket() {
+        return Err(ServerError::Io(format!(
+            "Unix listener path is not a socket after binding: {}",
+            owned.display()
+        )));
+    }
+    let identity = (stats.dev(), stats.ino());
+    published.identity = Some(identity);
+    chmod(owned, mode).map_err(|err| {
+        ServerError::Io(format!(
+            "cannot set mode {mode:o} on Unix socket {}: {err}",
+            owned.display()
+        ))
+    })?;
+    verify_socket(owned, identity, mode)?;
+    fs::hard_link(owned, public).map_err(|err| ServerError::Io(err.to_string()))?;
+    published.linked = true;
+    verify_socket(public, identity, mode)
+}
+
+fn verify_socket(path: &Path, identity: (u64, u64), mode: u32) -> Result<(), ServerError> {
+    let stats = fs::symlink_metadata(path).map_err(|err| ServerError::Io(err.to_string()))?;
+    if !stats.file_type().is_socket() || (stats.dev(), stats.ino()) != identity {
+        return Err(ServerError::Io(format!(
+            "Unix listener path changed while it was being published: {}",
+            path.display()
+        )));
+    }
+    let actual = stats.mode() & 0o777;
+    if actual != mode {
+        return Err(ServerError::Io(format!(
+            "Unix socket {} has mode {actual:o}, expected {mode:o}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Best-effort undo of a failed bind. Only paths that still hold the socket
+/// this call created are removed, never someone else's replacement.
+fn discard_unpublished(owned: &Path, public: &Path, published: &Published) {
+    let Some(identity) = published.identity else {
+        return;
+    };
+    let ours = |path: &Path| {
+        fs::symlink_metadata(path).is_ok_and(|stats| {
+            stats.file_type().is_socket() && (stats.dev(), stats.ino()) == identity
+        })
+    };
+    if published.linked && ours(public) {
+        let _ = fs::remove_file(public);
+    }
+    if ours(owned) {
+        let _ = fs::remove_file(owned);
+        if let Some(dir) = owned.parent() {
+            let _ = fs::remove_dir(dir);
+        }
+    }
 }
 
 impl BoundUnixListener {
@@ -567,6 +649,62 @@ mod tests {
         assert!(path.metadata().unwrap().file_type().is_socket());
         assert_eq!(socket_identity(&path), first_identity);
         drop(first);
+    }
+
+    #[test]
+    fn failed_chmod_publishes_nothing_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.sock");
+        let options = UnixListenerOptions::new(path.to_string_lossy()).unwrap();
+        let owned = owned_bind_path(&options.path);
+        let result = bind_unix_with_chmod(options, |_, _| {
+            Err(std::io::Error::from(ErrorKind::PermissionDenied))
+        });
+        let error = result.err().expect("a failed chmod must fail the bind");
+        assert!(error.to_string().contains("cannot set mode"), "{error}");
+        assert!(
+            fs::symlink_metadata(&path).is_err(),
+            "public path must stay absent"
+        );
+        assert!(
+            fs::symlink_metadata(&owned).is_err(),
+            "owned socket must be removed"
+        );
+        assert!(!owned.parent().unwrap().exists());
+        // A later bind at the same path still works.
+        bind_unix(&path.to_string_lossy()).unwrap().close().unwrap();
+    }
+
+    #[test]
+    fn failed_publish_leaves_a_replacement_at_the_public_path_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.sock");
+        let options = UnixListenerOptions::new(path.to_string_lossy()).unwrap();
+        let replacement = path.clone();
+        // Someone creates the public path between the stale check and the link.
+        let result = bind_unix_with_chmod(options, move |target, mode| {
+            fs::write(&replacement, "not ours").unwrap();
+            fs::set_permissions(target, Permissions::from_mode(mode))
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "not ours");
+    }
+
+    #[test]
+    fn custom_mode_is_applied_exactly_regardless_of_umask() {
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o660, 0o666, 0o640] {
+            let path = dir.path().join(format!("server-{mode:o}.sock"));
+            let mut options = UnixListenerOptions::new(path.to_string_lossy()).unwrap();
+            options.mode = mode;
+            let mut bound = bind_unix_with(options).unwrap();
+            let public = fs::symlink_metadata(&path).unwrap();
+            let owned = fs::symlink_metadata(&bound.owned_bind_path).unwrap();
+            assert_eq!(public.mode() & 0o777, mode);
+            assert_eq!(owned.mode() & 0o777, mode);
+            assert_eq!((public.dev(), public.ino()), (owned.dev(), owned.ino()));
+            bound.close().unwrap();
+        }
     }
 
     #[test]
