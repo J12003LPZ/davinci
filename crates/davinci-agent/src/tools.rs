@@ -729,7 +729,12 @@ pub fn execute_tool_with(
                 graph_node: None,
             };
             drop(contract);
-            manager.clone().with_provenance(provenance)
+            let shared_workspace = context.runtime.as_ref().filter(|runtime| {
+                runtime.registry.get(&runtime.agent_id).and_then(|r| r.worktree)
+                    .is_none_or(|path| path.canonicalize().ok().zip(cwd.canonicalize().ok())
+                        .is_none_or(|(worktree, current)| worktree != current))
+            }).cloned();
+            manager.clone().with_provenance(provenance).with_workspace_writer(shared_workspace)
                 .execute_with_operation(
                     cwd,
                     process,
@@ -2320,17 +2325,17 @@ fn sandboxed_background(
     (executable, argv, stdin): (std::path::PathBuf, Vec<String>, Option<&[u8]>),
     context: &ToolContext,
 ) -> Result<ToolResult, ToolError> {
-    let sandbox = context
-        .sandbox
-        .as_ref()
-        .expect("caller checked the sandbox");
     let Some(host) = &context.foreground_supervisor else {
         return Err(ToolError::Failed(
             "sandbox policy requires the trusted process supervisor; direct host background spawn denied"
                 .into(),
         ));
     };
-    if !sandbox.process.allow_background {
+    if context
+        .sandbox
+        .as_ref()
+        .is_some_and(|sandbox| !sandbox.process.allow_background)
+    {
         return Err(ToolError::Failed(
             "sandbox policy does not permit background processes".into(),
         ));
@@ -2386,7 +2391,7 @@ fn shell_tool(
     };
     let background = wants_background(input);
     let started_at_ms = crate::command_receipt::now();
-    if background && context.sandbox.is_some() {
+    if background && (context.sandbox.is_some() || context.foreground_supervisor.is_some()) {
         return sandboxed_background_shell(cwd, input, &command, context);
     }
     if background {
@@ -2756,7 +2761,7 @@ fn powershell_tool(
     }
     let wrapped = format!("{POWERSHELL_UTF8_PREFIX}{command}");
     let background = wants_background(input);
-    if background && context.sandbox.is_some() {
+    if background && (context.sandbox.is_some() || context.foreground_supervisor.is_some()) {
         return sandboxed_background(
             cwd,
             input,

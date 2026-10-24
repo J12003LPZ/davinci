@@ -17,7 +17,8 @@ pub fn tool_specs() -> Vec<AgentTool> {
                 "backoff_ms":{"type":"integer","minimum":50,"maximum":5000}
             },"required":["max_restarts","backoff_ms"]
         },
-        "ports":{"type":"array","items":{"type":"integer","minimum":1,"maximum":65535},"maxItems":8,"uniqueItems":true,"description":"Declared ports only; these are not verified listeners."}
+        "ports":{"type":"array","items":{"type":"integer","minimum":1,"maximum":65535},"maxItems":8,"uniqueItems":true,"description":"Declared ports only; these are not verified listeners."},
+        "exclusive_workspace":{"type":"boolean","description":"Hold shared-workspace write ownership until the process exits. Use for processes that modify tracked files (generators, formatters, migrations). Never for servers or watchers; edits fail while it runs."}
     });
     [
         ("process_start", "Start or reuse a session-owned process using literal executable and argv. It survives this call; final owner release or host loss stops descendants. Environment inherits only platform essentials; explicit overrides need this call's permission. No shell string is executed.", start, vec!["executable"]),

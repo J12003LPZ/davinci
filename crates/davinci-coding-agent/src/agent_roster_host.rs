@@ -677,8 +677,12 @@ mod tests {
         fn record_durably(
             &self,
             _event: &davinci_agent::runtime::RuntimeEventEnvelope,
-        ) -> Result<(), String> {
+        ) -> Result<(), davinci_agent::runtime::DurableError> {
             Err("runtime log append failed: no space left on device".into())
+        }
+
+        fn is_journal(&self) -> bool {
+            true
         }
     }
 

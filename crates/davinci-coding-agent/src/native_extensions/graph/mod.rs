@@ -110,7 +110,7 @@ pub use worker::run_fixture_worker_with_deadline;
 pub use worker::{build_worker_args, worker_cache_profile, WorkerCacheProfile};
 #[cfg(feature = "test-fixtures")]
 pub use worker::{parse_worker_event, WorkerEventState};
-pub use worker_hooks::GraphWorkerContext;
+pub use worker_hooks::{allow_codemode, GraphWorkerContext};
 #[cfg(feature = "test-fixtures")]
 pub use worker_sessions::fixtures as worker_session_fixtures;
 #[allow(unused_imports)]

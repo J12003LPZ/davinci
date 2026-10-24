@@ -760,6 +760,21 @@ pub fn run_tool(
     runner: Option<&SubagentRunner>,
     parent: &SubagentParent,
 ) -> Result<ToolResult, ToolError> {
+    run_tool_with_spawner(input, parent_tools, runner, parent, &mut |name, worker| {
+        std::thread::Builder::new()
+            .name(name)
+            .spawn(worker)
+            .map(|_| ())
+    })
+}
+
+fn run_tool_with_spawner(
+    input: &Value,
+    parent_tools: &[String],
+    runner: Option<&SubagentRunner>,
+    parent: &SubagentParent,
+    spawn: &mut dyn FnMut(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+) -> Result<ToolResult, ToolError> {
     let Some(runner) = runner else {
         return Err(ToolError::Failed("agent tool is not configured".into()));
     };
@@ -1113,9 +1128,9 @@ pub fn run_tool(
             let cleanup_manager = wt_manager.clone();
             let cleanup_operation = operation.clone();
             let (start_tx, start_rx) = std::sync::mpsc::channel();
-            std::thread::Builder::new()
-                .name(format!("agent-worker-{cid}"))
-                .spawn(move || {
+            let spawned = spawn(
+                format!("agent-worker-{cid}"),
+                Box::new(move || {
                     if start_rx.recv().is_err() {
                         return;
                     }
@@ -1137,25 +1152,33 @@ pub fn run_tool(
                             let _ = mgr.release_lease(&lease, false);
                         }
                     }
-                    if let Some(worker) = &req_clone.runtime {
-                        report_async_outcome(
-                            worker,
-                            req_clone.mode,
-                            &outcome,
-                            preserved.as_deref(),
-                        );
-                    }
+                    let reported = if let Some(worker) = &req_clone.runtime {
+                        report_async_outcome(worker, req_clone.mode, &outcome, preserved.as_deref())
+                    } else {
+                        true
+                    };
                     if let Some(rt) = &rt_clone {
                         // Remove the worker from the live roster before publishing its terminal
                         // registry state. Otherwise observers can see Completed while is_member()
                         // is still true for a brief race window.
                         rt.team.forget(&cid);
-                        crate::runtime::team::finish_agent(&rt.registry, cid, outcome.is_ok());
+                        crate::runtime::team::finish_agent(
+                            &rt.registry,
+                            cid,
+                            outcome.is_ok() && reported,
+                        );
                     }
-                })
-                .map_err(|e| {
-                    ToolError::Failed(format!("failed to spawn background agent thread: {e}"))
-                })?;
+                }),
+            );
+            if let Err(error) = spawned {
+                drop(rollback);
+                return Ok(partial_launch_receipt(
+                    &requests,
+                    &launched_ids,
+                    parent,
+                    format!("failed to spawn background agent thread: {error}"),
+                ));
+            }
             rollback.mark_started(cid);
             if start_tx.send(()).is_err() {
                 if let Some(operation) = &cleanup_operation {
@@ -1170,7 +1193,11 @@ pub fn run_tool(
                 if let (Some(manager), Some(lease)) = (&cleanup_manager, &cleanup_lease) {
                     let _ = manager.release_lease(lease, false);
                 }
-                return Err(ToolError::Failed(
+                drop(rollback);
+                return Ok(partial_launch_receipt(
+                    &requests,
+                    &launched_ids,
+                    parent,
                     "background agent thread exited before launch".into(),
                 ));
             }
@@ -1394,12 +1421,40 @@ pub fn run_tool(
 /// (the host's exit note, or the error it left on). A teammate that failed
 /// before its loop ran (host construction, a panic) never reported, so its
 /// failure is reported as a failure, not as a departure.
+fn partial_launch_receipt(
+    requests: &[SubagentRequest],
+    started: &[AgentId],
+    parent: &SubagentParent,
+    error: String,
+) -> ToolResult {
+    let agents: Vec<_> = requests.iter().enumerate().map(|(index, request)| {
+        let id = request.runtime_agent_id.unwrap_or_default();
+        serde_json::json!({
+            "requestIndex": index,
+            "agentId": id.to_string(),
+            "name": request.instance_name,
+            "mode": request.mode.to_string(),
+            "started": started.contains(&id),
+            "state": parent.runtime.as_ref().and_then(|rt| rt.registry.get(&id)).map(|r| r.state),
+        })
+    }).collect();
+    let details = serde_json::json!({
+        "status": "partial_launch", "agents": agents, "error": error,
+        "recovery": "Inspect agent_status for started IDs; retry only entries with started=false. Do not retry the entire batch."
+    });
+    ToolResult {
+        content: serde_json::to_string_pretty(&details).unwrap_or_default(),
+        is_error: true,
+        details: Some(details),
+    }
+}
+
 fn report_async_outcome(
     worker: &RuntimeHandle,
     mode: AgentSpawnMode,
     outcome: &Result<String, String>,
     worktree_note: Option<&str>,
-) {
+) -> bool {
     use crate::runtime::team::{report_status_to_lead, report_to_lead};
     match mode {
         AgentSpawnMode::Background | AgentSpawnMode::Oneshot => {
@@ -1465,6 +1520,75 @@ fn run_journaled_subagent(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn partial_background_launch_returns_started_and_unstarted_identities() {
+        let runtime = RuntimeHandle::new(
+            crate::runtime::RunId::new(),
+            crate::runtime::AgentId::new(),
+            crate::runtime::RuntimeBus::new(),
+        );
+        runtime.ensure_lead_registered("mock", "mock", std::path::Path::new("."));
+        let parent = SubagentParent {
+            runtime: Some(runtime.clone()),
+            allow_async: true,
+            ..Default::default()
+        };
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let receiver = Arc::new(std::sync::Mutex::new(release_rx));
+        let runner = SubagentRunner::new(move |_| {
+            receiver
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            Ok("finished".into())
+        });
+        let mut attempts = 0;
+        let result = run_tool_with_spawner(
+            &json!({"tasks":[
+                {"prompt":"first", "mode":"background", "name":"first"},
+                {"prompt":"second", "mode":"background", "name":"second"}
+            ]}),
+            &["read".into()],
+            Some(&runner),
+            &parent,
+            &mut |name, worker| {
+                attempts += 1;
+                if attempts == 2 {
+                    return Err(std::io::Error::other("injected spawn failure"));
+                }
+                std::thread::Builder::new()
+                    .name(name)
+                    .spawn(worker)
+                    .map(|_| ())
+            },
+        );
+        release_tx.send(()).unwrap();
+        let result = result.expect("partial launch must return a structured receipt");
+        assert!(result.is_error);
+        let details = result.details.unwrap();
+        assert_eq!(details["status"], "partial_launch");
+        assert_eq!(details["agents"].as_array().unwrap().len(), 2);
+        assert_eq!(details["agents"][0]["started"], true);
+        assert_eq!(details["agents"][1]["started"], false);
+        let first: AgentId = details["agents"][0]["agentId"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let second: AgentId = details["agents"][1]["agentId"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(runtime.registry.get(&first).is_some());
+        assert_eq!(
+            runtime.registry.get(&second).unwrap().state,
+            AgentState::Failed
+        );
+        assert_eq!(attempts, 2);
+    }
+
     #[test]
     fn configured_worker_concurrency_limits_real_fanout() {
         use super::*;

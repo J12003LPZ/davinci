@@ -13,15 +13,51 @@ pub enum RuntimeDecision {
     Deny { reason: String },
 }
 
+/// Why a durable record was not confirmed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableError {
+    /// Nothing was written; the caller may undo and retry.
+    Refused(String),
+    /// The record may be on disk (a failed write could not be rolled back), so
+    /// a restart may replay it. The caller must not treat it as absent.
+    Indeterminate(String),
+}
+
+impl std::fmt::Display for DurableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(reason) | Self::Indeterminate(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl From<String> for DurableError {
+    fn from(reason: String) -> Self {
+        Self::Refused(reason)
+    }
+}
+
+impl From<&str> for DurableError {
+    fn from(reason: &str) -> Self {
+        Self::Refused(reason.to_string())
+    }
+}
+
 pub trait RuntimeSubscriber: Send + Sync {
     fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision;
 
     /// Record the event and report whether it is safely kept. Subscribers that
     /// only watch cannot fail, so the default is `on_event`; the runtime log
     /// overrides it so a caller can refuse to confirm what was not written.
-    fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), String> {
+    fn record_durably(&self, event: &RuntimeEventEnvelope) -> Result<(), DurableError> {
         self.on_event(event);
         Ok(())
+    }
+
+    /// Whether this subscriber is a durable journal that `emit_durable` may
+    /// treat as authoritative. Observers are never journals.
+    fn is_journal(&self) -> bool {
+        false
     }
 }
 
@@ -165,30 +201,43 @@ impl RuntimeBus {
         drop(previous);
     }
 
-    /// Emit an event that a caller is about to confirm to a person. Every
-    /// observer still sees it; the first that could not keep it makes this an
-    /// error, so the caller can undo and say so instead of claiming success.
-    pub fn emit_durable(&self, event: RuntimeEventEnvelope) -> Result<(), String> {
+    /// Emit an event that a caller is about to confirm to a person. The first
+    /// journal subscriber (registration order) is authoritative: the event is
+    /// written to it alone first, and if that fails nobody else sees it, so a
+    /// refused event is never half kept. Once it is kept, every other
+    /// subscriber observes it and cannot change the result. With no journal
+    /// subscribed the event only reaches observers and the result is `Ok`.
+    pub fn emit_durable(&self, event: RuntimeEventEnvelope) -> Result<(), DurableError> {
         let subscribers = match self.inner.subscribers.lock() {
             Ok(subs) => subs.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
-        let mut failure = None;
-        for subscriber in subscribers {
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                subscriber.observer.record_durably(&event)
+        let journal = subscribers
+            .iter()
+            .position(|subscriber| subscriber.observer.is_journal());
+        if let Some(index) = journal {
+            let written = catch_unwind(AssertUnwindSafe(|| {
+                subscribers[index].observer.record_durably(&event)
             }));
-            match result {
+            match written {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    failure.get_or_insert(error);
-                }
+                Ok(Err(error)) => return Err(error),
                 Err(_) => {
-                    failure.get_or_insert_with(|| "an observer panicked".to_string());
+                    return Err(DurableError::Indeterminate(
+                        "the journal panicked while recording".to_string(),
+                    ))
                 }
             }
         }
-        failure.map_or(Ok(()), Err)
+        for (position, subscriber) in subscribers.iter().enumerate() {
+            if Some(position) == journal {
+                continue;
+            }
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                subscriber.observer.on_event(&event);
+            }));
+        }
+        Ok(())
     }
 
     /// Emits an event to observers in registration order. Observer panics are

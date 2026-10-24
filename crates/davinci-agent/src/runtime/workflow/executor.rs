@@ -1063,6 +1063,74 @@ impl WorkflowExecutor {
             tokens.insert(aid, agent_token.clone());
         }
         let mut result = (|| {
+            let spec = self
+                .specs
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(wf_id)
+                .cloned()
+                .ok_or("workflow spec unavailable for code handoff verification")?;
+            let code_phases =
+                super::validate::code_lineage_phases(&spec, &self.runtime.capability_registry);
+            let mut commits = Vec::new();
+            for dependency in &phase.depends_on {
+                let source = spec
+                    .phases
+                    .iter()
+                    .find(|p| p.id == *dependency)
+                    .ok_or("upstream phase missing")?;
+                let inherits_code = source.depends_on.iter().any(|p| code_phases.contains(p));
+                let artifacts = self.store.list_phase_artifacts(*wf_id, dependency);
+                // Only a worker with saved successful output contributes code.
+                for output in artifacts.iter().filter(|a| a.value.get("worker").is_some()) {
+                    let worker_id = output.value["worker"]
+                        .as_str()
+                        .ok_or("invalid upstream worker output")?;
+                    let source_worker = source
+                        .workers
+                        .iter()
+                        .find(|w| w.id == worker_id)
+                        .ok_or("unknown upstream worker")?;
+                    let needs_handoff = inherits_code
+                        || crate::subagent::tools_may_mutate(
+                            &source_worker.tools,
+                            &self.runtime.capability_registry,
+                        );
+                    let mut handoff = None;
+                    for artifact in artifacts.iter().filter(|a| {
+                        a.worker_id == output.worker_id && a.value.get("worker").is_none()
+                    }) {
+                        let value = self
+                            .store
+                            .get_full_value(&artifact.id)
+                            .map_err(|e| format!("code handoff could not be read: {e}"))?;
+                        if value.get("code_handoff").is_some() {
+                            handoff = Some(value);
+                        }
+                    }
+                    if needs_handoff && handoff.is_none() {
+                        return Err(format!("missing code handoff for {dependency}/{worker_id}"));
+                    }
+                    if let Some(value) = handoff {
+                        match &value["code_handoff"] {
+                            serde_json::Value::String(commit) => commits.push(commit.clone()),
+                            serde_json::Value::Null => {} // Verified snapshot with no code delta.
+                            _ => return Err("invalid code handoff commit".into()),
+                        }
+                    }
+                }
+            }
+            if !commits.is_empty() {
+                let lease = lease
+                    .as_ref()
+                    .ok_or("code handoff requires worktree isolation for the downstream worker")?;
+                self.runtime
+                    .worktree_manager
+                    .as_ref()
+                    .unwrap()
+                    .integrate_code(lease, &commits)
+                    .map_err(|e| format!("upstream code integration failed: {e}"))?;
+            }
             let effective_prompt = if !artifact_context.is_empty() {
                 format!(
                     "{}\n\n[Context from previous phases]:\n{}",
@@ -1241,6 +1309,29 @@ impl WorkflowExecutor {
         })();
         if let Ok(mut tokens) = self.agent_tokens.write() {
             tokens.remove(&aid);
+        }
+        if result.is_ok() {
+            if let (Some(manager), Some(lease)) = (&self.runtime.worktree_manager, &lease) {
+                let handoff = manager
+                    .snapshot_code(lease)
+                    .map_err(|e| e.to_string())
+                    .and_then(|commit| {
+                        let commit = (commit != lease.base_head).then_some(commit);
+                        self.store
+                            .put_artifact(
+                                *wf_id,
+                                &phase.id,
+                                aid,
+                                serde_json::json!({"code_handoff": commit}),
+                                None,
+                            )
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    });
+                if let Err(error) = handoff {
+                    result = Err(format!("code handoff could not be saved: {error}"));
+                }
+            }
         }
         reporter.finish(result.is_ok());
         if let (Some(manager), Some(lease)) = (&self.runtime.worktree_manager, &lease) {
@@ -2024,7 +2115,20 @@ mod tests {
         let p3_arts = executor
             .store
             .list_phase_artifacts(final_state.id, "implement");
-        assert_eq!(p3_arts.len(), 2);
+        assert_eq!(
+            p3_arts
+                .iter()
+                .filter(|a| a.value.get("worker").is_some())
+                .count(),
+            2
+        );
+        assert_eq!(
+            p3_arts
+                .iter()
+                .filter(|a| a.value.get("code_handoff").is_some())
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -2599,6 +2703,154 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn saved_coding_output_without_a_handoff_blocks_downstream() {
+        let (executor, _tmp) =
+            setup_executor(Some(SubagentRunner::new(|_| Ok("downstream ran".into()))));
+        let mut spec = two_worker_phase(Some("worktree"), &["write"]);
+        spec.phases[0].workers.truncate(1);
+        let consumer = WorkflowPhaseSpec {
+            id: "consumer".into(),
+            depends_on: vec!["p".into()],
+            workers: spec.phases[0].workers.clone(),
+            join: WorkflowJoin::All,
+        };
+        spec.phases.push(consumer.clone());
+        let id = WorkflowId::new();
+        executor.specs.write().unwrap().insert(id, spec);
+        executor
+            .store
+            .put_artifact(
+                id,
+                "p",
+                AgentId::new(),
+                serde_json::json!({"worker":"a", "output":"old saved coding result"}),
+                None,
+            )
+            .unwrap();
+        let aid = AgentId::new();
+        let tid = executor
+            .admit_worker(aid, "consumer", &consumer.workers[0])
+            .unwrap();
+        let result = executor.run_workflow_worker(
+            &id,
+            &consumer,
+            "",
+            (aid, tid),
+            &consumer.workers[0],
+            &CancellationToken::new(),
+        );
+        assert!(result.unwrap_err().contains("missing code handoff"));
+    }
+
+    #[test]
+    fn dependent_worktrees_inherit_uncommitted_and_transitive_code() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = seen.clone();
+        let (executor, _tmp) = setup_executor(Some(SubagentRunner::new(move |req| {
+            let path = req.worktree_path.as_ref().unwrap();
+            let id = req.instance_name.as_deref().unwrap();
+            if id != "first" {
+                assert_eq!(
+                    std::fs::read_to_string(path.join("api.txt")).unwrap(),
+                    "upstream API"
+                );
+            }
+            if id == "third" {
+                assert_eq!(
+                    std::fs::read_to_string(path.join("integration.txt")).unwrap(),
+                    "integrated"
+                );
+            }
+            if id == "first" {
+                std::fs::write(path.join("api.txt"), "upstream API").unwrap();
+            }
+            if id == "second" {
+                std::fs::write(path.join("integration.txt"), "integrated").unwrap();
+            }
+            observed.lock().unwrap().push(id.to_string());
+            Ok("done".into())
+        })));
+        let mut spec = two_worker_phase(Some("worktree"), &["write"]);
+        let template = spec.phases[0].workers[0].clone();
+        spec.max_total_agents = 3;
+        spec.phases = ["first", "second", "third"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| WorkflowPhaseSpec {
+                id: id.to_string(),
+                depends_on: if i == 0 {
+                    vec![]
+                } else {
+                    vec![["first", "second"][i - 1].into()]
+                },
+                workers: vec![WorkflowWorkerSpec {
+                    id: id.to_string(),
+                    ..template.clone()
+                }],
+                join: WorkflowJoin::All,
+            })
+            .collect();
+        let state = executor
+            .execute_with(
+                spec,
+                WorkflowLaunch {
+                    parent_permission_mode: Some(crate::PermissionMode::Edits),
+                    parent_tools: vec!["write".into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        assert_eq!(*seen.lock().unwrap(), ["first", "second", "third"]);
+        let repo = executor
+            .runtime
+            .worktree_manager
+            .as_ref()
+            .unwrap()
+            .repo_root();
+        assert!(!repo.join("api.txt").exists());
+    }
+
+    #[test]
+    fn conflicting_upstream_worktrees_block_downstream_execution() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let (executor, _tmp) = setup_executor(Some(SubagentRunner::new(move |req| {
+            let id = req.instance_name.as_deref().unwrap();
+            if id == "consumer" {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                std::fs::write(req.worktree_path.as_ref().unwrap().join("api.txt"), id).unwrap();
+            }
+            Ok("done".into())
+        })));
+        let mut spec = two_worker_phase(Some("worktree"), &["write"]);
+        spec.max_total_agents = 3;
+        spec.phases.push(WorkflowPhaseSpec {
+            id: "consumer".into(),
+            depends_on: vec!["p".into()],
+            workers: vec![WorkflowWorkerSpec {
+                id: "consumer".into(),
+                ..spec.phases[0].workers[0].clone()
+            }],
+            join: WorkflowJoin::All,
+        });
+        let result = executor.execute_with(
+            spec,
+            WorkflowLaunch {
+                parent_permission_mode: Some(crate::PermissionMode::Edits),
+                parent_tools: vec!["write".into()],
+                ..Default::default()
+            },
+        );
+        assert!(
+            result.is_err(),
+            "conflicting handoffs were silently ignored"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -3438,7 +3690,15 @@ mod tests {
         assert_eq!(state.status, WorkflowStatus::Completed);
         // It finished on its own terms, so its result counts.
         assert_eq!(agent_named(&executor, "b").state, AgentState::Completed);
-        assert_eq!(executor.store.list_phase_artifacts(state.id, "p").len(), 2);
+        assert_eq!(
+            executor
+                .store
+                .list_phase_artifacts(state.id, "p")
+                .iter()
+                .filter(|a| a.value.get("worker").is_some())
+                .count(),
+            2
+        );
     }
 
     /// WOR-117 review: a launch with no ceiling ran its workers read-only.

@@ -63,7 +63,8 @@ pub const RUNTIME_EVENT_SCHEMA_VERSION: u16 = 1;
 /// message rejected) are written at this version, so an older build that opens
 /// the log stops with "Unsupported runtime log schema version" rather than a
 /// corrupt-record error in the middle of the file. Every other record stays at
-/// version 1 and stays readable by older builds.
+/// version 1. Worker result records use version 3 so older readers reject
+/// them explicitly rather than treating an unknown event as corrupt JSON.
 pub const RUNTIME_EVENT_SCHEMA_VERSION_MESSAGE_OUTCOMES: u16 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -95,6 +96,7 @@ impl RuntimeEventEnvelope {
     ) -> Self {
         Self {
             schema_version: match payload {
+                RuntimeEvent::AgentResultRecorded { .. } => 3,
                 RuntimeEvent::AgentMessageApplied { .. }
                 | RuntimeEvent::AgentMessageRejected { .. } => {
                     RUNTIME_EVENT_SCHEMA_VERSION_MESSAGE_OUTCOMES
@@ -161,6 +163,10 @@ pub enum RuntimeEvent {
     AgentStateChanged {
         from: AgentState,
         to: AgentState,
+    },
+    /// Worker output retained independently of mailbox capacity.
+    AgentResultRecorded {
+        message: AgentMessage,
     },
     AgentMessageQueued {
         to: AgentId,
