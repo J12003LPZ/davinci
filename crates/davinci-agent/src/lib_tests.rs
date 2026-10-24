@@ -6427,6 +6427,47 @@ fn resume_invalidates_for_a_pending_effect_marker_and_bumps_once() {
 }
 
 #[test]
+fn an_interrupted_effect_revokes_earlier_test_credit() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let paths = vec![PathBuf::from("a.rs"), PathBuf::from("b.rs")];
+    let mut tested = verified_state(7);
+    tested.mutation_paths = paths.clone();
+    tested.covered_paths = paths.clone();
+    tested.tested_paths = paths;
+    tested.tests_passed_generation = Some(7);
+    let mut seed = effect_marker(MUTATION_VERIFICATION_ENTRY_TYPE, "unused");
+    seed.extra
+        .insert("data".into(), serde_json::to_value(tested).unwrap());
+    let path = seeded_session(
+        dir.path(),
+        vec![
+            seed,
+            effect_marker(MUTATION_EFFECT_PENDING_ENTRY_TYPE, "effect-1"),
+        ],
+    );
+    let mut agent = verifying_agent(work.path());
+    agent
+        .load_from_session(JsonlSession::open(&path).unwrap())
+        .unwrap();
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.mutation_generation, 8);
+    assert!(state.tested_paths.is_empty());
+    assert_eq!(state.tests_passed_generation, None);
+    // A later build-only check must not promote the stale test credit.
+    observe_shell_result(
+        &agent,
+        "c1",
+        work.path(),
+        "cargo check --workspace",
+        0,
+        false,
+    );
+    let state = agent.mutation_verification_state();
+    assert_eq!(state.tests_passed_generation, None);
+}
+
+#[test]
 fn a_reused_call_id_cannot_hide_a_mutating_call() {
     for calls in [
         [("bash", "x"), ("read", "x")],

@@ -309,6 +309,7 @@ impl WorktreeManager {
             let output = Command::new("git")
                 .current_dir(&lease.path)
                 .env("GIT_INDEX_FILE", &index)
+                .args(["-c", "safe.bareRepository=explicit"])
                 .args(args)
                 .output()
                 .map_err(|e| WorktreeError::GitError(e.to_string()))?;

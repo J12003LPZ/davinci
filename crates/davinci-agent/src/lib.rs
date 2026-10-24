@@ -1563,6 +1563,10 @@ impl Agent {
             state.last_verification_succeeded = false;
             state.latest_evidence = None;
             state.covered_paths.clear();
+            // The interrupted edit may have changed any tested file, so no
+            // earlier test pass vouches for the new generation.
+            state.tested_paths.clear();
+            state.tests_passed_generation = None;
             state.unknown_mutation_paths = true;
             state.last_classification_reason =
                 Some("a tool call was interrupted before its result was recorded".into());
