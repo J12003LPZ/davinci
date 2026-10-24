@@ -902,6 +902,11 @@ pub fn rebind_worker_spec(
 ///
 /// A `.git` file (linked worktree, submodule) names the real git directory, and
 /// its `commondir`; when those sit inside the workspace they are protected too.
+/// When they sit outside it, nothing is bound, which is only safe while no other
+/// writable mount reaches them: an extra read-write mount that equals, contains
+/// or lies inside any of these paths (or an outside git directory) refuses the
+/// launch, because the read-only binds above do not cover its second route to
+/// the same host files.
 ///
 /// When `.git` is not a valid repository entry (the empty placeholder above, or
 /// any directory that is not a git directory), git discovery skips it and then
@@ -924,8 +929,10 @@ pub fn protected_workspace_paths(spec: &SandboxSpec) -> Result<Vec<String>, Sand
     if !git.is_file() && !is_git_directory(&git) {
         paths.push(protect_workspace_head(&workspace.join("HEAD"))?);
     }
+    let mut outside = Vec::new();
     if git.is_file() {
-        let targets = protect_gitfile_targets(workspace, &git)?;
+        let (targets, outside_targets) = protect_gitfile_targets(workspace, &git)?;
+        outside = outside_targets;
         for path in &targets {
             // A bind mountpoint cannot be renamed, but its unbound parent can,
             // which lets the sandbox swap in a fresh directory at that path.
@@ -953,17 +960,71 @@ pub fn protected_workspace_paths(spec: &SandboxSpec) -> Result<Vec<String>, Sand
             }
         }
     }
+    reject_overlapping_writable_mounts(spec, &paths, &outside)?;
     Ok(paths)
 }
 
-/// Directories a `.git` file points at that lie inside the writable workspace.
+/// Refuses the launch when an extra read-write mount (any but the workspace
+/// mount itself) gives the sandbox a second writable route to a protected host
+/// path. Sources are compared lexically and, where they exist, canonicalized,
+/// because bubblewrap and docker follow a symlinked source.
+fn reject_overlapping_writable_mounts(
+    spec: &SandboxSpec,
+    protected: &[String],
+    outside: &[PathBuf],
+) -> Result<(), SandboxFailure> {
+    let forms = |path: &Path| {
+        let mut forms = vec![lexically_normalized(path)];
+        if let Ok(real) = path.canonicalize() {
+            forms.push(real);
+        }
+        forms
+    };
+    let protected = protected
+        .iter()
+        .map(Path::new)
+        .chain(outside.iter().map(PathBuf::as_path))
+        .collect::<Vec<_>>();
+    for mount in &spec.filesystem.mounts {
+        let Some(source) = mount.source.as_deref() else {
+            continue;
+        };
+        if mount.access != MountAccess::ReadWrite
+            || (source == spec.workspace && mount.target == spec.workspace)
+        {
+            continue;
+        }
+        let source_forms = forms(Path::new(source));
+        for path in &protected {
+            let overlaps = forms(path).iter().any(|path| {
+                source_forms
+                    .iter()
+                    .any(|source| path.starts_with(source) || source.starts_with(path))
+            });
+            if overlaps {
+                return Err(SandboxFailure::new(
+                    SandboxErrorCode::FilesystemDenied,
+                    format!(
+                        "writable mount {source} exposes workspace control path {}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Directories a `.git` file points at, split into those inside the writable
+/// workspace (to bind read-only) and those outside it (reported so the caller
+/// can refuse writable mounts that reach them).
 /// Binding the file alone would leave `gitdir: .metadata` pointing at a
 /// directory whose `config` the sandbox could still rewrite. Anything the file
 /// does not state plainly fails the launch.
 fn protect_gitfile_targets(
     workspace: &Path,
     gitfile: &Path,
-) -> Result<Vec<String>, SandboxFailure> {
+) -> Result<(Vec<String>, Vec<PathBuf>), SandboxFailure> {
     let denied = |detail: &str| {
         SandboxFailure::new(
             SandboxErrorCode::FilesystemDenied,
@@ -981,8 +1042,13 @@ fn protect_gitfile_targets(
         .ok_or_else(|| denied("the .git file must contain `gitdir: <path>`"))?;
     // Relative to the directory holding the file; `join` keeps absolute paths.
     let gitdir = workspace.join(gitdir);
-    let mut protected = Vec::new();
-    protected.extend(protect_inside_workspace(workspace, &gitdir, &denied)?);
+    let mut inside = Vec::new();
+    let mut outside = Vec::new();
+    let mut classify = |target: GitTarget| match target {
+        GitTarget::Inside(path) => inside.push(path),
+        GitTarget::Outside(path) => outside.push(path),
+    };
+    classify(protect_inside_workspace(workspace, &gitdir, &denied)?);
     let commondir = gitdir.join("commondir");
     match std::fs::read_to_string(&commondir) {
         Ok(content) => {
@@ -990,7 +1056,7 @@ fn protect_gitfile_targets(
             if relative.is_empty() {
                 return Err(denied("the commondir file is empty"));
             }
-            protected.extend(protect_inside_workspace(
+            classify(protect_inside_workspace(
                 workspace,
                 &gitdir.join(relative),
                 &denied,
@@ -999,18 +1065,26 @@ fn protect_gitfile_targets(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(denied(&error.to_string())),
     }
-    Ok(protected)
+    Ok((inside, outside))
 }
 
-/// `target` as a path to bind read-only if it is inside `workspace`, `None` if
-/// it is outside. A target outside the writable bind cannot be modified from the
-/// sandbox, so it needs nothing. Inside, every component below the workspace
-/// must be an existing real directory (no symlink to swap or redirect).
+/// Where a git directory named by a `.git` file lies relative to the workspace.
+enum GitTarget {
+    /// Inside: the path to bind read-only.
+    Inside(String),
+    /// Outside the writable workspace bind; needs no bind of its own, but no
+    /// extra writable mount may reach it.
+    Outside(PathBuf),
+}
+
+/// Classifies `target` against `workspace`. Inside, every component below the
+/// workspace must be an existing real directory (no symlink to swap or
+/// redirect).
 fn protect_inside_workspace(
     workspace: &Path,
     target: &Path,
     denied: &dyn Fn(&str) -> SandboxFailure,
-) -> Result<Option<String>, SandboxFailure> {
+) -> Result<GitTarget, SandboxFailure> {
     let root = lexically_normalized(workspace);
     let normalized = lexically_normalized(target);
     let Ok(relative) = normalized.strip_prefix(&root) else {
@@ -1022,7 +1096,7 @@ fn protect_inside_workspace(
                 ));
             }
         }
-        return Ok(None);
+        return Ok(GitTarget::Outside(normalized));
     };
     let mut current = root.clone();
     for component in relative.components() {
@@ -1051,7 +1125,7 @@ fn protect_inside_workspace(
     }
     current
         .to_str()
-        .map(|path| Some(path.to_string()))
+        .map(|path| GitTarget::Inside(path.to_string()))
         .ok_or_else(|| denied("the path is not valid UTF-8"))
 }
 
@@ -1703,6 +1777,90 @@ mod tests {
         let paths = protected_workspace_paths(&spec).unwrap();
         assert_eq!(paths.len(), 3, "{paths:?}");
         assert!(!paths.iter().any(|path| path.contains("..")));
+    }
+
+    fn protected_with_extra_mount(
+        workspace: &Path,
+        source: &Path,
+        access: MountAccess,
+    ) -> Result<Vec<String>, SandboxFailure> {
+        let mut spec = spec(SandboxMode::WorkspaceWrite, NetworkPolicy::Denied);
+        spec.workspace = workspace.to_string_lossy().into_owned();
+        spec.filesystem.mounts[0].source = Some(spec.workspace.clone());
+        spec.filesystem.mounts[0].target = spec.workspace.clone();
+        spec.filesystem.mounts.push(MountRule {
+            source: Some(source.to_string_lossy().into_owned()),
+            target: "/extra".into(),
+            access,
+        });
+        protected_workspace_paths(&spec)
+    }
+
+    fn assert_exposes_control_path(result: Result<Vec<String>, SandboxFailure>) {
+        let error = result.unwrap_err();
+        assert_eq!(error.code, SandboxErrorCode::FilesystemDenied);
+        assert!(
+            error.message.contains("exposes workspace control path"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn workspace_write_refuses_a_writable_mount_over_an_outside_git_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside = outside.path().canonicalize().unwrap();
+        let gitdir = outside.join("repo.git");
+        std::fs::create_dir(&gitdir).unwrap();
+        std::fs::write(
+            workspace.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        assert_exposes_control_path(protected_with_extra_mount(
+            &workspace,
+            &outside,
+            MountAccess::ReadWrite,
+        ));
+        // Read-only access to the same directory leaves it unwritable.
+        let paths =
+            protected_with_extra_mount(&workspace, &outside, MountAccess::ReadOnly).unwrap();
+        assert_eq!(paths.len(), 3, "{paths:?}");
+    }
+
+    #[test]
+    fn workspace_write_refuses_a_writable_mount_over_the_workspace_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().canonicalize().unwrap();
+        let workspace = parent.join("ws");
+        std::fs::create_dir(&workspace).unwrap();
+        assert_exposes_control_path(protected_with_extra_mount(
+            &workspace,
+            &parent,
+            MountAccess::ReadWrite,
+        ));
+    }
+
+    #[test]
+    fn workspace_write_refuses_a_writable_mount_inside_a_control_path() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        std::fs::create_dir_all(workspace.join(".git/hooks")).unwrap();
+        assert_exposes_control_path(protected_with_extra_mount(
+            &workspace,
+            &workspace.join(".git/hooks"),
+            MountAccess::ReadWrite,
+        ));
+    }
+
+    #[test]
+    fn workspace_write_accepts_a_writable_mount_on_an_unrelated_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        protected_with_extra_mount(&workspace, other.path(), MountAccess::ReadWrite).unwrap();
     }
 
     #[test]

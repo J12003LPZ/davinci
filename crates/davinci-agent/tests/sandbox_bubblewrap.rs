@@ -296,6 +296,42 @@ fn native_bubblewrap_protects_the_directory_a_git_file_points_at() {
     );
 }
 
+#[test]
+#[ignore = "requires Linux bubblewrap"]
+fn native_bubblewrap_refuses_a_writable_mount_over_an_outside_git_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let shared = temp.path().join("shared");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(shared.join("repo.git")).unwrap();
+    fs::write(
+        workspace.join(".git"),
+        format!("gitdir: {}\n", shared.join("repo.git").display()),
+    )
+    .unwrap();
+    let mut spec = spec(&workspace, SandboxMode::WorkspaceWrite);
+    spec.filesystem.mounts.push(MountRule {
+        source: Some(shared.to_string_lossy().into_owned()),
+        target: "/shared".into(),
+        access: MountAccess::ReadWrite,
+    });
+    let request = ExecutionRequest {
+        sandbox_id: spec.id.clone(),
+        executable: "/usr/bin/true".into(),
+        argv: Vec::new(),
+        cwd: spec.workspace.clone(),
+        launch_id: None,
+    };
+    let error = LinuxBubblewrapBackend::new(PathBuf::from("/usr/bin/bwrap"))
+        .prepare(&spec, &request, &BTreeMap::new())
+        .unwrap_err();
+    assert!(
+        error.message.contains("exposes workspace control path"),
+        "{}",
+        error.message
+    );
+}
+
 const BARE_ROOT_PROBE: &str = r#"
 import json, os, pathlib, sys
 marker = sys.argv[1]
