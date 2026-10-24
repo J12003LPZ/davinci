@@ -1277,7 +1277,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     // After the session: plugin SessionStart hooks receive its id.
     apply_discovered_resources(parsed, &mut agent);
     startup_mark("session opened");
-    agent.auto_compaction = settings.compaction_enabled();
+    apply_context_settings(&settings, &mut agent);
     agent.auto_verify =
         settings.auto_verify_enabled(std::env::var("DAVINCI_AUTO_VERIFY").ok().as_deref());
     agent.named_file_context =
@@ -1286,10 +1286,6 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         settings.effort_policy(std::env::var("DAVINCI_EFFORT_POLICY").ok().as_deref());
     agent.tool_surface =
         settings.tool_surface(std::env::var("DAVINCI_TOOL_SURFACE").ok().as_deref());
-    agent.compaction = settings.compaction_settings();
-    agent.set_context_vm_mode(
-        settings.context_vm_mode(std::env::var("DAVINCI_CONTEXT_VM").ok().as_deref()),
-    );
     agent.auto_retry = settings.retry_enabled();
     agent.retry_attempts = settings.retry_max_retries();
     agent.retry_base_delay_ms = settings.retry_base_delay_ms();
@@ -1445,33 +1441,16 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         agent.set_active_contract(contract);
     }
     attach_tool_executor(&mut agent, &host);
-    // Worker agents retain the default-off feature and their inherited tool ceiling.
-    if graph_worker.is_none() {
-        // `--codemode` is an explicit request and fails loudly. The `/config`
-        // switch is a preference: a missing runtime or a sessionless run
-        // starts without Codemode and says why, rather than refusing to start.
-        let explicit = parsed.codemode.is_some();
-        let agent_dir = default_agent_dir();
-        let staged = davinci_coding_agent::codemode_host::config::resolve_config(
-            parsed.codemode.as_deref(),
-            settings.codemode.as_ref(),
-            &agent_dir,
-        )
-        .and_then(|config| match config {
-            None => Ok(None),
-            Some(_) if parsed.no_session => Err(
-                "Codemode records its operations in the session journal; remove --no-session to use it"
-                    .to_string(),
-            ),
-            Some(config) => config.admit(cwd, &agent_dir).map(Some),
-        });
-        match staged {
-            Ok(Some(codemode)) => agent.stage_read_only_codemode(Arc::new(codemode)),
-            Ok(None) => {}
-            Err(error) if explicit => return Err(error),
-            Err(error) => eprintln!("Codemode is on in /config but stays off: {error}"),
-        }
-    }
+    let agent_dir = default_agent_dir();
+    start_codemode(
+        &mut agent,
+        parsed,
+        graph_worker.is_some(),
+        settings.codemode.as_ref(),
+        cwd,
+        &agent_dir,
+        admit_node(&agent_dir),
+    )?;
     host.emit(ExtensionEvent::SessionStart);
     let _ = host.describe_js();
     apply_resolved_models(parsed, &mut agent)?;
@@ -2435,15 +2414,98 @@ fn apply_max_model_turns(agent: &mut Agent, settings: &settings::Settings) {
     }
 }
 
+/// Auto compaction and Context VM mode as `/config` and the environment set
+/// them. Every model-backed agent applies the pair the same way.
+fn apply_context_settings(settings: &settings::Settings, agent: &mut Agent) {
+    agent.auto_compaction = settings.compaction_enabled();
+    agent.compaction = settings.compaction_settings();
+    agent.set_context_vm_mode(
+        settings.context_vm_mode(std::env::var("DAVINCI_CONTEXT_VM").ok().as_deref()),
+    );
+}
+
 /// An in-process worker (`agent`, fan-out, teammates, workflow tasks) compacts at the
-/// user's configured point, like the session and the `--print` graph workers
-/// that `build_agent` configures. It needs the model summarizer too: without
-/// one, compaction falls back to a mechanical transcript dump, which can save
-/// little and leave the worker over its threshold.
-fn apply_worker_compaction(parsed: &Args, settings: &settings::Settings, child: &mut Agent) {
-    child.auto_compaction = settings.compaction_enabled();
-    child.compaction = settings.compaction_settings();
+/// user's configured point and runs the configured Context VM mode, like the
+/// session and the `--print` graph workers that `build_agent` configures. Its
+/// runtime clone carries its own VM state (`RuntimeHandle::for_worker`), so
+/// the mode never touches the lead's. It needs the model summarizer too:
+/// without one, compaction falls back to a mechanical transcript dump, which
+/// can save little and leave the worker over its threshold.
+fn apply_worker_settings(parsed: &Args, settings: &settings::Settings, child: &mut Agent) {
+    apply_context_settings(settings, child);
     child.summarizer = Some(live_compaction_summarizer(parsed, child));
+}
+
+/// Whether the profile lets `/config`'s Codemode switch reach the worker: a
+/// profile that pins a tool list without `codemode` keeps its worker to it.
+/// Codemode only calls the worker's own authorized read-only tools, so it adds
+/// no capability and does not depend on the lead exposing it.
+fn profile_allows_worker_codemode(profile: Option<&agent_profiles::AgentProfile>) -> bool {
+    !profile.is_some_and(|profile| {
+        !profile.tools.is_empty() && !profile.tools.iter().any(|tool| tool == "codemode")
+    })
+}
+
+/// Whether Codemode may be staged on this worker right now: its profile allows
+/// it, it has a tool to wrap, and its runtime holds the operation journal that
+/// attributes its operations (a sessionless lead has none). Checked from the
+/// worker itself, so a teammate re-evaluates it before every turn.
+fn worker_codemode_offered(child: &Agent, profile_allows: bool) -> bool {
+    profile_allows
+        && !child.tools.is_empty()
+        && child
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.operations.is_some())
+}
+
+/// Stage or clear Codemode on a worker the way `/config` says; the lead's
+/// explicit `--codemode` does not reach workers. The worker turn registers a
+/// staged host after installing its runtime, exactly as the lead's does; a
+/// refused admission leaves the worker without Codemode.
+fn sync_worker_codemode(child: &mut Agent, settings: &settings::Settings, offered: bool) {
+    let agent_dir = default_agent_dir();
+    sync_worker_codemode_with(child, settings, offered, &agent_dir, admit_node(&agent_dir));
+}
+
+fn sync_worker_codemode_with(
+    child: &mut Agent,
+    settings: &settings::Settings,
+    offered: bool,
+    agent_dir: &Path,
+    admit: CodemodeAdmission<'_>,
+) {
+    if !offered {
+        if child.has_staged_codemode() {
+            child.clear_codemode();
+        }
+        return;
+    }
+    let config = davinci_coding_agent::codemode_host::config::resolve_config(
+        None,
+        settings.codemode.as_ref(),
+        agent_dir,
+    )
+    .ok()
+    .flatten();
+    match config {
+        None if child.has_staged_codemode() => child.clear_codemode(),
+        Some(config) if !child.has_staged_codemode() => {
+            if let Ok(host) = admit(&config, &child.cwd) {
+                child.stage_read_only_codemode(host);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A teammate lives across many turns, so `/config` changes made meanwhile
+/// reach it before its next turn.
+fn refresh_worker_settings(child: &mut Agent, profile_allows_codemode: bool) {
+    let settings = load_merged_settings(&default_agent_dir(), &child.cwd);
+    apply_context_settings(&settings, child);
+    let offered = worker_codemode_offered(child, profile_allows_codemode);
+    sync_worker_codemode(child, &settings, offered);
 }
 
 fn new_worker_agent(system_prompt: impl Into<String>) -> Agent {
@@ -2513,7 +2575,19 @@ fn resolve_subagent_model(
     ))
 }
 
+#[cfg(test)]
 fn build_worker_agent(
+    parsed: &Args,
+    cwd: &Path,
+    mcp: &davinci_agent::McpRegistry,
+    req: &davinci_agent::SubagentRequest,
+) -> Result<Agent, String> {
+    build_worker(parsed, cwd, mcp, req).map(|(agent, _)| agent)
+}
+
+/// The worker agent, and whether `/config`'s Codemode switch may reach it
+/// (see [`worker_codemode_offered`]).
+fn build_worker(
     parsed: &Args,
     cwd: &Path,
     mcp: &davinci_agent::McpRegistry,
@@ -2730,21 +2804,17 @@ fn build_worker_agent(
             child.context_window = max_tokens as u64;
         }
     }
-    apply_worker_compaction(parsed, &settings, &mut child);
+    apply_worker_settings(parsed, &settings, &mut child);
+    let profile_allows_codemode = profile_allows_worker_codemode(profile.as_ref());
+    let offered = worker_codemode_offered(&child, profile_allows_codemode);
+    sync_worker_codemode(&mut child, &settings, offered);
     // The worker's own tool calls and token use feed the lead's transcript.
     if let Some(progress) = req.progress.clone() {
         child.event_sink = Some(davinci_agent::EventSink(Arc::new(move |event| {
             progress.observe(event)
         })));
     }
-    let shared_writer = req.worktree_path.is_none()
-        && matches!(
-            child_mode,
-            davinci_agent::PermissionMode::Edits
-                | davinci_agent::PermissionMode::Auto
-                | davinci_agent::PermissionMode::AlwaysApprove
-        );
-    Ok((child, shared_writer))
+    Ok((child, profile_allows_codemode))
 }
 
 /// Permission mode for a worker without an explicit profile mode: the
@@ -2786,44 +2856,17 @@ fn run_nested_subagent(
     mcp: &davinci_agent::McpRegistry,
     req: &davinci_agent::SubagentRequest,
 ) -> Result<String, String> {
-    let (mut child, shared_writer) = build_worker_agent(parsed, cwd, mcp, req)?;
-    let team = req.runtime.as_ref().map(|runtime| runtime.team.clone());
-    // One shared-workspace writer at a time across the whole session. A
-    // worker takes the lease at its first mutating call and keeps it until
-    // its turn ends, so read-only work still runs in parallel.
-    let write_lease: Arc<Mutex<Option<davinci_agent::runtime::team::SharedWriteLease>>> =
-        Arc::default();
-    if let (Some(team), true) = (&team, shared_writer) {
-        let team = team.clone();
-        let lease = write_lease.clone();
-        let token = req.cancellation_token.clone();
-        child.pre_tool = Some(davinci_agent::PreToolHook(Arc::new(move |name, _| {
-            if matches!(
-                davinci_agent::tool_class(name),
-                davinci_agent::ToolClass::Read | davinci_agent::ToolClass::Network
-            ) {
-                return None;
-            }
-            let mut held = lease.lock().unwrap_or_else(|e| e.into_inner());
-            if held.is_none() {
-                match team.acquire_shared_write(token.as_ref()) {
-                    Some(acquired) => *held = Some(acquired),
-                    None => {
-                        return Some(
-                            "worker cancelled while waiting for the shared workspace".into(),
-                        )
-                    }
-                }
-            }
-            None
-        })));
-    }
+    let (mut child, profile_allows_codemode) = build_worker(parsed, cwd, mcp, req)?;
+    let teammate = req.mode == davinci_agent::AgentSpawnMode::Teammate;
+    // Shared-workspace write ownership is taken per mutating call by the
+    // turn's dispatch (`turn.rs`), the same path as the lead's own calls.
     let mut turn = |prompt: &str| {
-        let result = run_worker_turn(parsed, &mut child, prompt);
-        write_lease.lock().unwrap_or_else(|e| e.into_inner()).take();
-        result
+        if teammate {
+            refresh_worker_settings(&mut child, profile_allows_codemode);
+        }
+        run_worker_turn(parsed, &mut child, prompt)
     };
-    if req.mode == davinci_agent::AgentSpawnMode::Teammate {
+    if teammate {
         let runtime = req
             .runtime
             .as_ref()
@@ -3186,16 +3229,14 @@ fn complete_prompt_with_host(
         davinci_agent::runtime::workflow::state::DEFAULT_MAX_INLINE_ARTIFACT_BYTES,
         default_agent_dir().join("workflow_artifacts"),
     );
-    runtime_handle = match runtime_host::configure_session_workflow(
+    runtime_handle = match runtime_host::configure_session_workflow_with_journal(
         runtime_handle,
+        &agent.cwd,
         agent.session.as_ref(),
         agent.runtime_for_next_prompt(),
         wf_store,
         agent.subagent_runner.clone(),
-    )
-    .and_then(|runtime| {
-        runtime_host::attach_operation_runtime(runtime, &agent.cwd, agent.session.as_ref())
-    }) {
+    ) {
         Ok(runtime) => runtime,
         Err(error) => {
             let reply = if error.starts_with(davinci_agent::runtime::session::SESSION_IN_USE) {
@@ -4305,10 +4346,8 @@ fn run_print_turns(
         .unwrap_or_default();
     // Written before any approval_required, which stays the final line.
     if json_mode {
-        let encoded = serde_json::to_string(&serde_json::json!({
-            "type": "harness_stats", "schema_version": 1, "runtime": agent.run_stats(),
-        }))
-        .map_err(|err| err.to_string())?;
+        let encoded = serde_json::to_string(&output::harness_stats_record(agent))
+            .map_err(|err| err.to_string())?;
         output::write_raw_stdout_line(&encoded).map_err(|err| err.to_string())?;
     }
     if json_mode && !denied.is_empty() {
@@ -8410,47 +8449,169 @@ fn apply_orchestration_settings(agent: &mut Agent, settings: &settings::Settings
     agent.sync_orchestration_tools();
 }
 
+/// Record the Codemode mode the host resolved. The requested mode counts only
+/// once it was admitted; any error records `off`, so feature stats never
+/// report a mode that did not start. Shared by startup and `/config`.
+fn record_codemode_outcome(
+    agent: &mut Agent,
+    requested: &str,
+    outcome: Result<(), String>,
+) -> Result<(), String> {
+    agent.set_codemode_configured_mode(if outcome.is_ok() { requested } else { "off" });
+    outcome
+}
+
+type CodemodeAdmission<'a> = Box<
+    dyn FnOnce(
+            &davinci_coding_agent::codemode_host::config::ReadOnlyConfig,
+            &Path,
+        ) -> Result<Arc<dyn davinci_agent::codemode::CodeModeHost>, String>
+        + 'a,
+>;
+
+#[cfg(test)]
+thread_local! {
+    /// Stands in for the Node runtime that tests cannot install.
+    static TEST_CODEMODE_HOST: std::cell::RefCell<Option<Arc<dyn davinci_agent::codemode::CodeModeHost>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Admission against the Node runtime under the agent dir.
+fn admit_node(agent_dir: &Path) -> CodemodeAdmission<'_> {
+    #[cfg(test)]
+    if let Some(host) = TEST_CODEMODE_HOST.with(|host| host.borrow().clone()) {
+        return Box::new(move |_, _| Ok(host));
+    }
+    Box::new(move |config, cwd| Ok(Arc::new(config.admit(cwd, agent_dir)?)))
+}
+
+/// Startup admission of Codemode from `--codemode` and the stored setting.
+fn stage_startup_codemode(
+    agent: &mut Agent,
+    cli: Option<&str>,
+    stored: Option<&serde_json::Value>,
+    agent_dir: &Path,
+    cwd: &Path,
+    no_session: bool,
+    admit: CodemodeAdmission<'_>,
+) -> Result<(), String> {
+    use davinci_coding_agent::codemode_host::config::{configured_mode, resolve_config};
+    const SESSIONLESS: &str =
+        "Codemode records its operations in the session journal; remove --no-session to use it";
+    let requested = configured_mode(cli, stored);
+    let staged = resolve_config(cli, stored, agent_dir).and_then(|config| match config {
+        None => Ok(None),
+        Some(_) if no_session => Err(SESSIONLESS.to_string()),
+        Some(config) => admit(&config, cwd).map(Some),
+    });
+    let staged = staged.map(|codemode| {
+        if let Some(codemode) = codemode {
+            agent.stage_read_only_codemode(codemode);
+        }
+    });
+    record_codemode_outcome(agent, requested, staged)
+}
+
+/// Codemode at startup, for the lead and its Graph workers alike. `--codemode`
+/// is an explicit request and fails loudly. The `/config` switch is a
+/// preference: a missing runtime or a sessionless run starts without Codemode
+/// and says why, rather than refusing to start. A Graph worker follows the
+/// stored switch only, never the lead's explicit `--codemode`; it stays inside
+/// its authorized tools, since Codemode is read-only and its inner calls pass
+/// the same per-tool checks.
+fn start_codemode(
+    agent: &mut Agent,
+    parsed: &Args,
+    graph_worker: bool,
+    stored: Option<&serde_json::Value>,
+    cwd: &Path,
+    agent_dir: &Path,
+    admit: CodemodeAdmission<'_>,
+) -> Result<(), String> {
+    let staged = stage_startup_codemode(
+        agent,
+        parsed.codemode.as_deref(),
+        stored,
+        agent_dir,
+        cwd,
+        parsed.no_session,
+        admit,
+    );
+    if graph_worker {
+        crate::native_extensions::graph::allow_codemode(agent.has_staged_codemode());
+    }
+    match staged {
+        Err(error) if parsed.codemode.is_some() => Err(error),
+        // A worker launched without a conversation has no journal to use.
+        Err(_) if graph_worker => Ok(()),
+        Err(error) => {
+            eprintln!("Codemode is on in /config but stays off: {error}");
+            Ok(())
+        }
+        Ok(()) => Ok(()),
+    }
+}
+
 /// Bring a running agent's Codemode in line with settings after `/config`
-/// changes the switch. An error names why the runtime cannot be admitted.
+/// changes the switch. An error names why the runtime cannot be admitted, and
+/// leaves the recorded mode `off`: the caller turns the switch off with it.
 pub(crate) fn sync_codemode_from_settings(agent: &mut Agent) -> Result<(), String> {
     let agent_dir = default_agent_dir();
     let stored = load_merged_settings(&agent_dir, &agent.cwd);
-    let config = davinci_coding_agent::codemode_host::config::resolve_config(
+    let requested = davinci_coding_agent::codemode_host::config::configured_mode(
         None,
         stored.codemode.as_ref(),
-        &agent_dir,
-    )?;
-    match config {
-        None => {
-            agent.clear_codemode();
-            Ok(())
+    );
+    let synced = (|| {
+        let config = davinci_coding_agent::codemode_host::config::resolve_config(
+            None,
+            stored.codemode.as_ref(),
+            &agent_dir,
+        )?;
+        match config {
+            None => {
+                agent.clear_codemode();
+                Ok(())
+            }
+            Some(_) if agent.has_staged_codemode() => Ok(()),
+            Some(_) if agent.session.is_none() => {
+                Err("Codemode needs a session journal; this run has no session".into())
+            }
+            Some(config) => {
+                let host = admit_node(&agent_dir)(&config, &agent.cwd)?;
+                agent.stage_read_only_codemode(host);
+                Ok(())
+            }
         }
-        Some(_) if agent.has_staged_codemode() => Ok(()),
-        Some(_) if agent.session.is_none() => {
-            Err("Codemode needs a session journal; this run has no session".into())
-        }
-        Some(config) => {
-            let host = config.admit(&agent.cwd, &agent_dir)?;
-            agent.stage_read_only_codemode(Arc::new(host));
-            Ok(())
-        }
-    }
+    })();
+    record_codemode_outcome(agent, requested, synced)
+}
+
+/// What a replacement agent needs to match the one `build_agent` started: the
+/// compaction and Context VM settings, the model summarizer and Codemode
+/// staging for its (already loaded) session. `Err` says why Codemode stayed off.
+pub(crate) fn apply_session_agent_settings(
+    agent: &mut Agent,
+    summarizer: Option<Summarizer>,
+) -> Result<(), String> {
+    apply_context_settings(
+        &load_merged_settings(&default_agent_dir(), &agent.cwd),
+        agent,
+    );
+    agent.summarizer = summarizer;
+    sync_codemode_from_settings(agent)
 }
 
 fn sync_agent_from_settings(agent: &mut Agent) {
     let stored = load_merged_settings(&default_agent_dir(), &agent.cwd);
     apply_orchestration_settings(agent, &stored);
-    agent.auto_compaction = stored.compaction_enabled();
+    apply_context_settings(&stored, agent);
     agent.auto_verify =
         stored.auto_verify_enabled(std::env::var("DAVINCI_AUTO_VERIFY").ok().as_deref());
     agent.named_file_context =
         stored.named_file_context_enabled(std::env::var("DAVINCI_NAMED_FILES").ok().as_deref());
     agent.effort_policy =
         stored.effort_policy(std::env::var("DAVINCI_EFFORT_POLICY").ok().as_deref());
-    agent.compaction = stored.compaction_settings();
-    agent.set_context_vm_mode(
-        stored.context_vm_mode(std::env::var("DAVINCI_CONTEXT_VM").ok().as_deref()),
-    );
     agent.block_images = stored.block_images();
     agent.auto_resize_images = stored.image_auto_resize();
     agent.transport = stored.transport.clone();

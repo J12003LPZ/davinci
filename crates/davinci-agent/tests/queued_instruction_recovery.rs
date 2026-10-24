@@ -250,12 +250,19 @@ impl davinci_agent::runtime::RuntimeSubscriber for FailingLog {
         davinci_agent::runtime::RuntimeDecision::Continue
     }
 
-    fn record_durably(&self, _event: &RuntimeEventEnvelope) -> Result<(), String> {
+    fn record_durably(
+        &self,
+        _event: &RuntimeEventEnvelope,
+    ) -> Result<(), davinci_agent::runtime::DurableError> {
         if self.0.load(std::sync::atomic::Ordering::SeqCst) {
             Err("runtime log append failed: no space left on device".into())
         } else {
             Ok(())
         }
+    }
+
+    fn is_journal(&self) -> bool {
+        true
     }
 }
 

@@ -5,6 +5,9 @@ use serde_json::{json, Value};
 use super::events::AgentState;
 use crate::tools::{AgentTool, ToolContext, ToolError, ToolResult};
 
+const DEFAULT_RESULTS_LIMIT: usize = 5;
+const MAX_RESULTS_LIMIT: usize = 20;
+
 pub fn agent_tool_specs() -> Vec<AgentTool> {
     vec![
         AgentTool {
@@ -15,7 +18,15 @@ pub fn agent_tool_specs() -> Vec<AgentTool> {
                 "properties": {
                     "agent_id": {
                         "type": "string",
-                        "description": "Optional agent name or ID (UUID) to inspect. If omitted, returns all agents in the run."
+                        "description": "Optional agent name or ID (UUID) to inspect. If omitted, returns all agents in the run with only their latest result's preview."
+                    },
+                    "results_offset": {
+                        "type": "integer",
+                        "description": "With agent_id: skip this many of the newest results (default 0)."
+                    },
+                    "results_limit": {
+                        "type": "integer",
+                        "description": "With agent_id: how many results to return, 1-20 (default 5)."
                     }
                 }
             }),
@@ -65,6 +76,7 @@ pub fn agent_status_tool(input: &Value, context: &ToolContext) -> Result<ToolRes
         .as_ref()
         .ok_or_else(|| ToolError::Failed("Runtime subsystem not initialized".into()))?;
 
+    runtime.team.retry_results(runtime);
     if let Some(aid_str) = input.get("agent_id").and_then(Value::as_str) {
         let aid = super::team::resolve_agent(runtime, aid_str).map_err(ToolError::Failed)?;
 
@@ -74,6 +86,21 @@ pub fn agent_status_tool(input: &Value, context: &ToolContext) -> Result<ToolRes
             .ok_or_else(|| ToolError::Failed(format!("Agent '{aid}' not found in registry")))?;
 
         let pending_messages = runtime.mailbox.pending_count(&aid);
+        let number = |key: &str| input.get(key).and_then(Value::as_u64).map(|n| n as usize);
+        let limit = number("results_limit")
+            .unwrap_or(DEFAULT_RESULTS_LIMIT)
+            .clamp(1, MAX_RESULTS_LIMIT);
+        let page = runtime
+            .team
+            .result_page(&aid, number("results_offset").unwrap_or(0), limit);
+        let older_in_journal = page.offset + page.items.len() < page.total;
+        // Only the newest results stay in memory; the rest is not served here.
+        let past_window = older_in_journal && page.offset + page.items.len() >= page.retained;
+        let note = (past_window || page.total == 0).then_some(
+            "Results are not held in memory (older, or this worker's window was evicted); \
+             the full records are the AgentResultRecorded events in this session's \
+             runtime log (<session>.runtime.jsonl).",
+        );
 
         let details = json!({
             "agent_id": record.id.to_string(),
@@ -87,6 +114,14 @@ pub fn agent_status_tool(input: &Value, context: &ToolContext) -> Result<ToolRes
             "updated_ms": record.updated_ms,
             "pending_messages": pending_messages,
             "failure_reason": record.failure_reason,
+            "results": {
+                "total": page.total,
+                "offset": page.offset,
+                "limit": limit,
+                "items": page.items,
+                "older_in_journal": older_in_journal,
+                "note": note,
+            },
             "worktree": record.worktree.as_ref().map(|p| p.display().to_string()),
         });
 
@@ -101,6 +136,14 @@ pub fn agent_status_tool(input: &Value, context: &ToolContext) -> Result<ToolRes
             .into_iter()
             .map(|r| {
                 let pending = runtime.mailbox.pending_count(&r.id);
+                let page = runtime.team.result_page(&r.id, 0, 1);
+                let latest = page.items.first().map(|m| {
+                    json!({
+                        "id": m.id,
+                        "sent_at_ms": m.sent_at_ms,
+                        "preview": m.content.chars().take(200).collect::<String>(),
+                    })
+                });
                 json!({
                     "agent_id": r.id.to_string(),
                     "name": r.name,
@@ -108,6 +151,8 @@ pub fn agent_status_tool(input: &Value, context: &ToolContext) -> Result<ToolRes
                     "state": r.state,
                     "model_id": r.model_id,
                     "pending_messages": pending,
+                    "failure_reason": r.failure_reason,
+                    "results": {"total": page.total, "latest": latest},
                 })
             })
             .collect();
@@ -246,6 +291,107 @@ mod tests {
             runtime: Some(rt),
             ..ToolContext::default()
         }
+    }
+
+    #[test]
+    fn agent_status_summarizes_results_and_pages_them_for_one_agent() {
+        use crate::runtime::mailbox::AgentMessage;
+        let run_id = RunId::new();
+        let lead = AgentId::new();
+        let context = make_test_context(run_id, lead);
+        let rt = context.runtime.as_ref().unwrap();
+        rt.ensure_lead_registered("p", "m", std::path::Path::new("."));
+        let worker = AgentId::new();
+        rt.registry
+            .register_agent(AgentRecord {
+                id: worker,
+                run_id: rt.run_id,
+                parent: Some(rt.agent_id),
+                kind: AgentKind::Teammate,
+                name: "worker".into(),
+                provider: "mock".into(),
+                model_id: "mock-model".into(),
+                cwd: PathBuf::from("/"),
+                state: AgentState::Running,
+                task_id: None,
+                worktree: None,
+                started_ms: 1,
+                updated_ms: 1,
+                failure_reason: None,
+            })
+            .unwrap();
+        for n in 0..30 {
+            let body = format!("result {n} {}", "x".repeat(400));
+            rt.team.keep_result(
+                AgentMessage::new(rt.run_id, worker, rt.agent_id, body),
+                false,
+            );
+        }
+
+        let all = agent_status_tool(&json!({}), &context)
+            .unwrap()
+            .details
+            .unwrap();
+        let entry = all["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == "worker")
+            .unwrap();
+        assert_eq!(entry["results"]["total"], 30);
+        let latest = &entry["results"]["latest"];
+        assert!(latest["preview"].as_str().unwrap().starts_with("result 29"));
+        assert_eq!(latest["preview"].as_str().unwrap().chars().count(), 200);
+        assert!(latest.get("content").is_none() && entry["results"].get("items").is_none());
+
+        let id = worker.to_string();
+        let page = |extra: Value| {
+            let mut input = json!({ "agent_id": id });
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            agent_status_tool(&input, &context)
+                .unwrap()
+                .details
+                .unwrap()["results"]
+                .clone()
+        };
+        let first = page(json!({}));
+        assert_eq!(first["items"].as_array().unwrap().len(), 5);
+        assert_eq!(first["older_in_journal"], true);
+        assert!(first["items"][0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("result 29"));
+        let second = page(json!({"results_offset": 5, "results_limit": 2}));
+        assert!(second["items"][0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("result 24"));
+        assert_eq!(second["items"].as_array().unwrap().len(), 2);
+        let clamped = page(json!({"results_limit": 500, "results_offset": 28}));
+        assert_eq!(clamped["limit"], 20);
+        assert_eq!(clamped["items"].as_array().unwrap().len(), 2);
+        assert_eq!(clamped["older_in_journal"], false);
+        let beyond = page(json!({"results_offset": 99_999, "results_limit": 0}));
+        assert_eq!(beyond["limit"], 1);
+        assert!(beyond["items"].as_array().unwrap().is_empty());
+        assert_eq!(beyond["older_in_journal"], false);
+
+        // Past the retained window the page is clamped and points at the journal.
+        for n in 30..60 {
+            rt.team.keep_result(
+                AgentMessage::new(rt.run_id, worker, rt.agent_id, format!("result {n}")),
+                false,
+            );
+        }
+        let old = page(json!({"results_offset": 99_999}));
+        assert_eq!(old["total"], 60);
+        assert_eq!(old["offset"], 50);
+        assert!(old["items"].as_array().unwrap().is_empty());
+        assert_eq!(old["older_in_journal"], true);
+        assert!(old["note"].as_str().unwrap().contains("runtime log"));
     }
 
     #[test]

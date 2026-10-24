@@ -26,17 +26,21 @@ pub fn managed_paths(agent_dir: &Path) -> ReadOnlyConfig {
     }
 }
 
+/// The mode `--codemode` or `/config` selects, before the runtime is admitted.
+pub fn configured_mode<'a>(cli: Option<&'a str>, user: Option<&'a serde_json::Value>) -> &'a str {
+    cli.or_else(|| {
+        user.and_then(|value| value.get("mode"))
+            .and_then(|value| value.as_str())
+    })
+    .unwrap_or("off")
+}
+
 pub fn resolve_config(
     cli: Option<&str>,
     user: Option<&serde_json::Value>,
     agent_dir: &Path,
 ) -> Result<Option<ReadOnlyConfig>, String> {
-    let mode = cli
-        .or_else(|| {
-            user.and_then(|value| value.get("mode"))
-                .and_then(|value| value.as_str())
-        })
-        .unwrap_or("off");
+    let mode = configured_mode(cli, user);
     match mode {
         "off" => return Ok(None),
         "controlled" => {

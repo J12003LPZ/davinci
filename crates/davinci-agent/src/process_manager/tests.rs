@@ -46,6 +46,114 @@ fn server() -> Value {
 }
 
 #[test]
+fn long_running_managed_process_does_not_hold_the_writer_lease() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = crate::RuntimeHandle::new(
+        crate::RunId::new(),
+        crate::AgentId::new(),
+        crate::RuntimeBus::new(),
+    );
+    runtime.ensure_lead_registered("mock", "mock", root.path());
+    let agent = agent(root.path(), PermissionMode::AlwaysApprove).with_runtime(runtime.clone());
+    let result = call(&agent, "start", "process_start", &server());
+    assert!(!result.is_error, "{}", result.content);
+    let id = result.details.as_ref().unwrap()["process"]["id"]
+        .as_u64()
+        .unwrap();
+    let token = runtime.cancellation_token.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let watchdog = std::thread::spawn(move || {
+        if rx.recv_timeout(Duration::from_secs(2)).is_err() {
+            token.cancel();
+        }
+    });
+    let lease = runtime
+        .team
+        .acquire_shared_write(Some(&runtime.cancellation_token));
+    tx.send(()).ok();
+    watchdog.join().unwrap();
+    let stopped = call(&agent, "stop", "process_stop", &json!({"id":id}));
+    assert!(!stopped.is_error, "{}", stopped.content);
+    assert!(lease.is_ok(), "a running service blocked the next writer");
+}
+
+#[test]
+fn exclusive_managed_process_holds_writer_ownership_until_exit() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = crate::RuntimeHandle::new(
+        crate::RunId::new(),
+        crate::AgentId::new(),
+        crate::RuntimeBus::new(),
+    );
+    runtime.ensure_lead_registered("mock", "mock", root.path());
+    let agent = agent(root.path(), PermissionMode::AlwaysApprove).with_runtime(runtime.clone());
+    let args = json!({
+        "executable":"node",
+        "argv":["-e", "setTimeout(()=>require('fs').writeFileSync('delayed.txt','done'),250)"],
+        "exclusive_workspace": true
+    });
+    let result = call(&agent, "start", "process_start", &args);
+    assert!(!result.is_error, "{}", result.content);
+    let id = result.details.as_ref().unwrap()["process"]["id"]
+        .as_u64()
+        .unwrap();
+    match runtime.team.acquire_shared_write(None) {
+        Err(crate::runtime::team::SharedWriteError::Busy(reason)) => {
+            assert!(reason.contains(&format!("background job {id}")), "{reason}")
+        }
+        other => panic!(
+            "a running exclusive process must hold the workspace: {:?}",
+            other.err()
+        ),
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let lease = loop {
+        match runtime.team.acquire_shared_write(None) {
+            Ok(lease) => break lease,
+            Err(_) => {
+                assert!(Instant::now() < deadline, "the process never released");
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    };
+    assert!(
+        root.path().join("delayed.txt").exists(),
+        "managed process escaped workspace ownership"
+    );
+    drop(lease);
+}
+
+#[test]
+fn process_reuse_never_crosses_workspace_ownership_modes() {
+    for exclusive_first in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        );
+        runtime.ensure_lead_registered("mock", "mock", root.path());
+        let agent = agent(root.path(), PermissionMode::AlwaysApprove).with_runtime(runtime.clone());
+        let start = |id: &str, exclusive: bool| {
+            let mut args = server();
+            args["exclusive_workspace"] = json!(exclusive);
+            let result = call(&agent, id, "process_start", &args);
+            assert!(!result.is_error, "{}", result.content);
+            result.details.unwrap()["process"]["id"].as_u64().unwrap()
+        };
+        let first = start("first", exclusive_first);
+        let second = start("second", !exclusive_first);
+        assert_ne!(
+            first, second,
+            "a start reused a process of the other ownership mode"
+        );
+        for (name, id) in [("stop-a", first), ("stop-b", second)] {
+            call(&agent, name, "process_stop", &json!({"id":id}));
+        }
+    }
+}
+
+#[test]
 fn process_worker_workspace_isolation_preserves_parent_shutdown_and_reuse() {
     let parent_dir = tempfile::tempdir().unwrap();
     let worker_dir = tempfile::tempdir().unwrap();
@@ -851,6 +959,7 @@ fn process_validation_rejects_malformed_arguments_and_workspace_escape_without_s
             env: std::collections::BTreeMap::from([("FIXTURE_EXPLICIT".into(), "value".into())]),
             restart: Default::default(),
             ports: vec![],
+            exclusive_workspace: false,
         },
     )
     .unwrap();

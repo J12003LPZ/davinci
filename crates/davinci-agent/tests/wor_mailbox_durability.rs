@@ -173,3 +173,160 @@ fn wor93_rehydrate_preserves_queue_order_for_equal_timestamps() {
         .collect();
     assert_eq!(drained, vec!["first", "second"]);
 }
+
+#[test]
+fn peer_send_requires_a_durable_queue_record_and_can_retry_after_restart() {
+    use davinci_agent::runtime::{RuntimeBus, RuntimeDecision, RuntimeSubscriber};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+    struct Journal {
+        fail: AtomicBool,
+        events: Mutex<Vec<RuntimeEventEnvelope>>,
+    }
+    impl RuntimeSubscriber for Journal {
+        fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
+            let _ = self.record_durably(event);
+            RuntimeDecision::Continue
+        }
+        fn record_durably(
+            &self,
+            event: &RuntimeEventEnvelope,
+        ) -> Result<(), davinci_agent::runtime::DurableError> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err("injected journal failure".into());
+            }
+            self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+        fn is_journal(&self) -> bool {
+            true
+        }
+    }
+    let (registry, _, run, agent) = setup(AgentState::Running);
+    let journal = Arc::new(Journal {
+        fail: AtomicBool::new(true),
+        events: Mutex::new(vec![]),
+    });
+    let bus = RuntimeBus::new();
+    bus.subscribe(journal.clone());
+    let mailbox = AgentMailbox::with_registry_and_bus(registry.clone(), bus);
+    let message = AgentMessage::new(run, AgentId::new(), agent, "handoff");
+    assert!(matches!(
+        mailbox.send(message.clone()),
+        Err(MailboxError::NotRecorded(_))
+    ));
+    assert_eq!(mailbox.pending_count(&agent), 0);
+    let recovered = AgentMailbox::new().with_registry(registry);
+    recovered.rehydrate_from_events(&journal.events.lock().unwrap());
+    assert_eq!(recovered.pending_count(&agent), 0);
+    journal.fail.store(false, Ordering::SeqCst);
+    mailbox.send(message.clone()).unwrap();
+    recovered.rehydrate_from_events(&journal.events.lock().unwrap());
+    assert_eq!(recovered.drain(agent, 10), vec![message]);
+}
+
+/// A journal that records every event unless told to fail.
+struct SwitchJournal {
+    fail: std::sync::atomic::AtomicBool,
+    events: std::sync::Mutex<Vec<RuntimeEventEnvelope>>,
+}
+
+impl SwitchJournal {
+    fn new(fail: bool) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            fail: std::sync::atomic::AtomicBool::new(fail),
+            events: std::sync::Mutex::new(vec![]),
+        })
+    }
+}
+
+impl davinci_agent::runtime::RuntimeSubscriber for SwitchJournal {
+    fn on_event(&self, event: &RuntimeEventEnvelope) -> davinci_agent::runtime::RuntimeDecision {
+        let _ = self.record_durably(event);
+        davinci_agent::runtime::RuntimeDecision::Continue
+    }
+    fn record_durably(
+        &self,
+        event: &RuntimeEventEnvelope,
+    ) -> Result<(), davinci_agent::runtime::DurableError> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("injected journal failure".into());
+        }
+        self.events.lock().unwrap().push(event.clone());
+        Ok(())
+    }
+    fn is_journal(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn only_the_first_journal_decides_whether_a_queue_record_is_kept() {
+    use davinci_agent::runtime::RuntimeBus;
+    use std::sync::atomic::Ordering;
+    let (registry, _, run, agent) = setup(AgentState::Running);
+    let authoritative = SwitchJournal::new(true);
+    let second = SwitchJournal::new(false);
+    let bus = RuntimeBus::new();
+    bus.subscribe(authoritative.clone());
+    bus.subscribe(second.clone());
+    let mailbox = AgentMailbox::with_registry_and_bus(registry.clone(), bus);
+    let message = AgentMessage::new(run, AgentId::new(), agent, "handoff");
+
+    // The authoritative journal refuses: the second one never sees the record.
+    assert!(matches!(
+        mailbox.send(message.clone()),
+        Err(MailboxError::NotRecorded(_))
+    ));
+    assert_eq!(mailbox.pending_count(&agent), 0);
+    assert!(second.events.lock().unwrap().is_empty());
+    let recovered = AgentMailbox::new().with_registry(registry.clone());
+    recovered.rehydrate_from_events(&second.events.lock().unwrap());
+    assert_eq!(recovered.pending_count(&agent), 0);
+
+    // The authoritative journal keeps it: a failing second journal changes nothing.
+    authoritative.fail.store(false, Ordering::SeqCst);
+    second.fail.store(true, Ordering::SeqCst);
+    mailbox.send(message.clone()).unwrap();
+    assert_eq!(mailbox.pending_count(&agent), 1);
+    let recovered = AgentMailbox::new().with_registry(registry);
+    recovered.rehydrate_from_events(&authoritative.events.lock().unwrap());
+    assert_eq!(recovered.drain(agent, 10), vec![message]);
+    assert_eq!(recovered.pending_count(&agent), 0);
+}
+
+#[test]
+fn a_refused_queue_record_does_not_wake_an_idle_recipient() {
+    use davinci_agent::runtime::RuntimeBus;
+    let (registry, _, run, agent) = setup(AgentState::Idle);
+    let bus = RuntimeBus::new();
+    bus.subscribe(SwitchJournal::new(true));
+    let mailbox = AgentMailbox::with_registry_and_bus(registry.clone(), bus);
+    let message = AgentMessage::new(run, AgentId::new(), agent, "wake me");
+    assert!(matches!(
+        mailbox.send(message),
+        Err(MailboxError::NotRecorded(_))
+    ));
+    assert_eq!(registry.get(&agent).unwrap().state, AgentState::Idle);
+    assert_eq!(mailbox.pending_count(&agent), 0);
+}
+
+#[test]
+fn a_refused_steering_record_does_not_wake_an_idle_recipient() {
+    use davinci_agent::runtime::RuntimeBus;
+    let (registry, _, _, agent) = setup(AgentState::Idle);
+    let bus = RuntimeBus::new();
+    bus.subscribe(SwitchJournal::new(true));
+    let mailbox = AgentMailbox::with_registry_and_bus(registry.clone(), bus);
+    let id = Uuid::new_v4();
+    let generation = registry.get_generation(&agent);
+    assert!(matches!(
+        mailbox.send_steer_with_id(id, agent, generation, "wake me".into(), false),
+        Err(MailboxError::NotRecorded(_))
+    ));
+    assert_eq!(registry.get(&agent).unwrap().state, AgentState::Idle);
+    assert_eq!(mailbox.pending_count(&agent), 0);
+    assert!(mailbox.get_steering_receipt(&id).is_none());
+}

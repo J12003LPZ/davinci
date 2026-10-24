@@ -873,3 +873,60 @@ fn a_provider_count_follows_request_configuration_changes() {
     agent.set_provider_context_overhead_tokens(None);
     assert_eq!(agent.calibrated_context_tokens(), measured);
 }
+
+#[test]
+fn feature_use_reports_context_vm_off_as_mode_only() {
+    let agent = agent(ContextVmMode::Off);
+    assert_eq!(
+        agent.feature_use()["contextVm"],
+        serde_json::json!({"mode": "off"})
+    );
+}
+
+#[test]
+fn feature_use_reports_hybrid_folds_and_retrieval_after_compaction() {
+    let mut agent = agent(ContextVmMode::Hybrid);
+    agent.summarizer = Some(lazy_summarizer(Arc::default()));
+    let before = agent.feature_use()["contextVm"].clone();
+    assert_eq!(before["mode"], "hybrid");
+    assert_eq!(before["folds"], 0);
+    assert_eq!(before["retrievalOffered"], false);
+
+    long_session(&mut agent);
+    let used = agent.feature_use()["contextVm"].clone();
+    assert_eq!(used["mode"], "hybrid");
+    assert!(agent.run_stats().compactions >= 2);
+    assert!(used["folds"].as_u64().unwrap() > 0, "{used}");
+    assert_eq!(used["retrievalOffered"], true, "{used}");
+    assert!(used["imagesCompiled"].is_u64() && used["tokensBeforeFold"].is_u64());
+    // Every compaction entry is counted once, and an applied one adds its
+    // before/after message estimates (so `after` is smaller).
+    let hybrid = &used["hybridCompaction"];
+    for key in [
+        "attempts",
+        "applied",
+        "skippedNoFit",
+        "skippedNoAssistantReply",
+        "skippedBackoff",
+        "notAppliedAfterFold",
+        "notAppliedOther",
+        "contextTokensBefore",
+        "contextTokensAfter",
+    ] {
+        assert!(hybrid[key].is_u64(), "{key}: {hybrid}");
+    }
+    assert_eq!(hybrid["applied"], agent.run_stats().compactions, "{hybrid}");
+    assert!(hybrid["contextTokensAfter"].as_u64() < hybrid["contextTokensBefore"].as_u64());
+    let accounted: u64 = [
+        "applied",
+        "skippedNoFit",
+        "skippedNoAssistantReply",
+        "skippedBackoff",
+        "notAppliedAfterFold",
+        "notAppliedOther",
+    ]
+    .iter()
+    .map(|key| hybrid[key].as_u64().unwrap())
+    .sum();
+    assert_eq!(hybrid["attempts"], accounted, "{hybrid}");
+}

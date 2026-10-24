@@ -39,6 +39,68 @@ class StreamTelemetryTests(unittest.TestCase):
         self.assertNotIn("secret", result["runtime_stats"])
         self.assertIsNone(bench.parse_stream("davinci", "")["runtime_stats"])
 
+    def test_feature_use_comes_from_harness_stats_with_tool_events_alongside(self):
+        stats = {"type": "harness_stats", "schema_version": 1,
+                 "runtime": {"compactions": 2, "codemodeRuns": 1},
+                 "contextVm": {"mode": "hybrid", "folds": 3, "retrievalOffered": True,
+                               "imagesCompiled": 5, "retrievalHits": 2, "retrievalMisses": 1,
+                               "hybridCompaction": {"attempts": 4, "applied": 2, "skippedNoFit": 1}},
+                 "codemode": {"mode": "read-only", "available": True, "calls": 1}}
+        events = [{"type": "tool_execution_start", "toolName": "retrieve_context"},
+                  {"type": "tool_execution_start", "toolName": "codemode"}, stats]
+        result = bench.parse_stream("davinci", chr(10).join(map(json.dumps, events)))
+        self.assertEqual(result["context_vm"], {
+            "mode": "hybrid", "folds": 3, "compactions": 2,
+            "retrieve_context_calls": 1, "retrieval_offered": True,
+            "images_compiled": 5, "retrieval_hits": 2, "retrieval_misses": 1,
+            "shadow_comparisons": None,
+            "hybrid_compaction": {"attempts": 4, "applied": 2, "skippedNoFit": 1}})
+        self.assertEqual((result["codemode_calls"], result["codemode_calls_reported"]), (1, 1))
+        self.assertEqual((result["codemode_tool_events"], result["codemode_mode"], result["codemode_available"]),
+                         (1, "read-only", True))
+
+    def test_old_stream_keeps_harness_stats_fields_unknown(self):
+        events = [{"type": "tool_execution_start", "toolName": "read"},
+                  {"type": "harness_stats", "schema_version": 1, "runtime": {"wallMs": 5}}]
+        result = bench.parse_stream("davinci", chr(10).join(map(json.dumps, events)))
+        self.assertEqual(result["context_vm"], {
+            "mode": None, "folds": None, "compactions": None,
+            "retrieve_context_calls": 0, "retrieval_offered": None,
+            "images_compiled": None, "retrieval_hits": None, "retrieval_misses": None,
+            "shadow_comparisons": None, "hybrid_compaction": None})
+        # No codemode record: the count is unknown, not zero.
+        self.assertIsNone(result["codemode_calls"])
+        self.assertIsNone(result["codemode_calls_reported"])
+        self.assertEqual(result["codemode_tool_events"], 0)
+        self.assertIsNone(result["codemode_mode"])
+
+    def test_codemode_tool_events_and_harness_stats_disagreement_is_visible(self):
+        events = [{"type": "tool_execution_start", "toolName": "codemode"},
+                  {"type": "harness_stats", "schema_version": 1, "runtime": {},
+                   "codemode": {"mode": "read-only", "available": True, "calls": 2}}]
+        result = bench.parse_stream("davinci", chr(10).join(map(json.dumps, events)))
+        self.assertEqual((result["codemode_calls"], result["codemode_tool_events"]), (2, 1))
+
+    def test_a_historical_log_reaches_the_campaign_summary_as_unknown_not_unused(self):
+        # A pre-telemetry davinci stream: tool events, a harness_stats record with a
+        # runtime block only, no contextVm or codemode block.
+        events = [{"type": "tool_execution_start", "toolName": "read"},
+                  {"type": "tool_execution_start", "toolName": "edit"},
+                  {"type": "harness_stats", "schema_version": 1, "runtime": {"wallMs": 5}}]
+        parsed = bench.parse_stream("davinci", chr(10).join(map(json.dumps, events)))
+        run = {"task": "t1", "rep": 0, "variant": "B0", "tools": parsed["tools"],
+               "effective_settings": {"contextVm": "hybrid", "codemode": {"mode": "read-only"}}}
+        for key in ("context_vm", "codemode_calls", "codemode_calls_reported",
+                    "codemode_tool_events", "codemode_mode", "codemode_available"):
+            run[key] = parsed[key]
+        use = bench.feature_use([run])
+        self.assertEqual(use["codemode"]["status"], "unknown")
+        self.assertIsNone(use["codemode"]["configured_but_unused"])
+        self.assertEqual(use["codemode"]["observed_mode"], "unknown")
+        self.assertEqual(use["codemode"]["calls"], {"total": None, "runs_unknown": 1})
+        self.assertEqual(use["contextVm"]["status"], "unknown")
+        self.assertIsNone(use["contextVm"]["configured_but_unused"])
+
     def test_harness_conflicting_raw_receipt_cannot_remain_complete(self):
         usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0}
         events = self.observed_stream([(1, "completed", usage)])

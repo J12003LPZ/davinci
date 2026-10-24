@@ -190,26 +190,80 @@ const READ_PATTERNS: &[&str] = &[
     r"(?i)^\s*Select-String\b",
 ];
 
-const TEST_PATTERNS: &[&str] = &[
-    r"(?i)^\s*(?:npx\s+)?vitest\b",
-    r"(?i)^\s*(?:npx\s+)?jest\b",
-    r"(?i)^\s*(?:npx\s+)?mocha\b",
-    r"(?i)^\s*(?:npx\s+)?playwright\s+test\b",
-    r"(?i)^\s*(?:npx\s+)?tsc\b",
-    r"(?i)^\s*(?:npx\s+)?tsgo\b",
-    r"(?i)^\s*(?:npx\s+)?eslint\b",
-    r"(?i)^\s*(?:npx\s+)?biome\s+(check|lint)\b",
-    r"(?i)^\s*npm\s+(test|run\s+(test|tests|check|typecheck|lint|build))\b",
-    r"(?i)^\s*yarn\s+(test|check|typecheck|lint)\b",
-    r"(?i)^\s*pnpm\s+(test|check|typecheck|lint)\b",
-    r"(?i)^\s*node\s+.*vitest[/\\]dist[/\\]cli\.js\b",
-    r"(?i)^\s*node\s+--test\b",
-    r"(?i)^\s*ctest\b",
-    r"(?i)^\s*mvn\s+test\b",
-    r"(?i)^\s*gradle\s+test\b",
-    r"(?i)^\s*(?:(?:python|python3)\s+-m\s+(?:pytest|unittest)|pytest|cargo(?:\.exe)?(?:\s+\+[a-z0-9_.-]+)?(?:\s+--(?:offline|locked|frozen))*\s+(?:test|check|clippy|fmt|nextest)|go\s+(?:test|vet)|dotnet\s+test)\b",
-    r"(?i)^\s*make\s+(test|check|lint|fmt|clippy|build)\b",
-    r"(?i)^\s*\.[/\\]test\.sh\b",
+/// Whether a verifier executes tests or only builds, lints, formats or type
+/// checks. Each verifier is classified here, once.
+///
+/// Deliberate limitation: `make check` and `npm`/`yarn`/`pnpm check` are
+/// `Check`, although a project may wire them to its test suite. They are
+/// recognised as verifiers but never count as having run tests, so a pass does
+/// not skip the requirement review. The extra review is the safe direction.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VerifierKind {
+    Test,
+    Check,
+}
+
+macro_rules! cargo_verifier {
+    ($subcommands:literal) => {
+        concat!(
+            r"(?i)^\s*cargo(?:\.exe)?(?:\s+\+[a-z0-9_.-]+)?(?:\s+--(?:offline|locked|frozen))*\s+",
+            $subcommands,
+            r"\b"
+        )
+    };
+}
+
+const VERIFIER_PATTERNS: &[(VerifierKind, &str)] = &[
+    (VerifierKind::Test, r"(?i)^\s*(?:npx\s+)?vitest\b"),
+    (VerifierKind::Test, r"(?i)^\s*(?:npx\s+)?jest\b"),
+    (VerifierKind::Test, r"(?i)^\s*(?:npx\s+)?mocha\b"),
+    (
+        VerifierKind::Test,
+        r"(?i)^\s*(?:npx\s+)?playwright\s+test\b",
+    ),
+    (
+        VerifierKind::Check,
+        r"(?i)^\s*(?:npx\s+)?(?:tsc|tsgo|eslint)\b",
+    ),
+    (
+        VerifierKind::Check,
+        r"(?i)^\s*(?:npx\s+)?biome\s+(check|lint)\b",
+    ),
+    (
+        VerifierKind::Test,
+        r"(?i)^\s*npm\s+(test|run\s+(test|tests))\b",
+    ),
+    (
+        VerifierKind::Check,
+        r"(?i)^\s*npm\s+run\s+(check|typecheck|lint|build)\b",
+    ),
+    (VerifierKind::Test, r"(?i)^\s*(?:yarn|pnpm)\s+test\b"),
+    (
+        VerifierKind::Check,
+        r"(?i)^\s*(?:yarn|pnpm)\s+(check|typecheck|lint)\b",
+    ),
+    (
+        VerifierKind::Test,
+        r"(?i)^\s*node\s+.*vitest[/\\]dist[/\\]cli\.js\b",
+    ),
+    (VerifierKind::Test, r"(?i)^\s*node\s+--test\b"),
+    (VerifierKind::Test, r"(?i)^\s*ctest\b"),
+    (VerifierKind::Test, r"(?i)^\s*mvn\s+test\b"),
+    (VerifierKind::Test, r"(?i)^\s*gradle\s+test\b"),
+    (
+        VerifierKind::Test,
+        r"(?i)^\s*(?:(?:python|python3)\s+-m\s+(?:pytest|unittest)|pytest)\b",
+    ),
+    (VerifierKind::Test, cargo_verifier!("(?:test|nextest)")),
+    (VerifierKind::Check, cargo_verifier!("(?:check|clippy|fmt)")),
+    (VerifierKind::Test, r"(?i)^\s*(?:go\s+test|dotnet\s+test)\b"),
+    (VerifierKind::Check, r"(?i)^\s*go\s+vet\b"),
+    (VerifierKind::Test, r"(?i)^\s*make\s+test\b"),
+    (
+        VerifierKind::Check,
+        r"(?i)^\s*make\s+(check|lint|fmt|clippy|build)\b",
+    ),
+    (VerifierKind::Test, r"(?i)^\s*\.[/\\]test\.sh\b"),
 ];
 
 fn destructive_regex() -> &'static RegexSet {
@@ -242,9 +296,27 @@ fn read_regex() -> &'static RegexSet {
     SET.get_or_init(|| RegexSet::new(READ_PATTERNS).expect("read patterns compile"))
 }
 
+/// Every verifier, test or check.
 fn test_regex() -> &'static RegexSet {
     static SET: OnceLock<RegexSet> = OnceLock::new();
-    SET.get_or_init(|| RegexSet::new(TEST_PATTERNS).expect("test patterns compile"))
+    SET.get_or_init(|| {
+        RegexSet::new(VERIFIER_PATTERNS.iter().map(|(_, pattern)| pattern))
+            .expect("verifier patterns compile")
+    })
+}
+
+/// The verifiers that build, lint, format or type-check without running tests.
+fn non_test_check_regex() -> &'static RegexSet {
+    static SET: OnceLock<RegexSet> = OnceLock::new();
+    SET.get_or_init(|| {
+        RegexSet::new(
+            VERIFIER_PATTERNS
+                .iter()
+                .filter(|(kind, _)| *kind == VerifierKind::Check)
+                .map(|(_, pattern)| pattern),
+        )
+        .expect("check patterns compile")
+    })
 }
 
 // ----------------------------------------------------------------------------
@@ -793,20 +865,25 @@ pub(crate) fn shell_env_assignment(word: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-fn verification_segment(segment: &str) -> bool {
+/// The normalized program and arguments of a verifier segment, or `None` when
+/// the segment is not a verifier. The single parser behind both questions
+/// "is this a verifier" and "did it run tests".
+fn verifier_command(segment: &str) -> Option<String> {
+    verifier_program(segment).filter(|normalized| !normalized.contains("--no-run"))
+}
+
+/// As [`verifier_command`], but a `--no-run` build still counts: it compiles
+/// the tests and can fail, though it never ran them.
+fn verifier_program(segment: &str) -> Option<String> {
     let cleaned = segment.replace("2>&1", "");
-    let Some(words) = literal_shell_words(cleaned.trim()) else {
-        return false;
-    };
-    let first_command = words
-        .iter()
-        .position(|word| !shell_env_assignment(word))
-        .unwrap_or(words.len());
-    if first_command == words.len() {
-        return false;
-    }
+    let words = literal_shell_words(cleaned.trim())?;
+    let first_command = words.iter().position(|word| !shell_env_assignment(word))?;
     let normalized = words[first_command..].join(" ");
-    test_regex().is_match(&normalized) && !normalized.contains("--no-run")
+    test_regex().is_match(&normalized).then_some(normalized)
+}
+
+fn verification_segment(segment: &str) -> bool {
+    verifier_command(segment).is_some()
 }
 
 /// Classifies whether a command runs verification programs and whether the
@@ -828,6 +905,123 @@ pub fn verification_outcome(command: &str) -> Option<bool> {
     let status_masked =
         command.contains("||") || verification.iter().any(|is_verification| !is_verification);
     Some(!status_masked)
+}
+
+/// Whether any segment of `command` is a verifier, test or check. Used to
+/// decide that a nonzero exit invalidates earlier test evidence even when the
+/// rest of the chain (`&& echo ok`) keeps the command from being classified.
+pub fn invokes_verifier(command: &str) -> bool {
+    analyze_command(command)
+        .segments
+        .iter()
+        .any(|segment| verifier_program(segment).is_some())
+}
+
+/// As [`invokes_verifier`] or `turn::invokes_checker`, but tolerant of how the
+/// program is spelled: a directory (`./node_modules/.bin/eslint`,
+/// `.\node_modules\.bin\eslint.cmd`), case, an `.exe`, `.cmd`, `.bat` or `.ps1`
+/// suffix and an `env`, `command`, `exec`, `time` or `sudo` prefix are ignored.
+/// For revoking test coverage after a failure only: recognising more failures
+/// can only cause more reviews, but this must never earn test credit.
+pub(crate) fn invokes_verifier_or_checker_loosely(command: &str) -> bool {
+    let (segments, malformed) = split_shell_segments_with_diagnostic(command);
+    if malformed {
+        return false;
+    }
+    segments.iter().any(|segment| {
+        let words = split_words_keeping_backslashes(segment);
+        let mut words = words.iter().map(String::as_str).peekable();
+        // Skip a PowerShell call operator, then wrappers and their options.
+        words.next_if_eq(&"&");
+        let wrapper_name = |word: &str| {
+            let base = word
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            base.strip_suffix(".exe").unwrap_or(&base).to_string()
+        };
+        let mut after_env = false;
+        while let Some(word) = words.next_if(|word| {
+            shell_env_assignment(word)
+                || matches!(
+                    wrapper_name(word).as_str(),
+                    "env" | "time" | "sudo" | "command" | "exec"
+                )
+                || (after_env
+                    && (matches!(
+                        *word,
+                        "--" | "-i" | "--ignore-environment" | "-u" | "--unset"
+                    ) || word.starts_with("--unset=")))
+        }) {
+            after_env |= wrapper_name(word) == "env";
+            if after_env && matches!(word, "-u" | "--unset") {
+                words.next();
+            }
+        }
+        let Some(program) = words.next() else {
+            return false;
+        };
+        let program = program
+            .trim_matches(|ch| matches!(ch, '"' | '\'' | '(' | ')' | '{' | '}'))
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let program = [".exe", ".cmd", ".bat", ".ps1"]
+            .iter()
+            .find_map(|suffix| program.strip_suffix(suffix))
+            .unwrap_or(&program);
+        let normalized = std::iter::once(program)
+            .chain(words)
+            .collect::<Vec<_>>()
+            .join(" ");
+        test_regex().is_match(&normalized) || crate::turn::is_checker_program(program)
+    })
+}
+
+/// Splits on whitespace outside single or double quotes and drops the quote
+/// characters. Unlike `literal_shell_words`, backslashes are kept: here they
+/// are Windows path separators.
+fn split_words_keeping_backslashes(segment: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    for ch in segment.chars() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => word.push(ch),
+            None if ch == '\'' || ch == '"' => {
+                quote = Some(ch);
+                in_word = true;
+            }
+            None if ch.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            None => {
+                word.push(ch);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
+
+/// Whether a verification command ran tests: some segment is a verifier that
+/// is not a build, lint or type check. `cargo check && cargo test` ran tests;
+/// `cargo clippy` alone did not.
+pub fn verification_ran_tests(command: &str) -> bool {
+    analyze_command(command).segments.iter().any(|segment| {
+        verifier_command(segment)
+            .is_some_and(|normalized| !non_test_check_regex().is_match(&normalized))
+    })
 }
 
 impl ShellAnalysisReport {
@@ -968,6 +1162,193 @@ pub fn evaluate(profile: ShellPolicyProfile, command: &str) -> ShellCommandDecis
 mod tests {
     use super::*;
 
+    // Verbatim copies of the lists the VERIFIER_PATTERNS table replaced
+    // (`git show HEAD:crates/davinci-agent/src/shell_policy.rs`).
+    const ORIGINAL_TEST_PATTERNS: &[&str] = &[
+        r"(?i)^\s*(?:npx\s+)?vitest\b",
+        r"(?i)^\s*(?:npx\s+)?jest\b",
+        r"(?i)^\s*(?:npx\s+)?mocha\b",
+        r"(?i)^\s*(?:npx\s+)?playwright\s+test\b",
+        r"(?i)^\s*(?:npx\s+)?tsc\b",
+        r"(?i)^\s*(?:npx\s+)?tsgo\b",
+        r"(?i)^\s*(?:npx\s+)?eslint\b",
+        r"(?i)^\s*(?:npx\s+)?biome\s+(check|lint)\b",
+        r"(?i)^\s*npm\s+(test|run\s+(test|tests|check|typecheck|lint|build))\b",
+        r"(?i)^\s*yarn\s+(test|check|typecheck|lint)\b",
+        r"(?i)^\s*pnpm\s+(test|check|typecheck|lint)\b",
+        r"(?i)^\s*node\s+.*vitest[/\\]dist[/\\]cli\.js\b",
+        r"(?i)^\s*node\s+--test\b",
+        r"(?i)^\s*ctest\b",
+        r"(?i)^\s*mvn\s+test\b",
+        r"(?i)^\s*gradle\s+test\b",
+        r"(?i)^\s*(?:(?:python|python3)\s+-m\s+(?:pytest|unittest)|pytest|cargo(?:\.exe)?(?:\s+\+[a-z0-9_.-]+)?(?:\s+--(?:offline|locked|frozen))*\s+(?:test|check|clippy|fmt|nextest)|go\s+(?:test|vet)|dotnet\s+test)\b",
+        r"(?i)^\s*make\s+(test|check|lint|fmt|clippy|build)\b",
+        r"(?i)^\s*\.[/\\]test\.sh\b",
+    ];
+
+    const ORIGINAL_NON_TEST_CHECK_PATTERNS: &[&str] = &[
+        r"(?i)^\s*(?:npx\s+)?(?:tsc|tsgo|eslint)\b",
+        r"(?i)^\s*(?:npx\s+)?biome\s+(check|lint)\b",
+        r"(?i)^\s*npm\s+run\s+(check|typecheck|lint|build)\b",
+        r"(?i)^\s*(?:yarn|pnpm)\s+(check|typecheck|lint)\b",
+        r"(?i)^\s*cargo(?:\.exe)?(?:\s+\+[a-z0-9_.-]+)?(?:\s+--(?:offline|locked|frozen))*\s+(check|clippy|fmt)\b",
+        r"(?i)^\s*go\s+vet\b",
+        r"(?i)^\s*make\s+(check|lint|fmt|clippy|build)\b",
+    ];
+
+    /// At least one command per original pattern, plus variants and near
+    /// misses, so a regex edit in the table cannot change a classification.
+    const PARITY_CORPUS: &[&str] = &[
+        "vitest run",
+        "npx vitest",
+        "  NPX  Vitest run",
+        "vitestx",
+        "jest",
+        "npx jest --ci",
+        "mocha",
+        "npx mocha test/",
+        "playwright test",
+        "npx playwright test",
+        "playwright install",
+        "tsc",
+        "tsc --noEmit",
+        "npx tsc -p .",
+        "tsgo",
+        "npx tsgo",
+        "eslint .",
+        "npx eslint src",
+        "biome check .",
+        "npx biome lint",
+        "biome format",
+        "npm test",
+        "npm run test",
+        "npm run tests",
+        "npm run check",
+        "npm run typecheck",
+        "npm run lint",
+        "npm run build",
+        "npm run dev",
+        "npm run testing",
+        "npm install",
+        "npm check",
+        "yarn test",
+        "yarn check",
+        "yarn typecheck",
+        "yarn lint",
+        "yarn build",
+        "pnpm test",
+        "pnpm check",
+        "pnpm typecheck",
+        "pnpm lint",
+        "pnpm build",
+        "node node_modules/vitest/dist/cli.js run",
+        "node C:\\x\\vitest\\dist\\cli.js",
+        "node --test",
+        "node --version",
+        "node app.js",
+        "ctest",
+        "ctest --output-on-failure",
+        "mvn test",
+        "mvn package",
+        "gradle test",
+        "gradle build",
+        "python -m pytest",
+        "python3 -m pytest -q",
+        "python -m unittest",
+        "python3 -m unittest discover",
+        "python -m pip install x",
+        "pytest",
+        "pytest -q tests/",
+        "cargo test",
+        "cargo nextest run",
+        "cargo check",
+        "cargo clippy",
+        "cargo fmt",
+        "cargo build",
+        "cargo run",
+        "cargo testing",
+        "cargo +nightly test",
+        "cargo +1.88 clippy",
+        "cargo --offline --locked test",
+        "cargo --frozen check",
+        "cargo.exe test",
+        "cargo.exe +stable --locked fmt",
+        "CARGO test",
+        "go test ./...",
+        "go vet ./...",
+        "go build ./...",
+        "dotnet test",
+        "dotnet build",
+        "make test",
+        "make tests",
+        "make check",
+        "make lint",
+        "make fmt",
+        "make clippy",
+        "make build",
+        "make install",
+        "make",
+        "./test.sh",
+        ".\\test.sh",
+        "./test.sh --fast",
+        "./build.sh",
+        "echo cargo test",
+        "ls",
+    ];
+
+    fn compiled(patterns: &[&str]) -> RegexSet {
+        RegexSet::new(patterns).unwrap()
+    }
+
+    #[test]
+    fn verifier_table_classifies_every_original_pattern_as_before() {
+        let was_verifier = compiled(ORIGINAL_TEST_PATTERNS);
+        let was_check = compiled(ORIGINAL_NON_TEST_CHECK_PATTERNS);
+        for command in PARITY_CORPUS {
+            assert_eq!(
+                test_regex().is_match(command),
+                was_verifier.is_match(command),
+                "verifier changed for {command:?}"
+            );
+            assert_eq!(
+                non_test_check_regex().is_match(command),
+                was_check.is_match(command),
+                "check changed for {command:?}"
+            );
+        }
+        // Every original pattern is exercised by at least one corpus command,
+        // so the comparison above cannot pass vacuously.
+        for (list, name) in [
+            (ORIGINAL_TEST_PATTERNS, "test"),
+            (ORIGINAL_NON_TEST_CHECK_PATTERNS, "check"),
+        ] {
+            for pattern in list {
+                let one = RegexSet::new([pattern]).unwrap();
+                assert!(
+                    PARITY_CORPUS.iter().any(|c| one.is_match(c)),
+                    "no corpus command for {name} pattern {pattern}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn make_check_and_js_check_scripts_stay_verifiers_but_not_test_runs() {
+        for command in [
+            "make check",
+            "npm run check",
+            "yarn check",
+            "pnpm check",
+            "npm run typecheck",
+        ] {
+            assert!(test_regex().is_match(command), "{command}");
+            assert!(non_test_check_regex().is_match(command), "{command}");
+            assert!(!verification_ran_tests(command), "{command}");
+        }
+        assert!(verification_ran_tests("make test"));
+        assert!(verification_ran_tests("make check && make test"));
+    }
+
     #[test]
     fn verification_commands_are_recognised_by_their_program() {
         for (command, expected) in [
@@ -994,6 +1375,47 @@ mod tests {
             ("ls", None),
         ] {
             assert_eq!(verification_outcome(command), expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn only_verifiers_that_execute_tests_count_as_ran_tests() {
+        for (command, expected) in [
+            ("cargo test", true),
+            ("cargo --offline --locked test -p x", true),
+            ("RUST_BACKTRACE=1 cargo test", true),
+            ("cd crates/x && cargo test", true),
+            ("cargo check && cargo test", true),
+            ("pytest -q", true),
+            ("npm test", true),
+            ("go test ./...", true),
+            ("cargo check", false),
+            (
+                "cargo --offline --locked clippy --all-targets -- -D warnings",
+                false,
+            ),
+            ("cargo fmt --all -- --check", false),
+            ("cargo +nightly fmt --check", false),
+            ("RUST_BACKTRACE=1 cargo clippy", false),
+            ("cargo check && cargo clippy", false),
+            ("tsc --noEmit", false),
+            ("npx eslint .", false),
+            ("npm run typecheck", false),
+            ("go vet ./...", false),
+            // Deliberate limitation: these may run tests in a project, but are
+            // classified as checks, so the extra review stays (the safe side).
+            ("make check", false),
+            ("npm run check", false),
+            ("yarn check", false),
+            ("pnpm check", false),
+            ("make test", true),
+            ("yarn test", true),
+            ("pnpm test", true),
+            ("cargo test --no-run", false),
+            ("echo cargo test", false),
+            ("ls", false),
+        ] {
+            assert_eq!(verification_ran_tests(command), expected, "{command}");
         }
     }
 

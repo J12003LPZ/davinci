@@ -128,7 +128,42 @@ pub fn child_operation_status(
 /// legacy task creations. Existing journals remain authoritative and ignore
 /// the mapping, while missing or unused entries fail closed during migration.
 pub fn configure_session_workflow_with_legacy_recovery(
+    runtime: davinci_agent::RuntimeHandle,
+    session: Option<&davinci_session::JsonlSession>,
+    previous: Option<&davinci_agent::RuntimeHandle>,
+    store: davinci_agent::WorkflowStateStore,
+    runner: Option<davinci_agent::SubagentRunner>,
+    recovery: &HashMap<davinci_agent::TaskId, davinci_agent::runtime::LegacyTaskRecovery>,
+) -> Result<davinci_agent::RuntimeHandle, String> {
+    configure_workflow_runtime(runtime, None, session, previous, store, runner, recovery)
+}
+
+/// [`configure_session_workflow`] for a host that also installs the workspace
+/// operation journal. The journal is attached before the workflow executor is
+/// built, because the executor keeps a clone of this runtime and its workers
+/// inherit the journal (and with it Codemode) from that clone.
+pub fn configure_session_workflow_with_journal(
+    runtime: davinci_agent::RuntimeHandle,
+    cwd: &Path,
+    session: Option<&davinci_session::JsonlSession>,
+    previous: Option<&davinci_agent::RuntimeHandle>,
+    store: davinci_agent::WorkflowStateStore,
+    runner: Option<davinci_agent::SubagentRunner>,
+) -> Result<davinci_agent::RuntimeHandle, String> {
+    configure_workflow_runtime(
+        runtime,
+        Some(cwd),
+        session,
+        previous,
+        store,
+        runner,
+        &HashMap::new(),
+    )
+}
+
+fn configure_workflow_runtime(
     mut runtime: davinci_agent::RuntimeHandle,
+    journal_cwd: Option<&Path>,
     session: Option<&davinci_session::JsonlSession>,
     previous: Option<&davinci_agent::RuntimeHandle>,
     store: davinci_agent::WorkflowStateStore,
@@ -170,6 +205,9 @@ pub fn configure_session_workflow_with_legacy_recovery(
             .with_bus(runtime.bus.clone());
             runtime = runtime.with_worktree_manager(manager);
         }
+    }
+    if let Some(cwd) = journal_cwd {
+        runtime = attach_operation_runtime(runtime, cwd, session)?;
     }
     // The conversation's executor carries over (see
     // `RuntimeHandle::with_session_state_from`); a new one is built only for
@@ -1047,6 +1085,54 @@ mod tests {
             first.workflow_executor.as_ref().unwrap(),
             unrelated.workflow_executor.as_ref().unwrap()
         ));
+    }
+
+    #[test]
+    fn the_workflow_executor_runtime_holds_the_operation_journal_on_a_fresh_session() {
+        // Workflow workers inherit their runtime from the executor's clone, so
+        // that clone must already carry the journal Codemode attributes to.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let session =
+            davinci_session::JsonlSession::create(dir.path(), &workspace.to_string_lossy(), None)
+                .unwrap();
+        let store =
+            || davinci_agent::WorkflowStateStore::with_options(1024, dir.path().join("artifacts"));
+        let fresh = || {
+            davinci_agent::RuntimeHandle::new(
+                davinci_agent::RunId::new(),
+                davinci_agent::AgentId::new(),
+                davinci_agent::RuntimeBus::new(),
+            )
+        };
+        let runtime = configure_session_workflow_with_journal(
+            fresh(),
+            &workspace,
+            Some(&session),
+            None,
+            store(),
+            None,
+        )
+        .unwrap();
+        assert!(runtime.operations.is_some());
+        let executor = runtime.workflow_executor.as_ref().unwrap();
+        assert!(executor.runtime.operations.is_some());
+
+        let next = configure_session_workflow_with_journal(
+            fresh(),
+            &workspace,
+            Some(&session),
+            Some(&runtime),
+            store(),
+            None,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            executor,
+            next.workflow_executor.as_ref().unwrap()
+        ));
+        assert!(next.operations.is_some());
     }
 
     #[test]
