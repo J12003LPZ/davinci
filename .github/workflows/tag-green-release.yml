@@ -1,57 +1,116 @@
 name: Tag green release
 
+# Dispatch from the default branch. The verifier is always the default-branch
+# commit of the dispatch (github.sha); the candidate commit is only ever read
+# as Git objects and is never checked out or executed.
 on:
   workflow_dispatch:
     inputs:
       commit:
-        description: Full commit SHA with completed green CI
+        description: Full lowercase 40-hex commit SHA with completed green push CI on the default branch
         required: true
+        type: string
       version:
         description: Product version from Cargo.toml (initial release 1.0.71)
         required: true
         default: '1.1.7'
+        type: string
 
-permissions:
-  contents: write
-  actions: read
+permissions: {}
+
+concurrency:
+  group: tag-green-release
+  cancel-in-progress: false
 
 jobs:
-  tag:
+  verify:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     env:
-      RELEASE_COMMIT: ${{ inputs.commit }}
-      RELEASE_VERSION: ${{ inputs.version }}
-      GH_TOKEN: ${{ github.token }}
+      CANDIDATE: ${{ inputs.commit }}
+      VERSION: ${{ inputs.version }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      VERIFIER_SHA: ${{ github.sha }}
+      GIT_NO_REPLACE_OBJECTS: '1'
+    outputs:
+      sha: ${{ steps.verify.outputs.sha }}
+      version: ${{ steps.verify.outputs.version }}
+      verifier_sha: ${{ steps.verify.outputs.verifier_sha }}
     steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?(\+[0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*)?$'
+          [[ "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]] || { echo "commit must be a full lowercase 40-hex SHA"; exit 1; }
+          [[ "$VERSION" =~ $semver ]] || { echo "version must be strict semver"; exit 1; }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.commit }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
-      - name: Verify exact source, full CI, and version before creating tag
+      - name: Fetch candidate objects
+        # Without persisted credentials this can fail on a private repository;
+        # the default-branch history from the checkout already holds any valid
+        # candidate, and verify-commit rejects one that is missing.
+        run: git fetch --no-tags origin "$CANDIDATE" || echo "candidate not fetchable; using default-branch history"
+      - name: Verify candidate commit, version, ancestry and push CI
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python scripts/release_identity.py preflight --repo "$PWD" --output "$RUNNER_TEMP/release-proof.json"
-          python - <<'PY'
-          import json, os, re
-          from pathlib import Path
-          proof = json.loads(Path(os.environ['RUNNER_TEMP'], 'release-proof.json').read_text())
-          assert re.fullmatch(r'[0-9a-f]{40}', os.environ['RELEASE_COMMIT'])
-          assert proof['source']['source_sha'] == os.environ['RELEASE_COMMIT']
-          assert proof['version'] == os.environ['RELEASE_VERSION']
-          PY
-          tag="v$RELEASE_VERSION"
-          if git show-ref --verify --quiet "refs/tags/$tag"; then
-            test "$(git rev-parse "$tag^{commit}")" = "$RELEASE_COMMIT"
-            echo "Version tag already identifies this verified commit."
-          else
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git tag -a "$tag" "$RELEASE_COMMIT" -m "DaVinci $RELEASE_VERSION; green full CI verified"
-            git push origin "refs/tags/$tag"
-          fi
+          python scripts/release_identity.py verify-commit --repo "$PWD" --commit "$CANDIDATE" \
+            --repository "$GITHUB_REPOSITORY" --default-branch "$DEFAULT_BRANCH" \
+            --main-commit "$VERIFIER_SHA" --expected-version "$VERSION" \
+            --output "$RUNNER_TEMP/release-proof.json" --github-output "$GITHUB_OUTPUT"
+
+  tag:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+    env:
+      CANDIDATE: ${{ needs.verify.outputs.sha }}
+      VERSION: ${{ needs.verify.outputs.version }}
+      VERIFIER_SHA: ${{ needs.verify.outputs.verifier_sha }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      GIT_NO_REPLACE_OBJECTS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.verifier_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Re-verify before tagging
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?(\+[0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*)?$'
+          [[ "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]] || { echo "bad candidate SHA"; exit 1; }
+          [[ "$VERIFIER_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "bad verifier SHA"; exit 1; }
+          [[ "$VERSION" =~ $semver ]] || { echo "bad version"; exit 1; }
+          test "$(git rev-parse HEAD)" = "$VERIFIER_SHA"
+          git fetch --no-tags origin "$CANDIDATE" || echo "candidate not fetchable; using default-branch history"
+          python scripts/release_identity.py verify-commit --repo "$PWD" --commit "$CANDIDATE" \
+            --repository "$GITHUB_REPOSITORY" --default-branch "$DEFAULT_BRANCH" \
+            --main-commit "$VERIFIER_SHA" --expected-version "$VERSION" \
+            --output "$RUNNER_TEMP/release-proof.json"
+      - name: Create the annotated version tag through the API
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/release_identity.py publish-tag --proof "$RUNNER_TEMP/release-proof.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-ci-proof

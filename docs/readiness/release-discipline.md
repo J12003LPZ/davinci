@@ -23,6 +23,30 @@ an annotated version tag. An existing tag is never moved. It creates no deployed
 site and publishes no executable. A reviewer invokes it after the desired
 commit has passed all checks.
 
+The workflow is split so that candidate code never runs with a write token:
+
+- Dispatch it from the default branch; any other ref skips the `verify` job.
+  The verifier (`scripts/release_identity.py`) is always the default-branch
+  commit of the dispatch (`github.sha`), never the candidate.
+- `verify` has read-only permissions. It validates the inputs (a full lowercase
+  40-hex commit, a strict semver version), then `verify-commit` reads the
+  candidate as Git objects only: the commit must be an ancestor of the
+  verifier commit, `Cargo.toml` must be a regular blob whose
+  `[workspace.package].version` equals the requested version, and the CI proof
+  must be a push run on the default branch for exactly that commit. No candidate
+  file is checked out or executed.
+- `tag` runs in the `release` environment with `contents: write`. It checks out
+  the verifier commit again, repeats the verification, and creates the annotated
+  tag and ref through the GitHub REST API. An existing `v<version>` tag is
+  accepted only if it is an annotated tag of the verified commit; a lost race
+  is re-read under the same rule, and a ref is never force-updated.
+- Checkouts use `persist-credentials: false`.
+- Manual step for the repository owner: add a protection rule (required
+  reviewers) to the `release` environment in the repository settings. Without
+  it the `tag` job runs unattended after `verify`.
+- Tags created with `GITHUB_TOKEN` do not trigger tag-push workflows. Anything
+  that must react to a release tag needs a different trigger.
+
 The installed executable has an adjacent `davinci.identity.json` (Unix) or
 `davinci.exe.identity.json` (Windows). Schema 3 records the exact source commit,
 tree, clean-source digest, version tag, CI run/URL, complete CI evidence and its
