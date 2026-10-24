@@ -204,7 +204,7 @@ pub fn project_settings_path(cwd: &Path) -> PathBuf {
     if pi.exists() {
         return pi;
     }
-    if cwd.join(LEGACY_CONFIG_DIR_NAME).is_dir() {
+    if crate::project_config::is_populated_dir(&cwd.join(LEGACY_CONFIG_DIR_NAME)) {
         return pi;
     }
     davinci
@@ -358,6 +358,11 @@ mod tests {
         }
     }
 
+    /// A populated `.pi`: an empty one counts as absent (sandbox placeholder).
+    fn legacy_project_dir(project: &Path) {
+        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        std::fs::write(project.join(".pi").join("keep"), "").unwrap();
+    }
     #[test]
     fn additional_directories_come_from_flags_user_and_trusted_project_only() {
         let temp = tempfile::tempdir().unwrap();
@@ -368,7 +373,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             dir
         });
-        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        legacy_project_dir(&project);
         let agent_dir = user_dir_with(
             PermissionSettings {
                 additional_directories: vec!["../user".into(), "../missing".into()],
@@ -452,7 +457,7 @@ mod tests {
     fn user_and_trusted_project_rules_are_unioned_and_the_project_mode_wins() {
         let project = tempfile::tempdir().unwrap();
         let agent_dir = user_dir_with(block(Some("edits"), &["bash(git *)"], &["bash(rm *)"]), &[]);
-        std::fs::create_dir_all(project.path().join(".pi")).unwrap();
+        legacy_project_dir(project.path());
         std::fs::write(
             project_settings_path(project.path()),
             r#"{"permissions": {"mode": "ask", "allow": ["bash(cargo *)"]}, "other": 1}"#,
@@ -477,7 +482,7 @@ mod tests {
     #[test]
     fn folder_trust_does_not_grant_tool_execution() {
         let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(project.path().join(".pi")).unwrap();
+        legacy_project_dir(project.path());
         let load = |user: Option<&str>, project_mode: &str| {
             let agent_dir = user_dir_with(block(user, &[], &[]), &[]);
             std::fs::write(
@@ -525,7 +530,7 @@ mod tests {
     #[test]
     fn a_ignored_project_mode_is_reported_to_the_user() {
         let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(project.path().join(".pi")).unwrap();
+        legacy_project_dir(project.path());
         std::fs::write(
             project_settings_path(project.path()),
             r#"{"permissions": {"mode": "always-approve"}}"#,
@@ -557,7 +562,7 @@ mod tests {
     fn an_untrusted_project_grants_nothing() {
         let project = tempfile::tempdir().unwrap();
         let agent_dir = user_dir_with(block(None, &["edit"], &[]), &[]);
-        std::fs::create_dir_all(project.path().join(".pi")).unwrap();
+        legacy_project_dir(project.path());
         std::fs::write(
             project_settings_path(project.path()),
             r#"{"permissions": {"mode": "auto", "allow": ["bash"]}}"#,

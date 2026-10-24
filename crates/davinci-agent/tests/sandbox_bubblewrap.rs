@@ -39,6 +39,30 @@ print(json.dumps({
 }))
 "#;
 
+const CONTROL_PATH_PROBE: &str = r#"
+import json, os, pathlib, shutil
+def allowed(operation):
+    try:
+        operation()
+        return True
+    except OSError:
+        return False
+def replace_with_dir(name):
+    os.mkdir('replacement-' + name)
+    os.rename('replacement-' + name, name)
+result = {'new_top_level_file': allowed(lambda: pathlib.Path('created').write_text('ok'))}
+for name in ['.git', '.davinci', '.pi']:
+    result[name] = {
+        'mkdir_inside': allowed(lambda: os.mkdir(name + '/x')),
+        'write_inside': allowed(lambda: pathlib.Path(name + '/hooks.json').write_text('{}')),
+        'rmtree': allowed(lambda: shutil.rmtree(name)),
+        'rmdir': allowed(lambda: os.rmdir(name)),
+        'rename_over': allowed(lambda: replace_with_dir(name)),
+        'rename_away': allowed(lambda: os.rename(name, 'moved-' + name)),
+    }
+print(json.dumps(result))
+"#;
+
 fn spec(workspace: &Path, mode: SandboxMode) -> SandboxSpec {
     let workspace = workspace.to_string_lossy().into_owned();
     let mut spec: SandboxSpec = serde_json::from_value(serde_json::json!({
@@ -149,4 +173,125 @@ fn native_bubblewrap_enforces_filesystem_network_and_environment() {
         );
         println!("{mode:?}: {actual}");
     }
+}
+
+#[test]
+#[ignore = "requires Linux bubblewrap, python3, and permission to create user/PID/network namespaces"]
+fn native_bubblewrap_protects_control_paths_that_did_not_exist() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let spec = spec(&workspace, SandboxMode::WorkspaceWrite);
+    let request = ExecutionRequest {
+        sandbox_id: spec.id.clone(),
+        executable: "/usr/bin/python3".into(),
+        argv: vec!["-c".into(), CONTROL_PATH_PROBE.into()],
+        cwd: spec.workspace.clone(),
+        launch_id: None,
+    };
+    let environment = sanitize_environment_from(&spec.environment, &BTreeMap::new()).unwrap();
+    let prepared = LinuxBubblewrapBackend::new(PathBuf::from("/usr/bin/bwrap"))
+        .prepare(&spec, &request, &environment)
+        .unwrap();
+    let output = Command::new(prepared.executable)
+        .args(prepared.argv)
+        .current_dir(prepared.cwd)
+        .env_clear()
+        .envs(prepared.environment)
+        .stdin(Stdio::null())
+        .output()
+        .expect("provision bubblewrap before running this opt-in test");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let denied = serde_json::json!({
+        "mkdir_inside":false, "write_inside":false, "rmtree":false,
+        "rmdir":false, "rename_over":false, "rename_away":false
+    });
+    let actual: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        actual,
+        serde_json::json!({
+            "new_top_level_file":true, ".git":denied, ".davinci":denied, ".pi":denied
+        })
+    );
+    // The host created the placeholders; the sandbox changed nothing in them.
+    for name in [".git", ".davinci", ".pi"] {
+        assert_eq!(
+            fs::read_dir(workspace.join(name)).unwrap().count(),
+            0,
+            "{name}"
+        );
+    }
+    assert!(workspace.join("created").is_file());
+}
+
+const GITFILE_TARGET_PROBE: &str = r#"
+import json, os, pathlib
+def allowed(operation):
+    try:
+        operation()
+        return True
+    except OSError:
+        return False
+print(json.dumps({
+    'write_config': allowed(lambda: pathlib.Path('.metadata/config').write_text('[core]\nfsmonitor = evil')),
+    'create_inside': allowed(lambda: pathlib.Path('.metadata/hooks').write_text('x')),
+    'rename_away': allowed(lambda: os.rename('.metadata', 'moved')),
+    'write_git_file': allowed(lambda: pathlib.Path('.git').write_text('gitdir: moved')),
+    'write_elsewhere': allowed(lambda: pathlib.Path('other').write_text('ok')),
+}))
+"#;
+
+#[test]
+#[ignore = "requires Linux bubblewrap, python3, and permission to create user/PID/network namespaces"]
+fn native_bubblewrap_protects_the_directory_a_git_file_points_at() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(workspace.join(".metadata")).unwrap();
+    fs::write(workspace.join(".git"), "gitdir: .metadata\n").unwrap();
+    fs::write(workspace.join(".metadata/config"), "preserved").unwrap();
+    let spec = spec(&workspace, SandboxMode::WorkspaceWrite);
+    let request = ExecutionRequest {
+        sandbox_id: spec.id.clone(),
+        executable: "/usr/bin/python3".into(),
+        argv: vec!["-c".into(), GITFILE_TARGET_PROBE.into()],
+        cwd: spec.workspace.clone(),
+        launch_id: None,
+    };
+    let environment = sanitize_environment_from(&spec.environment, &BTreeMap::new()).unwrap();
+    let prepared = LinuxBubblewrapBackend::new(PathBuf::from("/usr/bin/bwrap"))
+        .prepare(&spec, &request, &environment)
+        .unwrap();
+    let output = Command::new(prepared.executable)
+        .args(prepared.argv)
+        .current_dir(prepared.cwd)
+        .env_clear()
+        .envs(prepared.environment)
+        .stdin(Stdio::null())
+        .output()
+        .expect("provision bubblewrap before running this opt-in test");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let actual: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        actual,
+        serde_json::json!({
+            "write_config":false, "create_inside":false, "rename_away":false,
+            "write_git_file":false, "write_elsewhere":true
+        })
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join(".metadata/config")).unwrap(),
+        "preserved"
+    );
+    assert_eq!(
+        fs::read_dir(workspace.join(".metadata")).unwrap().count(),
+        1
+    );
 }

@@ -27,6 +27,14 @@ pub fn all(cwd: &Path, name: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// A config directory that holds something. Linux sandboxes pre-create empty
+/// `.davinci`, `.git` and `.pi` placeholders, so for choosing between the two
+/// config directories an empty one counts as absent: a placeholder must not
+/// shadow a populated legacy `.pi`.
+pub fn is_populated_dir(path: &Path) -> bool {
+    std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
+}
+
 pub fn any_exists(cwd: &Path, names: &[&str]) -> bool {
     names
         .iter()
