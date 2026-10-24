@@ -161,3 +161,6 @@ required before any saving is claimed.
 Trade-off: on the rename task the review led to added boundary tests. With the
 fix that review would be skipped when `pytest -q` passed. No hidden-test grade
 changed in that campaign, so this cost is not observed, only possible.
+
+Result: the 2026-10-24 live A/B replaced this counterfactual estimate with a
+measured result. See [pytest-receipts-ab-2026-10-24.md](pytest-receipts-ab-2026-10-24.md).
