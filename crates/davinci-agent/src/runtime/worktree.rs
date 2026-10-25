@@ -405,13 +405,11 @@ impl WorktreeManager {
     ///
     /// A failing `git status` or `rev-parse` is an error, never "clean":
     /// treating unreadable state as clean let a forced cleanup delete
-    /// uncommitted work. Commits made in the worktree count as integrated once
-    /// they are reachable from the repository's current HEAD (the branch they
-    /// were merged into), or once every one of their patches already exists
-    /// there (rebase, cherry-pick or squash). Comparing against the lease's
-    /// recorded `base_head` instead made every worker commit look unmerged
-    /// forever, since a commit made after the lease is never an ancestor of
-    /// the commit the lease started from.
+    /// uncommitted work. Commits count as integrated once reachable from
+    /// the repository's current HEAD, or when virtually merging the worker
+    /// produces exactly the same tree as HEAD. Patch-ID equivalence is unsafe:
+    /// `git cherry` ignores whitespace and merge-only edits. A worker that
+    /// still points to its original `base_head` has no new committed work.
     pub fn check_dirty(&self, lease: &WorktreeLease) -> Result<bool, WorktreeError> {
         if !lease.path.exists() {
             return Ok(false);
