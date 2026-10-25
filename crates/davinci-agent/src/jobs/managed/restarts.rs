@@ -81,13 +81,16 @@ pub(super) fn callback(
 }
 
 fn finish_shared(shared: &Shared, exit: &ProcessExit) {
+    // The supervisor has reaped the process and completed cleanup. Release its
+    // workspace ownership before publishing the terminal status: consumers may
+    // immediately start another writer when they observe an exited job.
+    shared.release_shared_write();
+    *shared.finished_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     *shared.status.lock().unwrap_or_else(|e| e.into_inner()) = if exit.stopped {
         JobStatus::Killed
     } else {
         JobStatus::Exited(exit.code.unwrap_or(-1))
     };
-    *shared.finished_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
-    shared.release_shared_write();
 }
 
 fn finish(shared: &Shared, record: &Record, mut exit: ProcessExit) {
