@@ -226,10 +226,9 @@ impl McpRegistry {
                     Ok(davinci_mcp::McpExecutionPolicy::Remote)
                 )
             {
-                inner.remote_configs.insert(
-                    name.clone(),
-                    (server.clone(), cwd.to_path_buf()),
-                );
+                inner
+                    .remote_configs
+                    .insert(name.clone(), (server.clone(), cwd.to_path_buf()));
             }
         }
     }
@@ -1226,7 +1225,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn project_trust_revocation_prevents_remote_mcp_reconnection() {
         let (dir, mut config) = http_fixture(
@@ -1267,7 +1265,6 @@ mod tests {
         assert!(registry.lock().reconnecting.is_empty());
         assert!(!registry.take_ready());
     }
-
 }
 
 #[cfg(test)]
