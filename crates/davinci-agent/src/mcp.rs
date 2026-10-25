@@ -430,6 +430,23 @@ impl McpRegistry {
             .ok_or_else(|| ToolError::Failed(format!("no MCP server named `{server}`")))
     }
 
+    /// HTTP 4xx errors are generally configuration, authorization, or input
+    /// problems, not dropped transport connections. Only timeout/rate-limit
+    /// statuses in that range are eligible for transient reconnection.
+    fn should_reconnect(error: &davinci_mcp::Error) -> bool {
+        match error {
+            davinci_mcp::Error::Rpc { .. } => false,
+            davinci_mcp::Error::Transport(message) => {
+                let status = message
+                    .strip_prefix("mcp http ")
+                    .and_then(|tail| tail.split(|ch: char| !ch.is_ascii_digit()).next())
+                    .and_then(|digits| digits.parse::<u16>().ok());
+                !matches!(status, Some(400..=499) if status != Some(408) && status != Some(429))
+            }
+            davinci_mcp::Error::Protocol(_) | davinci_mcp::Error::Io(_) => true,
+        }
+    }
+
     /// Handle an error only if it belongs to this exact server connection.
     /// An older, still-in-flight call must never evict a replacement connection.
     fn failed_client(
@@ -438,7 +455,7 @@ impl McpRegistry {
         client: &SharedClient,
         err: davinci_mcp::Error,
     ) -> Result<ToolResult, ToolError> {
-        let reconnect = !err.is_rpc();
+        let reconnect = Self::should_reconnect(&err);
         let result = {
             let mut inner = self.lock();
             if !inner
@@ -1252,6 +1269,30 @@ mod tests {
         assert!(registry.rows().is_empty(), "revoked server was restored");
         assert!(registry.tool_names().is_empty());
         assert!(registry.resolve_tool("mcp__memory__ping").is_none());
+    }
+
+    #[test]
+    fn remote_mcp_does_not_reconnect_after_auth_or_bad_request_status() {
+        use davinci_mcp::Error;
+
+        for status in [400, 401, 403, 404, 422] {
+            let failure = Error::Transport(format!("mcp http {status}: denied"));
+            assert!(
+                !McpRegistry::should_reconnect(&failure),
+                "status {status} must not trigger a retry"
+            );
+        }
+        for status in [408, 429, 500, 502, 503] {
+            let failure = Error::Transport(format!("mcp http {status}"));
+            assert!(
+                McpRegistry::should_reconnect(&failure),
+                "status {status} should be treated as transient"
+            );
+        }
+        assert!(!McpRegistry::should_reconnect(&Error::Rpc {
+            code: -32602,
+            message: "bad parameters".into(),
+        }));
     }
 
     #[test]
