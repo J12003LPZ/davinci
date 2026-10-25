@@ -254,7 +254,6 @@ pub(super) fn supervise(
     });
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
