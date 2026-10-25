@@ -1064,6 +1064,52 @@ mod tests {
         assert!(registry.specs().is_empty());
         assert_eq!(registry.rows()[0].status, "disabled");
     }
+
+    #[test]
+    fn remote_mcp_recovers_after_transport_failure_without_replaying_the_tool() {
+        let (dir, config) = http_fixture(
+            r#"{
+                "initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
+                "tools/list":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]}
+            }"#,
+        );
+        let registry = McpRegistry::connect(&config, dir.path());
+        assert_eq!(registry.rows()[0].status, "connected");
+
+        // The existing connection has snapshotted the broken response map.
+        // Only a NEW connection can see this repaired server. No tool call
+        // should be replayed automatically because the old call's effect may
+        // have been committed before the transport failed.
+        let fixture = dir.path().join("mcp-fixture.json");
+        std::fs::write(
+            &fixture,
+            r#"{
+                "initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
+                "tools/list":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]},
+                "tools/call":{"content":[{"type":"text","text":"recovered"}]}
+            }"#,
+        )
+        .unwrap();
+
+        let first = registry.call("memory", "ping", &json!({}));
+        assert!(first.is_err(), "an unknown-effect call must not be replayed");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while !registry.take_ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "failed remote MCP connection was never re-established"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(registry.rows()[0].status, "connected");
+        assert_eq!(registry.tool_names(), ["mcp__memory__ping"]);
+        assert_eq!(
+            registry.call("memory", "ping", &json!({})).unwrap().content,
+            "recovered"
+        );
+    }
+
 }
 
 #[cfg(test)]
