@@ -1223,6 +1223,48 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn project_trust_revocation_prevents_remote_mcp_reconnection() {
+        let (dir, mut config) = http_fixture(
+            r#"{
+                "initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
+                "tools/list":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]}
+            }"#,
+        );
+        config.mcp_servers.get_mut("memory").unwrap().project_origin = true;
+        let registry = McpRegistry::connect(&config, dir.path());
+        assert!(registry.call("memory", "ping", &json!({})).is_err());
+        registry.disconnect_project();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while registry.lock().reconnecting.contains("memory") {
+            assert!(std::time::Instant::now() < deadline, "reconnect never stopped");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(registry.rows().is_empty(), "revoked server was restored");
+        assert!(registry.tool_names().is_empty());
+        assert!(registry.resolve_tool("mcp__memory__ping").is_none());
+    }
+
+    #[test]
+    fn rpc_tool_errors_keep_the_mcp_connection_and_do_not_schedule_reconnect() {
+        let (dir, config) = http_fixture(
+            r#"{
+                "initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
+                "tools/list":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]},
+                "tools/call":{"$rpcError":{"code":-32602,"message":"bad args"}}
+            }"#,
+        );
+        let registry = McpRegistry::connect(&config, dir.path());
+        let result = registry.call("memory", "ping", &json!({})).unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("bad args"));
+        assert_eq!(registry.rows()[0].status, "connected");
+        assert!(registry.lock().reconnecting.is_empty());
+        assert!(!registry.take_ready());
+    }
+
 }
 
 #[cfg(test)]
