@@ -47,6 +47,11 @@ struct Inner {
     /// Project servers stopped on purpose; a background connect that finishes
     /// later must not bring them back.
     blocked: BTreeSet<String>,
+    /// Original user/project-authorized HTTP endpoints only. Local stdio and
+    /// sandboxed services require their own supervisor restart policy.
+    remote_configs: BTreeMap<String, (davinci_mcp::ServerConfig, PathBuf)>,
+    /// At most one reconnect worker may own a server at a time.
+    reconnecting: BTreeSet<String>,
 }
 
 /// Connected MCP servers, shared with the tool thread and the shell.
@@ -95,7 +100,7 @@ impl McpRegistry {
         )>,
     ) -> Self {
         let registry = Self::default();
-        registry.note_project_servers(config);
+        registry.note_project_servers(config, cwd);
         registry.adopt(Self::connect_parts(config, cwd, executor));
         registry
     }
@@ -116,7 +121,7 @@ impl McpRegistry {
         if config.mcp_servers.is_empty() {
             return registry;
         }
-        registry.note_project_servers(config);
+        registry.note_project_servers(config, cwd);
         registry.progress.running.store(true, Ordering::SeqCst);
         let worker = registry.clone();
         let config = config.clone();
@@ -206,11 +211,22 @@ impl McpRegistry {
         self.inner.lock().unwrap_or_else(|err| err.into_inner())
     }
 
-    fn note_project_servers(&self, config: &davinci_mcp::ConfigFile) {
+    fn note_project_servers(&self, config: &davinci_mcp::ConfigFile, cwd: &Path) {
         let mut inner = self.lock();
         for (name, server) in &config.mcp_servers {
             if server.project_origin {
                 inner.project.insert(name.clone());
+            }
+            // Only an explicitly remote HTTP endpoint is eligible for this
+            // retry path. Never restart a local command outside its sandbox.
+            if server.url.is_some()
+                && !server.disabled
+                && server.execution_policy() == Ok(davinci_mcp::McpExecutionPolicy::Remote)
+            {
+                inner.remote_configs.insert(
+                    name.clone(),
+                    (server.clone(), cwd.to_path_buf()),
+                );
             }
         }
     }
@@ -412,6 +428,103 @@ impl McpRegistry {
             .ok_or_else(|| ToolError::Failed(format!("no MCP server named `{server}`")))
     }
 
+    /// Handle an error only if it belongs to this exact server connection.
+    /// An older, still-in-flight call must never evict a replacement connection.
+    fn failed_client(
+        &self,
+        server: &str,
+        client: &SharedClient,
+        err: davinci_mcp::Error,
+    ) -> Result<ToolResult, ToolError> {
+        let reconnect = !err.is_rpc();
+        let result = {
+            let mut inner = self.lock();
+            if !inner
+                .clients
+                .get(server)
+                .is_some_and(|current| Arc::ptr_eq(current, client))
+            {
+                return Err(ToolError::Failed(err.to_string()));
+            }
+            inner.failed(server, err)
+        };
+        if reconnect {
+            self.schedule_remote_reconnect(server);
+        }
+        result
+    }
+
+    /// Repair the transport for future calls only. The call that lost its
+    /// response may have mutated remote state and is NEVER replayed.
+    fn schedule_remote_reconnect(&self, server: &str) {
+        let reconnect = {
+            let mut inner = self.lock();
+            if inner.blocked.contains(server) || inner.reconnecting.contains(server) {
+                return;
+            }
+            let Some(config) = inner.remote_configs.get(server).cloned() else {
+                return;
+            };
+            inner.reconnecting.insert(server.to_string());
+            if let Some(row) = inner.rows.iter_mut().find(|row| row.name == server) {
+                row.status = "reconnecting".into();
+            }
+            config
+        };
+
+        let worker = self.clone();
+        let name = server.to_string();
+        std::thread::spawn(move || {
+            let (config, cwd) = reconnect;
+            let mut last_error = String::from("MCP reconnect failed");
+            for attempt in 0..3 {
+                if attempt > 0 {
+                    std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 1)));
+                }
+                if worker.lock().blocked.contains(&name) {
+                    break;
+                }
+                let mut part = Inner::default();
+                part.connect_one(&name, &config, &cwd, None);
+                let connected = part.clients.contains_key(&name);
+                if connected {
+                    let mut inner = worker.lock();
+                    // A project trust revocation during handshake wins.
+                    if !inner.blocked.contains(&name) {
+                        inner.clients.remove(&name);
+                        inner.routes.retain(|_, (owner, _)| owner != &name);
+                        inner.trusted_read_only_servers.remove(&name);
+                        inner.rows.retain(|row| row.name != name);
+                        inner.clients.extend(part.clients);
+                        inner.routes.extend(part.routes);
+                        inner
+                            .trusted_read_only_servers
+                            .extend(part.trusted_read_only_servers);
+                        inner.rows.extend(part.rows);
+                    }
+                    break;
+                }
+                if let Some(error) = part.rows.first().and_then(|row| row.error.as_ref()) {
+                    last_error = error.clone();
+                }
+            }
+
+            {
+                let mut inner = worker.lock();
+                inner.reconnecting.remove(&name);
+                if let Some(row) = inner.rows.iter_mut().find(|row| row.name == name) {
+                    if row.status == "reconnecting" {
+                        row.status = "error".into();
+                        row.error = Some(last_error);
+                    }
+                }
+            }
+            // The host must rebuild the model-visible MCP tool surface after
+            // recovery; a reconnect never grants permissions by itself.
+            worker.progress.unreported.store(true, Ordering::SeqCst);
+        });
+    }
+
     pub fn call(
         &self,
         server: &str,
@@ -446,7 +559,7 @@ impl McpRegistry {
                 // Preserve the direct path's distinction: an RPC error is a
                 // failed tool answer; transport/protocol failure drops the
                 // server and remains an error, not an empty structured value.
-                let result = self.lock().failed(server, err)?;
+                let result = self.failed_client(server, &client, err)?;
                 Ok(davinci_mcp::CallToolResult {
                     content: vec![davinci_mcp::ContentBlock {
                         kind: "text".into(),
@@ -474,7 +587,7 @@ impl McpRegistry {
                 is_error: false,
                 details: None,
             }),
-            Err(err) => self.lock().failed(server, err),
+            Err(err) => self.failed_client(server, &client, err),
         }
     }
 }
