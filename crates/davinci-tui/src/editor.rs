@@ -977,13 +977,38 @@ fn parse_marker_id(marker: &str) -> Option<usize> {
     inner.parse().ok()
 }
 
+/// `[Image #N]` chips the shell inserts for pasted images. They edit as one
+/// unit, like paste markers, but carry no stored content of their own.
+fn image_chips(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("[Image #") {
+        let start = search + rel;
+        let digits = &text[start + "[Image #".len()..];
+        let count = digits.bytes().take_while(u8::is_ascii_digit).count();
+        if count > 0 && digits[count..].starts_with(']') {
+            let end = start + "[Image #".len() + count + 1;
+            out.push((start, end));
+            search = end;
+        } else {
+            search = start + 1;
+        }
+    }
+    out
+}
+
+/// Spans that edit as one unit, in text order: paste markers with stored
+/// content, and image chips.
 fn valid_markers(text: &str, pastes: &BTreeMap<usize, String>) -> Vec<(usize, usize)> {
-    paste_markers(text)
+    let mut out: Vec<(usize, usize)> = paste_markers(text)
         .into_iter()
         .filter(|(start, end)| {
             parse_marker_id(&text[*start..*end]).is_some_and(|id| pastes.contains_key(&id))
         })
-        .collect()
+        .chain(image_chips(text))
+        .collect();
+    out.sort_unstable();
+    out
 }
 
 fn marker_starting_at(
@@ -1631,6 +1656,32 @@ mod tests {
     fn typed_marker_like_text_is_not_atomic() {
         let mut editor = Editor::new();
         editor.set_text("[paste #99 +5 lines]");
+        editor.move_line_start();
+        editor.move_right();
+        assert_eq!(editor.cursor, 1);
+    }
+
+    #[test]
+    fn an_image_chip_deletes_and_steps_as_one_unit() {
+        let mut editor = Editor::new();
+        editor.set_text("see [Image #1] and [Image #12]");
+        editor.backspace();
+        assert_eq!(editor.get_text(), "see [Image #1] and ");
+        for _ in " and ".chars() {
+            editor.move_left();
+        }
+        editor.move_left();
+        assert_eq!(editor.cursor, "see ".len(), "one step crosses the chip");
+        editor.delete_forward();
+        assert_eq!(editor.get_text(), "see  and ");
+        editor.move_right();
+        assert_eq!(editor.cursor, "see  ".len());
+
+        // Only a whole chip is atomic: a broken one edits per character.
+        let mut editor = Editor::new();
+        editor.set_text("[Image #] [Image #3");
+        editor.backspace();
+        assert_eq!(editor.get_text(), "[Image #] [Image #");
         editor.move_line_start();
         editor.move_right();
         assert_eq!(editor.cursor, 1);

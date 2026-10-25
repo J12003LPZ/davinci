@@ -5360,7 +5360,8 @@ mod scroll_to_entry_tests {
                 row: targets[usize::from(row)].rows.start,
                 modifiers: KeyModifiers::NONE,
             };
-            assert!(super::super::runtime::route_click_target(m, event));
+            // Placed, and left to selection so a drag can copy the draft.
+            assert!(!super::super::runtime::route_click_target(m, event));
         };
         // Two cells of prompt, then "hello".
         click(&mut m, 0, 2 + 5);
@@ -5379,6 +5380,42 @@ mod scroll_to_entry_tests {
         assert_eq!(
             m.composer.editor().cursor,
             m.composer.editor().get_text().len()
+        );
+    }
+
+    #[test]
+    fn dragging_over_the_composer_selects_the_draft_for_copying() {
+        use crate::davinci::selection::Selector;
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut m = chat(24, 6);
+        m.composer.set_text("copy this draft");
+        let frame = compose_frame(&m, m.height);
+        let row = frame
+            .targets
+            .iter()
+            .find(|hit| matches!(hit.target, Target::ComposerRow(_)))
+            .expect("the composer is a target")
+            .rows
+            .start;
+        let rendered = rows(&m);
+        let mut selector = Selector::default();
+        let at = |kind, column| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let now = std::time::Instant::now();
+        let down = at(MouseEventKind::Down(MouseButton::Left), 2);
+        assert!(!super::super::runtime::route_click_target(&mut m, down));
+        assert_eq!(selector.mouse(&mut m, &rendered, down, now), None);
+        let end = 2 + "copy this draft".len() as u16 - 1;
+        let drag = at(MouseEventKind::Drag(MouseButton::Left), end);
+        selector.mouse(&mut m, &rendered, drag, now);
+        let up = at(MouseEventKind::Up(MouseButton::Left), end);
+        assert_eq!(
+            selector.mouse(&mut m, &rendered, up, now).as_deref(),
+            Some("copy this draft")
         );
     }
 

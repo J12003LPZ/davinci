@@ -607,13 +607,12 @@ fn status_right(model: &Model) -> Vec<Span<'static>> {
     right
 }
 
-/// Claude-style effort affordance shared by the conversation composer and
-/// command sheets. The session's real effort label is preserved.
+/// The row above the composer. It stays empty, since the masthead names the
+/// effort, and carries notes on its right end.
 pub fn effort_line(model: &Model) -> Line<'static> {
     let cc = model.theme.cc();
-    let quiet = cc.inactive;
     // A note ("copied 709 chars to clipboard") takes this row's right end in
-    // the permission blue while it lasts, then gives the effort label back.
+    // the permission blue while it lasts, then leaves the row empty again.
     if let Some(note) = live_toast(model) {
         let room = model.width.saturating_sub(4);
         return spread(
@@ -625,26 +624,12 @@ pub fn effort_line(model: &Model) -> Line<'static> {
             )],
         );
     }
-    spread(
-        model.width,
-        Vec::new(),
-        vec![
-            span("● ", quiet),
-            span(model.thinking_level.to_lowercase(), quiet),
-            span(" · /effort  ", quiet),
-        ],
-    )
+    spread(model.width, Vec::new(), Vec::new())
 }
 
 pub fn effort_rule(model: &Model) -> Line<'static> {
     let cc = model.theme.cc();
-    let label = format!(" ● {} · /effort ▔", model.thinking_level.to_lowercase());
-    let label_width = UnicodeWidthStr::width(label.as_str()).min(model.width as usize);
-    let left = "▔".repeat((model.width as usize).saturating_sub(label_width));
-    Line::from(crate::davinci::ui::truncate_run(
-        vec![span(left, cc.permission), span(label, cc.inactive)],
-        model.width,
-    ))
+    Line::from(span("▔".repeat(model.width as usize), cc.permission))
 }
 /// Rows for the composer plus its hint row. Grows with content. The box takes
 /// two neutral rules and no side borders. The prompt and caret carry
@@ -2430,7 +2415,7 @@ mod tests {
             std::time::Instant::now() - std::time::Duration::from_secs(60),
         ));
         let row = effort_line(&m);
-        assert!(text(&row).contains("/effort") && !text(&row).contains("copied"));
+        assert!(text(&row).trim().is_empty(), "{:?}", text(&row));
     }
 
     #[test]
