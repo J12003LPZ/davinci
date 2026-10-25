@@ -2,6 +2,7 @@
 //! publication, cross-process lock files, and supervised child processes.
 //! This crate depends on no other davinci crate, so any crate can use it.
 
+pub mod clock;
 pub mod fs;
 pub mod hex;
 pub mod lock;

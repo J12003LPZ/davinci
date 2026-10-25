@@ -1781,6 +1781,10 @@ Issue the call again if it is still needed.";
         tool_calls: Vec<(String, String, Value)>,
         events: &mut Vec<AgentEvent>,
     ) -> Vec<ChatMessage> {
+        // A mode the host queued mid-turn takes effect here, before the first
+        // permission check of this batch. The prepare loop below holds only
+        // `&Agent`, so this is the last point with `&mut self`.
+        self.apply_pending_permission_mode();
         // Provider history retains the original spelling and call ID. Every
         // downstream decision uses this shared ingress interpretation.
         let tool_calls: Vec<_> = tool_calls
@@ -6281,6 +6285,104 @@ mod tests {
             .contains(&instructions));
         assert!(!dir.path().join("denied.txt").exists());
         assert!(agent.permissions.lock().unwrap().session_allow.is_empty());
+    }
+
+    fn mid_turn_mode_fixture(
+        mode: crate::PermissionMode,
+        asked: Arc<std::sync::atomic::AtomicUsize>,
+        on_ask: impl Fn() + Send + Sync + 'static,
+    ) -> Agent {
+        let mut agent = Agent::new("offline mid-turn mode fixture");
+        agent.tools = vec!["write".into()];
+        agent.permissions = Arc::new(crate::PermissionState::new(crate::PermissionPolicy::new(
+            mode,
+        )));
+        agent.approval_responder = Some(crate::approval::ApprovalResponder(Arc::new(
+            move |_, challenge| {
+                asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                on_ask();
+                crate::approval::ApprovalReply {
+                    challenge_id: challenge.id,
+                    choice_id: "once".into(),
+                    instructions: None,
+                }
+            },
+        )));
+        agent
+    }
+
+    #[test]
+    fn mid_turn_mode_applies_before_the_next_batch_and_stops_prompting() {
+        let dir = tempdir().unwrap();
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut agent = mid_turn_mode_fixture(crate::PermissionMode::Ask, asked.clone(), || {});
+        *agent.pending_permission_mode.lock().unwrap() = Some(crate::PermissionMode::Edits);
+        let args = json!({"path":"edit.txt", "content":"fixture"});
+        let mut events = Vec::new();
+        let messages = agent.execute_tool_batch(
+            dir.path(),
+            vec![("w1".into(), "write".into(), args)],
+            &mut events,
+        );
+        assert_eq!(messages.len(), 1);
+        assert_eq!(agent.permission_mode(), crate::PermissionMode::Edits);
+        assert!(agent.pending_permission_mode.lock().unwrap().is_none());
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("edit.txt")).unwrap(),
+            "fixture"
+        );
+    }
+
+    #[test]
+    fn mid_turn_mode_to_manual_makes_the_next_call_ask() {
+        let dir = tempdir().unwrap();
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut agent = mid_turn_mode_fixture(crate::PermissionMode::Edits, asked.clone(), || {});
+        *agent.pending_permission_mode.lock().unwrap() = Some(crate::PermissionMode::Ask);
+        let args = json!({"path":"asked.txt", "content":"fixture"});
+        let mut events = Vec::new();
+        agent.execute_tool_batch(
+            dir.path(),
+            vec![("w1".into(), "write".into(), args)],
+            &mut events,
+        );
+        assert_eq!(agent.permission_mode(), crate::PermissionMode::Ask);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn mid_turn_mode_queued_during_an_open_approval_does_not_resolve_it() {
+        let dir = tempdir().unwrap();
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let mut agent = {
+            let slot = slot.clone();
+            mid_turn_mode_fixture(crate::PermissionMode::Ask, asked.clone(), move || {
+                // The user cycles the mode while the question is on screen.
+                *slot.lock().unwrap() = Some(crate::PermissionMode::AlwaysApprove);
+            })
+        };
+        agent.pending_permission_mode = slot;
+        let args = json!({"path":"open.txt", "content":"fixture"});
+        let preparation = agent.prepare_tool_call(dir.path(), "open", "write", &args, 0);
+        // The question was asked once, and answered by the user's reply alone.
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(preparation, Preparation::Ready { .. }));
+        // The queued mode waits for the next batch; the policy was not touched.
+        assert_eq!(agent.permission_mode(), crate::PermissionMode::Ask);
+        assert_eq!(
+            *agent.pending_permission_mode.lock().unwrap(),
+            Some(crate::PermissionMode::AlwaysApprove)
+        );
+        assert_eq!(
+            agent.apply_pending_permission_mode(),
+            Some(crate::PermissionMode::AlwaysApprove)
+        );
+        assert_eq!(
+            agent.permission_mode(),
+            crate::PermissionMode::AlwaysApprove
+        );
     }
 
     #[test]
