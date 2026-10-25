@@ -6647,10 +6647,12 @@ mod tests {
                     "--nocapture".into(),
                 ],
             });
+        // The process waits for the test, not a wall-clock sleep: a loaded
+        // Windows CI runner must not let it exit before the busy assertion.
         let command = if cfg!(windows) {
-            "Start-Sleep -Milliseconds 1000; Set-Content -LiteralPath delayed.txt -Value done"
+            "while (-not (Test-Path -LiteralPath release.txt)) { Start-Sleep -Milliseconds 25 }; Set-Content -LiteralPath delayed.txt -Value done"
         } else {
-            "sleep 1; printf done > delayed.txt"
+            "while [ ! -f release.txt ]; do sleep 0.025; done; printf done > delayed.txt"
         };
         let args = json!({"command":command,"background":true});
         assert!(matches!(
@@ -6677,20 +6679,39 @@ mod tests {
             "{reason}"
         );
         assert!(reason.contains(&command[..20]), "{reason}");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let next_writer = loop {
-            match runtime.team.acquire_shared_write(None) {
-                Ok(lease) => break Some(lease),
-                Err(_) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                Err(_) => break None,
+        let job_id = result
+            .details
+            .as_ref()
+            .and_then(|details| details.get("jobId"))
+            .and_then(Value::as_u64)
+            .expect("background job ID") as u32;
+        // Explicitly release the fixture. Wait for the process to finish,
+        // then check ownership; do not conflate slow Windows startup with
+        // a leaked workspace lease.
+        std::fs::write(root.path().join("release.txt"), "go").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            let status = agent
+                .tool_context
+                .jobs
+                .lock()
+                .unwrap()
+                .get(job_id)
+                .expect("registered background job")
+                .status();
+            if !status.is_running() {
+                break status;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background process did not finish within 30 seconds: {status:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
         };
-        assert!(
-            next_writer.is_some(),
-            "background job never released its lease"
-        );
+        assert_eq!(status, crate::jobs::JobStatus::Exited(0));
+        // Terminal status is published only after write ownership is free.
+        let next_writer = runtime.team.acquire_shared_write(None);
+        assert!(next_writer.is_ok(), "exited background job still owns the workspace");
         assert!(
             root.path().join("delayed.txt").exists(),
             "lease was released while the process could still write"
