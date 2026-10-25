@@ -478,7 +478,10 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
     if is_package_command(raw.first().map(String::as_str)) {
         let command = raw[0].as_str();
         if raw.iter().any(|a| a == "--help" || a == "-h") {
-            println!("{}", print_help());
+            let help = packages::package_command_help(command)
+                .map(str::to_string)
+                .unwrap_or_else(print_help);
+            println!("{help}");
             return Ok(0);
         }
         let agent_dir = default_agent_dir();
