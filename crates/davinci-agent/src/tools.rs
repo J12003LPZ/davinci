@@ -5145,6 +5145,56 @@ mod tests {
     }
 
     #[test]
+    fn timed_out_decision_hosts_cannot_spawn_unbounded_waiters() {
+        let slots = std::sync::Arc::new(DecisionWorkerSlots::default());
+        let (release, rx) = std::sync::mpsc::channel::<()>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let blocked = DecisionResponder::new(move |_| {
+            let _ = rx.lock().unwrap().recv();
+            DecisionHostResponse::Unavailable
+        });
+        let request = DecisionHostRequest {
+            questions: Vec::new(),
+        };
+        let context = ToolContext {
+            decision_timeout: Some(std::time::Duration::from_millis(25)),
+            ..ToolContext::default()
+        };
+
+        let first = wait_for_decision_host_with_slots(
+            blocked.clone(),
+            request.clone(),
+            &context,
+            slots.clone(),
+            1,
+        );
+        assert_eq!(first, DecisionHostResponse::Timeout);
+        assert_eq!(slots.active.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let second = wait_for_decision_host_with_slots(
+            blocked,
+            request.clone(),
+            &context,
+            slots.clone(),
+            1,
+        );
+        assert_eq!(second, DecisionHostResponse::Unavailable);
+        assert_eq!(slots.active.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while slots.active.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            assert!(std::time::Instant::now() < deadline, "decision slot was not reclaimed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let ready = DecisionResponder::new(|_| DecisionHostResponse::Unavailable);
+        assert_eq!(
+            wait_for_decision_host_with_slots(ready, request, &context, slots, 1),
+            DecisionHostResponse::Unavailable
+        );
+    }
+
+    #[test]
     fn f02_host_answer_uses_authenticated_reply_and_never_changes_files() {
         let (dir, context, question) = f02_question_fixture();
         let source_before = fs::read(dir.path().join("src.rs")).unwrap();
