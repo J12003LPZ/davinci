@@ -950,4 +950,107 @@ mod tests {
         assert!(!manager.is_dirty(&lease));
         manager.release_lease(&lease, false).unwrap();
     }
+
+    #[test]
+    fn unregistered_lease_cannot_delete_another_managers_worktree() {
+        let repo = init_temp_git_repo();
+        let trees = tempdir().unwrap();
+        let owner = WorktreeManager::new(repo.path(), trees.path());
+        let stranger = WorktreeManager::new(repo.path(), trees.path());
+        let lease = owner
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        let err = stranger.release_lease(&lease, true).unwrap_err();
+        assert_eq!(err, WorktreeError::LeaseNotFound(lease.path.clone()));
+        assert!(lease.path.join("README.md").exists());
+        assert_eq!(owner.get_lease(&lease.path), Some(lease.clone()));
+        owner.release_lease(&lease, false).unwrap();
+    }
+
+    #[test]
+    fn locked_worktree_cannot_be_removed_even_with_force() {
+        let repo = init_temp_git_repo();
+        let trees = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo.path(), trees.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        let worktree = lease.path.to_str().unwrap();
+        git_in(repo.path(), &["worktree", "lock", worktree]);
+        let err = manager.release_lease(&lease, true).unwrap_err();
+        assert!(matches!(err, WorktreeError::GitError(_)), "{err:?}");
+        assert!(lease.path.join("README.md").exists());
+        assert_eq!(manager.get_lease(&lease.path), Some(lease.clone()));
+        git_in(repo.path(), &["worktree", "unlock", worktree]);
+        manager.release_lease(&lease, false).unwrap();
+    }
+
+    #[test]
+    fn merge_only_changes_are_preserved_even_if_every_non_merge_patch_landed() {
+        let repo = init_temp_git_repo();
+        let trees = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo.path(), trees.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        git_in(&lease.path, &["config", "user.name", "w"]);
+        git_in(&lease.path, &["config", "user.email", "w@x"]);
+
+        git_in(&lease.path, &["checkout", "-b", "side"]);
+        std::fs::write(lease.path.join("side.txt"), "side\n").unwrap();
+        git_in(&lease.path, &["add", "side.txt"]);
+        git_in(&lease.path, &["commit", "-m", "side patch"]);
+        let side = run_git(&lease.path, &["rev-parse", "HEAD"]).unwrap();
+
+        git_in(&lease.path, &["checkout", &lease.branch]);
+        std::fs::write(lease.path.join("worker.txt"), "worker\n").unwrap();
+        git_in(&lease.path, &["add", "worker.txt"]);
+        git_in(&lease.path, &["commit", "-m", "worker patch"]);
+        let worker = run_git(&lease.path, &["rev-parse", "HEAD"]).unwrap();
+
+        git_in(&lease.path, &["merge", "--no-ff", "-m", "worker merge", "side"]);
+        std::fs::write(lease.path.join("merge-only.txt"), "unique merge change\n").unwrap();
+        git_in(&lease.path, &["add", "merge-only.txt"]);
+        git_in(&lease.path, &["commit", "--amend", "--no-edit"]);
+
+        git_in(repo.path(), &["cherry-pick", &worker]);
+        git_in(repo.path(), &["cherry-pick", &side]);
+        assert!(!repo.path().join("merge-only.txt").exists());
+        assert!(manager.is_dirty(&lease), "merge-only edits must survive cleanup");
+        assert!(matches!(
+            manager.release_lease(&lease, false),
+            Err(WorktreeError::DirtyWorktreePreserved { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(lease.path.join("merge-only.txt")).unwrap(),
+            "unique merge change\n"
+        );
+        manager.release_lease(&lease, true).unwrap();
+    }
+
+    #[test]
+    fn whitespace_different_patch_is_not_equivalent_for_cleanup() {
+        let repo = init_temp_git_repo();
+        let trees = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo.path(), trees.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        git_in(&lease.path, &["config", "user.name", "w"]);
+        git_in(&lease.path, &["config", "user.email", "w@x"]);
+        std::fs::write(lease.path.join("README.md"), "# Main Repo\n\toutput\n").unwrap();
+        git_in(&lease.path, &["add", "README.md"]);
+        git_in(&lease.path, &["commit", "-m", "worker whitespace"]);
+        std::fs::write(repo.path().join("README.md"), "# Main Repo\n    output\n").unwrap();
+        git_in(repo.path(), &["add", "README.md"]);
+        git_in(repo.path(), &["commit", "-m", "main whitespace"]);
+        assert!(manager.is_dirty(&lease), "patch-id ignores whitespace differences");
+        assert!(matches!(
+            manager.release_lease(&lease, false),
+            Err(WorktreeError::DirtyWorktreePreserved { .. })
+        ));
+        assert!(lease.path.exists());
+        manager.release_lease(&lease, true).unwrap();
+    }
+
 }
