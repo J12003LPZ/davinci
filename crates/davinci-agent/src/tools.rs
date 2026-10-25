@@ -5252,11 +5252,17 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "decision slot was not reclaimed");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let ready = DecisionResponder::new(|_| DecisionHostResponse::Unavailable);
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_in_worker = called.clone();
+        let ready = DecisionResponder::new(move |_| {
+            called_in_worker.store(true, std::sync::atomic::Ordering::SeqCst);
+            DecisionHostResponse::Unavailable
+        });
         assert_eq!(
             wait_for_decision_host_with_slots(ready, request, &context, slots, 1),
             DecisionHostResponse::Unavailable
         );
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
