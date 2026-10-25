@@ -1207,7 +1207,10 @@ mod tests {
         .unwrap();
 
         let first = registry.call("memory", "ping", &json!({}));
-        assert!(first.is_err(), "an unknown-effect call must not be replayed");
+        assert!(
+            first.is_err(),
+            "an unknown-effect call must not be replayed"
+        );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
         while !registry.take_ready() {
@@ -1240,7 +1243,10 @@ mod tests {
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
         while registry.lock().reconnecting.contains("memory") {
-            assert!(std::time::Instant::now() < deadline, "reconnect never stopped");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reconnect never stopped"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(registry.rows().is_empty(), "revoked server was restored");
