@@ -221,7 +221,10 @@ impl McpRegistry {
             // retry path. Never restart a local command outside its sandbox.
             if server.url.is_some()
                 && !server.disabled
-                && server.execution_policy() == Ok(davinci_mcp::McpExecutionPolicy::Remote)
+                && matches!(
+                    server.execution_policy(),
+                    Ok(davinci_mcp::McpExecutionPolicy::Remote)
+                )
             {
                 inner.remote_configs.insert(
                     name.clone(),
