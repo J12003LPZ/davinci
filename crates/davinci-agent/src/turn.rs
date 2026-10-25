@@ -6711,7 +6711,10 @@ mod tests {
         assert_eq!(status, crate::jobs::JobStatus::Exited(0));
         // Terminal status is published only after write ownership is free.
         let next_writer = runtime.team.acquire_shared_write(None);
-        assert!(next_writer.is_ok(), "exited background job still owns the workspace");
+        assert!(
+            next_writer.is_ok(),
+            "exited background job still owns the workspace"
+        );
         assert!(
             root.path().join("delayed.txt").exists(),
             "lease was released while the process could still write"
