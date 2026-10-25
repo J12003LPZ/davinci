@@ -433,9 +433,20 @@ impl WorktreeManager {
         if integrated {
             return Ok(false);
         }
-        // Not an ancestor: still integrated if every patch already landed.
-        let cherry = run_git(&self.repo_root, &["cherry", "HEAD", &current_head])?;
-        Ok(cherry.lines().any(|line| line.starts_with('+')))
+        // Patch IDs used by `git cherry` ignore whitespace and merge-only
+        // changes. Instead, compute the exact result of merging the worker
+        // HEAD into the main checkout. Only a byte-identical tree proves that
+        // cleanup cannot discard committed work. A conflict or unsupported Git
+        // command is ambiguous and must preserve the worker worktree.
+        let merged_tree = match run_git(
+            &self.repo_root,
+            &["merge-tree", "--write-tree", "--no-messages", "HEAD", &current_head],
+        ) {
+            Ok(tree) => tree,
+            Err(_) => return Ok(true),
+        };
+        let main_tree = run_git(&self.repo_root, &["rev-parse", "HEAD^{tree}"])?;
+        Ok(merged_tree != main_tree)
     }
 
     /// Release an existing worktree lease.
@@ -447,11 +458,10 @@ impl WorktreeManager {
         // The manager's record is the authority, not the caller's struct: a
         // newer lease on the same path must survive a stale holder's release,
         // even a forced one.
-        if leases
-            .get(&lease.path)
-            .is_some_and(|recorded| recorded != lease)
-        {
-            return Err(WorktreeError::StaleLease(lease.path.clone()));
+        match leases.get(&lease.path) {
+            Some(recorded) if recorded == lease => {}
+            Some(_) => return Err(WorktreeError::StaleLease(lease.path.clone())),
+            None => return Err(WorktreeError::LeaseNotFound(lease.path.clone())),
         }
         // Unreadable state preserves the worktree unless the caller forces.
         let dirty = match self.check_dirty(lease) {
@@ -472,19 +482,25 @@ impl WorktreeManager {
             .ok_or_else(|| WorktreeError::IoError("Worktree path is not valid unicode".into()))?;
 
         if lease.path.exists() {
-            let _ = run_git(
+            // Do not bypass Git's worktree locks or erase a directory that Git
+            // refused to remove. Keep the lease on any failed cleanup so it
+            // can be inspected and retried safely.
+            run_git(
                 &self.repo_root,
                 &["worktree", "remove", "--force", wt_path_str],
-            );
-            // In case git worktree remove left artifacts, cleanup directory
+            )?;
             if lease.path.exists() {
-                let _ = std::fs::remove_dir_all(&lease.path);
+                return Err(WorktreeError::GitError(format!(
+                    "git removed the worktree registration but {} still exists",
+                    lease.path.display()
+                )));
             }
         }
 
-        // Delete branch if it starts with default prefix and force is true or clean
+        // A failed branch removal is not a successful release: keep the
+        // record so the owner can reconcile the incomplete cleanup.
         if lease.branch.starts_with("davinci/agent/") {
-            let _ = run_git(&self.repo_root, &["branch", "-D", &lease.branch]);
+            run_git(&self.repo_root, &["branch", "-D", &lease.branch])?;
         }
 
         // Remove from leases, then unlock before invoking subscribers.
