@@ -438,7 +438,13 @@ impl WorktreeManager {
         // command is ambiguous and must preserve the worker worktree.
         let merged_tree = match run_git(
             &self.repo_root,
-            &["merge-tree", "--write-tree", "--no-messages", "HEAD", &current_head],
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--no-messages",
+                "HEAD",
+                &current_head,
+            ],
         ) {
             Ok(tree) => tree,
             Err(_) => return Ok(true),
@@ -1022,7 +1028,10 @@ mod tests {
         git_in(&lease.path, &["commit", "-m", "worker patch"]);
         let worker = run_git(&lease.path, &["rev-parse", "HEAD"]).unwrap();
 
-        git_in(&lease.path, &["merge", "--no-ff", "-m", "worker merge", "side"]);
+        git_in(
+            &lease.path,
+            &["merge", "--no-ff", "-m", "worker merge", "side"],
+        );
         std::fs::write(lease.path.join("merge-only.txt"), "unique merge change\n").unwrap();
         git_in(&lease.path, &["add", "merge-only.txt"]);
         git_in(&lease.path, &["commit", "--amend", "--no-edit"]);
@@ -1030,7 +1039,10 @@ mod tests {
         git_in(repo.path(), &["cherry-pick", &worker]);
         git_in(repo.path(), &["cherry-pick", &side]);
         assert!(!repo.path().join("merge-only.txt").exists());
-        assert!(manager.is_dirty(&lease), "merge-only edits must survive cleanup");
+        assert!(
+            manager.is_dirty(&lease),
+            "merge-only edits must survive cleanup"
+        );
         assert!(matches!(
             manager.release_lease(&lease, false),
             Err(WorktreeError::DirtyWorktreePreserved { .. })
@@ -1058,7 +1070,10 @@ mod tests {
         std::fs::write(repo.path().join("README.md"), "# Main Repo\n    output\n").unwrap();
         git_in(repo.path(), &["add", "README.md"]);
         git_in(repo.path(), &["commit", "-m", "main whitespace"]);
-        assert!(manager.is_dirty(&lease), "patch-id ignores whitespace differences");
+        assert!(
+            manager.is_dirty(&lease),
+            "patch-id ignores whitespace differences"
+        );
         assert!(matches!(
             manager.release_lease(&lease, false),
             Err(WorktreeError::DirtyWorktreePreserved { .. })
@@ -1066,5 +1081,4 @@ mod tests {
         assert!(lease.path.exists());
         manager.release_lease(&lease, true).unwrap();
     }
-
 }
