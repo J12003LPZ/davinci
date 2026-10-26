@@ -5236,20 +5236,18 @@ mod tests {
         assert_eq!(first, DecisionHostResponse::Timeout);
         assert_eq!(slots.active.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        let second = wait_for_decision_host_with_slots(
-            blocked,
-            request.clone(),
-            &context,
-            slots.clone(),
-            1,
-        );
+        let second =
+            wait_for_decision_host_with_slots(blocked, request.clone(), &context, slots.clone(), 1);
         assert_eq!(second, DecisionHostResponse::Unavailable);
         assert_eq!(slots.active.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         release.send(()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while slots.active.load(std::sync::atomic::Ordering::SeqCst) != 0 {
-            assert!(std::time::Instant::now() < deadline, "decision slot was not reclaimed");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "decision slot was not reclaimed"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
