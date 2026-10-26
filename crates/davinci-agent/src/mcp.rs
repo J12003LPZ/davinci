@@ -551,6 +551,20 @@ impl Inner {
             });
             return;
         }
+        let call_timeout = match server.call_timeout() {
+            Ok(timeout) => timeout,
+            Err(err) => {
+                self.rows.push(McpServerRow {
+                    name: name.to_string(),
+                    transport: transport_label.into(),
+                    status: "error".into(),
+                    tools: 0,
+                    error: Some(err.to_string()),
+                    skipped: Vec::new(),
+                });
+                return;
+            }
+        };
         if policy == davinci_mcp::McpExecutionPolicy::Sandboxed {
             let Some((host, sandbox)) = executor else {
                 self.rows.push(McpServerRow {
@@ -568,7 +582,11 @@ impl Inner {
             };
             let client = sandboxed::SupervisedMcpTransport::spawn(host, server, cwd, sandbox)
                 .and_then(|transport| {
-                    davinci_mcp::Client::connect_transport(name, Box::new(transport))
+                    davinci_mcp::Client::connect_transport_with_timeout(
+                        name,
+                        Box::new(transport),
+                        call_timeout,
+                    )
                 });
             self.finish_connection(name, server, "sandboxed-stdio", client);
             return;
@@ -587,7 +605,7 @@ impl Inner {
                 return;
             }
         };
-        let client = davinci_mcp::Client::connect(name, transport, cwd);
+        let client = davinci_mcp::Client::connect_with_timeout(name, transport, cwd, call_timeout);
         self.finish_connection(name, server, transport_label, client);
     }
 
