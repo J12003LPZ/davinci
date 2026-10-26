@@ -36,7 +36,7 @@ regex = "=1.13.1"
 ring = "=0.17.14"
 fancy-regex = "=0.14.0"
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "gif", "webp", "bmp", "png"] }
-libc = "=0.2.189"
+libc = "=0.2.191"
 rusqlite = { version = "=0.40.2", features = ["backup", "bundled"] }
 serde = { version = "=1.0.229", features = ["derive", "rc"] }
 serde_json = "=1.0.154"
