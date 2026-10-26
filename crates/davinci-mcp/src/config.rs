@@ -248,6 +248,31 @@ mod tests {
     }
 
     #[test]
+    fn remote_tool_timeout_defaults_to_one_minute_and_rejects_out_of_range_values() {
+        let default = parse(r#"{"mcpServers":{"remote":{"url":"https://example.com/mcp"}}}"#)
+            .unwrap();
+        assert_eq!(
+            default.mcp_servers["remote"].call_timeout().unwrap(),
+            std::time::Duration::from_secs(60)
+        );
+        let custom = parse(
+            r#"{"mcpServers":{"remote":{"url":"https://example.com/mcp","callTimeoutSeconds":120}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            custom.mcp_servers["remote"].call_timeout().unwrap(),
+            std::time::Duration::from_secs(120)
+        );
+        for seconds in [0, 1801, u64::MAX] {
+            let config = parse(&format!(
+                r#"{{"mcpServers":{{"remote":{{"url":"https://example.com/mcp","callTimeoutSeconds":{seconds}}}}}}}"#
+            ))
+            .unwrap();
+            assert!(config.mcp_servers["remote"].call_timeout().is_err());
+        }
+    }
+
+    #[test]
     fn env_values_expand_parent_variables() {
         let lookup = |name: &str| (name == "GITHUB_TOKEN").then(|| "ghp_x".to_string());
         assert_eq!(expand_env("${GITHUB_TOKEN}", lookup), "ghp_x");
