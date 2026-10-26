@@ -596,6 +596,41 @@ mod tests {
     }
 
     #[test]
+    fn external_transport_receives_custom_timeout_before_initialize() {
+        struct TimedRpc {
+            observed: Arc<Mutex<Option<Duration>>>,
+            delegate: FixtureRpc,
+        }
+        impl RpcTransport for TimedRpc {
+            fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+                assert!(
+                    self.observed.lock().unwrap().is_some(),
+                    "timeout must be set before the handshake"
+                );
+                self.delegate.call(method, params)
+            }
+            fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+                self.delegate.notify(method, params)
+            }
+            fn set_call_timeout(&mut self, timeout: Duration) {
+                *self.observed.lock().unwrap() = Some(timeout);
+            }
+        }
+        let observed = Arc::new(Mutex::new(None));
+        let client = Client::connect_transport_with_timeout(
+            "fixture",
+            Box::new(TimedRpc {
+                observed: observed.clone(),
+                delegate: FixtureRpc { calls: Vec::new() },
+            }),
+            Duration::from_secs(120),
+        )
+        .unwrap();
+        assert_eq!(client.tools.len(), 1);
+        assert_eq!(*observed.lock().unwrap(), Some(Duration::from_secs(120)));
+    }
+
+    #[test]
     fn server_names_are_unambiguous_and_long_tools_are_bounded() {
         assert!(validate_server_name("server-memory").is_ok());
         for invalid in ["has space", "my__srv", "a_", "_a"] {
