@@ -859,6 +859,31 @@ mod tests {
     }
 
     #[test]
+    fn invalid_remote_mcp_call_timeout_fails_before_connecting() {
+        let (dir, _) = http_fixture(
+            r#"{
+                "initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
+                "tools/list":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]}
+            }"#,
+        );
+        let path = dir.path().join("mcp-fixture.json");
+        let config = davinci_mcp::parse_config(&format!(
+            r#"{{"mcpServers":{{"memory":{{"url":{},"callTimeoutSeconds":1801}}}}}}"#,
+            serde_json::to_string(&format!("fixture:{}", path.display())).unwrap()
+        ))
+        .unwrap();
+        let registry = McpRegistry::connect(&config, dir.path());
+        assert!(registry.tool_names().is_empty());
+        assert_eq!(registry.rows()[0].status, "error");
+        assert!(
+            registry.rows()[0]
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("callTimeoutSeconds"))
+        );
+    }
+
+    #[test]
     fn a_fixture_server_becomes_one_agent_tool() {
         let (_dir, mut config) = http_fixture(
             r#"{
