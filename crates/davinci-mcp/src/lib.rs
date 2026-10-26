@@ -184,7 +184,18 @@ impl Client {
         })
     }
 
-    pub fn connect_transport(name: &str, mut transport: Box<dyn RpcTransport>) -> Result<Self> {
+    pub fn connect_transport(name: &str, transport: Box<dyn RpcTransport>) -> Result<Self> {
+        Self::connect_transport_with_timeout(name, transport, CALL_TIMEOUT)
+    }
+
+    /// Apply the deadline before the first initialize RPC, not after the
+    /// connection has already waited for an unresponsive MCP server.
+    pub fn connect_transport_with_timeout(
+        name: &str,
+        mut transport: Box<dyn RpcTransport>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        transport.set_call_timeout(timeout);
         let handshake = handshake(transport.as_mut())?;
         Ok(Self {
             name: name.to_string(),
