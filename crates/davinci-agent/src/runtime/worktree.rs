@@ -213,7 +213,14 @@ pub struct WorktreeManager {
     bus: Option<RuntimeBus>,
     seq: Arc<AtomicU64>,
     generations: Arc<AtomicU64>,
+    /// Runs between the cleanliness check and the removal, to prove git
+    /// decides cleanliness atomically at removal time.
+    #[cfg(test)]
+    before_remove_hook: Arc<std::sync::Mutex<Option<BeforeRemoveHook>>>,
 }
+
+#[cfg(test)]
+type BeforeRemoveHook = Box<dyn Fn() + Send + Sync>;
 
 impl std::fmt::Debug for WorktreeManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -233,7 +240,14 @@ impl WorktreeManager {
             bus: None,
             seq: Arc::new(AtomicU64::new(0)),
             generations: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            before_remove_hook: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    #[cfg(test)]
+    fn set_before_remove_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.before_remove_hook.lock().unwrap() = Some(Box::new(hook));
     }
 
     pub fn with_bus(mut self, bus: RuntimeBus) -> Self {
@@ -519,6 +533,21 @@ impl WorktreeManager {
         {
             return Err(WorktreeError::StaleLease(lease.path.clone()));
         }
+        // Nothing recorded for this path: the manager owns nothing here, so
+        // whatever exists at the path or branch belongs to someone else (a
+        // replacement created after this lease was released). Succeed only
+        // when there is nothing left to clean; never touch what is there.
+        if !leases.contains_key(&lease.path) {
+            let leftover = lease.path.exists()
+                || self.is_registered(&lease.path)?
+                || (lease.branch.starts_with("davinci/agent/")
+                    && self.branch_exists(&lease.branch)?);
+            return if leftover {
+                Err(WorktreeError::LeaseNotFound(lease.path.clone()))
+            } else {
+                Ok(())
+            };
+        }
         // Unreadable state preserves the worktree too.
         if self.check_dirty(lease)? {
             return Err(WorktreeError::DirtyWorktreePreserved {
@@ -538,49 +567,56 @@ impl WorktreeManager {
         let mut left_branch = None;
         let mut details = Vec::new();
 
-        let removal = lease.path.exists().then(|| {
-            run_git(
-                &self.repo_root,
-                &["worktree", "remove", "--force", wt_path_str],
-            )
-        });
-        // Registration is checked whatever happened to the directory: git can
-        // delete the files and still fail to delete its own metadata. A failed
-        // check is not proof of absence, so it keeps the lease like a leftover.
-        match self.is_registered(&lease.path) {
-            Ok(false) => {
-                // Git leaving files behind after dropping its registration is
-                // cleaned up here.
-                if lease.path.exists() {
-                    if let Err(error) = std::fs::remove_dir_all(&lease.path) {
-                        details.push(format!("cannot delete directory: {error}"));
+        #[cfg(test)]
+        if let Some(hook) = self.before_remove_hook.lock().unwrap().as_ref() {
+            hook();
+        }
+        // Not forced: git refuses modified or untracked files and locked
+        // worktrees, deciding at removal time. The check above would race with
+        // work created since.
+        let removal = lease
+            .path
+            .exists()
+            .then(|| run_git(&self.repo_root, &["worktree", "remove", wt_path_str]));
+        // Git can delete the files and still fail on its metadata; with the
+        // directory gone that is the registration case below.
+        if let Some(Err(error)) = removal.as_ref().filter(|_| lease.path.exists()) {
+            details.push(error.to_string());
+        } else {
+            // Registration is checked whatever happened to the directory: git
+            // can delete the files and still fail to delete its own metadata.
+            // A failed check is not proof of absence, so it keeps the lease
+            // like a leftover.
+            match self.is_registered(&lease.path) {
+                Ok(false) => {
+                    // Only an empty leftover directory goes; anything with
+                    // content is reported, never deleted recursively.
+                    if lease.path.exists() {
+                        if let Err(error) = std::fs::remove_dir(&lease.path) {
+                            details.push(format!("cannot delete directory: {error}"));
+                        }
                     }
                 }
-            }
-            Ok(true) if lease.path.exists() => {
-                // A worktree git still owns (locked, in use) is left alone:
-                // deleting its files would orphan the registration.
-                details.push(match &removal {
-                    Some(Err(error)) => error.to_string(),
-                    _ => "git still lists the worktree".into(),
-                });
-            }
-            Ok(true) => {
-                if let Err(error) = self.remove_registration(&lease.path, wt_path_str) {
-                    details.push(error);
+                Ok(true) if lease.path.exists() => {
+                    details.push("git still lists the worktree".into());
                 }
-                match self.is_registered(&lease.path) {
-                    Ok(false) => {}
-                    Ok(true) => left_path = Some(lease.path.clone()),
-                    Err(error) => {
-                        details.push(error.to_string());
-                        left_path = Some(lease.path.clone());
+                Ok(true) => {
+                    if let Err(error) = self.remove_registration(&lease.path, wt_path_str) {
+                        details.push(error);
+                    }
+                    match self.is_registered(&lease.path) {
+                        Ok(false) => {}
+                        Ok(true) => left_path = Some(lease.path.clone()),
+                        Err(error) => {
+                            details.push(error.to_string());
+                            left_path = Some(lease.path.clone());
+                        }
                     }
                 }
-            }
-            Err(error) => {
-                details.push(error.to_string());
-                left_path = Some(lease.path.clone());
+                Err(error) => {
+                    details.push(error.to_string());
+                    left_path = Some(lease.path.clone());
+                }
             }
         }
         if lease.path.exists() {
@@ -1562,6 +1598,73 @@ mod tests {
         manager.release_lease(&lease, false).unwrap();
         manager.release_lease(&lease, false).unwrap();
         manager.release_lease(&lease, true).unwrap();
+    }
+
+    /// A holder whose lease the manager no longer records must not tear down
+    /// a worktree (or branch) someone created at the same path afterwards.
+    #[test]
+    fn a_stale_release_never_deletes_a_replacement_the_manager_does_not_own() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let old = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        manager.release_lease(&old, false).unwrap();
+        // A clean replacement at the same path on a recreated branch of the same name.
+        git_in(
+            repo_dir.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &old.branch,
+                old.path.to_str().unwrap(),
+            ],
+        );
+
+        let err = manager.release_lease(&old, false).unwrap_err();
+        assert!(matches!(err, WorktreeError::LeaseNotFound(_)), "{err:?}");
+        assert!(old.path.join("README.md").exists(), "replacement untouched");
+        assert!(manager.is_registered(&old.path).unwrap());
+        assert!(branch_exists(repo_dir.path(), &old.branch));
+
+        // Only the branch recreated: still refused, still untouched.
+        git_in(
+            repo_dir.path(),
+            &["worktree", "remove", old.path.to_str().unwrap()],
+        );
+        let err = manager.release_lease(&old, false).unwrap_err();
+        assert!(matches!(err, WorktreeError::LeaseNotFound(_)), "{err:?}");
+        assert!(branch_exists(repo_dir.path(), &old.branch));
+    }
+
+    /// Git decides cleanliness at removal time: a file created after the
+    /// manager's own check must survive, and the lease must be kept.
+    #[test]
+    fn a_file_created_between_the_check_and_the_removal_is_preserved() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        let late = lease.path.join("late.txt");
+        let hook_file = late.clone();
+        manager.set_before_remove_hook(move || {
+            std::fs::write(&hook_file, "created after check_dirty").unwrap();
+        });
+
+        let err = manager.release_lease(&lease, true).unwrap_err();
+        match &err {
+            WorktreeError::CleanupIncomplete { path, detail, .. } => {
+                assert_eq!(path.as_deref(), Some(lease.path.as_path()));
+                assert!(detail.contains("worktree remove"), "git's reason: {err}");
+            }
+            other => panic!("expected CleanupIncomplete, got {other:?}"),
+        }
+        assert!(late.exists(), "late work preserved");
+        assert_eq!(manager.get_lease(&lease.path).as_ref(), Some(&lease));
     }
 
     #[test]

@@ -186,6 +186,46 @@ pub fn session_cleanup() -> &'static Cleanup {
     SESSION.get_or_init(Cleanup::new)
 }
 
+/// How long past [`CLEANUP_DEADLINE`] a signal-triggered shutdown may take
+/// before the watchdog ends the process.
+pub const EXIT_GRACE: Duration = Duration::from_secs(1);
+
+/// How long an exit waits for a diagnostic to reach stderr.
+const WARN_WAIT: Duration = Duration::from_millis(200);
+
+/// Ends the process with `code` at `deadline + grace`, whatever the main path
+/// is doing: a hung extension holding the stderr lock or a full pipe cannot
+/// stop it, since it touches no lock and writes nothing. `exit` is injected so
+/// a test does not end its own process.
+pub fn arm_exit_watchdog(
+    code: i32,
+    deadline: Duration,
+    grace: Duration,
+    exit: impl FnOnce(i32) + Send + 'static,
+) {
+    thread::spawn(move || {
+        thread::sleep(deadline + grace);
+        exit(code);
+    });
+}
+
+/// Runs `write` on its own thread and waits for it at most `wait`, so a
+/// blocked stderr costs the exit that long and no more. Returns whether the
+/// write finished.
+fn warn_with(write: impl FnOnce() + Send + 'static, wait: Duration) -> bool {
+    let (done, finished) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        write();
+        let _ = done.send(());
+    });
+    finished.recv_timeout(wait).is_ok()
+}
+
+/// A diagnostic that is never on the critical path of an exit.
+pub fn warn_best_effort(message: String) {
+    warn_with(move || eprintln!("warning: {message}"), WARN_WAIT);
+}
+
 /// `dispose` must be bounded (route its work through [`session_cleanup`]):
 /// the process exits as soon as it returns.
 pub fn install_shutdown_watchers(dispose: impl Fn(i32) + Send + Sync + 'static) {
@@ -201,16 +241,18 @@ pub fn install_shutdown_watchers(dispose: impl Fn(i32) + Send + Sync + 'static) 
     // the terminal back: a killed pi used to leave the shell in raw mode
     // inside the alternate screen. `restore` is idempotent and a no-op when no
     // TUI ever opened.
+    // The watchdog is armed before anything that can block (the terminal
+    // restore, cleanup, a warning), so none of them can keep the process alive.
     thread::spawn(move || loop {
-        if term.load(Ordering::SeqCst) {
-            let _ = davinci_tui::davinci::runtime::restore();
-            dispose(143);
-            std::process::exit(143);
-        }
-        if hup.load(Ordering::SeqCst) {
-            let _ = davinci_tui::davinci::runtime::restore();
-            dispose(129);
-            std::process::exit(129);
+        for (flag, code) in [(&term, 143), (&hup, 129)] {
+            if flag.load(Ordering::SeqCst) {
+                arm_exit_watchdog(code, CLEANUP_DEADLINE, EXIT_GRACE, |code| {
+                    std::process::exit(code)
+                });
+                let _ = davinci_tui::davinci::runtime::restore();
+                dispose(code);
+                std::process::exit(code);
+            }
         }
         thread::sleep(Duration::from_millis(250));
     });
@@ -395,6 +437,57 @@ mod tests {
         );
         assert!(broken.report(true).is_some());
         assert_eq!(broken.report(true), None, "the second trigger stays quiet");
+    }
+
+    /// A cleanup step stuck forever, then a warning path stuck on a lock the
+    /// hung code holds: only the watchdog can still end the process.
+    #[test]
+    fn the_exit_watchdog_fires_while_cleanup_and_the_warning_path_are_stuck() {
+        let cleanup = Arc::new(Cleanup::new());
+        let held = Arc::new(Mutex::new(()));
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let deadline = Duration::from_millis(100);
+        let started = Instant::now();
+        arm_exit_watchdog(143, deadline, Duration::from_millis(50), move |code| {
+            let _ = exit_tx.send(code);
+        });
+
+        let _holder = held.lock().unwrap();
+        let (path_cleanup, path_held) = (Arc::clone(&cleanup), Arc::clone(&held));
+        thread::spawn(move || {
+            path_cleanup.run_steps(
+                deadline,
+                vec![Step::new("hung", || thread::sleep(Duration::from_secs(60)))],
+            );
+            // Stands in for a synchronous warning that needs a held lock.
+            let _blocked_forever = path_held.lock();
+        });
+
+        let code = exit_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the watchdog exits regardless of the main path");
+        assert_eq!(code, 143);
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(150),
+            "not before deadline + grace: {waited:?}"
+        );
+        assert!(waited < Duration::from_secs(3), "{waited:?}");
+    }
+
+    #[test]
+    fn a_warning_that_cannot_be_written_never_holds_up_the_exit() {
+        let started = Instant::now();
+        let written = warn_with(
+            || thread::sleep(Duration::from_secs(60)),
+            Duration::from_millis(100),
+        );
+        assert!(!written, "a blocked write is abandoned");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(
+            warn_with(|| {}, Duration::from_secs(5)),
+            "a free stderr is written"
+        );
     }
 
     #[test]

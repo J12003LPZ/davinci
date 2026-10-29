@@ -47,6 +47,23 @@ fn after_permission_decision_hook() {
     });
 }
 
+// Test seam: runs in the journal dispatch callback after every validation and
+// right before the final cancellation and policy gate.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_JOURNAL_GATE: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn before_journal_gate_hook() {
+    BEFORE_JOURNAL_GATE.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook();
+        }
+    });
+}
+
 fn unprepared_dispatch_refusal() -> crate::ToolResult {
     crate::ToolResult {
         content: "Internal error: the tool call was not prepared before dispatch, so its authorization is unknown; no adapter was run.".into(),
@@ -3541,7 +3558,6 @@ Issue the call again if it is still needed.";
                         );
                     }
                     latest_runtime.validate_workspace(cwd)?;
-                    self.journal_dispatch_gate(permission_revision)?;
                     self.check_contract_gate(cwd, id, name, args)
                         .map_err(|error| error.to_string())?;
                     self.check_contract_dispatch_boundary(cwd, name, args)
@@ -3557,6 +3573,11 @@ Issue the call again if it is still needed.";
                     if latest_digest != current_digest {
                         return Err("tool payload or task contract changed at dispatch".into());
                     }
+                    // Last: a cancel or policy change during any check above
+                    // is seen here. Only the durable effect latch follows.
+                    #[cfg(test)]
+                    before_journal_gate_hook();
+                    self.journal_dispatch_gate(permission_revision)?;
                     Ok(())
                 },
                 execute,
@@ -9533,6 +9554,77 @@ mod operation_dispatch_tests {
         });
         let refused = refused.expect_err("a cancel during the wait must be seen");
         assert!(refused.contains("cancelled before dispatch"), "{refused}");
+    }
+
+    /// A policy change that lands during the contract and capability checks
+    /// must still stop the call: the gate is the last step before the latch.
+    #[test]
+    fn journal_route_policy_change_during_validation_is_denied_before_the_adapter() {
+        let (agent, workspace, journal) = configured_agent();
+        let args = json!({"path": "input.txt"});
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), "late-validation", "read", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        let operation_id = journal.snapshot().unwrap().operations[0].operation_id();
+        let permissions = agent.permissions.clone();
+        super::BEFORE_JOURNAL_GATE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                permissions.lock().unwrap().mode = crate::PermissionMode::Ask;
+            }));
+        });
+        let result = agent.run_prepared_call(workspace.path(), "late-validation", "read", &args, 0);
+        super::BEFORE_JOURNAL_GATE.with(|slot| *slot.borrow_mut() = None);
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result
+                .content
+                .contains("permission policy changed at dispatch"),
+            "{}",
+            result.content
+        );
+        assert_eq!(adapter_runs(&agent), 0, "the adapter must not run");
+        let snapshot = journal.snapshot().unwrap();
+        let attempt = snapshot
+            .attempts
+            .iter()
+            .find(|attempt| attempt.operation_id() == operation_id)
+            .unwrap();
+        assert_eq!(attempt.state(), OperationState::Cancelled);
+    }
+
+    /// A call a cancelled turn never starts must not leave its prepared
+    /// revision behind for a later call that reuses the id.
+    #[test]
+    fn a_sibling_skipped_by_a_cancelled_batch_leaves_no_prepared_revision() {
+        let (mut agent, workspace) = compat_agent();
+        let runtime = agent.runtime.clone().unwrap();
+        agent.event_sink = Some(crate::EventSink(Arc::new(move |event| {
+            if matches!(event, crate::AgentEvent::ToolExecutionStart { .. }) {
+                runtime.cancel();
+            }
+        })));
+        let calls = ["first", "second"]
+            .map(|id| {
+                (
+                    id.to_string(),
+                    "read".to_string(),
+                    json!({"path": "input.txt"}),
+                )
+            })
+            .to_vec();
+        let mut events = Vec::new();
+        let messages = agent.execute_tool_batch(workspace.path(), calls, &mut events);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(adapter_runs(&agent), 0, "cancelled before any adapter ran");
+        assert!(
+            agent
+                .prepared_permission_revisions
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "skipped sibling must release its prepared revision"
+        );
     }
 
     #[test]

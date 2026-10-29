@@ -517,12 +517,20 @@ impl ToolCallLedger {
         if ledger.lineage_id.is_empty() {
             ledger.lineage_id = session_id.to_string();
         }
-        let (events, _) = read_journal(&journal_path(path), true)?;
+        // Read without repairing: a refused load must leave both files as found.
+        let (events, _) = read_journal(&journal_path(path), false)?;
         let legacy = ledger.tombstone_format < TOMBSTONE_FORMAT;
         let journal_removed = events
             .iter()
             .any(|event| matches!(event, LedgerJournalEvent::Remove { .. }));
         ledger.apply_journal_events(events)?;
+        // Imported records skipped admission. Past the cap there is no room to
+        // remember every id pruning would forget, and a tombstone is never
+        // dropped, so refuse rather than prune or exceed it.
+        if ledger.tombstone_count() + ledger.live_non_safe_count() > ledger.tombstone_cap {
+            return Err("tool ledger is over its replay-protection budget: this session holds more unsafe-to-replay calls than can be tracked. Start a new session.".into());
+        }
+        read_journal(&journal_path(path), true)?;
         if legacy {
             // The previous build pruned without tombstones, so which ids were
             // forgotten is unknowable. A removal in the journal or a full
@@ -774,14 +782,21 @@ impl ToolCallLedger {
             .collect();
         let excess = terminal.len().saturating_sub(MAX_TERMINAL_RECORDS);
         for id in terminal.into_iter().take(excess) {
-            if let Some(record) = self.records.remove(&id) {
-                // Forgetting the id would let it reserve a fresh attempt,
-                // which replays the call, whatever its recorded outcome was.
-                // A safe read can run again, so it is not remembered.
-                if record.replay_policy != ReplayPolicy::SafeToReplay {
-                    self.tombstone(&id, record.outcome == AttemptOutcome::StartedUnknown);
-                }
+            let Some(record) = self.records.get(&id) else {
+                continue;
+            };
+            // Forgetting the id would let it reserve a fresh attempt, which
+            // replays the call, whatever its recorded outcome was. A safe read
+            // can run again, so it is not remembered. An id that cannot be
+            // remembered is not forgotten: its record stays.
+            if record.replay_policy != ReplayPolicy::SafeToReplay
+                && self
+                    .tombstone(&id, record.outcome == AttemptOutcome::StartedUnknown)
+                    .is_err()
+            {
+                continue;
             }
+            self.records.remove(&id);
             self.dirty_call_ids.insert(id);
         }
         let records = &self.records;
@@ -1308,18 +1323,26 @@ impl ToolCallLedger {
         self.tombstone_count() + self.live_non_safe_count() >= self.tombstone_cap
     }
 
-    /// Remember a pruned id. A tombstone is never dropped. Admission keeps the
-    /// set within the cap: a non-safe call is accepted only while tombstones
-    /// plus live non-safe records stay under it (see `refusal_for_forgotten_id`),
-    /// and every live record turns into at most one tombstone. The one way past
-    /// the cap is records imported over budget at load, which skip admission.
-    /// That excess is finite, bounded by the imported record count, and the
-    /// ledger is saturated from the load on, so nothing new is admitted to grow
-    /// it. The set may therefore exceed the cap but never drops a hash.
-    fn tombstone(&mut self, call_id: &str, unknown: bool) {
+    /// Remember a pruned id. A tombstone is never dropped and the set never
+    /// passes the cap. Admission keeps tombstones plus live non-safe records
+    /// within it (see `refusal_for_forgotten_id`), every live record turns into
+    /// at most one tombstone, and a load over budget is refused. A tombstone
+    /// that would not fit is therefore a bug: it is refused, and the caller
+    /// keeps the record instead of forgetting the id.
+    fn tombstone(&mut self, call_id: &str, unknown: bool) -> Result<(), String> {
         let hash = tombstone_hash(call_id);
-        if self.tombstone_count() >= self.tombstone_cap {
+        let known = if unknown {
+            self.unknown_tombstones.contains(&hash)
+        } else {
+            self.finished_tombstones.contains(&hash)
+        };
+        if !known && self.tombstone_count() >= self.tombstone_cap {
             self.mark_saturated();
+            return Err(format!(
+                "tombstone set is full ({} of {}); `{call_id}` stays recorded",
+                self.tombstone_count(),
+                self.tombstone_cap
+            ));
         }
         let added = if unknown {
             self.unknown_tombstones.insert(hash)
@@ -1330,6 +1353,10 @@ impl ToolCallLedger {
             self.pending_tombstones
                 .push(LedgerJournalEvent::Tombstone { hash, unknown });
         }
+        if self.tombstone_count() >= self.tombstone_cap {
+            self.mark_saturated();
+        }
+        Ok(())
     }
 
     /// Why a call id with no live record must not start, if it must not: it
@@ -2022,32 +2049,38 @@ mod tests {
                 json!({"event": "upsert", "record": record}).to_string()
             })
             .collect();
-        std::fs::write(journal_path(&path), imported.join("\n") + "\n").unwrap();
+        // A torn final line is repaired on a normal load; a refused one is not.
+        std::fs::write(
+            journal_path(&path),
+            imported.join("\n") + "\n{\"event\":\"upsert\"",
+        )
+        .unwrap();
 
-        // 266 live non-safe records against a cap of 5: the load prunes ten
-        // of them, so the tombstones alone pass the cap.
-        let cap = 5;
+        // 266 live non-safe records against a cap of 5: pruning ten of them
+        // would push the tombstones past the cap, so the load is refused and
+        // neither durable file is touched.
+        let before = (
+            std::fs::read(&path).unwrap(),
+            std::fs::read(journal_path(&path)).unwrap(),
+        );
         for pass in ["first load", "reload"] {
-            let mut ledger = ToolCallLedger::load_bound_with_cap(&path, "sess_imp", cap).unwrap();
-            assert!(ledger.tombstones_saturated, "{pass}");
-            assert_eq!(ledger.tombstone_count(), 10, "{pass}: no hash is dropped");
-            assert!(ledger.tombstone_count() > cap, "{pass}");
-            for n in 0..10 {
-                let id = format!("kept-{n}");
-                for claimed in [ReplayPolicy::NeverAutoReplay, ReplayPolicy::SafeToReplay] {
-                    let message = refusal(&mut ledger, &id, claimed)
-                        .unwrap_or_else(|| panic!("{pass}: pruned `{id}` ran as {claimed:?}"));
-                    assert!(message.contains("previously completed"), "{message}");
-                }
-            }
-            let message = refusal(&mut ledger, "fresh-write", policy).expect("saturated");
-            assert!(message.contains("saturated"), "{pass}: {message}");
-            assert_eq!(
-                refusal(&mut ledger, "fresh-read", ReplayPolicy::SafeToReplay),
-                None,
-                "{pass}: saturation still lets a safe read run"
+            let error = match ToolCallLedger::load_bound_with_cap(&path, "sess_imp", 5) {
+                Ok(_) => panic!("{pass}: an over-budget import must be refused"),
+                Err(error) => error,
+            };
+            assert!(error.contains("new session"), "{pass}: {error}");
+            let after = (
+                std::fs::read(&path).unwrap(),
+                std::fs::read(journal_path(&path)).unwrap(),
             );
+            assert_eq!(before, after, "{pass}: files are byte-identical");
         }
+
+        // At exactly the budget the load still succeeds and stays within it.
+        let ledger = ToolCallLedger::load_bound_with_cap(&path, "sess_imp", 266).unwrap();
+        assert!(ledger.tombstones_saturated, "no room left to admit");
+        assert_eq!(ledger.tombstone_count(), 10, "no hash is dropped");
+        assert!(ledger.tombstone_count() + ledger.live_non_safe_count() <= 266);
     }
 
     #[test]

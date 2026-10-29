@@ -5731,7 +5731,7 @@ fn emit_session_shutdown_with(
         session_cleanup_steps(parsed.clone(), startup),
     );
     if let Some(warning) = cleanup.report(finished) {
-        eprintln!("warning: {warning}");
+        shutdown::warn_best_effort(warning);
     }
 }
 
