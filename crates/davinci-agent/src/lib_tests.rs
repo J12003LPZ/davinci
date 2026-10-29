@@ -6002,14 +6002,22 @@ fn a_restriction_recorded_only_in_a_legacy_compaction_summary_survives_the_next_
     let mut agent = agent_with_legacy_compaction(dir.path(), "Never delete vendor/");
     let second = agent.compact(None);
     assert!(second.compacted, "{}", second.summary);
-    let carried = crate::compaction_summary_meta(&agent.messages[0])
-        .expect("generated summary metadata")
-        .carried_user_requirements;
+    let meta =
+        crate::compaction_summary_meta(&agent.messages[0]).expect("generated summary metadata");
+    // Model-written legacy text is carried verbatim, but never as a user requirement.
     assert!(
-        carried
+        !meta
+            .carried_user_requirements
             .iter()
             .any(|entry| entry.contains("Never delete vendor/")),
-        "{carried:?}"
+        "{:?}",
+        meta.carried_user_requirements
+    );
+    assert!(
+        meta.carried_legacy_summary
+            .as_deref()
+            .is_some_and(|text| text.contains("Never delete vendor/")),
+        "{meta:?}"
     );
     // And it keeps surviving: the entry is now ordinary carried metadata.
     let path = agent.session.as_ref().unwrap().path.clone();
@@ -6018,7 +6026,7 @@ fn a_restriction_recorded_only_in_a_legacy_compaction_summary_survives_the_next_
         .iter()
         .find_map(crate::compaction_summary_meta)
         .unwrap();
-    assert_eq!(reloaded.carried_user_requirements, carried);
+    assert_eq!(reloaded, meta);
 }
 
 #[test]

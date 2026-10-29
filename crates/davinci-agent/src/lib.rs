@@ -5616,6 +5616,12 @@ impl Agent {
                     COMPACTION_CARRIED_KEY.into(),
                     serde_json::json!(meta.carried_user_requirements),
                 );
+                if let Some(legacy) = meta.carried_legacy_summary {
+                    extra.insert(
+                        COMPACTION_CARRIED_LEGACY_KEY.into(),
+                        serde_json::json!(legacy),
+                    );
+                }
             }
             if let Some(usage) = &result.usage {
                 extra.insert(
@@ -6273,6 +6279,9 @@ pub(crate) fn is_legacy_verification_notice(message: &ChatMessage) -> bool {
 /// `extra` key of a `compaction` session entry holding the user requirements
 /// its summary carries. The summary text only displays them.
 const COMPACTION_CARRIED_KEY: &str = "carriedUserRequirements";
+/// `extra` key holding a legacy summary's text, carried apart from the
+/// requirements because the model wrote it.
+const COMPACTION_CARRIED_LEGACY_KEY: &str = "carriedLegacySummary";
 
 /// The requirements a `compaction` entry records. An entry saved before the
 /// metadata existed, or whose list does not parse, is `legacy`: its list is
@@ -6285,6 +6294,11 @@ fn compaction_entry_meta(entry: &SessionEntry) -> crate::compaction::CompactionS
     crate::compaction::CompactionSummaryMeta {
         legacy: carried.is_none(),
         carried_user_requirements: carried.unwrap_or_default(),
+        carried_legacy_summary: entry
+            .extra
+            .get(COMPACTION_CARRIED_LEGACY_KEY)
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
     }
 }
 

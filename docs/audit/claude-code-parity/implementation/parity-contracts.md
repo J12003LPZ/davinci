@@ -17,7 +17,7 @@ The interfaces and invariants this branch relies on, stated once so later work c
 
 ## Context (I-04)
 
-- **Compaction summaries** are identified only by `ChatMessage.extra["davinciCompaction"]` (persisted as `carriedUserRequirements` in the compaction session entry), never by text. The carried list holds the verbatim user-authored text of every compacted message, in order, exact-deduped; markers in model-written text are escaped; the rendered block is bounded and an over-bound or failed verification keeps the original history. Tests: `compaction.rs` `*user_requirement*` tests.
+- **Compaction summaries** are identified only by `ChatMessage.extra["davinciCompaction"]` (persisted as `carriedUserRequirements` in the compaction session entry), never by text. The carried list holds the verbatim user-authored text of every compacted message, in order, exact-deduped; markers in model-written text are escaped; a pre-upgrade (legacy) summary is never promoted to a user requirement: its text is carried verbatim in a separate `carriedLegacySummary` field, rendered as a section labelled model-written context; the rendered block plus that section are bounded and an over-bound or failed verification keeps the original history. Tests: `compaction.rs` `*user_requirement*` tests.
 - **Skills.** Discovery reads only frontmatter (stops at the closing `---`, capped); bodies are read fresh on invocation only; accounting and retrieval use file size. Tests: `discovery_reads_only_bounded_frontmatter`, `invocation_reloads_body_after_file_change`.
 
 ## Background work (I-05, I-06)
