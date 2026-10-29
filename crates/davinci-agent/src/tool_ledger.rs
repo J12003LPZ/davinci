@@ -293,6 +293,12 @@ pub struct ToolCallLedger {
     /// since it might be one that was forgotten.
     #[serde(default)]
     tombstones_saturated: bool,
+    /// Set when a ledger written before tombstones showed it had pruned. Which
+    /// ids were forgotten cannot be known, so every id without a live record
+    /// is refused whatever policy it claims, `SafeToReplay` included. Unlike
+    /// `tombstones_saturated`, nothing is known about what was forgotten.
+    #[serde(default)]
+    legacy_pruned: bool,
     /// 0 for a ledger written before tombstones existed (see `load_bound`).
     #[serde(default)]
     tombstone_format: u32,
@@ -325,6 +331,7 @@ impl Default for ToolCallLedger {
             unknown_tombstones: BTreeSet::new(),
             finished_tombstones: BTreeSet::new(),
             tombstones_saturated: false,
+            legacy_pruned: false,
             tombstone_format: TOMBSTONE_FORMAT,
             tombstone_cap: MAX_TOMBSTONES,
             pending_tombstones: Vec::new(),
@@ -443,6 +450,10 @@ impl ToolCallLedger {
         if journal_eligible && journal_configured {
             if self.records.contains_key(call_id) {
                 ToolCallExecutionAuthority::LegacyObservationBlocked
+            } else if self.has_forgotten(call_id) {
+                // The journal only dedupes ids it admitted, so an id this
+                // ledger pruned is new to it. The ledger refuses it by name.
+                ToolCallExecutionAuthority::CompatibilityLedger
             } else {
                 ToolCallExecutionAuthority::OperationJournal
             }
@@ -460,6 +471,7 @@ impl ToolCallLedger {
             unknown_tombstones: BTreeSet::new(),
             finished_tombstones: BTreeSet::new(),
             tombstones_saturated: false,
+            legacy_pruned: false,
             tombstone_format: TOMBSTONE_FORMAT,
             tombstone_cap: MAX_TOMBSTONES,
             pending_tombstones: Vec::new(),
@@ -481,6 +493,14 @@ impl ToolCallLedger {
     }
 
     pub fn load_bound(path: &Path, session_id: &str) -> Result<Self, String> {
+        Self::load_bound_with_cap(path, session_id, MAX_TOMBSTONES)
+    }
+
+    fn load_bound_with_cap(
+        path: &Path,
+        session_id: &str,
+        tombstone_cap: usize,
+    ) -> Result<Self, String> {
         let mut ledger = if path.is_file() {
             let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
             serde_json::from_slice::<Self>(&bytes)
@@ -491,6 +511,7 @@ impl ToolCallLedger {
         if !ledger.session_id.is_empty() && ledger.session_id != session_id {
             return Err("tool ledger belongs to a different session".into());
         }
+        ledger.tombstone_cap = tombstone_cap;
         let mut metadata_changed = ledger.session_id != session_id || ledger.lineage_id.is_empty();
         ledger.session_id = session_id.to_string();
         if ledger.lineage_id.is_empty() {
@@ -519,10 +540,16 @@ impl ToolCallLedger {
                 })
                 .count();
             if journal_removed || terminal >= MAX_TERMINAL_RECORDS {
-                ledger.tombstones_saturated = true;
+                ledger.legacy_pruned = true;
             }
             ledger.tombstone_format = TOMBSTONE_FORMAT;
             metadata_changed = true;
+        }
+        // Imported records never went through admission, so the budget may
+        // already be spent. Say so before anything is reconciled or pruned;
+        // the evidence on disk is left as it is.
+        if ledger.over_budget() {
+            ledger.mark_saturated();
         }
         ledger.dirty_call_ids.clear();
         ledger.snapshot_metadata_dirty = metadata_changed;
@@ -1258,18 +1285,39 @@ impl ToolCallLedger {
         }
     }
 
-    /// Remember a pruned id. A tombstone is never dropped. The cap holds
-    /// because admission reserves room: a non-safe call is accepted only while
-    /// tombstones plus live non-safe records stay under it (see
-    /// `refusal_for_forgotten_id`), and every live record turns into at most
-    /// one tombstone. A tombstone arriving at a full set can only come from a
-    /// record that bypassed admission; it is kept anyway, and saturates.
+    /// Whether this ledger holds a pruned-id mark for `call_id`, or cannot
+    /// vouch for any id (`legacy_pruned`). The same marks `refusal_for_forgotten_id`
+    /// refuses on, without the capacity rule for fresh ids.
+    fn has_forgotten(&self, call_id: &str) -> bool {
+        let hash = tombstone_hash(call_id);
+        self.legacy_pruned
+            || self.unknown_tombstones.contains(&hash)
+            || self.finished_tombstones.contains(&hash)
+    }
+
+    fn live_non_safe_count(&self) -> usize {
+        self.records
+            .values()
+            .filter(|record| record.replay_policy != ReplayPolicy::SafeToReplay)
+            .count()
+    }
+
+    /// Whether every live non-safe record turning into a tombstone could
+    /// overflow the set: no room is left to admit another non-safe call.
+    fn over_budget(&self) -> bool {
+        self.tombstone_count() + self.live_non_safe_count() >= self.tombstone_cap
+    }
+
+    /// Remember a pruned id. A tombstone is never dropped. Admission keeps the
+    /// set within the cap: a non-safe call is accepted only while tombstones
+    /// plus live non-safe records stay under it (see `refusal_for_forgotten_id`),
+    /// and every live record turns into at most one tombstone. The one way past
+    /// the cap is records imported over budget at load, which skip admission.
+    /// That excess is finite, bounded by the imported record count, and the
+    /// ledger is saturated from the load on, so nothing new is admitted to grow
+    /// it. The set may therefore exceed the cap but never drops a hash.
     fn tombstone(&mut self, call_id: &str, unknown: bool) {
         let hash = tombstone_hash(call_id);
-        debug_assert!(
-            self.tombstone_count() < self.tombstone_cap,
-            "tombstone set exceeded its cap despite admission control"
-        );
         if self.tombstone_count() >= self.tombstone_cap {
             self.mark_saturated();
         }
@@ -1294,6 +1342,11 @@ impl ToolCallLedger {
         tool_name: &str,
         replay_policy: ReplayPolicy,
     ) -> Option<String> {
+        if self.legacy_pruned {
+            return Some(format!(
+                "Tool call `{tool_name}` was refused: this session's history predates replay protection and cannot rule out an earlier call with this id. Start a new session."
+            ));
+        }
         let hash = tombstone_hash(call_id);
         if self.unknown_tombstones.contains(&hash) {
             return Some(replay_blocked_message(
@@ -1309,13 +1362,7 @@ impl ToolCallLedger {
         if replay_policy == ReplayPolicy::SafeToReplay {
             return None;
         }
-        let live_non_safe = self
-            .records
-            .values()
-            .filter(|record| record.replay_policy != ReplayPolicy::SafeToReplay)
-            .count();
-        if self.tombstones_saturated || self.tombstone_count() + live_non_safe >= self.tombstone_cap
-        {
+        if self.tombstones_saturated || self.over_budget() {
             self.mark_saturated();
             return Some(format!(
                 "Tool call `{tool_name}` was refused: the tool ledger is saturated, so an earlier call with this id cannot be ruled out. Start a new session."
@@ -1870,6 +1917,7 @@ mod tests {
         for key in [
             "tombstone_format",
             "tombstones_saturated",
+            "legacy_pruned",
             "unknown_tombstones",
             "finished_tombstones",
         ] {
@@ -1899,20 +1947,106 @@ mod tests {
             write_legacy_ledger(&path, &seed, journal);
 
             let mut ledger = ToolCallLedger::load_bound(&path, "sess_old").unwrap();
-            assert!(ledger.tombstones_saturated, "{case}");
-            let message = refusal(&mut ledger, "old-0", policy).expect("pruned id refused");
-            assert!(message.contains("saturated"), "{case}: {message}");
-            assert_eq!(
-                refusal(&mut ledger, "fresh-read", ReplayPolicy::SafeToReplay),
-                None,
-                "{case}"
-            );
+            assert!(ledger.legacy_pruned, "{case}");
+            assert!(!ledger.tombstones_saturated, "{case}: not a capacity event");
+            assert_forgotten_ids_refused(&mut ledger, case);
             drop(ledger);
 
             // The upgrade is persisted: a reload still refuses.
             let mut reloaded = ToolCallLedger::load_bound(&path, "sess_old").unwrap();
             assert_eq!(reloaded.tombstone_format, TOMBSTONE_FORMAT, "{case}");
-            assert!(refusal(&mut reloaded, "old-0", policy).is_some(), "{case}");
+            assert_forgotten_ids_refused(&mut reloaded, case);
+        }
+    }
+
+    /// A legacy ledger cannot say which ids it forgot, so no claimed policy
+    /// lets a non-live id through. That includes a fresh `SafeToReplay` id:
+    /// refusing it is the price of not trusting the caller's claim.
+    fn assert_forgotten_ids_refused(ledger: &mut ToolCallLedger, case: &str) {
+        for (id, policy) in [
+            ("old-0", ReplayPolicy::NeverAutoReplay),
+            ("old-0", ReplayPolicy::SafeToReplay),
+            ("fresh-read", ReplayPolicy::SafeToReplay),
+            ("fresh-write", ReplayPolicy::NeverAutoReplay),
+        ] {
+            let message = refusal(ledger, id, policy)
+                .unwrap_or_else(|| panic!("{case}: `{id}` claimed {policy:?} and was let through"));
+            assert!(
+                message.contains("predates replay protection") && message.contains("new session"),
+                "{case}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn g16_a_legacy_ledger_still_serves_its_live_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let policy = ReplayPolicy::NeverAutoReplay;
+        let mut seed = ToolCallLedger::new("sess_old", "sess_old");
+        for n in 0..MAX_TERMINAL_RECORDS {
+            finish(&mut seed, &format!("kept-{n}"), policy);
+        }
+        write_legacy_ledger(&path, &seed, &[]);
+        let mut ledger = ToolCallLedger::load_bound(&path, "sess_old").unwrap();
+        assert!(ledger.legacy_pruned);
+        let args = json!({"name": "effect"});
+        // The record answers for itself; the legacy gate is not what refuses it.
+        match ledger
+            .reserve_call_with_policy("kept-0", "mcp__x__effect", &args, policy)
+            .unwrap()
+        {
+            ReservationOutcome::ReplayBlocked(message) => {
+                assert!(!message.contains("predates replay protection"), "{message}")
+            }
+            ReservationOutcome::Replay { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn g16_imported_records_over_the_budget_load_saturated_and_keep_every_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let policy = ReplayPolicy::NeverAutoReplay;
+        let mut seed = ToolCallLedger::new("sess_imp", "sess_imp");
+        for n in 0..MAX_TERMINAL_RECORDS {
+            finish(&mut seed, &format!("kept-{n}"), policy);
+        }
+        std::fs::write(&path, serde_json::to_vec(&seed).unwrap()).unwrap();
+        // Ten more records arrive through the journal, past admission control.
+        let imported: Vec<String> = (0..10)
+            .map(|n| {
+                let mut record = serde_json::to_value(&seed.records()["kept-0"]).unwrap();
+                record["call_id"] = json!(format!("import-{n}"));
+                json!({"event": "upsert", "record": record}).to_string()
+            })
+            .collect();
+        std::fs::write(journal_path(&path), imported.join("\n") + "\n").unwrap();
+
+        // 266 live non-safe records against a cap of 5: the load prunes ten
+        // of them, so the tombstones alone pass the cap.
+        let cap = 5;
+        for pass in ["first load", "reload"] {
+            let mut ledger = ToolCallLedger::load_bound_with_cap(&path, "sess_imp", cap).unwrap();
+            assert!(ledger.tombstones_saturated, "{pass}");
+            assert_eq!(ledger.tombstone_count(), 10, "{pass}: no hash is dropped");
+            assert!(ledger.tombstone_count() > cap, "{pass}");
+            for n in 0..10 {
+                let id = format!("kept-{n}");
+                for claimed in [ReplayPolicy::NeverAutoReplay, ReplayPolicy::SafeToReplay] {
+                    let message = refusal(&mut ledger, &id, claimed)
+                        .unwrap_or_else(|| panic!("{pass}: pruned `{id}` ran as {claimed:?}"));
+                    assert!(message.contains("previously completed"), "{message}");
+                }
+            }
+            let message = refusal(&mut ledger, "fresh-write", policy).expect("saturated");
+            assert!(message.contains("saturated"), "{pass}: {message}");
+            assert_eq!(
+                refusal(&mut ledger, "fresh-read", ReplayPolicy::SafeToReplay),
+                None,
+                "{pass}: saturation still lets a safe read run"
+            );
         }
     }
 
@@ -2042,6 +2176,45 @@ mod tests {
         assert_eq!(
             ledger.execution_authority("legacy-call", true, false),
             ToolCallExecutionAuthority::CompatibilityLedger
+        );
+    }
+
+    /// The journal only knows the ids it admitted. An id this ledger pruned
+    /// (or may have pruned) is new to it, so it must not be routed there.
+    #[test]
+    fn a_forgotten_id_never_reaches_the_operation_journal() {
+        let policy = ReplayPolicy::NeverAutoReplay;
+        let mut pruned = ToolCallLedger::new("sess_route", "lin_route");
+        for n in 0..=MAX_TERMINAL_RECORDS {
+            finish(&mut pruned, &format!("done-{n}"), policy);
+        }
+        assert!(!pruned.records().contains_key("done-0"), "pruned");
+        assert_eq!(
+            pruned.execution_authority("done-0", true, true),
+            ToolCallExecutionAuthority::CompatibilityLedger,
+            "the ledger refuses it by name"
+        );
+        assert_eq!(
+            pruned.execution_authority("never-seen", true, true),
+            ToolCallExecutionAuthority::OperationJournal
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut seed = ToolCallLedger::new("sess_old", "sess_old");
+        for n in 0..MAX_TERMINAL_RECORDS {
+            finish(&mut seed, &format!("kept-{n}"), policy);
+        }
+        write_legacy_ledger(&path, &seed, &[]);
+        let legacy = ToolCallLedger::load_bound(&path, "sess_old").unwrap();
+        assert_eq!(
+            legacy.execution_authority("anything", true, true),
+            ToolCallExecutionAuthority::CompatibilityLedger,
+            "a legacy ledger that pruned cannot vouch for any id"
+        );
+        assert_eq!(
+            legacy.execution_authority("kept-0", true, true),
+            ToolCallExecutionAuthority::LegacyObservationBlocked
         );
     }
 

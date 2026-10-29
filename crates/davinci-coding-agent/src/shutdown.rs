@@ -33,6 +33,39 @@ pub struct Cleanup {
     started: AtomicBool,
     started_at: OnceLock<Instant>,
     done: Arc<(Mutex<bool>, Condvar)>,
+    steps: Arc<Mutex<StepLog>>,
+    reported: AtomicBool,
+}
+
+/// One independent unit of cleanup work, named for the warning that says what
+/// went wrong when it does.
+pub struct Step {
+    pub name: &'static str,
+    work: Box<dyn FnOnce() + Send>,
+}
+
+impl Step {
+    pub fn new(name: &'static str, work: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            name,
+            work: Box::new(work),
+        }
+    }
+}
+
+/// What the steps did so far, readable by a trigger that gives up waiting.
+#[derive(Default)]
+struct StepLog {
+    /// Not started yet, in order.
+    pending: Vec<&'static str>,
+    running: Option<&'static str>,
+    panicked: Vec<&'static str>,
+    /// Refused because the deadline had passed when their turn came.
+    skipped: Vec<&'static str>,
+}
+
+fn lock(log: &Mutex<StepLog>) -> std::sync::MutexGuard<'_, StepLog> {
+    log.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Marks the cleanup finished when its thread ends, even by panic.
@@ -51,19 +84,84 @@ impl Cleanup {
             started: AtomicBool::new(false),
             started_at: OnceLock::new(),
             done: Arc::new((Mutex::new(false), Condvar::new())),
+            steps: Arc::new(Mutex::new(StepLog::default())),
+            reported: AtomicBool::new(false),
         }
     }
 
     /// Start `work` if no caller has, then wait for it until `deadline` after
     /// the first trigger. Returns whether the cleanup finished in time.
+    #[cfg(test)]
     pub fn run(&self, deadline: Duration, work: impl FnOnce() + Send + 'static) -> bool {
+        self.run_until(deadline, move |_| work())
+    }
+
+    /// Like [`run`](Self::run), for work made of independent steps. Each step
+    /// runs under `catch_unwind`, so one failure never skips the rest, and all
+    /// share the one absolute deadline: a step whose turn comes after it is
+    /// skipped. Order the steps so the ones that run user or extension code,
+    /// and may hang, come last.
+    pub fn run_steps(&self, deadline: Duration, steps: Vec<Step>) -> bool {
+        let log = Arc::clone(&self.steps);
+        self.run_until(deadline, move |deadline_at| {
+            lock(&log).pending = steps.iter().map(|step| step.name).collect();
+            for step in steps {
+                {
+                    let mut log = lock(&log);
+                    log.pending.retain(|name| *name != step.name);
+                    if Instant::now() >= deadline_at {
+                        log.skipped.push(step.name);
+                        continue;
+                    }
+                    log.running = Some(step.name);
+                }
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(step.work));
+                let mut log = lock(&log);
+                log.running = None;
+                if outcome.is_err() {
+                    log.panicked.push(step.name);
+                }
+            }
+        })
+    }
+
+    /// The warning for what went wrong, once per process: `finished` is what
+    /// the trigger saw. `None` when every step ran clean, or it was said.
+    pub fn report(&self, finished: bool) -> Option<String> {
+        let log = lock(&self.steps);
+        let timed_out = log.running.filter(|_| !finished);
+        let mut skipped = log.skipped.clone();
+        if !finished {
+            skipped.extend(log.pending.iter().copied());
+        }
+        let mut parts = Vec::new();
+        if !log.panicked.is_empty() {
+            parts.push(format!("panicked: {}", log.panicked.join(", ")));
+        }
+        if let Some(name) = timed_out {
+            parts.push(format!("timed out: {name}"));
+        }
+        if !skipped.is_empty() {
+            parts.push(format!("skipped: {}", skipped.join(", ")));
+        }
+        if parts.is_empty() || self.reported.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        Some(format!(
+            "shutdown cleanup incomplete ({})",
+            parts.join("; ")
+        ))
+    }
+
+    fn run_until(&self, deadline: Duration, work: impl FnOnce(Instant) + Send + 'static) -> bool {
         let first = !self.started.swap(true, Ordering::SeqCst);
         let started_at = *self.started_at.get_or_init(Instant::now);
         if first {
             let finish = Finish(Arc::clone(&self.done));
+            let deadline_at = started_at + deadline;
             thread::spawn(move || {
                 let _finish = finish;
-                work();
+                work(deadline_at);
             });
         }
         let (lock, finished) = &*self.done;
@@ -222,6 +320,81 @@ mod tests {
     fn panicking_cleanup_still_releases_waiters() {
         let cleanup = Cleanup::new();
         assert!(cleanup.run(Duration::from_secs(5), || panic!("destructor failed")));
+    }
+
+    fn marker(ran: &Arc<Mutex<Vec<&'static str>>>, name: &'static str) -> Step {
+        let ran = Arc::clone(ran);
+        Step::new(name, move || ran.lock().unwrap().push(name))
+    }
+
+    #[test]
+    fn a_panicking_step_does_not_skip_the_steps_after_it() {
+        let cleanup = Cleanup::new();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let steps = vec![
+            marker(&ran, "first"),
+            Step::new("broken", || panic!("destructor failed")),
+            marker(&ran, "third"),
+            marker(&ran, "fourth"),
+        ];
+        assert!(cleanup.run_steps(Duration::from_secs(5), steps));
+        assert_eq!(*ran.lock().unwrap(), ["first", "third", "fourth"]);
+        let report = cleanup.report(true).expect("a panic is reported");
+        assert!(report.contains("panicked: broken"), "{report}");
+        assert!(!report.contains("skipped"), "{report}");
+    }
+
+    #[test]
+    fn a_step_that_would_start_after_the_deadline_is_skipped_and_reported() {
+        let cleanup = Cleanup::new();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let steps = vec![
+            Step::new("slow", || thread::sleep(Duration::from_millis(250))),
+            marker(&ran, "late"),
+            marker(&ran, "later"),
+        ];
+        // The slow step finishes after the deadline; nothing may start then.
+        let finished = cleanup.run_steps(Duration::from_millis(100), steps);
+        assert!(!finished, "the slow step outlasts the wait");
+        thread::sleep(Duration::from_millis(400));
+        assert!(
+            ran.lock().unwrap().is_empty(),
+            "no step starts past the deadline"
+        );
+        let report = cleanup.report(true).expect("skips are reported");
+        assert!(report.contains("skipped: late, later"), "{report}");
+    }
+
+    #[test]
+    fn a_hung_step_is_reported_as_timed_out_with_the_rest_skipped() {
+        let cleanup = Cleanup::new();
+        let steps = vec![
+            Step::new("kill children", || {}),
+            Step::new("hook", || thread::sleep(Duration::from_secs(30))),
+            Step::new("after hook", || {}),
+        ];
+        let started = Instant::now();
+        assert!(!cleanup.run_steps(Duration::from_millis(150), steps));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let report = cleanup.report(false).expect("a hang is reported");
+        assert!(report.contains("timed out: hook"), "{report}");
+        assert!(report.contains("skipped: after hook"), "{report}");
+        assert!(!report.contains("kill children"), "{report}");
+    }
+
+    #[test]
+    fn a_clean_run_reports_nothing_and_reports_once() {
+        let cleanup = Cleanup::new();
+        assert!(cleanup.run_steps(Duration::from_secs(5), vec![Step::new("ok", || {})]));
+        assert_eq!(cleanup.report(true), None);
+
+        let broken = Cleanup::new();
+        broken.run_steps(
+            Duration::from_secs(5),
+            vec![Step::new("bad", || panic!("x"))],
+        );
+        assert!(broken.report(true).is_some());
+        assert_eq!(broken.report(true), None, "the second trigger stays quiet");
     }
 
     #[test]

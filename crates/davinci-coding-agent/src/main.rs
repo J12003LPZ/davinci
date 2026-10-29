@@ -5706,22 +5706,54 @@ fn run_stop_hooks_for(parsed: &Args, cwd: &Path) {
 /// `shutdown::CLEANUP_DEADLINE`, whether the normal exit or a signal gets here
 /// first. A step that hangs is abandoned at the deadline, not waited for.
 fn emit_session_shutdown(parsed: &Args) {
-    let parsed = parsed.clone();
-    // Thread-locals do not follow the work to its thread.
-    let startup = WORKER_STARTUP_CONTEXT.with(|context| context.borrow().clone());
-    shutdown::session_cleanup().run(shutdown::CLEANUP_DEADLINE, move || {
-        WORKER_STARTUP_CONTEXT.with(|context| *context.borrow_mut() = startup);
-        loaded_extension_host(&parsed).emit(ExtensionEvent::SessionShutdown {
-            reason: "quit".into(),
-        });
-        crate::js_host::shutdown_js_pool();
-        // `process::exit` follows: nothing below runs a destructor, so the
-        // children are reaped here.
-        davinci_agent::jobs::kill_every_job();
-        davinci_agent::McpRegistry::shutdown_all();
-        let cwd = std::env::current_dir().unwrap_or_default();
-        run_stop_hooks_for(&parsed, &cwd);
-    });
+    emit_session_shutdown_with(parsed, current_startup_context());
+}
+
+/// The graph worker context the session was built with. It is a thread-local
+/// of the thread that built the agent, so a trigger on another thread (the
+/// signal watcher) must be handed it rather than read it.
+fn current_startup_context() -> Option<crate::native_extensions::graph::GraphWorkerContext> {
+    WORKER_STARTUP_CONTEXT.with(|context| context.borrow().clone())
+}
+
+fn emit_session_shutdown_with(
+    parsed: &Args,
+    startup: Option<crate::native_extensions::graph::GraphWorkerContext>,
+) {
+    let cleanup = shutdown::session_cleanup();
+    let finished = cleanup.run_steps(
+        shutdown::CLEANUP_DEADLINE,
+        session_cleanup_steps(parsed.clone(), startup),
+    );
+    if let Some(warning) = cleanup.report(finished) {
+        eprintln!("warning: {warning}");
+    }
+}
+
+/// Independent steps, ordered so the children we own are terminated first and
+/// the steps that run user or extension code, which may hang, come last.
+/// `process::exit` follows: nothing runs a destructor, so children are reaped
+/// here.
+fn session_cleanup_steps(
+    parsed: Args,
+    startup: Option<crate::native_extensions::graph::GraphWorkerContext>,
+) -> Vec<shutdown::Step> {
+    let event_args = parsed.clone();
+    vec![
+        shutdown::Step::new("background jobs", davinci_agent::jobs::kill_every_job),
+        shutdown::Step::new("MCP servers", davinci_agent::McpRegistry::shutdown_all),
+        shutdown::Step::new("JS pool", crate::js_host::shutdown_js_pool),
+        shutdown::Step::new("session_shutdown event", move || {
+            WORKER_STARTUP_CONTEXT.with(|context| *context.borrow_mut() = startup);
+            loaded_extension_host(&event_args).emit(ExtensionEvent::SessionShutdown {
+                reason: "quit".into(),
+            });
+        }),
+        shutdown::Step::new("stop hooks", move || {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            run_stop_hooks_for(&parsed, &cwd);
+        }),
+    ]
 }
 
 fn immediate_shutdown_if_fixture(parsed: &Args) -> Option<i32> {
@@ -5732,9 +5764,19 @@ fn immediate_shutdown_if_fixture(parsed: &Args) -> Option<i32> {
 
 fn install_mode_shutdown_watchers(parsed: &Args) {
     let parsed = parsed.clone();
+    let startup = capture_startup_context();
     shutdown::install_shutdown_watchers(move |_| {
-        emit_session_shutdown(&parsed);
+        emit_session_shutdown_with(&parsed, startup());
     });
+}
+
+/// Reads the startup context now, on the thread that built the agent, and
+/// returns a reader any thread may call later. The signal watcher thread has
+/// its own empty thread-local, so reading it there would lose the context.
+fn capture_startup_context(
+) -> impl Fn() -> Option<crate::native_extensions::graph::GraphWorkerContext> + Send + Sync {
+    let startup = std::sync::Mutex::new(current_startup_context());
+    move || startup.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// UI brand: the identity mark follows the installed binary name, so a copy

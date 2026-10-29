@@ -502,8 +502,11 @@ impl WorktreeManager {
     }
 
     /// Release an existing worktree lease.
-    /// If dirty and `force` is false, preserves the worktree directory and returns `DirtyWorktreePreserved`.
-    pub fn release_lease(&self, lease: &WorktreeLease, force: bool) -> Result<(), WorktreeError> {
+    /// A dirty worktree is preserved and returns `DirtyWorktreePreserved`;
+    /// state that cannot be read counts as dirty. `force` does not override
+    /// that: uncommitted work is never deleted. No production caller passes
+    /// `true`, so the parameter is kept only for the signature.
+    pub fn release_lease(&self, lease: &WorktreeLease, _force: bool) -> Result<(), WorktreeError> {
         let mut leases = self.leases.write().map_err(|_| {
             WorktreeError::GitError("Failed to acquire write lock on leases".into())
         })?;
@@ -516,13 +519,8 @@ impl WorktreeManager {
         {
             return Err(WorktreeError::StaleLease(lease.path.clone()));
         }
-        // Unreadable state preserves the worktree unless the caller forces.
-        let dirty = match self.check_dirty(lease) {
-            Ok(dirty) => dirty,
-            Err(error) if !force => return Err(error),
-            Err(_) => true,
-        };
-        if dirty && !force {
+        // Unreadable state preserves the worktree too.
+        if self.check_dirty(lease)? {
             return Err(WorktreeError::DirtyWorktreePreserved {
                 path: lease.path.clone(),
             });
@@ -751,10 +749,15 @@ impl WorktreeManager {
             let Ok(gitdir) = std::fs::read(admin.join("gitdir")) else {
                 continue;
             };
-            let gitdir = gitdir.trim_ascii_end();
-            let points_here = path_from_git_bytes(gitdir)
-                .parent()
-                .is_some_and(|dir| path_key(dir) == wanted);
+            // A relative `gitdir` is relative to the admin directory that
+            // holds it; `path_key` would resolve it against the process cwd.
+            let gitdir = path_from_git_bytes(gitdir.trim_ascii_end());
+            let gitdir = if gitdir.is_relative() {
+                admin.join(gitdir)
+            } else {
+                gitdir
+            };
+            let points_here = gitdir.parent().is_some_and(|dir| path_key(dir) == wanted);
             if !points_here {
                 continue;
             }
@@ -896,8 +899,6 @@ mod tests {
             [0, 255, 10, 13]
         );
         assert!(!target.path.join("README.md").exists());
-        manager.release_lease(&source, true).unwrap();
-        manager.release_lease(&target, true).unwrap();
     }
 
     #[test]
@@ -915,7 +916,10 @@ mod tests {
     }
 
     fn init_temp_git_repo() -> tempfile::TempDir {
-        let dir = tempdir().unwrap();
+        init_git_repo_in(tempdir().unwrap())
+    }
+
+    fn init_git_repo_in(dir: tempfile::TempDir) -> tempfile::TempDir {
         let path = dir.path();
 
         Command::new("git")
@@ -1141,7 +1145,16 @@ mod tests {
         assert!(lease.path.exists());
         assert!(dirty_file.exists());
 
-        // Now release with force: true
+        // `force` never overrides uncommitted work either.
+        let err = manager.release_lease(&lease, true).unwrap_err();
+        assert!(
+            matches!(err, WorktreeError::DirtyWorktreePreserved { .. }),
+            "{err:?}"
+        );
+        assert!(dirty_file.exists());
+
+        // Once the work is gone the same lease releases, forced or not.
+        std::fs::remove_file(&dirty_file).unwrap();
         manager.release_lease(&lease, true).unwrap();
         assert!(!lease.path.exists());
     }
@@ -1379,6 +1392,78 @@ mod tests {
             manager.get_lease(&bystander.path).as_ref(),
             Some(&bystander)
         );
+    }
+
+    /// A relative `gitdir` is relative to the registration's own directory,
+    /// not to the process cwd. Resolved against the cwd, a bystander's path
+    /// aliases the lease and its registration is deleted, while the lease's
+    /// own locked registration is never recognised.
+    #[test]
+    fn a_relative_gitdir_is_resolved_against_its_registration_not_the_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let repo_dir = init_git_repo_in(tempfile::tempdir_in(&cwd).unwrap());
+        let wt_dir = tempfile::tempdir_in(&cwd).unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        let bystander = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        git_in(
+            repo_dir.path(),
+            &["worktree", "lock", lease.path.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(&lease.path).unwrap();
+        std::fs::remove_dir_all(&bystander.path).unwrap();
+
+        // Both files become relative. The lease's resolves from its admin
+        // directory to the lease; the bystander's is written so that it would
+        // reach the lease only from the cwd.
+        let admin_root = repo_dir.path().join(".git").join("worktrees");
+        let (mut lease_admin, mut bystander_admin) = (None, None);
+        for admin in std::fs::read_dir(&admin_root).unwrap() {
+            let admin = admin.unwrap().path();
+            if admin.join("locked").exists() {
+                lease_admin = Some(admin);
+            } else {
+                bystander_admin = Some(admin);
+            }
+        }
+        let (lease_admin, bystander_admin) = (lease_admin.unwrap(), bystander_admin.unwrap());
+        let up = |admin: &Path| {
+            let depth = admin.strip_prefix(&cwd).unwrap().components().count();
+            PathBuf::from_iter(std::iter::repeat_n("..", depth))
+        };
+        let lease_git = lease.path.join(".git");
+        let from_admin = up(&lease_admin).join(lease_git.strip_prefix(&cwd).unwrap());
+        let from_cwd = lease_git.strip_prefix(&cwd).unwrap();
+        std::fs::write(
+            lease_admin.join("gitdir"),
+            format!("{}\n", from_admin.to_string_lossy().replace('\\', "/")),
+        )
+        .unwrap();
+        std::fs::write(
+            bystander_admin.join("gitdir"),
+            format!("{}\n", from_cwd.to_string_lossy().replace('\\', "/")),
+        )
+        .unwrap();
+
+        let err = manager.release_lease(&lease, true).unwrap_err();
+        assert!(
+            matches!(&err, WorktreeError::CleanupIncomplete { detail, .. }
+                if detail.contains("the registration is locked")),
+            "{err:?}"
+        );
+        assert!(
+            lease_admin.exists(),
+            "a locked registration is never deleted"
+        );
+        assert!(
+            bystander_admin.exists(),
+            "a relative path that only the cwd would resolve to the lease is not the lease"
+        );
+        assert_eq!(manager.get_lease(&lease.path).as_ref(), Some(&lease));
     }
 
     /// A git command that fails is not evidence that the thing is gone.

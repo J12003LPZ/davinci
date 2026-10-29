@@ -246,7 +246,7 @@ mod tests {
     use std::path::Path;
 
     fn call(agent: &mut Agent, root: &Path, id: &str, name: &str, args: Value) {
-        let result = agent.run_prepared_call(root, id, name, &args, 0);
+        let result = agent.prepare_and_run_call(root, id, name, &args, 0);
         assert!(!result.is_error, "{}", result.content);
         agent
             .messages
@@ -391,7 +391,7 @@ mod tests {
             )
             .is_none());
         // Unknown/failed observations cannot become a retry veto.
-        let result = agent.run_prepared_call(
+        let result = agent.prepare_and_run_call(
             dir.path(),
             "allowed-grep",
             "grep",

@@ -3730,7 +3730,7 @@ fn concurrent_identical_calls_followers_receive_terminal_result() {
         let a = Arc::clone(&agent);
         handles.push(std::thread::spawn(move || {
             let cwd = std::path::PathBuf::from(".");
-            a.run_prepared_call(
+            a.prepare_and_run_call(
                 &cwd,
                 "concurrent_call_id",
                 "custom_slow",
