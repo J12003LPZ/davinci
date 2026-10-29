@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -15,6 +15,10 @@ use crate::runtime::{conservative_replay_policy, ReplayPolicy};
 
 const MAX_STORED_OUTPUT: usize = 64 * 1024;
 const MAX_TERMINAL_RECORDS: usize = 256;
+/// Pruned call ids remembered so they are never reserved again: one 64-bit
+/// hash each, so a full set is about 2 MiB. Past it the ledger is saturated
+/// (see `tombstones_saturated`); old entries are never dropped to make room.
+const MAX_TOMBSTONES: usize = 262_144;
 const MAX_JOURNAL_BYTES: u64 = 48 * 1024 * 1024;
 const OUTPUT_TRUNCATED_MARKER: &str = "\n[output truncated in ledger; digest covers the full text]";
 
@@ -123,11 +127,24 @@ fn compute_digest(content: &str) -> String {
     format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum LedgerJournalEvent {
     Upsert { record: ToolCallRecord },
     Remove { call_id: String },
+    Tombstone { hash: u64, unknown: bool },
+    Saturated,
+}
+
+/// Stable 64-bit identity of a call id for the tombstone sets: the first eight
+/// bytes of its SHA-256. Not `DefaultHasher`, whose output changes between
+/// releases and would orphan a persisted ledger. A collision makes an unrelated
+/// id look tombstoned and refuses it, which fails closed.
+fn tombstone_hash(call_id: &str) -> u64 {
+    let digest = Sha256::digest(call_id.as_bytes());
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(head)
 }
 
 fn bounded_output(output: &str) -> String {
@@ -248,6 +265,10 @@ fn default_condvar() -> Arc<Condvar> {
     Arc::new(Condvar::new())
 }
 
+fn default_tombstone_cap() -> usize {
+    MAX_TOMBSTONES
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallLedger {
     pub session_id: String,
@@ -255,6 +276,25 @@ pub struct ToolCallLedger {
     records: HashMap<String, ToolCallRecord>,
     #[serde(default)]
     record_order: Vec<String>,
+    /// Hashes of pruned ids whose outcome was unknown and whose replay is not
+    /// safe: the effect may exist. Reserving one again would replay it.
+    #[serde(default)]
+    unknown_tombstones: BTreeSet<u64>,
+    /// Hashes of pruned ids whose call finished (any known outcome) and whose
+    /// replay is not safe. The result is gone, and running the call again
+    /// would repeat its effect.
+    #[serde(default)]
+    finished_tombstones: BTreeSet<u64>,
+    /// Set when a pruned id could not be remembered because the tombstone sets
+    /// are full. From then on no new non-`SafeToReplay` call id is accepted,
+    /// since it might be one that was forgotten.
+    #[serde(default)]
+    tombstones_saturated: bool,
+    #[serde(skip, default = "default_tombstone_cap")]
+    tombstone_cap: usize,
+    /// Tombstones and the saturation mark not yet appended to the journal.
+    #[serde(skip, default)]
+    pending_tombstones: Vec<LedgerJournalEvent>,
     #[serde(skip, default = "default_condvar")]
     condvar: Arc<Condvar>,
     #[serde(skip, default)]
@@ -276,6 +316,11 @@ impl Default for ToolCallLedger {
             lineage_id: String::new(),
             records: HashMap::new(),
             record_order: Vec::new(),
+            unknown_tombstones: BTreeSet::new(),
+            finished_tombstones: BTreeSet::new(),
+            tombstones_saturated: false,
+            tombstone_cap: MAX_TOMBSTONES,
+            pending_tombstones: Vec::new(),
             condvar: default_condvar(),
             persistence_path: None,
             persistence_error: None,
@@ -405,6 +450,11 @@ impl ToolCallLedger {
             lineage_id: lineage_id.into(),
             records: HashMap::new(),
             record_order: Vec::new(),
+            unknown_tombstones: BTreeSet::new(),
+            finished_tombstones: BTreeSet::new(),
+            tombstones_saturated: false,
+            tombstone_cap: MAX_TOMBSTONES,
+            pending_tombstones: Vec::new(),
             condvar: default_condvar(),
             persistence_path: None,
             persistence_error: None,
@@ -412,6 +462,14 @@ impl ToolCallLedger {
             snapshot_metadata_dirty: false,
             persistence_bytes_written: 0,
         }
+    }
+
+    /// A ledger whose tombstone sets hold at most `cap` ids, so a test can
+    /// saturate it without recording hundreds of thousands of calls.
+    #[cfg(test)]
+    fn with_tombstone_cap(mut self, cap: usize) -> Self {
+        self.tombstone_cap = cap;
+        self
     }
 
     pub fn load_bound(path: &Path, session_id: &str) -> Result<Self, String> {
@@ -458,6 +516,14 @@ impl ToolCallLedger {
                     self.record_order
                         .retain(|recorded_id| recorded_id != &call_id);
                 }
+                LedgerJournalEvent::Tombstone { hash, unknown } => {
+                    if unknown {
+                        self.unknown_tombstones.insert(hash);
+                    } else {
+                        self.finished_tombstones.insert(hash);
+                    }
+                }
+                LedgerJournalEvent::Saturated => self.tombstones_saturated = true,
             }
         }
         Ok(())
@@ -531,6 +597,13 @@ impl ToolCallLedger {
                 event_bytes.push(b'\n');
             }
         }
+        // Protection before deletion: the batch is one write, but a crash can
+        // leave any line-aligned prefix durable, so no `Remove` may precede
+        // the tombstones that make its id refusable.
+        for event in &self.pending_tombstones {
+            serde_json::to_writer(&mut event_bytes, event).map_err(|error| error.to_string())?;
+            event_bytes.push(b'\n');
+        }
         let mut removed: Vec<_> = self
             .dirty_call_ids
             .iter()
@@ -550,6 +623,7 @@ impl ToolCallLedger {
                 .persistence_bytes_written
                 .saturating_add(event_bytes.len() as u64);
             self.dirty_call_ids.clear();
+            self.pending_tombstones.clear();
         }
 
         let journal_len = match std::fs::metadata(&journal) {
@@ -577,6 +651,8 @@ impl ToolCallLedger {
             Err(error) => return Err(error.to_string()),
         }
         self.dirty_call_ids.clear();
+        // The snapshot carries the tombstone sets, so nothing is pending.
+        self.pending_tombstones.clear();
         self.snapshot_metadata_dirty = false;
         Ok(())
     }
@@ -637,7 +713,14 @@ impl ToolCallLedger {
             .collect();
         let excess = terminal.len().saturating_sub(MAX_TERMINAL_RECORDS);
         for id in terminal.into_iter().take(excess) {
-            self.records.remove(&id);
+            if let Some(record) = self.records.remove(&id) {
+                // Forgetting the id would let it reserve a fresh attempt,
+                // which replays the call, whatever its recorded outcome was.
+                // A safe read can run again, so it is not remembered.
+                if record.replay_policy != ReplayPolicy::SafeToReplay {
+                    self.tombstone(&id, record.outcome == AttemptOutcome::StartedUnknown);
+                }
+            }
             self.dirty_call_ids.insert(id);
         }
         let records = &self.records;
@@ -804,6 +887,9 @@ impl ToolCallLedger {
                 }
             }
         }
+        if let Some(refusal) = self.refusal_for_forgotten_id(call_id, tool_name, replay_policy) {
+            return Ok(ReservationOutcome::ReplayBlocked(refusal));
+        }
         self.record_order.push(call_id.to_string());
         self.records.insert(
             call_id.to_string(),
@@ -893,6 +979,10 @@ impl ToolCallLedger {
                     BeginOutcome::Execute
                 }
             }
+        } else if let Some(refusal) =
+            self.refusal_for_forgotten_id(call_id, tool_name, replay_policy)
+        {
+            BeginOutcome::ReplayBlocked(refusal)
         } else {
             self.record_order.push(call_id.to_string());
             self.records.insert(
@@ -1123,6 +1213,60 @@ impl ToolCallLedger {
         let _ = self.persist();
     }
 
+    /// Remember a pruned id. A tombstone is never dropped. Reaching the cap
+    /// only marks the ledger saturated, which refuses new non-safe call ids
+    /// from then on (see `refusal_for_forgotten_id`). Past that point the only
+    /// tombstones still added come from records already live: at most
+    /// `MAX_TERMINAL_RECORDS` terminal ones plus the active ones, so the sets
+    /// overshoot the cap by a bounded amount.
+    fn tombstone(&mut self, call_id: &str, unknown: bool) {
+        let hash = tombstone_hash(call_id);
+        if self.unknown_tombstones.len() + self.finished_tombstones.len() >= self.tombstone_cap
+            && !self.tombstones_saturated
+        {
+            self.tombstones_saturated = true;
+            self.pending_tombstones.push(LedgerJournalEvent::Saturated);
+        }
+        let added = if unknown {
+            self.unknown_tombstones.insert(hash)
+        } else {
+            self.finished_tombstones.insert(hash)
+        };
+        if added {
+            self.pending_tombstones
+                .push(LedgerJournalEvent::Tombstone { hash, unknown });
+        }
+    }
+
+    /// Why a call id with no live record must not start, if it must not: it
+    /// was pruned earlier (and its replay is not safe), or the ledger can no
+    /// longer tell whether it was. `None` means a fresh attempt is fine.
+    fn refusal_for_forgotten_id(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+        replay_policy: ReplayPolicy,
+    ) -> Option<String> {
+        let hash = tombstone_hash(call_id);
+        if self.unknown_tombstones.contains(&hash) {
+            return Some(replay_blocked_message(
+                tool_name,
+                ReplayPolicy::NeverAutoReplay,
+            ));
+        }
+        if self.finished_tombstones.contains(&hash) {
+            return Some(format!(
+                "Tool call `{tool_name}` previously completed; result no longer retained. It was not run again."
+            ));
+        }
+        if self.tombstones_saturated && replay_policy != ReplayPolicy::SafeToReplay {
+            return Some(format!(
+                "Tool call `{tool_name}` was refused: the tool ledger is saturated, so an earlier call with this id cannot be ruled out. Start a new session."
+            ));
+        }
+        None
+    }
+
     pub fn record_completion(&mut self, call_id: &str, output: &str, is_error: bool) {
         if let Some(entry) = self.records.get_mut(call_id) {
             entry.status = ToolExecutionStatus::Completed;
@@ -1146,6 +1290,22 @@ impl ToolCallLedger {
         if let Some(entry) = self.records.get_mut(call_id) {
             entry.status = ToolExecutionStatus::Failed;
             entry.outcome = AttemptOutcome::Failed;
+            entry.output = Some(bounded_output(error));
+            entry.result_digest = Some(compute_digest(error));
+            entry.is_error = true;
+            self.dirty_call_ids.insert(call_id.to_string());
+        }
+        self.prune_terminal_records();
+        self.condvar.notify_all();
+    }
+
+    /// Record an attempt whose effect may exist but whose result was lost.
+    /// The status is terminal (nothing is still in flight), while the outcome
+    /// stays `StartedUnknown` so recovery reconciles instead of retrying.
+    pub fn record_unknown_outcome(&mut self, call_id: &str, error: &str) {
+        if let Some(entry) = self.records.get_mut(call_id) {
+            entry.status = ToolExecutionStatus::Failed;
+            entry.outcome = AttemptOutcome::StartedUnknown;
             entry.output = Some(bounded_output(error));
             entry.result_digest = Some(compute_digest(error));
             entry.is_error = true;
@@ -1245,6 +1405,404 @@ mod tests {
                 ReplayPolicy::SafeToReplay,
             ),
             BeginOutcome::Execute
+        );
+    }
+
+    #[test]
+    fn an_unknown_outcome_is_not_recorded_as_a_confirmed_failure() {
+        let mut ledger = ToolCallLedger::new("sess_recovery", "lin_recovery");
+        let args = json!({"name": "effect"});
+        ledger.record_start_with_policy(
+            "call_lost",
+            "mcp__lost__effect",
+            &args,
+            ReplayPolicy::NeverAutoReplay,
+        );
+        ledger.record_unknown_outcome("call_lost", "the reply was lost after the request");
+
+        let record = ledger.records().get("call_lost").unwrap();
+        assert_eq!(record.outcome, AttemptOutcome::StartedUnknown);
+        assert_eq!(record.status, ToolExecutionStatus::Failed);
+        assert_eq!(
+            ledger
+                .get_completed_result("call_lost")
+                .map(|(_, is_error)| is_error),
+            None,
+            "an unknown outcome must not be replayable as a completed result"
+        );
+
+        // A second delivery of the same call id is reconciled, never executed
+        // again and never left waiting on a call that already ended.
+        assert!(matches!(
+            ledger.reserve_call_with_policy(
+                "call_lost",
+                "mcp__lost__effect",
+                &args,
+                ReplayPolicy::NeverAutoReplay,
+            ),
+            Ok(ReservationOutcome::ReplayBlocked(_))
+        ));
+        assert_eq!(
+            ledger
+                .recover_attempt("call_lost", "mcp__lost__effect", &args, 1)
+                .unwrap(),
+            RecoveryAction::Stop(replay_blocked_message(
+                "mcp__lost__effect",
+                ReplayPolicy::NeverAutoReplay
+            ))
+        );
+    }
+
+    #[test]
+    fn g16_a_pruned_unknown_outcome_is_still_refused() {
+        let mut ledger = ToolCallLedger::new("sess_prune", "lin_prune");
+        let args = json!({"name": "effect"});
+        let policy = ReplayPolicy::NeverAutoReplay;
+        ledger
+            .reserve_call_with_policy("unknown-0", "mcp__x__effect", &args, policy)
+            .unwrap();
+        assert_eq!(
+            ledger.begin_execution_with_policy("unknown-0", "mcp__x__effect", &args, policy),
+            BeginOutcome::Execute
+        );
+        ledger.record_unknown_outcome("unknown-0", "reply lost");
+
+        // One call stays in flight the whole time and must never be pruned.
+        ledger
+            .reserve_call_with_policy("active-1", "mcp__x__effect", &args, policy)
+            .unwrap();
+
+        // Enough terminal records after it to push the oldest two past the cap.
+        for n in 0..=MAX_TERMINAL_RECORDS {
+            let id = format!("done-{n}");
+            ledger
+                .reserve_call_with_policy(&id, "mcp__x__effect", &args, policy)
+                .unwrap();
+            ledger.begin_execution_with_policy(&id, "mcp__x__effect", &args, policy);
+            ledger.record_completion(&id, "ok", false);
+        }
+        assert!(!ledger.records().contains_key("unknown-0"), "pruned");
+        assert!(!ledger.records().contains_key("done-0"), "pruned");
+        assert!(ledger.records().contains_key("active-1"), "in flight, kept");
+
+        // The evicted unknown id is refused, exactly like a live unknown record.
+        let refused = ledger
+            .reserve_call_with_policy("unknown-0", "mcp__x__effect", &args, policy)
+            .unwrap();
+        assert_eq!(
+            refused,
+            ReservationOutcome::ReplayBlocked(replay_blocked_message("mcp__x__effect", policy))
+        );
+        assert!(matches!(
+            ledger.begin_execution_with_policy("unknown-0", "mcp__x__effect", &args, policy),
+            BeginOutcome::ReplayBlocked(_)
+        ));
+        assert!(
+            !ledger.records().contains_key("unknown-0"),
+            "no new attempt"
+        );
+
+        // A pruned completed mutation is not forgotten either: it also would
+        // run its effect a second time.
+        assert!(matches!(
+            ledger
+                .reserve_call_with_policy("done-0", "mcp__x__effect", &args, policy)
+                .unwrap(),
+            ReservationOutcome::ReplayBlocked(_)
+        ));
+    }
+
+    fn finish(ledger: &mut ToolCallLedger, id: &str, policy: ReplayPolicy) {
+        let args = json!({"name": "effect"});
+        ledger
+            .reserve_call_with_policy(id, "mcp__x__effect", &args, policy)
+            .unwrap();
+        ledger.begin_execution_with_policy(id, "mcp__x__effect", &args, policy);
+        ledger.record_completion(id, "ok", false);
+    }
+
+    fn refusal(ledger: &mut ToolCallLedger, id: &str, policy: ReplayPolicy) -> Option<String> {
+        let args = json!({"name": "effect"});
+        match ledger
+            .reserve_call_with_policy(id, "mcp__x__effect", &args, policy)
+            .unwrap()
+        {
+            ReservationOutcome::ReplayBlocked(message) => Some(message),
+            ReservationOutcome::Reserved => None,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn g16_a_pruned_completed_mutation_is_refused_not_rerun() {
+        let mut ledger = ToolCallLedger::new("sess_prune", "lin_prune");
+        let policy = ReplayPolicy::NeverAutoReplay;
+        for n in 0..=MAX_TERMINAL_RECORDS {
+            finish(&mut ledger, &format!("done-{n}"), policy);
+        }
+        assert!(!ledger.records().contains_key("done-0"), "pruned");
+
+        let message = refusal(&mut ledger, "done-0", policy).expect("refused");
+        assert!(
+            message.contains("previously completed; result no longer retained"),
+            "{message}"
+        );
+        // The same on the begin path, and no record appears for it.
+        let args = json!({"name": "effect"});
+        assert!(matches!(
+            ledger.begin_execution_with_policy("done-0", "mcp__x__effect", &args, policy),
+            BeginOutcome::ReplayBlocked(m) if m.contains("previously completed")
+        ));
+        assert!(!ledger.records().contains_key("done-0"), "no new attempt");
+        // An id that never ran is unaffected.
+        assert_eq!(refusal(&mut ledger, "brand-new", policy), None);
+    }
+
+    #[test]
+    fn g16_a_full_tombstone_set_saturates_instead_of_forgetting() {
+        let mut ledger = ToolCallLedger::new("sess_cap", "lin_cap").with_tombstone_cap(3);
+        let policy = ReplayPolicy::NeverAutoReplay;
+        // done-0 is pruned by the 257th completion, done-1 by the 258th, and so
+        // on; done-3 is the fourth prune and overflows the cap. From then on
+        // the ledger refuses new ids, so `finish` for later ones does nothing.
+        for n in 0..(MAX_TERMINAL_RECORDS + 10) {
+            finish(&mut ledger, &format!("done-{n}"), policy);
+        }
+        assert!(
+            ledger.tombstones_saturated,
+            "the fourth prune overflows a cap of 3"
+        );
+        assert!(!ledger.records().contains_key("done-3"), "pruned");
+
+        // Every pruned id is still remembered, the one that overflowed the cap
+        // included: nothing is dropped.
+        for n in 0..4 {
+            let message = refusal(&mut ledger, &format!("done-{n}"), policy).unwrap();
+            assert!(
+                message.contains("previously completed"),
+                "done-{n}: {message}"
+            );
+        }
+        // Any id the ledger has never seen, once it cannot tell.
+        let message = refusal(&mut ledger, "never-seen", policy).expect("refused");
+        assert!(message.contains("saturated") && message.contains("new session"));
+        // Safe reads are unaffected, and a live record still answers for itself.
+        assert_eq!(
+            refusal(&mut ledger, "a-read", ReplayPolicy::SafeToReplay),
+            None
+        );
+        assert!(matches!(
+            ledger
+                .reserve_call_with_policy(
+                    "done-4",
+                    "mcp__x__effect",
+                    &json!({"name": "effect"}),
+                    policy
+                )
+                .unwrap(),
+            ReservationOutcome::ReplayBlocked(_)
+        ));
+    }
+
+    #[test]
+    fn g16_tombstones_and_saturation_survive_persist_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let policy = ReplayPolicy::NeverAutoReplay;
+        let args = json!({"name": "effect"});
+
+        let mut ledger = ToolCallLedger::load_bound(&path, "sess_disk").unwrap();
+        // An unknown outcome, then enough finished calls to prune it.
+        ledger
+            .reserve_call_with_policy("unknown-0", "mcp__x__effect", &args, policy)
+            .unwrap();
+        ledger.begin_execution_with_policy("unknown-0", "mcp__x__effect", &args, policy);
+        ledger.record_unknown_outcome("unknown-0", "reply lost");
+        for n in 0..=MAX_TERMINAL_RECORDS {
+            finish(&mut ledger, &format!("done-{n}"), policy);
+        }
+        ledger.persist().unwrap();
+        assert!(!ledger.records().contains_key("unknown-0"), "pruned");
+        drop(ledger);
+
+        // Reload from the snapshot plus the journal events appended since.
+        let mut reloaded = ToolCallLedger::load_bound(&path, "sess_disk").unwrap();
+        let unknown = refusal(&mut reloaded, "unknown-0", policy).unwrap();
+        assert!(
+            unknown.contains("cannot be replayed automatically"),
+            "{unknown}"
+        );
+        let done = refusal(&mut reloaded, "done-0", policy).unwrap();
+        assert!(done.contains("previously completed"), "{done}");
+
+        // Force a compaction: the tombstones must live in the snapshot too.
+        reloaded.snapshot_metadata_dirty = true;
+        reloaded.persist().unwrap();
+        assert_eq!(
+            std::fs::metadata(journal_path(&path)).unwrap().len(),
+            0,
+            "compaction empties the journal"
+        );
+        drop(reloaded);
+        let mut compacted = ToolCallLedger::load_bound(&path, "sess_disk").unwrap();
+        assert!(refusal(&mut compacted, "unknown-0", policy).is_some());
+        assert!(refusal(&mut compacted, "done-0", policy).is_some());
+
+        // Saturation persists as well, through the journal and the snapshot.
+        // Two tombstones exist already, so the next prune overflows a cap of 2.
+        let mut capped = compacted.with_tombstone_cap(2);
+        for n in 0..4 {
+            finish(&mut capped, &format!("more-{n}"), policy);
+        }
+        capped.persist().unwrap();
+        assert!(capped.tombstones_saturated);
+        drop(capped);
+        let mut after = ToolCallLedger::load_bound(&path, "sess_disk").unwrap();
+        assert!(after.tombstones_saturated, "saturation survives a reload");
+        let message = refusal(&mut after, "never-seen", policy).expect("refused");
+        assert!(message.contains("saturated"), "{message}");
+        assert_eq!(
+            refusal(&mut after, "a-read", ReplayPolicy::SafeToReplay),
+            None
+        );
+    }
+
+    #[test]
+    fn g16_ids_pruned_after_saturation_stay_refused_whatever_policy_is_claimed() {
+        let mut ledger = ToolCallLedger::new("sess_sat", "lin_sat").with_tombstone_cap(3);
+        let policy = ReplayPolicy::NeverAutoReplay;
+        let safe = ReplayPolicy::SafeToReplay;
+        for n in 0..(MAX_TERMINAL_RECORDS + 10) {
+            finish(&mut ledger, &format!("done-{n}"), policy);
+        }
+        assert!(ledger.tombstones_saturated);
+
+        // Safe reads still run once saturated, and each completion prunes one
+        // more live non-safe record (done-4 onward) past the cap.
+        let args = json!({"path": "a"});
+        for n in 0..8 {
+            let id = format!("read-{n}");
+            assert_eq!(
+                ledger
+                    .reserve_call_with_policy(&id, "read", &args, safe)
+                    .unwrap(),
+                ReservationOutcome::Reserved
+            );
+            ledger.begin_execution_with_policy(&id, "read", &args, safe);
+            ledger.record_completion(&id, "ok", false);
+        }
+        for n in 0..12 {
+            let id = format!("done-{n}");
+            assert!(!ledger.records().contains_key(&id), "{id} pruned");
+            for claimed in [policy, safe] {
+                let message = refusal(&mut ledger, &id, claimed)
+                    .unwrap_or_else(|| panic!("{id} ran again as {claimed:?}"));
+                assert!(message.contains("previously completed"), "{id}: {message}");
+            }
+        }
+        // A brand-new safe id still runs; a brand-new non-safe one does not.
+        assert_eq!(refusal(&mut ledger, "fresh-read", safe), None);
+        assert!(refusal(&mut ledger, "fresh-write", policy).is_some());
+    }
+
+    #[test]
+    fn g16_every_durable_journal_prefix_protects_a_removed_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let journal = journal_path(&path);
+        let policy = ReplayPolicy::NeverAutoReplay;
+
+        let mut ledger = ToolCallLedger::load_bound(&path, "sess_torn").unwrap();
+        for n in 0..MAX_TERMINAL_RECORDS {
+            finish(&mut ledger, &format!("done-{n}"), policy);
+        }
+        ledger.persist().unwrap();
+        let before = std::fs::read(&journal).unwrap();
+        // Two more completions prune done-0 and done-1 in one persist batch.
+        // Starting persists, so start both first: the prunes then share one batch.
+        let args = json!({"name": "effect"});
+        let last = MAX_TERMINAL_RECORDS + 2;
+        for n in MAX_TERMINAL_RECORDS..last {
+            ledger.record_start_with_policy(&format!("done-{n}"), "mcp__x__effect", &args, policy);
+        }
+        for n in MAX_TERMINAL_RECORDS..last {
+            ledger.record_completion(&format!("done-{n}"), "ok", false);
+        }
+        ledger.persist().unwrap();
+        let after = std::fs::read(&journal).unwrap();
+        drop(ledger);
+        let batch = &after[before.len()..];
+        let lines: Vec<&[u8]> = batch.split_inclusive(|byte| *byte == b'\n').collect();
+        let position = |needle: &str| {
+            lines
+                .iter()
+                .rposition(|line| String::from_utf8_lossy(line).contains(needle))
+        };
+        let last_tombstone = position("\"event\":\"tombstone\"").expect("batch has tombstones");
+        let first_remove = lines
+            .iter()
+            .position(|line| String::from_utf8_lossy(line).contains("\"event\":\"remove\""))
+            .expect("batch has removes");
+        assert!(last_tombstone < first_remove, "protection before deletion");
+
+        // Cut the journal after every line of the batch, as a crash would.
+        for keep in 0..=lines.len() {
+            let torn = tempfile::tempdir().unwrap();
+            let torn_path = torn.path().join("ledger.json");
+            std::fs::copy(&path, &torn_path).unwrap();
+            let mut bytes = before.clone();
+            bytes.extend(lines[..keep].concat());
+            std::fs::write(journal_path(&torn_path), bytes).unwrap();
+            let mut reloaded = ToolCallLedger::load_bound(&torn_path, "sess_torn").unwrap();
+            for id in ["done-0", "done-1"] {
+                if !reloaded.records().contains_key(id) {
+                    assert!(
+                        refusal(&mut reloaded, id, policy).is_some(),
+                        "{id} unprotected after keeping {keep} of {} lines",
+                        lines.len()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn g16_a_snapshot_without_tombstone_fields_still_loads() {
+        let mut ledger: ToolCallLedger =
+            serde_json::from_str(r#"{"session_id":"s","lineage_id":"l","records":{}}"#).unwrap();
+        assert!(!ledger.tombstones_saturated);
+        assert_eq!(
+            refusal(&mut ledger, "any", ReplayPolicy::NeverAutoReplay),
+            None
+        );
+    }
+
+    #[test]
+    fn g16_tombstone_hashes_are_pinned() {
+        // Persisted values: changing the hash orphans every stored ledger.
+        // First eight bytes of `printf 'call-1' | sha256sum`.
+        assert_eq!(tombstone_hash("call-1"), 0x5d7963c4f471e142);
+    }
+
+    #[test]
+    fn g16_an_evicted_safe_read_may_run_again() {
+        let mut ledger = ToolCallLedger::new("sess_prune", "lin_prune");
+        let args = json!({"path": "a"});
+        let safe = ReplayPolicy::SafeToReplay;
+        ledger.record_start_with_policy("read-0", "read", &args, safe);
+        ledger.record_unknown_outcome("read-0", "lost");
+        for n in 0..=MAX_TERMINAL_RECORDS {
+            let id = format!("done-{n}");
+            ledger.record_start_with_policy(&id, "read", &args, safe);
+            ledger.record_completion(&id, "ok", false);
+        }
+        assert!(!ledger.records().contains_key("read-0"), "pruned");
+        // Re-running a read is harmless, so it is not tombstoned.
+        assert_eq!(
+            ledger
+                .reserve_call_with_policy("read-0", "read", &args, safe)
+                .unwrap(),
+            ReservationOutcome::Reserved
         );
     }
 

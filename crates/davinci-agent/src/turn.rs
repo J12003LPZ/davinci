@@ -3102,7 +3102,7 @@ Issue the call again if it is still needed.";
                 } else if structured.is_some() && name.starts_with("mcp__") {
                     match context.mcp.resolve_tool(name) {
                         Some((server, tool)) => {
-                            context.mcp.call_full(&server, &tool, args).map(|full| {
+                            context.mcp.call_full(&server, &tool, args, id).map(|full| {
                                 let unsupported = full.content.iter().any(|block| {
                                     block.kind != "text"
                                         && !(block.kind == "resource" && block.resource.as_ref()
@@ -3189,11 +3189,7 @@ Issue the call again if it is still needed.";
                     Err(crate::tools::ToolError::Durability(error)) => {
                         self.tool_durability_failure(error)
                     }
-                    Err(err) => crate::ToolResult {
-                        content: err.to_string(),
-                        is_error: true,
-                        details: None,
-                    },
+                    Err(err) => err.into_tool_result(name),
                 };
 
                 if let Some(receipt) = context
@@ -3476,7 +3472,17 @@ Issue the call again if it is still needed.";
         if !journal_authoritative {
             if let Ok(mut ledger) = self.tool_ledger.lock() {
                 if outcome.is_error {
-                    ledger.record_failure(id, &outcome.content);
+                    let unknown = outcome
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("outcome_unknown"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if unknown {
+                        ledger.record_unknown_outcome(id, &outcome.content);
+                    } else {
+                        ledger.record_failure(id, &outcome.content);
+                    }
                 } else {
                     ledger.record_completion(id, &outcome.content, false);
                 }
@@ -8742,6 +8748,216 @@ mod operation_dispatch_tests {
         assert_eq!(
             attempt.effect_status(),
             crate::runtime::operations::EffectStatus::NotStarted
+        );
+    }
+
+    /// An agent with one MCP server, `rec`, whose `effect` tool is served by
+    /// `transport`.
+    fn mcp_agent(
+        transport: impl davinci_mcp::RpcTransport + 'static,
+    ) -> (Agent, tempfile::TempDir, Arc<OperationJournal>) {
+        let (mut agent, workspace, journal) = configured_agent();
+        agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+        agent.attach_mcp(crate::mcp::McpRegistry::with_test_transport(
+            "rec",
+            Box::new(transport),
+        ));
+        (agent, workspace, journal)
+    }
+
+    fn recorded_ids(calls: &Arc<std::sync::Mutex<Vec<serde_json::Value>>>) -> Vec<String> {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|params| {
+                params["_meta"][davinci_mcp::INVOCATION_ID_META_KEY]
+                    .as_str()
+                    .unwrap_or("<none>")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn g12_a_direct_mcp_call_carries_its_tool_call_id_to_the_server() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (agent, workspace, _journal) =
+            mcp_agent(crate::mcp::test_support::RecordingTransport {
+                calls: calls.clone(),
+                lose_reply: false,
+            });
+        let args = json!({});
+        assert!(matches!(
+            agent.prepare_tool_call(
+                workspace.path(),
+                "direct-mcp-1",
+                "mcp__rec__effect",
+                &args,
+                0
+            ),
+            Preparation::Ready { .. }
+        ));
+        let result = agent.run_prepared_call(
+            workspace.path(),
+            "direct-mcp-1",
+            "mcp__rec__effect",
+            &args,
+            0,
+        );
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(recorded_ids(&calls), ["direct-mcp-1"]);
+    }
+
+    #[test]
+    fn g12_a_batched_mcp_call_carries_its_own_child_call_id_to_the_server() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (agent, workspace, journal) = mcp_agent(crate::mcp::test_support::RecordingTransport {
+            calls: calls.clone(),
+            lose_reply: false,
+        });
+        let args = json!({"operations": [{"tool": "mcp__rec__effect", "args": {}}]});
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), "batch-mcp-1", "batch", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        let result = agent.run_prepared_call(workspace.path(), "batch-mcp-1", "batch", &args, 0);
+        assert!(!result.is_error, "{}", result.content);
+        // The id the server sees is the one the batch gave that child: the
+        // parent's tool-call id and the child's position.
+        assert_eq!(recorded_ids(&calls), ["batch-mcp-1#1"]);
+        assert_eq!(journal.snapshot().unwrap().operations.len(), 2);
+    }
+
+    /// Commits the effect, then cancels the agent's run the way a user does
+    /// mid-call, and never produces a reply: the connection reports that no
+    /// reply arrived. Every `tools/call` is counted, resends included.
+    struct CommitThenCancel {
+        token: crate::runtime::CancellationToken,
+        calls: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl davinci_mcp::RpcTransport for CommitThenCancel {
+        fn call(
+            &mut self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> davinci_mcp::Result<serde_json::Value> {
+            match method {
+                "initialize" => Ok(json!({
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {"tools": {}}
+                })),
+                "tools/list" => Ok(json!({
+                    "tools": [{"name": "effect", "inputSchema": {"type": "object"}}]
+                })),
+                "tools/call" => {
+                    self.calls.lock().unwrap().push(params);
+                    self.token.cancel();
+                    Err(davinci_mcp::Error::Transport(
+                        "no reply before the call was cancelled".into(),
+                    ))
+                }
+                other => Err(davinci_mcp::Error::Protocol(format!("unexpected {other}"))),
+            }
+        }
+
+        fn notify(&mut self, _: &str, _: serde_json::Value) -> davinci_mcp::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn g14_a_cancel_after_the_effect_committed_reaches_the_model_as_unknown_and_is_not_resent() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut configured, workspace, journal) = configured_agent();
+        let token = configured
+            .runtime
+            .as_ref()
+            .unwrap()
+            .cancellation_token
+            .clone();
+        configured.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+        configured.attach_mcp(crate::mcp::McpRegistry::with_test_transport(
+            "rec",
+            Box::new(CommitThenCancel {
+                token: token.clone(),
+                calls: calls.clone(),
+            }),
+        ));
+        let agent = configured;
+        let args = json!({});
+        let id = "g14-agent";
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), id, "mcp__rec__effect", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        let result = agent.run_prepared_call(workspace.path(), id, "mcp__rec__effect", &args, 0);
+
+        assert!(token.is_cancelled(), "the run was cancelled mid-call");
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("Outcome unknown"),
+            "{}",
+            result.content
+        );
+        assert!(result.content.contains("not retried"), "{}", result.content);
+        assert_eq!(
+            result
+                .details
+                .as_ref()
+                .and_then(|d| d.get("outcome_unknown")),
+            Some(&json!(true)),
+            "the model-visible result is the unknown outcome, not a failure"
+        );
+        assert_eq!(recorded_ids(&calls), [id], "exactly one tools/call");
+
+        // The journal keeps the attempt open with a possible effect, so the
+        // call is not a confirmed failure that something may retry.
+        let snapshot = journal.snapshot().unwrap();
+        let attempt = &snapshot.attempts[0];
+        assert_ne!(attempt.state(), OperationState::Succeeded);
+        assert!(
+            matches!(
+                attempt.effect_status(),
+                crate::runtime::operations::EffectStatus::Possible
+                    | crate::runtime::operations::EffectStatus::Unknown
+                    | crate::runtime::operations::EffectStatus::EffectsObserved
+            ),
+            "{:?}",
+            attempt.effect_status()
+        );
+        // Delivering the same call id again does not send it again.
+        let again = agent.run_prepared_call(workspace.path(), id, "mcp__rec__effect", &args, 0);
+        assert!(again.is_error);
+        assert_eq!(recorded_ids(&calls), [id], "still exactly one tools/call");
+    }
+
+    #[test]
+    fn g14_a_cancel_before_dispatch_sends_nothing() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (agent, workspace, _journal) =
+            mcp_agent(crate::mcp::test_support::RecordingTransport {
+                calls: calls.clone(),
+                lose_reply: false,
+            });
+        let args = json!({});
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), "g14-early", "mcp__rec__effect", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        agent.runtime.as_ref().unwrap().cancel();
+        let result =
+            agent.run_prepared_call(workspace.path(), "g14-early", "mcp__rec__effect", &args, 0);
+        assert!(result.is_error);
+        assert!(
+            !result.content.contains("Outcome unknown"),
+            "{}",
+            result.content
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "nothing reached the server"
         );
     }
 
