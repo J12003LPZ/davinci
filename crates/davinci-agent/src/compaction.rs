@@ -1564,6 +1564,63 @@ mod tests {
     }
 
     #[test]
+    fn b3_compaction_of_an_interrupted_turn_never_splits_a_call_from_its_result() {
+        let call = |id: &str| MessageContent::ToolCall {
+            id: id.into(),
+            name: "write".into(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+        };
+        // The interrupted turn: two calls, one answered, one closed by the
+        // recovery result a resumed session inserts.
+        let messages = vec![
+            ChatMessage::text("user", "old request ".repeat(40)),
+            ChatMessage::text("assistant", "old reply ".repeat(40)),
+            ChatMessage::text("user", "write both files"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: vec![call("c1"), call("c2")],
+                tool_call_id: None,
+                tool_name: None,
+                is_error: None,
+                extra: Default::default(),
+            },
+            ChatMessage::tool_result("c1", "write", "done ".repeat(60), false),
+            ChatMessage::tool_result("c2", "write", "Outcome unknown: not re-run.", true),
+            ChatMessage::text("user", "continue"),
+        ];
+        let mut compacted_any = false;
+        for keep_recent_tokens in [1, 5, 20, 60, 120, 400, 5_000] {
+            let result = compact_messages_with(&messages, None, keep_recent_tokens);
+            compacted_any |= result.compacted;
+            let mut called = std::collections::HashSet::new();
+            let mut answered = std::collections::HashSet::new();
+            for message in &result.messages {
+                for content in &message.content {
+                    if let MessageContent::ToolCall { id, .. } = content {
+                        called.insert(id.clone());
+                    }
+                }
+                if message.role == "toolResult" {
+                    let id = message.tool_call_id.clone().unwrap();
+                    assert!(
+                        called.contains(&id),
+                        "keep={keep_recent_tokens}: result {id} lost its call"
+                    );
+                    answered.insert(id);
+                }
+            }
+            assert_eq!(
+                called, answered,
+                "keep={keep_recent_tokens}: a kept call has no result"
+            );
+        }
+        assert!(
+            compacted_any,
+            "the fixture never compacted, so it proves nothing"
+        );
+    }
+
+    #[test]
     fn find_cut_point_keeps_recent_tokens_and_skips_tool_results() {
         let messages = vec![
             ChatMessage::text("user", "one two three four five six seven eight"),

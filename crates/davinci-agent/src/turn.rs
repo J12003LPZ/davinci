@@ -7140,6 +7140,247 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    /// Agent with `design_read` (read class, so the parallel lane, unknown to
+    /// the built-in dispatcher) and `fixture` (class other, so a serial
+    /// barrier) both routed to `executor`.
+    fn pairing_agent(
+        mode: crate::PermissionMode,
+        executor: impl Fn(&str, &Value) -> crate::ToolResult + Send + Sync + 'static,
+    ) -> Agent {
+        let mut agent = Agent::new("pairing fixture");
+        agent.tools = vec!["design_read".into(), "fixture".into(), "write".into()];
+        agent.permissions = Arc::new(crate::PermissionState::new(crate::PermissionPolicy::new(
+            mode,
+        )));
+        agent.custom_tool_executor = Some(crate::CustomToolExecutor::new(move |_, name, args| {
+            Ok(executor(name, args))
+        }));
+        agent
+    }
+
+    fn ok_result(content: impl Into<String>) -> crate::ToolResult {
+        crate::ToolResult {
+            content: content.into(),
+            is_error: false,
+            details: None,
+        }
+    }
+
+    /// (call id, is_error, text) of every tool result message, in order.
+    fn paired(messages: &[ChatMessage]) -> Vec<(String, bool, String)> {
+        messages
+            .iter()
+            .map(|m| {
+                (
+                    m.tool_call_id.clone().expect("tool result without call id"),
+                    m.is_error == Some(true),
+                    content_text(&m.content),
+                )
+            })
+            .collect()
+    }
+
+    fn end_count(events: &[AgentEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
+            .count()
+    }
+
+    #[test]
+    fn b2_reverse_completion_pairs_each_result_to_its_call_id_in_call_order() {
+        let root = tempdir().unwrap();
+        let finished = Arc::new(Mutex::new(Vec::new()));
+        let record = finished.clone();
+        let mut agent = pairing_agent(crate::PermissionMode::AlwaysApprove, move |_, args| {
+            let tag = args["tag"].as_str().unwrap().to_owned();
+            if tag == "slow" {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            record.lock().unwrap().push(tag.clone());
+            ok_result(format!("result-of-{tag}"))
+        });
+        let calls = vec![
+            (
+                "c-slow".into(),
+                "design_read".into(),
+                json!({"tag": "slow"}),
+            ),
+            (
+                "c-fast".into(),
+                "design_read".into(),
+                json!({"tag": "fast"}),
+            ),
+        ];
+        let mut events = Vec::new();
+        let messages = agent.execute_tool_batch(root.path(), calls, &mut events);
+
+        assert_eq!(
+            *finished.lock().unwrap(),
+            ["fast", "slow"],
+            "the fixture must complete in reverse call order"
+        );
+        assert_eq!(
+            paired(&messages),
+            [
+                ("c-slow".into(), false, "result-of-slow".into()),
+                ("c-fast".into(), false, "result-of-fast".into()),
+            ]
+        );
+        assert_eq!(end_count(&events), 2);
+    }
+
+    #[test]
+    fn b2_a_denied_call_does_not_stop_its_sibling_and_pairing_holds() {
+        // Policy: a per-call permission denial is that call's error result only.
+        // Siblings in the same message still run; only a cancelling denial
+        // (the approver aborting the turn) stops the rest.
+        let root = tempdir().unwrap();
+        let mut agent = pairing_agent(crate::PermissionMode::ReadOnly, |_, _| ok_result("ran"));
+        let calls = vec![
+            (
+                "c-write".into(),
+                "write".into(),
+                json!({"path": "denied.txt", "content": "x"}),
+            ),
+            ("c-read".into(), "design_read".into(), json!({})),
+        ];
+        let mut events = Vec::new();
+        let messages = agent.execute_tool_batch(root.path(), calls, &mut events);
+
+        let got = paired(&messages);
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].0.as_str(), got[0].1), ("c-write", true));
+        assert_eq!(got[1], ("c-read".into(), false, "ran".into()));
+        assert!(!root.path().join("denied.txt").exists());
+        assert_eq!(end_count(&events), 2);
+    }
+
+    #[test]
+    fn b2_an_invalid_call_next_to_a_valid_one_errors_alone() {
+        let root = tempdir().unwrap();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counter = ran.clone();
+        let mut agent = pairing_agent(crate::PermissionMode::AlwaysApprove, move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            ok_result("valid ran")
+        });
+        let calls = vec![
+            (
+                "c-bad".into(),
+                "design_read".into(),
+                json!({"__davinci_invalid_arguments": r#"{"path":"#}),
+            ),
+            ("c-good".into(), "design_read".into(), json!({})),
+        ];
+        let mut events = Vec::new();
+        let messages = agent.execute_tool_batch(root.path(), calls, &mut events);
+
+        let got = paired(&messages);
+        assert_eq!((got[0].0.as_str(), got[0].1), ("c-bad", true));
+        assert!(got[0].2.contains("not valid JSON"), "{}", got[0].2);
+        assert_eq!(got[1], ("c-good".into(), false, "valid ran".into()));
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "only the valid call runs");
+        assert_eq!(end_count(&events), 2);
+    }
+
+    #[test]
+    fn b2_cancel_mid_batch_gives_every_call_exactly_one_result() {
+        let root = tempdir().unwrap();
+        let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trigger = abort.clone();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counter = ran.clone();
+        let mut agent = pairing_agent(crate::PermissionMode::AlwaysApprove, move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            trigger.store(true, Ordering::SeqCst);
+            ok_result("first finished")
+        });
+        agent.abort_signal = Some(abort);
+        let calls = ["c1", "c2", "c3"]
+            .map(|id| (id.to_owned(), "fixture".to_owned(), json!({"id": id})))
+            .to_vec();
+        let mut events = Vec::new();
+        let messages = agent.execute_tool_batch(root.path(), calls, &mut events);
+
+        let got = paired(&messages);
+        assert_eq!(
+            got.iter().map(|g| g.0.as_str()).collect::<Vec<_>>(),
+            ["c1", "c2", "c3"],
+            "no orphan tool_use and no duplicate result"
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "later calls never dispatch");
+        assert!(!got[0].1);
+        assert!(got[1].1 && got[2].1, "skipped calls are error results");
+        assert_eq!(end_count(&events), 3);
+    }
+
+    #[test]
+    fn b2_mutating_calls_run_one_at_a_time_in_call_order() {
+        // Policy (scheduler.rs): anything that is not read-class is a barrier
+        // that runs alone, after earlier calls and before later ones.
+        let root = tempdir().unwrap();
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (l, p, o) = (live.clone(), peak.clone(), order.clone());
+        let mut agent = pairing_agent(crate::PermissionMode::AlwaysApprove, move |_, args| {
+            let now = l.fetch_add(1, Ordering::SeqCst) + 1;
+            p.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            o.lock()
+                .unwrap()
+                .push(args["id"].as_str().unwrap().to_owned());
+            l.fetch_sub(1, Ordering::SeqCst);
+            ok_result("done")
+        });
+        let calls = ["m1", "m2", "m3"]
+            .map(|id| (id.to_owned(), "fixture".to_owned(), json!({"id": id})))
+            .to_vec();
+        let mut events = Vec::new();
+        let messages = agent.execute_tool_batch(root.path(), calls, &mut events);
+
+        assert_eq!(peak.load(Ordering::SeqCst), 1, "mutating calls overlapped");
+        assert_eq!(*order.lock().unwrap(), ["m1", "m2", "m3"]);
+        assert_eq!(paired(&messages).len(), 3);
+    }
+
+    #[test]
+    fn b2_an_oversize_result_is_truncated_and_stays_paired_to_its_call() {
+        let root = tempdir().unwrap();
+        let huge: String = (0..20_000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(root.path().join("huge.txt"), &huge).unwrap();
+        std::fs::write(root.path().join("small.txt"), "tiny\n").unwrap();
+        let mut agent = Agent::new("output cap fixture");
+        agent.tools = vec!["read".into()];
+        agent.permissions = Arc::new(crate::PermissionState::new(crate::PermissionPolicy::new(
+            crate::PermissionMode::AlwaysApprove,
+        )));
+        let calls = vec![
+            ("c-huge".into(), "read".into(), json!({"path": "huge.txt"})),
+            (
+                "c-small".into(),
+                "read".into(),
+                json!({"path": "small.txt"}),
+            ),
+        ];
+        let mut events = Vec::new();
+        let messages = agent.execute_tool_batch(root.path(), calls, &mut events);
+
+        let got = paired(&messages);
+        assert_eq!(got[0].0, "c-huge");
+        assert!(!got[0].1);
+        assert!(
+            got[0].2.len() < huge.len() / 2,
+            "huge result was not capped: {} of {} bytes",
+            got[0].2.len(),
+            huge.len()
+        );
+        assert!(!got[0].2.contains("line 19999"), "tail leaked past the cap");
+        assert_eq!(got[1].0, "c-small");
+        assert!(got[1].2.contains("tiny"), "{}", got[1].2);
+    }
+
     #[test]
     fn existing_serialized_agent_event_json_is_unchanged() {
         let event = AgentEvent::ToolExecutionStart {

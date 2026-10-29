@@ -924,6 +924,65 @@ mod tests {
     }
 
     #[test]
+    fn b3_open_leaves_a_torn_tail_on_disk_and_the_first_append_preserves_its_bytes() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/work", None).unwrap();
+        session
+            .append_entry(SessionEntry::message("user", serde_json::json!("one")))
+            .unwrap();
+        let path = session.path.clone();
+        drop(session);
+        let torn: &[u8] = b"{\"kind\":\"entry\",\"seq\":9,\"entry\":{\"id\":\"to";
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(torn);
+        fs::write(&path, &bytes).unwrap();
+
+        let mut reopened = JsonlSession::open(&path).unwrap();
+        assert_eq!(reopened.entries.len(), 1);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "open must not rewrite the file before the user's next append"
+        );
+
+        reopened
+            .append_entry(SessionEntry::message("user", serde_json::json!("two")))
+            .unwrap();
+        drop(reopened);
+        let backups: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains(".torn-"))
+            .collect();
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert_eq!(fs::read(&backups[0]).unwrap(), torn);
+        assert_eq!(JsonlSession::open(&path).unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn b3_a_fork_is_a_new_session_that_records_its_parent() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/work", None).unwrap();
+        session
+            .append_entry(SessionEntry::message("user", serde_json::json!("one")))
+            .unwrap();
+        let leaf = session.leaf_id.clone().unwrap();
+        let fork = session.fork(&leaf, &dir.path().join("forks")).unwrap();
+        assert_ne!(fork.header.id, session.header.id);
+        assert_ne!(fork.path, session.path);
+        assert_eq!(
+            fork.header.parent_session_id.as_deref(),
+            Some(session.header.id.as_str())
+        );
+        // Sidecar state (tool ledger, operation journal rows) is keyed by the
+        // session id and path, neither of which the fork shares.
+        assert_ne!(
+            fork.path.with_extension("tool-ledger.json"),
+            session.path.with_extension("tool-ledger.json")
+        );
+    }
+
+    #[test]
     fn append_after_torn_tail_does_not_glue_lines() {
         let dir = tempdir().unwrap();
         let mut session = JsonlSession::create(dir.path(), "/work", None).unwrap();
