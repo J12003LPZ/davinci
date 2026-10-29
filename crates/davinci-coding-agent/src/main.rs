@@ -38,6 +38,7 @@ mod experimental {
         Pi {
             options: Args,
             listen: Vec<UnixAddress>,
+            auth: Option<ExperimentalAuth>,
         },
         Server {
             listen: Vec<UnixAddress>,
@@ -69,7 +70,7 @@ mod experimental {
     ) -> Result<Option<String>, String> {
         Ok(None)
     }
-    pub fn bind_listen_addresses(_: &[UnixAddress]) -> Result<String, String> {
+    pub fn bind_listen_addresses(_: &[UnixAddress], _: Option<&str>) -> Result<String, String> {
         Ok(String::new())
     }
     pub fn run_server(_: ServerCommand) -> Result<String, String> {
@@ -91,6 +92,7 @@ mod experimental {
             _ => Ok(ExperimentalCli::Pi {
                 options: parse_args(raw),
                 listen: vec![],
+                auth: None,
             }),
         }
     }
@@ -524,10 +526,13 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
                 return Ok(0);
             }
             experimental::ExperimentalCli::Pi {
-                listen, options, ..
+                listen,
+                auth,
+                options,
             } => {
                 if !listen.is_empty() {
-                    let _ = experimental::bind_listen_addresses(&listen)?;
+                    let token = experimental::resolve_experimental_auth(auth)?;
+                    let _ = experimental::bind_listen_addresses(&listen, token.as_deref())?;
                 }
                 options
             }

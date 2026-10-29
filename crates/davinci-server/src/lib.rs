@@ -5,7 +5,6 @@ mod unix;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -1041,8 +1040,11 @@ pub fn require_auth_token(token: Option<&str>) -> Result<&str, ServerError> {
     })
 }
 
-/// Length check, then XOR-accumulate over every byte so the time does not
-/// depend on where the first mismatch is.
+/// Constant time in the token contents. The only early exit is the length
+/// comparison, which leaks the length alone. After it, every byte pair is
+/// XORed and OR-folded into one accumulator with no data-dependent branch, so
+/// the work done is the same wherever (or whether) the inputs differ. A plain
+/// `==` on slices stops at the first mismatching byte.
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     left.len() == right.len()
         && left
@@ -1082,10 +1084,22 @@ fn read_auth_line<R: Read>(stream: &mut R) -> Result<Vec<u8>, ServerError> {
     Ok(buf)
 }
 
-pub fn bind_tcp(addr: &str) -> Result<TcpListener, ServerError> {
-    TcpListener::bind(addr).map_err(|err| ServerError::Io(err.to_string()))
-}
-
+/// The only way to serve a connection from outside this crate: it reads the
+/// auth preamble and refuses a missing or empty token before any protocol byte
+/// is decoded. The unauthenticated `serve_stream` is crate-private.
+///
+/// ```
+/// use davinci_server::{serve_stream_with_auth, PiServer};
+/// let mut server = PiServer::new(std::env::temp_dir());
+/// let stream = std::io::Cursor::new(Vec::<u8>::new());
+/// assert!(serve_stream_with_auth(&mut server, stream, None).is_err());
+/// ```
+///
+/// ```compile_fail
+/// use davinci_server::{serve_stream, PiServer};
+/// let mut server = PiServer::new(std::env::temp_dir());
+/// let _ = serve_stream(&mut server, std::io::Cursor::new(Vec::<u8>::new()));
+/// ```
 pub fn serve_stream_with_auth<S: Read + Write>(
     server: &mut PiServer,
     mut stream: S,
@@ -1097,7 +1111,7 @@ pub fn serve_stream_with_auth<S: Read + Write>(
     serve_stream(server, stream)
 }
 
-pub fn serve_stream<S: Read + Write>(
+pub(crate) fn serve_stream<S: Read + Write>(
     server: &mut PiServer,
     mut stream: S,
 ) -> Result<(), ServerError> {

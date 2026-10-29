@@ -254,10 +254,16 @@ pub fn resolve_experimental_auth(auth: Option<ExperimentalAuth>) -> Result<Optio
     }
 }
 
-pub fn bind_listen_addresses(listen: &[UnixAddress]) -> Result<String, String> {
+/// Binding a listening socket without a token would leave an open, unauthenticated
+/// endpoint, so a nonempty token is required before anything is bound.
+pub fn bind_listen_addresses(
+    listen: &[UnixAddress],
+    auth_token: Option<&str>,
+) -> Result<String, String> {
     if listen.is_empty() {
         return Ok(String::new());
     }
+    require_auth_token(auth_token).map_err(|err| err.to_string())?;
     if std::env::var("PI_SERVER_DRY_RUN").is_ok() || cfg!(test) {
         return Ok(format!(
             "Listening on {}",
@@ -476,6 +482,19 @@ mod tests {
             let error = run_server(command).unwrap_err();
             assert!(error.contains("auth token"), "{error}");
         }
+    }
+
+    #[test]
+    fn pi_listen_refuses_to_bind_without_a_nonempty_token() {
+        let listen = vec![UnixAddress {
+            path: "/tmp/pi.sock".into(),
+        }];
+        for token in [None, Some("")] {
+            let error = bind_listen_addresses(&listen, token).unwrap_err();
+            assert!(error.contains("auth token"), "{error}");
+        }
+        assert!(bind_listen_addresses(&listen, Some("secret")).is_ok());
+        assert_eq!(bind_listen_addresses(&[], None).unwrap(), "");
     }
 
     #[test]

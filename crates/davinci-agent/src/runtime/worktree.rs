@@ -115,6 +115,19 @@ fn path_key(path: &Path) -> String {
     }
 }
 
+/// Git prints raw bytes; Windows paths from git are UTF-8.
+fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -552,13 +565,28 @@ impl WorktreeManager {
             if lease.path.exists() {
                 left_path = Some(lease.path.clone());
             }
-        } else if self.is_registered(&lease.path).unwrap_or(false) {
-            // The directory is gone but git still lists it.
-            if let Err(error) = run_git(&self.repo_root, &["worktree", "prune"]) {
-                details.push(error.to_string());
-            }
-            if self.is_registered(&lease.path).unwrap_or(false) {
-                left_path = Some(lease.path.clone());
+        } else {
+            // The directory is gone; git may still list it. A failed check is
+            // not proof of absence, so it keeps the lease like a leftover does.
+            match self.is_registered(&lease.path) {
+                Ok(false) => {}
+                Ok(true) => {
+                    if let Err(error) = run_git(&self.repo_root, &["worktree", "prune"]) {
+                        details.push(error.to_string());
+                    }
+                    match self.is_registered(&lease.path) {
+                        Ok(false) => {}
+                        Ok(true) => left_path = Some(lease.path.clone()),
+                        Err(error) => {
+                            details.push(error.to_string());
+                            left_path = Some(lease.path.clone());
+                        }
+                    }
+                }
+                Err(error) => {
+                    details.push(error.to_string());
+                    left_path = Some(lease.path.clone());
+                }
             }
         }
 
@@ -668,25 +696,52 @@ impl WorktreeManager {
         Ok(orphans)
     }
 
+    /// `Ok(false)` only when git reports the ref missing (exit 1, no message).
+    /// Any other failure is an error: a broken check is not an absent branch.
     fn branch_exists(&self, branch: &str) -> Result<bool, WorktreeError> {
-        Command::new("git")
+        let output = Command::new("git")
             .current_dir(&self.repo_root)
             .args(["-c", "safe.bareRepository=explicit"])
             .args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("refs/heads/{branch}"))
             .output()
-            .map(|output| output.status.success())
-            .map_err(|e| WorktreeError::GitError(format!("Failed to execute git: {e}")))
+            .map_err(|e| WorktreeError::GitError(format!("Failed to execute git: {e}")))?;
+        if output.status.success() {
+            return Ok(true);
+        }
+        if output.status.code() == Some(1) && output.stderr.iter().all(u8::is_ascii_whitespace) {
+            return Ok(false);
+        }
+        Err(WorktreeError::GitError(format!(
+            "cannot check branch {branch} (status {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
     }
 
     /// Whether git still lists `path` as a worktree of the repository.
+    /// Reads the NUL-separated listing: plain `--porcelain` quotes unusual
+    /// path characters, which would never compare equal to the real path.
     fn is_registered(&self, path: &Path) -> Result<bool, WorktreeError> {
-        let listing = run_git(&self.repo_root, &["worktree", "list", "--porcelain"])?;
+        let output = Command::new("git")
+            .current_dir(&self.repo_root)
+            .args(["-c", "safe.bareRepository=explicit"])
+            .args(["worktree", "list", "--porcelain", "-z"])
+            .output()
+            .map_err(|e| WorktreeError::GitError(format!("Failed to execute git: {e}")))?;
+        if !output.status.success() {
+            return Err(WorktreeError::GitError(format!(
+                "cannot list worktrees (status {:?}): {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
         let wanted = path_key(path);
-        Ok(listing
-            .lines()
-            .filter_map(|line| line.strip_prefix("worktree "))
-            .any(|listed| path_key(Path::new(listed)) == wanted))
+        Ok(output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter_map(|field| field.strip_prefix(b"worktree "))
+            .any(|listed| path_key(&path_from_git_bytes(listed)) == wanted))
     }
 
     pub fn repo_root(&self) -> &Path {
@@ -1115,6 +1170,100 @@ mod tests {
         assert!(!lease.path.exists());
         assert!(!branch_exists(repo_dir.path(), &lease.branch));
         assert!(manager.get_lease(&lease.path).is_none());
+    }
+
+    /// Git prints unusual path characters quoted in plain `--porcelain`; a
+    /// locked worktree under such a path must still be recognised as owned.
+    #[test]
+    fn a_locked_worktree_under_a_path_git_quotes_is_still_recognised() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        // A user-level `core.quotePath=false` would hide the quoting.
+        git_in(repo_dir.path(), &["config", "core.quotePath", "true"]);
+        // Windows filenames cannot hold a double quote, which is what forces
+        // git to quote the path on every platform that allows it.
+        let name = if cfg!(unix) {
+            "sp ace \"q\" \u{e9}\u{4e16}"
+        } else {
+            "sp ace \u{e9}\u{4e16}"
+        };
+        let root = wt_dir.path().join(name);
+        let manager = WorktreeManager::new(repo_dir.path(), &root);
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        let plain = run_git(repo_dir.path(), &["worktree", "list", "--porcelain"]).unwrap();
+        if cfg!(unix) {
+            assert!(plain.contains("\\\""), "git must quote this path: {plain}");
+        }
+        assert!(manager.is_registered(&lease.path).unwrap());
+        git_in(
+            repo_dir.path(),
+            &["worktree", "lock", lease.path.to_str().unwrap()],
+        );
+
+        let err = manager.release_lease(&lease, true).unwrap_err();
+        assert!(
+            matches!(err, WorktreeError::CleanupIncomplete { .. }),
+            "{err:?}"
+        );
+        assert!(lease.path.join("README.md").exists(), "locked files stay");
+        assert_eq!(manager.get_lease(&lease.path).as_ref(), Some(&lease));
+
+        git_in(
+            repo_dir.path(),
+            &["worktree", "unlock", lease.path.to_str().unwrap()],
+        );
+        manager.release_lease(&lease, true).unwrap();
+        assert!(!lease.path.exists());
+    }
+
+    /// A git command that fails is not evidence that the thing is gone.
+    #[test]
+    fn a_failing_inspection_keeps_the_lease_instead_of_assuming_absence() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        // Directory already gone, registration and branch still present.
+        std::fs::remove_dir_all(&lease.path).unwrap();
+        let head_path = repo_dir.path().join(".git").join("HEAD");
+        let head = std::fs::read(&head_path).unwrap();
+        std::fs::write(&head_path, "garbage\n").unwrap();
+
+        let err = manager.release_lease(&lease, true).unwrap_err();
+        match &err {
+            WorktreeError::CleanupIncomplete { path, detail, .. } => {
+                assert!(path.is_some(), "registration state is unknown: {err}");
+                assert!(detail.contains("git"), "names the failed check: {err}");
+            }
+            other => panic!("expected CleanupIncomplete, got {other:?}"),
+        }
+        assert_eq!(manager.get_lease(&lease.path).as_ref(), Some(&lease));
+
+        std::fs::write(&head_path, head).unwrap();
+        manager.release_lease(&lease, true).unwrap();
+        assert!(!branch_exists(repo_dir.path(), &lease.branch));
+        assert!(manager.get_lease(&lease.path).is_none());
+    }
+
+    #[test]
+    fn branch_existence_tells_a_missing_ref_from_a_failed_check() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        assert!(!manager
+            .branch_exists("davinci/agent/never-created")
+            .unwrap());
+        let head_path = repo_dir.path().join(".git").join("HEAD");
+        let head = std::fs::read(&head_path).unwrap();
+        std::fs::write(&head_path, "garbage\n").unwrap();
+        assert!(manager
+            .branch_exists("davinci/agent/never-created")
+            .is_err());
+        std::fs::write(&head_path, head).unwrap();
     }
 
     #[test]

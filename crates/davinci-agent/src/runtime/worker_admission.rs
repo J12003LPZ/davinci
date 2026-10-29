@@ -153,31 +153,33 @@ impl WorkerAdmission {
             ));
         }
         state.waiting_workers += 1;
+        let mut waiter = QueuedWaiter(Some(state));
         let deadline = Instant::now() + self.0.wait_timeout;
+        // Order matters: cancellation, then the deadline, then capacity, so a
+        // waiter that already expired is never admitted by a late release.
         loop {
             if cancelled() {
-                state.waiting_workers -= 1;
                 return Err("worker cancelled while waiting for local resources".into());
-            }
-            if fits(state.reserved_bytes) {
-                state.waiting_workers -= 1;
-                return Ok(self.reserve(&mut state, bytes));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                state.waiting_workers -= 1;
                 return Err(format!(
                     "worker timed out after {} ms waiting for local resources \
                      (workerResources limits are estimates, not measured RSS)",
                     self.0.wait_timeout.as_millis()
                 ));
             }
-            state = self
-                .0
-                .changed
-                .wait_timeout(state, remaining.min(Duration::from_millis(50)))
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
+            if fits(waiter.state().reserved_bytes) {
+                return Ok(self.reserve(waiter.state(), bytes));
+            }
+            let parked = waiter.0.take().expect("waiter holds the admission lock");
+            waiter.0 = Some(
+                self.0
+                    .changed
+                    .wait_timeout(parked, remaining.min(Duration::from_millis(50)))
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0,
+            );
         }
     }
     fn reserve(&self, state: &mut WorkerResourceStats, bytes: u64) -> WorkerLease {
@@ -186,6 +188,22 @@ impl WorkerAdmission {
             owner: self.clone(),
             bytes,
             alive: Arc::new(()),
+        }
+    }
+}
+/// A counted queue slot. It owns the admission lock guard so that dropping it
+/// on any exit (admitted, refused, timed out, cancelled, or a panicking
+/// cancellation callback) releases the slot while the lock is still held.
+struct QueuedWaiter<'a>(Option<std::sync::MutexGuard<'a, WorkerResourceStats>>);
+impl QueuedWaiter<'_> {
+    fn state(&mut self) -> &mut WorkerResourceStats {
+        self.0.as_mut().expect("waiter holds the admission lock")
+    }
+}
+impl Drop for QueuedWaiter<'_> {
+    fn drop(&mut self) {
+        if let Some(state) = self.0.as_mut() {
+            state.waiting_workers = state.waiting_workers.saturating_sub(1);
         }
     }
 }
@@ -303,6 +321,55 @@ mod tests {
         let error = admission.acquire_worker(|| true).unwrap_err();
         assert!(error.contains("cancelled"), "{error}");
         assert_eq!(admission.stats().waiting_workers, 0);
+    }
+    #[test]
+    fn a_panicking_cancellation_callback_frees_its_queue_slot() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let admission = bounded(1, 100);
+        let held = admission.acquire_worker(|| false).unwrap();
+        let calls = AtomicUsize::new(0);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            admission.acquire_worker(|| {
+                // False before queueing, then panic while the slot is taken.
+                assert!(calls.fetch_add(1, Ordering::SeqCst) == 0, "callback");
+                false
+            })
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(admission.stats().waiting_workers, 0);
+        // The single slot is reusable: this waiter queues and times out
+        // instead of being refused as "queue is full".
+        let error = admission.acquire_worker(|| false).unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        drop(held);
+        assert!(admission.acquire_worker(|| false).is_ok());
+    }
+    #[test]
+    fn an_expired_deadline_wins_over_capacity_freed_meanwhile() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let admission = bounded(4, 100);
+        let held = admission.acquire_worker(|| false).unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let releaser = std::thread::spawn(move || {
+            release_rx.recv().unwrap();
+            // Blocks on the admission lock until the waiter parks on the condvar.
+            drop(held);
+        });
+        let calls = AtomicUsize::new(0);
+        let result = admission.acquire_worker(|| {
+            match calls.fetch_add(1, Ordering::SeqCst) {
+                0 => {}
+                1 => release_tx.send(()).unwrap(),
+                // Capacity is free by now; outlast the deadline before the check.
+                _ => std::thread::sleep(Duration::from_millis(200)),
+            }
+            false
+        });
+        releaser.join().unwrap();
+        let error = result.expect_err("an expired waiter must not be admitted");
+        assert!(error.contains("timed out"), "{error}");
+        assert_eq!(admission.stats().waiting_workers, 0);
+        assert_eq!(admission.stats().reserved_bytes, 0);
     }
     #[test]
     fn invalid_bounds_are_rejected() {
