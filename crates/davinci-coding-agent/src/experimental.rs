@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use davinci_client::{connect_unix, write_message, PiClient};
 use davinci_server::{
-    bind_unix, encode_auth_preamble, serve_stream_with_auth, BoundUnixListener, PiServer,
+    bind_unix, encode_auth_preamble, require_auth_token, serve_stream_with_auth, BoundUnixListener,
+    PiServer,
 };
 use std::io::Write;
 use std::sync::Mutex;
@@ -364,6 +365,7 @@ pub fn run_server(command: ServerCommand) -> Result<String, String> {
     if command.listen.is_empty() {
         return Err("server requires --listen unix:///absolute/path".into());
     }
+    require_auth_token(command.auth_token.as_deref()).map_err(|err| err.to_string())?;
     if std::env::var("PI_SERVER_DRY_RUN").is_ok() || cfg!(test) {
         return Ok(format!(
             "Listening on {}",
@@ -460,6 +462,20 @@ mod tests {
             parse_client_command(&["--connect".into(), "unix:///tmp/pi.sock".into()]).unwrap();
         assert!(run_client(client).unwrap().contains("unix:///tmp/pi.sock"));
         std::env::remove_var("PI_CLIENT_DRY_RUN");
+    }
+
+    #[test]
+    fn run_server_refuses_to_listen_without_a_nonempty_token() {
+        for token in [None, Some(String::new())] {
+            let command = ServerCommand {
+                listen: vec![UnixAddress {
+                    path: "/tmp/pi.sock".into(),
+                }],
+                auth_token: token,
+            };
+            let error = run_server(command).unwrap_err();
+            assert!(error.contains("auth token"), "{error}");
+        }
     }
 
     #[test]

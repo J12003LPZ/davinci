@@ -891,6 +891,7 @@ mod tests {
         let admission = WorkerAdmission::new(Some(WorkerResourceConfig {
             memory_budget_bytes: 8,
             estimated_worker_bytes: 8,
+            ..Default::default()
         }))
         .unwrap();
         let lease = admission.acquire_worker(|| false).unwrap();
