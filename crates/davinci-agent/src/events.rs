@@ -15,7 +15,7 @@ pub enum AgentEvent {
     /// Harness display metadata; never an assistant message or provider input.
     #[serde(rename = "verification_notice")]
     VerificationNotice {
-        status: crate::CompletionEvidence,
+        status: crate::CompletionStatus,
         generation: u64,
         text: String,
     },

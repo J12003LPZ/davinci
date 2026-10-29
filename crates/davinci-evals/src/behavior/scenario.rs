@@ -96,6 +96,10 @@ pub struct BehaviorScenario {
     pub verification_commands: Vec<VerificationCommand>,
 }
 
+/// The original 200-scenario corpus. It is retained for trace/behavior
+/// scoring, but it is **not** a success-scored corpus: most scenarios reference
+/// files their fixture does not contain and none of them declares a real
+/// correctness oracle. See `behavior::validity` for the classification.
 pub fn load_core_200_corpus() -> Result<Vec<BehaviorScenario>, String> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("fixtures")
@@ -103,22 +107,19 @@ pub fn load_core_200_corpus() -> Result<Vec<BehaviorScenario>, String> {
         .join("core-200.json");
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-    let mut scenarios: Vec<BehaviorScenario> = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
-    for scenario in &mut scenarios {
-        let is_mutating = scenario
-            .requirements
-            .iter()
-            .any(|requirement| matches!(requirement, BehaviorRequirement::FileChanged { .. }));
-        if is_mutating && scenario.verification_commands.is_empty() {
-            scenario.verification_commands.push(VerificationCommand {
-                command: "git diff --check".into(),
-                timeout_seconds: 30,
-                expected_exit: 0,
-            });
-        }
-    }
-    Ok(scenarios)
+    serde_json::from_str(&content).map_err(|e| format!("Failed to parse {}: {e}", path.display()))
+}
+
+/// The success-scored corpus. Every scenario has a real fixture, a failing
+/// reproducer and a meaningful verification command.
+pub fn load_verified_core_corpus() -> Result<Vec<BehaviorScenario>, String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join("behavior")
+        .join("verified-core.json");
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    serde_json::from_str(&content).map_err(|e| format!("Failed to parse {}: {e}", path.display()))
 }
 
 pub fn load_debugging_hard_corpus() -> Result<Vec<BehaviorScenario>, String> {
@@ -448,24 +449,69 @@ mod tests {
     }
 
     #[test]
-    fn mutating_core_scenarios_have_independent_verification() {
+    fn mutating_core_scenarios_are_not_success_scored() {
         let scenarios = load_core_200_corpus().expect("core-200 corpus must load");
         let mut mutating = 0;
-        for scenario in scenarios {
+        for scenario in &scenarios {
             if scenario
                 .requirements
                 .iter()
                 .any(|requirement| matches!(requirement, BehaviorRequirement::FileChanged { .. }))
             {
                 mutating += 1;
-                assert_eq!(scenario.verification_commands.len(), 1);
-                assert_eq!(
-                    scenario.verification_commands[0].command,
-                    "git diff --check"
+                assert!(
+                    scenario.verification_commands.is_empty(),
+                    "{} must not gain an implied oracle",
+                    scenario.id
                 );
             }
         }
         assert_eq!(mutating, 90);
+
+        let report = crate::behavior::validity::CorpusValidityReport::build(
+            "core-200",
+            &scenarios,
+            &crate::behavior::validity::default_fixture_root(),
+        );
+        assert_eq!(report.success_scored_scenarios, 0);
+        assert!(
+            report.structural_only_scenarios + report.invalid_scenarios == scenarios.len(),
+            "every core-200 scenario must be structural-only or invalid"
+        );
+        assert!(report.require_all_verified().is_err());
+    }
+
+    #[test]
+    fn verified_core_scenarios_are_all_success_scored() {
+        let scenarios = load_verified_core_corpus().expect("verified-core corpus must load");
+        assert!(scenarios.len() >= 6);
+        let report = crate::behavior::validity::CorpusValidityReport::build(
+            "verified-core",
+            &scenarios,
+            &crate::behavior::validity::default_fixture_root(),
+        );
+        assert_eq!(report.invalid_scenarios, 0);
+        assert_eq!(report.structural_only_scenarios, 0);
+        assert_eq!(report.success_scored_scenarios, scenarios.len());
+        report.require_all_verified().unwrap();
+        for scenario in &scenarios {
+            assert!(
+                scenario.requirements.iter().any(|requirement| matches!(
+                    requirement,
+                    BehaviorRequirement::FileChanged { .. }
+                )),
+                "{} must require a change",
+                scenario.id
+            );
+            assert!(
+                scenario.requirements.iter().any(|requirement| matches!(
+                    requirement,
+                    BehaviorRequirement::VerificationPassed { kind } if kind == "test"
+                )),
+                "{} must require a passing test oracle",
+                scenario.id
+            );
+        }
     }
 
     #[test]

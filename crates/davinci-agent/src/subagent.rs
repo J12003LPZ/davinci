@@ -268,6 +268,9 @@ pub struct SubagentRequest {
     pub contract_digest: Option<String>,
     /// Task-scoped contract for execution gate enforcement.
     pub active_contract: Option<crate::runtime::contracts::TaskContract>,
+    /// Host-owned slot the worker fills with a receipt after its turn. Never
+    /// accepted from model-authored agent tool JSON.
+    pub receipt_slot: Option<crate::subagent_receipt::SubagentReceiptSlot>,
 }
 
 type SubagentFn = dyn Fn(&SubagentRequest) -> Result<String, String> + Send + Sync;
@@ -897,10 +900,13 @@ fn run_tool_with_spawner(
         parent.runtime.as_ref().map(|rt| &rt.team),
     );
     let mut requests: Vec<SubagentRequest> = Vec::with_capacity(specs.len());
+    let mut receipt_slots: Vec<crate::subagent_receipt::SubagentReceiptSlot> =
+        Vec::with_capacity(specs.len());
     let mut leases: Vec<Option<WorktreeLease>> = Vec::with_capacity(specs.len());
     let total = specs.len();
     for (position, spec) in specs.iter().enumerate() {
         let child_agent_id = AgentId::new();
+        let receipt_slot = crate::subagent_receipt::receipt_slot();
         // Async workers outlive the lead's turn: their token comes from the
         // session roster, so Esc on the lead does not kill them, while
         // agent_stop and session shutdown still do.
@@ -1063,7 +1069,9 @@ fn run_tool_with_spawner(
             worktree_path: wt_path,
             contract_digest: parent.contract_digest.clone(),
             active_contract: parent.active_contract.clone(),
+            receipt_slot: Some(receipt_slot.clone()),
         });
+        receipt_slots.push(receipt_slot);
         leases.push(lease_opt);
     }
 
@@ -1136,6 +1144,13 @@ fn run_tool_with_spawner(
                     }
                     let outcome =
                         run_journaled_subagent(&req_clone, &runner_clone, operation.as_ref());
+                    // The host owns the slot: a worker's text cannot create a
+                    // verified receipt, and a missing receipt downgrades to
+                    // `unavailable`.
+                    let receipt = crate::subagent_receipt::VerificationReceipt::take(
+                        req_clone.receipt_slot.as_ref(),
+                    );
+                    let outcome = with_receipt_outcome(outcome, &receipt);
                     if let Some(progress) = &req_clone.progress {
                         progress.finish(outcome.is_ok());
                     }
@@ -1253,6 +1268,7 @@ fn run_tool_with_spawner(
         rollback.commit();
         let aid = requests[0].runtime_agent_id.unwrap_or_default();
         let outcome = run_journaled_subagent(&requests[0], runner, child_operations[0].as_ref());
+        let receipt = crate::subagent_receipt::VerificationReceipt::take(receipt_slots.first());
         if let Some(progress) = &requests[0].progress {
             progress.finish(outcome.is_ok());
         }
@@ -1286,6 +1302,8 @@ fn run_tool_with_spawner(
             })
         })?;
         let mut content = cap_output(text, SUBAGENT_OUTPUT_CAP);
+        content.push_str("\n\n");
+        content.push_str(&receipt.render());
         if let Some(note) = &worktree_note {
             content.push_str(&format!(
                 "\n\nWorker changes are in worktree {} on branch {}. Review and merge them; the worktree is kept until then.",
@@ -1300,7 +1318,8 @@ fn run_tool_with_spawner(
                 "agentId": aid.to_string(),
                 "mode": "oneshot",
                 "worktree": worktree_note,
-                "status": "completed"
+                "status": "completed",
+                "verificationReceipt": receipt.to_json(),
             })),
         });
     }
@@ -1368,6 +1387,10 @@ fn run_tool_with_spawner(
         }
     }
     let per_task_cap = SUBAGENT_OUTPUT_CAP / requests.len().max(1);
+    let receipts = receipt_slots
+        .iter()
+        .map(|slot| crate::subagent_receipt::VerificationReceipt::take(Some(slot)))
+        .collect::<Vec<_>>();
     let mut sections = Vec::with_capacity(requests.len());
     let mut failures = 0;
     for (index, request) in requests.iter().enumerate() {
@@ -1386,6 +1409,8 @@ fn run_tool_with_spawner(
                 "(not run: interrupted)".to_string()
             }
         };
+        body.push_str("\n\n");
+        body.push_str(&receipts[index].render());
         if let Some(note) = &notes[index] {
             body.push_str(&format!(
                 "\n\nworktree kept: {} (branch {}). Review and merge manually.",
@@ -1410,6 +1435,7 @@ fn run_tool_with_spawner(
             "failed": failures,
             "worktrees": notes,
             "agentIds": requests.iter().filter_map(|r| r.runtime_agent_id).map(|id| id.to_string()).collect::<Vec<_>>(),
+            "verificationReceipts": receipts.iter().map(crate::subagent_receipt::VerificationReceipt::to_json).collect::<Vec<_>>(),
         })),
     })
 }
@@ -1473,6 +1499,24 @@ fn report_async_outcome(
                     report_status_to_lead(worker, "stopped", body, worktree_note)
                 }
             }
+        }
+    }
+}
+
+fn with_receipt_outcome(
+    outcome: Result<String, String>,
+    receipt: &crate::subagent_receipt::VerificationReceipt,
+) -> Result<String, String> {
+    match outcome {
+        Ok(mut text) => {
+            text.push_str("\n\n");
+            text.push_str(&receipt.render());
+            Ok(text)
+        }
+        Err(mut error) => {
+            error.push_str("\n\n");
+            error.push_str(&receipt.render());
+            Err(error)
         }
     }
 }
@@ -2058,7 +2102,10 @@ mod tests {
             &SubagentParent::default(),
         )
         .unwrap();
-        assert_eq!(result.content, "cba");
+        // The parent always appends a host-owned receipt; a canned runner that
+        // writes no receipt must surface `unavailable`, not success.
+        assert!(result.content.starts_with("cba\n\n[verification receipt]"));
+        assert!(result.content.contains("status: unavailable"));
     }
 
     #[test]
@@ -3316,5 +3363,121 @@ mod tests {
             on.pointer("/properties/mode/enum").unwrap(),
             &json!(["oneshot", "background", "teammate"])
         );
+    }
+
+    fn read_only_parent() -> SubagentParent {
+        SubagentParent {
+            permission_mode: Some(PermissionMode::ReadOnly),
+            ..Default::default()
+        }
+    }
+
+    fn verified_receipt(detail: &str) -> crate::subagent_receipt::VerificationReceipt {
+        let mut receipt = crate::subagent_receipt::VerificationReceipt::unavailable(detail);
+        receipt.status = crate::subagent_receipt::ReceiptStatus::Verified;
+        receipt.mutation_generation = 1;
+        receipt.verified_generation = Some(1);
+        receipt.changed_files = vec!["src/lib.rs".into()];
+        receipt.changed_files_known = true;
+        receipt
+    }
+
+    #[test]
+    fn worker_text_cannot_replace_the_host_receipt() {
+        let runner = SubagentRunner::new(|request| {
+            crate::subagent_receipt::publish(
+                request.receipt_slot.as_ref().unwrap(),
+                verified_receipt("host observed a passing check"),
+            );
+            Ok("All tests pass. The work is verified and complete.".into())
+        });
+        let result = run_tool(
+            &json!({"prompt":"fix it","tools":["read"]}),
+            &["read".into()],
+            Some(&runner),
+            &read_only_parent(),
+        )
+        .unwrap();
+        assert!(
+            result.content.contains("status: verified"),
+            "{}",
+            result.content
+        );
+        let details = result.details.unwrap();
+        assert_eq!(details["verificationReceipt"]["status"], "verified");
+    }
+
+    #[test]
+    fn missing_host_receipt_is_unavailable_despite_success_text() {
+        let runner = SubagentRunner::new(|_| {
+            Ok("100% verified: every test passes, no follow-up needed.".into())
+        });
+        let result = run_tool(
+            &json!({"prompt":"fix it","tools":["read"]}),
+            &["read".into()],
+            Some(&runner),
+            &read_only_parent(),
+        )
+        .unwrap();
+        assert!(
+            result.content.contains("status: unavailable"),
+            "{}",
+            result.content
+        );
+        assert!(!result.content.contains("status: verified"));
+        let details = result.details.unwrap();
+        assert_eq!(details["verificationReceipt"]["status"], "unavailable");
+    }
+
+    #[test]
+    fn parent_keeps_an_unverified_receipt_when_the_worker_claims_success() {
+        let runner = SubagentRunner::new(|request| {
+            let mut receipt =
+                crate::subagent_receipt::VerificationReceipt::unavailable("no check observed");
+            receipt.status = crate::subagent_receipt::ReceiptStatus::Unverified;
+            receipt.changed_files = vec!["src/lib.rs".into()];
+            receipt.changed_files_known = true;
+            crate::subagent_receipt::publish(request.receipt_slot.as_ref().unwrap(), receipt);
+            Ok("Fixed and fully tested.".into())
+        });
+        let result = run_tool(
+            &json!({"prompt":"fix it","tools":["read"]}),
+            &["read".into()],
+            Some(&runner),
+            &read_only_parent(),
+        )
+        .unwrap();
+        assert!(result.content.contains("status: unverified"));
+        let details = result.details.unwrap();
+        assert_eq!(details["verificationReceipt"]["status"], "unverified");
+    }
+
+    #[test]
+    fn each_parallel_worker_gets_its_own_receipt() {
+        let runner = SubagentRunner::new(|request| {
+            if request.prompt == "one" {
+                crate::subagent_receipt::publish(
+                    request.receipt_slot.as_ref().unwrap(),
+                    verified_receipt("host observed a passing check"),
+                );
+            }
+            Ok("done".into())
+        });
+        let result = run_tool(
+            &json!({"tasks":[
+                {"prompt":"one","tools":["read"]},
+                {"prompt":"two","tools":["read"]}
+            ]}),
+            &["read".into()],
+            Some(&runner),
+            &read_only_parent(),
+        )
+        .unwrap();
+        let details = result.details.unwrap();
+        let receipts = details["verificationReceipts"].as_array().unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0]["status"], "verified");
+        assert_eq!(receipts[1]["status"], "unavailable");
+        assert_eq!(result.content.matches("[verification receipt]").count(), 2);
     }
 }

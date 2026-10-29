@@ -1438,7 +1438,20 @@ fn parallel_workers_in_one_message_overlap_and_answer_in_order() {
         .filter(|message| message.role == "toolResult")
         .map(|message| content_text(&message.content))
         .collect();
-    assert_eq!(results, ["answer:one", "answer:two", "answer:three"]);
+    assert_eq!(results.len(), 3);
+    for (result, expected) in results
+        .iter()
+        .zip(["answer:one", "answer:two", "answer:three"])
+    {
+        assert!(
+            result.starts_with(expected),
+            "expected {expected}, got {result}"
+        );
+        assert!(
+            result.contains("[verification receipt] status: unavailable"),
+            "a worker with no host observation must be unavailable: {result}"
+        );
+    }
     // Every start precedes every end, and the ends are recorded in
     // source order even though the workers finished together.
     let kinds: Vec<(&str, String)> = events
@@ -5175,7 +5188,7 @@ fn partial_check_discloses_unchecked_paths_after_requirement_review() {
     assert_eq!(harness_runs(&agent), 0);
     assert!(reminders(&agent).is_empty());
     assert!(events.iter().any(|event| matches!(event,
-        crate::AgentEvent::VerificationNotice { status: CompletionEvidence::Partial, text, .. }
+        crate::AgentEvent::VerificationNotice { status: crate::CompletionStatus::Partial, text, .. }
             if text.contains("unchecked"))));
     assert!(!agent
         .messages

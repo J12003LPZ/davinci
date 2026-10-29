@@ -81,10 +81,20 @@ pub fn require_scored_runs(
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExcludedScenario {
+    pub scenario_id: String,
+    pub validity: super::validity::ScenarioValidity,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DispositionedSuiteSummary {
     pub dispositions: RunDispositionSummary,
     pub behavioral: BehaviorSuiteSummary,
+    /// Scenarios that ran but cannot be part of the verified success rate.
+    #[serde(default)]
+    pub excluded_scenarios: Vec<ExcludedScenario>,
 }
 
 pub fn classify_failure_signal(signal: &str) -> RunDisposition {
@@ -204,16 +214,30 @@ pub fn aggregate_scenario_results(
     let behavioral_results = results
         .iter()
         .filter(|result| {
-            matches!(
-                result.disposition,
-                RunDisposition::Completed | RunDisposition::VerificationFailed
-            )
+            result.is_success_scored()
+                && matches!(
+                    result.disposition,
+                    RunDisposition::Completed | RunDisposition::VerificationFailed
+                )
         })
         .map(|result| (&result.scenario, &result.trace, &result.score))
+        .collect::<Vec<_>>();
+    let excluded_scenarios = results
+        .iter()
+        .filter(|result| !result.is_success_scored())
+        .map(|result| ExcludedScenario {
+            scenario_id: result.scenario.id.clone(),
+            validity: result.validity,
+            reason: format!(
+                "scenario is {} and cannot count as verified task success",
+                result.validity.as_str()
+            ),
+        })
         .collect::<Vec<_>>();
     DispositionedSuiteSummary {
         dispositions,
         behavioral: aggregate_suite_scores(&behavioral_results),
+        excluded_scenarios,
     }
 }
 
@@ -801,5 +825,58 @@ mod tests {
         assert_eq!(summary.configuration_failures, 1);
         assert_eq!(summary.behavioral_runs, 1);
         assert_eq!(summary.verification_failures, 0);
+    }
+
+    #[test]
+    fn invalid_and_structural_results_are_excluded_from_success_denominators() {
+        use crate::behavior::executor::{ScenarioRunResult, WorkspaceDiff};
+        use crate::behavior::validity::ScenarioValidity;
+
+        let scenario = BehaviorScenario {
+            id: "s".into(),
+            category: BehaviorCategory::Exploration,
+            request: "r".into(),
+            repo_fixture: "f".into(),
+            requirements: vec![BehaviorRequirement::ToolUsed {
+                tool: "grep".into(),
+            }],
+            limits: BehaviorLimits::default(),
+            setup_commands: Vec::new(),
+            verification_commands: Vec::new(),
+        };
+        let trace = BehaviorTrace::new("s", None);
+        let card = ScoreCard::new();
+        let result = |validity| ScenarioRunResult {
+            scenario: scenario.clone(),
+            validity,
+            trace: trace.clone(),
+            score: card.clone(),
+            verification: Vec::new(),
+            workspace_diff: WorkspaceDiff {
+                files_changed: Vec::new(),
+                file_diffs: Vec::new(),
+            },
+            infrastructure_error: None,
+            disposition: RunDisposition::Completed,
+        };
+
+        let summary = aggregate_scenario_results(&[
+            result(ScenarioValidity::Verified),
+            result(ScenarioValidity::StructuralOnly),
+            result(ScenarioValidity::Invalid),
+        ]);
+
+        assert_eq!(summary.behavioral.total_scenarios, 1);
+        assert_eq!(summary.behavioral.passed_scenarios, 1);
+        assert_eq!(summary.behavioral.macro_pass_rate, 1.0);
+        assert_eq!(summary.excluded_scenarios.len(), 2);
+        assert_eq!(
+            summary
+                .excluded_scenarios
+                .iter()
+                .map(|excluded| excluded.validity)
+                .collect::<Vec<_>>(),
+            vec![ScenarioValidity::StructuralOnly, ScenarioValidity::Invalid]
+        );
     }
 }

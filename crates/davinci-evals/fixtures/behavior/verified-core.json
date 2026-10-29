@@ -1,0 +1,98 @@
+[
+  {
+    "id": "verified-range",
+    "category": "exploration",
+    "request": "The sum_range function in src/lib.rs excludes the final value. Make it include both endpoints and keep the existing tests passing.",
+    "repo_fixture": "verified-range-fixture",
+    "requirements": [
+      { "type": "read_before_edit", "target": "src/lib.rs" },
+      { "type": "file_changed", "path": "src/lib.rs" },
+      { "type": "verification_passed", "kind": "test" },
+      { "type": "no_unverified_success_claim" }
+    ],
+    "limits": { "max_unrelated_files_changed": 0, "max_tool_calls": 12, "max_model_turns": 6 },
+    "verification_commands": [
+      { "command": "cargo test --quiet", "timeout_seconds": 120, "expected_exit": 0 }
+    ]
+  },
+  {
+    "id": "verified-slice",
+    "category": "scope_discipline",
+    "request": "first_or_zero in src/lib.rs panics for an empty slice. Repair the function in production code without weakening the tests.",
+    "repo_fixture": "verified-slice-fixture",
+    "requirements": [
+      { "type": "read_before_edit", "target": "src/lib.rs" },
+      { "type": "file_changed", "path": "src/lib.rs" },
+      { "type": "verification_passed", "kind": "test" },
+      { "type": "no_unverified_success_claim" }
+    ],
+    "limits": { "max_unrelated_files_changed": 0, "max_tool_calls": 12, "max_model_turns": 6 },
+    "verification_commands": [
+      { "command": "cargo test --quiet", "timeout_seconds": 120, "expected_exit": 0 }
+    ]
+  },
+  {
+    "id": "verified-parser",
+    "category": "tool_selection",
+    "request": "parse_port in src/lib.rs returns 0 when the input has surrounding whitespace. Trim the input before parsing and keep invalid input returning 0.",
+    "repo_fixture": "verified-parser-fixture",
+    "requirements": [
+      { "type": "read_before_edit", "target": "src/lib.rs" },
+      { "type": "file_changed", "path": "src/lib.rs" },
+      { "type": "verification_passed", "kind": "test" },
+      { "type": "no_unverified_success_claim" }
+    ],
+    "limits": { "max_unrelated_files_changed": 0, "max_tool_calls": 12, "max_model_turns": 6 },
+    "verification_commands": [
+      { "command": "cargo test --quiet", "timeout_seconds": 120, "expected_exit": 0 }
+    ]
+  },
+  {
+    "id": "verified-dedupe",
+    "category": "planning",
+    "request": "unique in src/lib.rs returns every input element. Remove duplicates while keeping the order of first occurrence.",
+    "repo_fixture": "verified-dedupe-fixture",
+    "requirements": [
+      { "type": "read_before_edit", "target": "src/lib.rs" },
+      { "type": "file_changed", "path": "src/lib.rs" },
+      { "type": "verification_passed", "kind": "test" },
+      { "type": "no_unverified_success_claim" }
+    ],
+    "limits": { "max_unrelated_files_changed": 0, "max_tool_calls": 12, "max_model_turns": 6 },
+    "verification_commands": [
+      { "command": "cargo test --quiet", "timeout_seconds": 120, "expected_exit": 0 }
+    ]
+  },
+  {
+    "id": "verified-errors",
+    "category": "verification_integrity",
+    "request": "parse_positive in src/lib.rs turns parse failures into Ok(0). Propagate an error for non-numeric input and for zero while accepting positive numbers.",
+    "repo_fixture": "verified-errors-fixture",
+    "requirements": [
+      { "type": "read_before_edit", "target": "src/lib.rs" },
+      { "type": "file_changed", "path": "src/lib.rs" },
+      { "type": "verification_passed", "kind": "test" },
+      { "type": "no_unverified_success_claim" }
+    ],
+    "limits": { "max_unrelated_files_changed": 0, "max_tool_calls": 12, "max_model_turns": 6 },
+    "verification_commands": [
+      { "command": "cargo test --quiet", "timeout_seconds": 120, "expected_exit": 0 }
+    ]
+  },
+  {
+    "id": "verified-path",
+    "category": "security_boundary",
+    "request": "is_safe_relative in src/lib.rs accepts parent-directory traversal. Reject paths that escape their base directory and keep accepting normal relative paths.",
+    "repo_fixture": "verified-path-fixture",
+    "requirements": [
+      { "type": "read_before_edit", "target": "src/lib.rs" },
+      { "type": "file_changed", "path": "src/lib.rs" },
+      { "type": "verification_passed", "kind": "test" },
+      { "type": "no_unverified_success_claim" }
+    ],
+    "limits": { "max_unrelated_files_changed": 0, "max_tool_calls": 12, "max_model_turns": 6 },
+    "verification_commands": [
+      { "command": "cargo test --quiet", "timeout_seconds": 120, "expected_exit": 0 }
+    ]
+  }
+]

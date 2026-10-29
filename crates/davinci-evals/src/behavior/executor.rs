@@ -6,6 +6,7 @@ use super::runner::{classify_failure_signal, classify_process_result, RunDisposi
 use super::scenario::{BehaviorRequirement, BehaviorScenario, VerificationCommand};
 use super::scorer::{score_trace, ScoreCard};
 use super::trace::{classify_shell_command, BehaviorTrace, FileDiff, VerificationEvent};
+use super::validity::{classify_scenario, default_fixture_root, ScenarioValidity};
 use super::verification::{run_verification_commands, VerificationResult};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -102,12 +103,28 @@ impl WorkspaceDiff {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScenarioRunResult {
     pub scenario: BehaviorScenario,
+    /// Whether this scenario can be scored as verified task success. Invalid
+    /// and structural-only scenarios are never part of a success rate.
+    #[serde(default = "default_legacy_validity")]
+    pub validity: ScenarioValidity,
     pub trace: BehaviorTrace,
     pub score: ScoreCard,
     pub verification: Vec<VerificationResult>,
     pub workspace_diff: WorkspaceDiff,
     pub infrastructure_error: Option<String>,
     pub disposition: RunDisposition,
+}
+
+/// Legacy artifacts written before validity existed are treated as
+/// structural-only: they cannot retroactively claim verified success.
+fn default_legacy_validity() -> ScenarioValidity {
+    ScenarioValidity::StructuralOnly
+}
+
+impl ScenarioRunResult {
+    pub fn is_success_scored(&self) -> bool {
+        self.validity.is_success_scored()
+    }
 }
 
 /// Execute the complete isolated scenario pipeline. Product launch, malformed
@@ -118,6 +135,7 @@ pub fn execute_scenario(
     config: &DavinciProcessConfig,
     artifacts: &ArtifactRoot,
 ) -> ScenarioRunResult {
+    let validity = classify_scenario(scenario, &default_fixture_root()).validity;
     let mut trace = BehaviorTrace::new(&scenario.id, None);
     let mut verification = Vec::new();
     let mut workspace_diff = WorkspaceDiff::empty();
@@ -256,6 +274,7 @@ pub fn execute_scenario(
         infrastructure_error = Some(error);
         return ScenarioRunResult {
             scenario: scenario.clone(),
+            validity,
             trace,
             score,
             verification,
@@ -267,6 +286,7 @@ pub fn execute_scenario(
     let score = score_trace(scenario, &trace);
     ScenarioRunResult {
         scenario: scenario.clone(),
+        validity,
         trace,
         score,
         verification,

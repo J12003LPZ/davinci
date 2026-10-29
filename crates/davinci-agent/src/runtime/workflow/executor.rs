@@ -1188,6 +1188,7 @@ impl WorkflowExecutor {
                 worktree_path: lease.as_ref().map(|l| l.path.clone()),
                 contract_digest: None,
                 active_contract: None,
+                receipt_slot: None,
             };
 
             let retry_limit = worker.retry_budget.unwrap_or(0);
