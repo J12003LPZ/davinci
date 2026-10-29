@@ -729,6 +729,9 @@ Issue the call again if it is still needed.";
                 self.append_turn_context(None);
             }
             self.refresh_instruction_context();
+            if let Some(error) = &self.instruction_error {
+                return Err(error.clone());
+            }
 
             let active_context_vm = self.context_vm_mode() == crate::runtime::ContextVmMode::Active;
             let hybrid_context_vm = self.context_vm_mode() == crate::runtime::ContextVmMode::Hybrid;

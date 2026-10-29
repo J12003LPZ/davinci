@@ -90,12 +90,35 @@ impl LaunchPlan {
     }
 }
 
-/// The capability name a mount's grant is keyed to: stable for a path and an
-/// access level, so the grant is reused. Case-folded: Windows paths are.
+/// The capability name a mount's grant is keyed to: stable for an exact path
+/// and an access level, so the grant is reused. The key is the full SHA-256 of
+/// the path's UTF-16LE code units, with no case folding: lowercasing maps
+/// distinct paths (`İ` and `i` + combining dot) to one name, and a shared name
+/// is a shared grant. Case aliases of one directory just get separate grants.
 pub fn mount_capability(path: &str, write: bool) -> String {
-    let digest = Sha256::digest(path.to_lowercase().as_bytes());
-    let hex: String = digest[..12].iter().map(|b| format!("{b:02x}")).collect();
+    let utf16: Vec<u8> = path.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let digest = Sha256::digest(&utf16);
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     format!("davinciSandbox{}{hex}", if write { "W" } else { "R" })
+}
+
+/// A mount path as it may be granted: it must already be the canonical form of
+/// an existing path. An alias (link, junction, `..`, other spelling) that
+/// resolves elsewhere than it names is refused before any grant is made, so a
+/// capability is only ever derived from, and applied to, the one resolved target.
+pub fn admitted_mount_path(path: &str) -> Result<(), String> {
+    let canonical = Path::new(path)
+        .canonicalize()
+        .map_err(|error| format!("AppContainer mount path unavailable: {error}"))?;
+    // Planned paths are shown without the `\?\` prefix `canonicalize` adds.
+    let resolved = crate::permission::strip_verbatim_prefix(&canonical);
+    if resolved.as_os_str() != Path::new(path).as_os_str() {
+        return Err(format!(
+            "AppContainer mount {path} is not canonical (resolves to {})",
+            resolved.display()
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -371,7 +394,7 @@ pub fn process_confinement(_pid: u32) -> Option<ProcessConfinement> {
 
 #[cfg(windows)]
 mod native {
-    use super::{mount_capability, LaunchPlan, PROFILE_NAME};
+    use super::{admitted_mount_path, mount_capability, LaunchPlan, PROFILE_NAME};
     use std::ffi::{c_void, OsStr};
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::{null, null_mut};
@@ -812,6 +835,9 @@ mod native {
 
     pub(super) fn launch(plan: LaunchPlan) -> Result<i32, String> {
         plan.validate()?;
+        for path in plan.read.iter().chain(&plan.write) {
+            admitted_mount_path(path)?;
+        }
         let everyone = string_sid(ALL_APP_PACKAGES)?;
         for path in &plan.read {
             check_read_mount(path, &everyone)?;
@@ -1158,9 +1184,46 @@ mod tests {
     #[test]
     fn mount_capabilities_are_stable_per_path_and_access() {
         let read = mount_capability(r"C:\Runtime\Node", false);
-        assert_eq!(read, mount_capability(r"c:\runtime\node", false));
+        assert_eq!(read, mount_capability(r"C:\Runtime\Node", false));
         assert_ne!(read, mount_capability(r"C:\Runtime\Node", true));
         assert_ne!(read, mount_capability(r"C:\Runtime\Other", false));
-        assert!(read.starts_with("davinciSandboxR") && read.len() == 15 + 24);
+        assert!(read.starts_with("davinciSandboxR") && read.len() == 15 + 64);
+    }
+
+    #[test]
+    fn audit_wp01_b002_distinct_unicode_paths_get_distinct_grants() {
+        // `İ`.to_lowercase() is "i" + U+0307, so a lowercasing key conflated them.
+        let dotted = "C:\\work\\\u{130}";
+        let decomposed = "C:\\work\\i\u{307}";
+        assert_eq!(dotted.to_lowercase(), decomposed.to_lowercase());
+        assert_ne!(
+            mount_capability(dotted, false),
+            mount_capability(decomposed, false)
+        );
+        assert_ne!(
+            mount_capability(dotted, false),
+            mount_capability(dotted, true)
+        );
+        // Case aliases are separate (redundant) grants, never a merged one.
+        assert_ne!(
+            mount_capability(r"C:\Runtime\Node", false),
+            mount_capability(r"c:\runtime\node", false)
+        );
+    }
+
+    #[test]
+    fn audit_wp01_b002_only_the_canonical_target_is_admitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let canonical = real.canonicalize().unwrap();
+        let planned = crate::permission::strip_verbatim_prefix(&canonical);
+        admitted_mount_path(&planned.to_string_lossy()).unwrap();
+
+        let dotted = real.join("..").join("real");
+        let err = admitted_mount_path(&dotted.to_string_lossy()).unwrap_err();
+        assert!(err.contains("not canonical"), "{err}");
+        let missing = real.join("missing");
+        assert!(admitted_mount_path(&missing.to_string_lossy()).is_err());
     }
 }

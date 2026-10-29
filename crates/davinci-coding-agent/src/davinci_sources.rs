@@ -24,11 +24,11 @@ pub struct GitChange {
 /// workspace root as a bare repository it discovered by itself: sandboxed code
 /// can write a root `HEAD`, `objects/`, `refs/` and a `config` with
 /// `core.fsmonitor`, which the next `git status` would then run on the host.
+/// `isolated_git_command` also forces `core.fsmonitor` off for repositories
+/// found normally and drops user config and inherited `GIT_*` overrides.
 pub(crate) fn host_git(cwd: &Path) -> Command {
-    let mut command = Command::new("git");
-    command
-        .args(["-c", "safe.bareRepository=explicit", "-C"])
-        .arg(cwd);
+    let mut command = davinci_sys::process::isolated_git_command();
+    command.arg("-C").arg(cwd);
     command
 }
 
@@ -70,7 +70,15 @@ pub fn parse_porcelain(text: &str) -> Vec<GitChange> {
 /// `Δn +a -d` for the status bar, from `git diff --numstat` plus the count of
 /// changed files. Untracked files count as changed but contribute no lines.
 pub fn git_delta(cwd: &Path, changes: &[GitChange]) -> (u32, u32, u32) {
-    let output = host_git(cwd).args(["diff", "--numstat", "HEAD"]).output();
+    let output = host_git(cwd)
+        .args([
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--numstat",
+            "HEAD",
+        ])
+        .output();
     let (adds, dels) = match output {
         Ok(output) if output.status.success() => {
             parse_numstat(&String::from_utf8_lossy(&output.stdout))
@@ -97,7 +105,13 @@ pub fn parse_numstat(text: &str) -> (u32, u32) {
 /// The changes popover (`1e`), with per-file line counts where git has them.
 pub fn change_rows(cwd: &Path, changes: &[GitChange]) -> Vec<ChangeRow> {
     let counts = host_git(cwd)
-        .args(["diff", "--numstat", "HEAD"])
+        .args([
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--numstat",
+            "HEAD",
+        ])
         .output()
         .ok()
         .filter(|output| output.status.success())
@@ -647,7 +661,15 @@ mod tests {
         let args: Vec<_> = command.get_args().collect();
         assert_eq!(
             args,
-            ["-c", "safe.bareRepository=explicit", "-C", "work"].map(std::ffi::OsStr::new)
+            [
+                "-c",
+                "safe.bareRepository=explicit",
+                "-c",
+                "core.fsmonitor=false",
+                "-C",
+                "work"
+            ]
+            .map(std::ffi::OsStr::new)
         );
     }
 
@@ -678,5 +700,45 @@ mod tests {
         change_rows(root, &changes);
         assert!(changes.is_empty());
         assert!(!marker.exists(), "host git ran the planted core.fsmonitor");
+    }
+
+    #[test]
+    fn audit_wp01_b003_host_git_never_runs_a_repository_fsmonitor() {
+        let git = |root: &Path, args: &[&str]| {
+            let out = Command::new("git").current_dir(root).args(args).output();
+            out.map(|out| out.status.success()).unwrap_or(false)
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        if !git(root, &["init", "-q"]) {
+            eprintln!("git is unavailable: skipping");
+            return;
+        }
+        let marker = root.join("fsmonitor-ran");
+        let hook = format!(
+            "echo ran > {} #",
+            marker.display().to_string().replace('\\', "/")
+        );
+        assert!(git(root, &["config", "core.fsmonitor", &hook]));
+        std::fs::write(root.join("new.txt"), "x").unwrap();
+
+        // Positive control: plain git runs the planted hook.
+        git(root, &["status", "--porcelain"]);
+        if !marker.exists() {
+            eprintln!("git here does not run core.fsmonitor shell hooks: skipping");
+            return;
+        }
+        std::fs::remove_file(&marker).unwrap();
+
+        let changes = git_changes(root);
+        git_delta(root, &changes);
+        assert!(
+            changes.iter().any(|change| change.path == "new.txt"),
+            "real status must still be reported: {changes:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "host git ran the repository core.fsmonitor"
+        );
     }
 }

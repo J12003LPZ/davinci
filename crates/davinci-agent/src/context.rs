@@ -248,10 +248,83 @@ pub fn repository_root(cwd: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// Largest single instruction file that is read into the prompt.
+pub const MAX_INSTRUCTION_FILE_BYTES: u64 = 256 * 1024;
+/// Largest total of all instruction files in one prompt.
+pub const MAX_INSTRUCTION_TOTAL_BYTES: u64 = 1024 * 1024;
+
+/// Read one instruction file on its opened handle. `Ok(None)` is a file that
+/// is absent or unreadable as text (nothing to load). `Err` is a file that
+/// exists but must not be admitted: it is larger than
+/// [`MAX_INSTRUCTION_FILE_BYTES`], or it has more than one hard link and may
+/// alias a file outside the checkout. Instruction files are mandatory prompt
+/// context, so the caller refuses the turn rather than dropping them.
+fn read_instruction_file(path: &Path) -> Result<Option<String>, String> {
+    let Ok(mut file) = fs::File::open(path) else {
+        return Ok(None);
+    };
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+        return Ok(None);
+    }
+    davinci_sys::fs::ensure_single_link(&file).map_err(|error| {
+        format!(
+            "Instruction file {} was not loaded: {error}. Replace it with a regular, singly linked file.",
+            path.display()
+        )
+    })?;
+    match davinci_sys::fs::read_bounded(&mut file, MAX_INSTRUCTION_FILE_BYTES) {
+        Ok(bytes) => Ok(String::from_utf8(bytes).ok()),
+        Err(error) if error.kind() == std::io::ErrorKind::FileTooLarge => Err(format!(
+            "Instruction file {} is larger than the {MAX_INSTRUCTION_FILE_BYTES} byte limit. Shrink it or move detail into nested AGENTS.md files.",
+            path.display()
+        )),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Fail when the loaded on-disk instruction files together exceed
+/// [`MAX_INSTRUCTION_TOTAL_BYTES`].
+pub(crate) fn check_instruction_total(files: &[ContextFile]) -> Result<(), String> {
+    let total: u64 = files
+        .iter()
+        .filter(|file| !is_plugin_context(file))
+        .map(|file| file.body.len() as u64)
+        .sum();
+    if total > MAX_INSTRUCTION_TOTAL_BYTES {
+        return Err(format!(
+            "Instruction files total {total} bytes, over the {MAX_INSTRUCTION_TOTAL_BYTES} byte limit. Shrink them or move detail into nested AGENTS.md files."
+        ));
+    }
+    Ok(())
+}
+
 /// `AGENTS.md` from the repository root down to `cwd`, outermost first, so a
 /// nested file reads after the rules it refines. Outside a repository there
 /// is no codebase to describe and nothing is loaded: a session started in a
 /// home or Desktop folder must not pick up whatever instructions sit there.
+///
+/// A file that is over its size limit or hard-linked, or a set that is over
+/// the total limit, is an error naming the file and the limit.
+pub fn load_context_files_checked(cwd: &Path, enabled: bool) -> Result<Vec<ContextFile>, String> {
+    if !enabled {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for path in instruction_chain(cwd) {
+        if let Some(body) = read_instruction_file(&path)? {
+            files.push(ContextFile {
+                path,
+                name: INSTRUCTION_FILE.to_string(),
+                body,
+            });
+        }
+    }
+    check_instruction_total(&files)?;
+    Ok(files)
+}
+
+/// [`load_context_files_checked`] for callers that only report what exists:
+/// files that cannot be admitted are left out.
 pub fn load_context_files(cwd: &Path, enabled: bool) -> Vec<ContextFile> {
     if !enabled {
         return Vec::new();
@@ -259,7 +332,7 @@ pub fn load_context_files(cwd: &Path, enabled: bool) -> Vec<ContextFile> {
     instruction_chain(cwd)
         .into_iter()
         .filter_map(|path| {
-            let body = fs::read_to_string(&path).ok()?;
+            let body = read_instruction_file(&path).ok()??;
             Some(ContextFile {
                 path,
                 name: INSTRUCTION_FILE.to_string(),
@@ -325,12 +398,14 @@ pub(crate) fn is_plugin_context(file: &ContextFile) -> bool {
 /// Bring loaded on-disk instruction files up to date: re-read a file whose
 /// stamp moved, drop one that is gone, leave every other file (and the
 /// `plugin:` pseudo-files) untouched. Returns whether any body changed, so a
-/// caller that sees `false` knows the system prompt is byte-identical.
+/// caller that sees `false` knows the system prompt is byte-identical. A file
+/// that can no longer be admitted keeps its last body and is an error.
 pub(crate) fn reload_changed_context_files(
     files: &mut Vec<ContextFile>,
     stamps: &mut HashMap<PathBuf, FileStamp>,
-) -> bool {
+) -> Result<bool, String> {
     let mut changed = false;
+    let mut refused = None;
     files.retain_mut(|file| {
         if is_plugin_context(file) {
             return true;
@@ -352,33 +427,38 @@ pub(crate) fn reload_changed_context_files(
         if stamps.get(&file.path) == Some(&stamp) && !is_racy(stamp.0) {
             return true;
         }
-        if let Ok(body) = fs::read_to_string(&file.path) {
-            if body != file.body {
-                file.body = body;
-                changed = true;
+        match read_instruction_file(&file.path) {
+            Ok(Some(body)) => {
+                if body != file.body {
+                    file.body = body;
+                    changed = true;
+                }
+                stamps.insert(file.path.clone(), stamp);
             }
-            stamps.insert(file.path.clone(), stamp);
+            Ok(None) => {}
+            Err(error) => refused = Some(error),
         }
         true
     });
-    changed
+    refused.map_or(Ok(changed), Err)
 }
 
 /// Pick up an `AGENTS.md` created, mid-session, at a place on the root-to-cwd
 /// `chain` that had none at load. One `stat` per missing chain entry. New
 /// files are inserted in chain order, ahead of `plugin:` pseudo-files.
-/// Returns whether any file was added.
+/// Returns whether any file was added; a created file that cannot be admitted
+/// is an error.
 pub(crate) fn discover_created_context_files(
     files: &mut Vec<ContextFile>,
     stamps: &mut HashMap<PathBuf, FileStamp>,
     chain: &[PathBuf],
-) -> bool {
+) -> Result<bool, String> {
     let mut added = false;
     for (rank, path) in chain.iter().enumerate() {
         if files.iter().any(|file| &file.path == path) || !path.is_file() {
             continue;
         }
-        let Ok(body) = fs::read_to_string(path) else {
+        let Some(body) = read_instruction_file(path)? else {
             continue;
         };
         if let Some(stamp) = file_stamp(path) {
@@ -404,7 +484,7 @@ pub(crate) fn discover_created_context_files(
         );
         added = true;
     }
-    added
+    Ok(added)
 }
 
 /// Custom-message type of the appended nested-instruction delivery.
@@ -500,7 +580,8 @@ pub(crate) fn governing_instruction_files(
             if !fs::canonicalize(&path).ok()?.starts_with(&root) {
                 return None;
             }
-            let body = fs::read_to_string(&path).ok()?;
+            // Nested files are advisory: one that cannot be admitted is skipped.
+            let body = read_instruction_file(&path).ok()??;
             Some(ContextFile {
                 path,
                 name: INSTRUCTION_FILE.to_string(),
@@ -638,17 +719,17 @@ mod tests {
             body: "hook output".into(),
         });
 
-        assert!(!reload_changed_context_files(&mut files, &mut stamps));
+        assert!(!reload_changed_context_files(&mut files, &mut stamps).unwrap());
         assert_eq!(files[0].body, "first");
 
         fs::write(&path, "second, longer").unwrap();
-        assert!(reload_changed_context_files(&mut files, &mut stamps));
+        assert!(reload_changed_context_files(&mut files, &mut stamps).unwrap());
         assert_eq!(files[0].body, "second, longer");
         // Now current: the next check is quiet again.
-        assert!(!reload_changed_context_files(&mut files, &mut stamps));
+        assert!(!reload_changed_context_files(&mut files, &mut stamps).unwrap());
 
         fs::remove_file(&path).unwrap();
-        assert!(reload_changed_context_files(&mut files, &mut stamps));
+        assert!(reload_changed_context_files(&mut files, &mut stamps).unwrap());
         let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
         assert_eq!(names, ["plugin:demo"], "plugin entries are never statted");
     }
@@ -663,7 +744,7 @@ mod tests {
         fs::write(&path, "use gaps").unwrap();
         let modified = fs::metadata(&path).unwrap().modified().unwrap();
         stamps.insert(path.clone(), (Some(modified), 8));
-        assert!(reload_changed_context_files(&mut files, &mut stamps));
+        assert!(reload_changed_context_files(&mut files, &mut stamps).unwrap());
         assert_eq!(files[0].body, "use gaps");
     }
 
@@ -675,7 +756,7 @@ mod tests {
         let (mut files, mut stamps) = loaded(&path);
         // A stale stamp forces a re-read; identical content must report no change.
         stamps.insert(path.clone(), (None, 0));
-        assert!(!reload_changed_context_files(&mut files, &mut stamps));
+        assert!(!reload_changed_context_files(&mut files, &mut stamps).unwrap());
         assert_eq!(stamps[&path], file_stamp(&path).unwrap());
     }
 
@@ -1115,5 +1196,122 @@ mod tests {
         let wide = "é".repeat(MAX_NESTED_INSTRUCTION_BYTES);
         let text = render_nested_instructions(&[nested_file(dir.path(), &wide)], dir.path());
         assert!(text.contains("[truncated:"));
+    }
+
+    fn checkout(root: &Path) {
+        fs::create_dir_all(root.join(".git")).unwrap();
+    }
+
+    /// Run one prompt whose provider must never be reached; returns the error
+    /// the turn was refused with and whether the provider was called.
+    fn refused_turn(cwd: &Path) -> (String, bool) {
+        let mut agent = crate::Agent::new("base");
+        agent.cwd = cwd.to_path_buf();
+        agent.load_instruction_files(true);
+        agent.prompt("go");
+        let mut called = false;
+        let error = agent
+            .run_loop(|_| {
+                called = true;
+                Err::<davinci_ai::AssistantMessage, String>("provider reached".into())
+            })
+            .unwrap_err();
+        (error, called)
+    }
+
+    #[test]
+    fn audit_wp01_b017_oversized_root_instructions_refuse_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        checkout(dir.path());
+        let root_file = dir.path().join(INSTRUCTION_FILE);
+        fs::write(
+            &root_file,
+            vec![b'x'; MAX_INSTRUCTION_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        let (error, called) = refused_turn(dir.path());
+        assert!(error.contains(INSTRUCTION_FILE), "{error}");
+        assert!(
+            error.contains(&MAX_INSTRUCTION_FILE_BYTES.to_string()),
+            "{error}"
+        );
+        assert!(!called, "the provider must not be called");
+
+        // Exactly at the limit is admitted.
+        fs::write(&root_file, vec![b'x'; MAX_INSTRUCTION_FILE_BYTES as usize]).unwrap();
+        let files = load_context_files_checked(dir.path(), true).unwrap();
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn audit_wp01_b017_small_nested_files_keep_their_order_and_overflow_is_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        checkout(dir.path());
+        let mut cwd = dir.path().to_path_buf();
+        fs::write(cwd.join(INSTRUCTION_FILE), "root").unwrap();
+        for level in ["a", "b"] {
+            cwd = cwd.join(level);
+            fs::create_dir(&cwd).unwrap();
+            fs::write(cwd.join(INSTRUCTION_FILE), level).unwrap();
+        }
+        let bodies: Vec<_> = load_context_files_checked(&cwd, true)
+            .unwrap()
+            .into_iter()
+            .map(|file| file.body)
+            .collect();
+        assert_eq!(bodies, ["root", "a", "b"]);
+
+        // Four files under the per-file cap that together pass the total cap.
+        let big = vec![b'y'; MAX_INSTRUCTION_FILE_BYTES as usize - 1];
+        let mut cwd = dir.path().to_path_buf();
+        fs::write(cwd.join(INSTRUCTION_FILE), &big).unwrap();
+        for level in ["a", "b", "c"] {
+            cwd = cwd.join(level);
+            fs::create_dir_all(&cwd).unwrap();
+            fs::write(cwd.join(INSTRUCTION_FILE), &big).unwrap();
+        }
+        let total = 4 * big.len() as u64;
+        assert!(total <= MAX_INSTRUCTION_TOTAL_BYTES);
+        fs::write(cwd.join(INSTRUCTION_FILE), &big).unwrap();
+        let deeper = cwd.join("d");
+        fs::create_dir(&deeper).unwrap();
+        fs::write(deeper.join(INSTRUCTION_FILE), &big).unwrap();
+        let error = load_context_files_checked(&deeper, true).unwrap_err();
+        assert!(
+            error.contains("total") && error.contains("limit"),
+            "{error}"
+        );
+        let (error, called) = refused_turn(&deeper);
+        assert!(error.contains("total"), "{error}");
+        assert!(!called);
+    }
+
+    #[test]
+    fn audit_wp01_b001_a_hard_linked_instruction_file_is_not_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        checkout(dir.path());
+        let canary = outside.path().join("secret.md");
+        fs::write(&canary, "outside secret").unwrap();
+        fs::hard_link(&canary, dir.path().join(INSTRUCTION_FILE)).unwrap();
+
+        let error = load_context_files_checked(dir.path(), true).unwrap_err();
+        assert!(error.contains("not loaded"), "{error}");
+        assert!(load_context_files(dir.path(), true).is_empty());
+        let (error, called) = refused_turn(dir.path());
+        assert!(error.contains("not loaded") && !called, "{error}");
+        assert_eq!(fs::read_to_string(&canary).unwrap(), "outside secret");
+
+        // A single-link file still loads.
+        let plain = tempfile::tempdir().unwrap();
+        checkout(plain.path());
+        fs::write(plain.path().join(INSTRUCTION_FILE), "rules").unwrap();
+        assert_eq!(
+            load_context_files_checked(plain.path(), true)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

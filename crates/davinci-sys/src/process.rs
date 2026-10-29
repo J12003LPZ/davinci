@@ -101,6 +101,47 @@ pub fn set_own_process_group(command: &mut Command) {
     }
 }
 
+/// `git` for inspecting a repository the user does not fully trust. Repository
+/// config can name programs (`core.fsmonitor`), so `core.fsmonitor` is forced
+/// off, system and global config are replaced by the null file, and inherited
+/// environment overrides that inject config or reroute the repository are
+/// removed. Discovery from the working directory and the normal index are kept.
+/// Callers add their own `current_dir`, arguments and, if they need one,
+/// `GIT_INDEX_FILE` (set after this call, so it wins).
+pub fn isolated_git_command() -> Command {
+    let mut command = Command::new("git");
+    command.args([
+        "-c",
+        "safe.bareRepository=explicit",
+        "-c",
+        "core.fsmonitor=false",
+    ]);
+    for (key, _) in std::env::vars_os() {
+        let Some(key_str) = key.to_str() else {
+            continue;
+        };
+        if key_str.starts_with("GIT_CONFIG_KEY_") || key_str.starts_with("GIT_CONFIG_VALUE_") {
+            command.env_remove(&key);
+        }
+    }
+    for name in [
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_EXTERNAL_DIFF",
+    ] {
+        command.env_remove(name);
+    }
+    command.env("GIT_CONFIG_NOSYSTEM", "1").env(
+        "GIT_CONFIG_GLOBAL",
+        if cfg!(windows) { "NUL" } else { "/dev/null" },
+    );
+    command
+}
+
 /// Kill `pid` and its descendants. On Unix, `pid` must be the leader of its
 /// own process group (see [`set_own_process_group`]).
 ///
@@ -633,5 +674,40 @@ mod tests {
         let path_var = std::ffi::OsString::new();
         assert_eq!(resolve_program_in("./npm", &path_var, Some(".CMD")), None);
         assert_eq!(resolve_program("./npm"), std::path::PathBuf::from("./npm"));
+    }
+
+    #[test]
+    fn audit_wp01_isolated_git_command_pins_config_and_strips_overrides() {
+        let command = isolated_git_command();
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                "-c",
+                "safe.bareRepository=explicit",
+                "-c",
+                "core.fsmonitor=false"
+            ]
+            .map(OsStr::new)
+        );
+        let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            envs[OsStr::new("GIT_CONFIG_NOSYSTEM")],
+            Some(OsStr::new("1"))
+        );
+        let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        assert_eq!(
+            envs[OsStr::new("GIT_CONFIG_GLOBAL")],
+            Some(OsStr::new(null))
+        );
+        for removed in [
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+        ] {
+            assert_eq!(envs[OsStr::new(removed)], None, "{removed} must be removed");
+        }
     }
 }

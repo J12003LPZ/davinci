@@ -579,6 +579,9 @@ pub struct Agent {
     /// disk, so edits and nested files are kept current (false under
     /// `--no-context-files`, and for files a caller assigned by hand).
     pub instruction_files_enabled: bool,
+    /// Why the mandatory instruction files cannot be admitted (over a size
+    /// limit, hard-linked); the turn is refused while it is set.
+    pub(crate) instruction_error: Option<String>,
     pub(crate) context_file_stamps: std::collections::HashMap<PathBuf, context::FileStamp>,
     /// Where an `AGENTS.md` could sit from the repository root to `cwd`, set
     /// at load, so one created mid-session is noticed.
@@ -824,6 +827,7 @@ impl Agent {
             templates: Vec::new(),
             context_files: Vec::new(),
             instruction_files_enabled: false,
+            instruction_error: None,
             context_file_stamps: std::collections::HashMap::new(),
             instruction_chain: Vec::new(),
             session: None,

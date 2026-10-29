@@ -26,9 +26,9 @@ use davinci_ai::{ChatMessage, MessageContent};
 use serde_json::Value;
 
 use crate::context::{
-    self, discover_created_context_files, file_stamp, governing_instruction_files,
-    is_plugin_context, reload_changed_context_files, render_nested_instructions,
-    NESTED_INSTRUCTIONS_CUSTOM_TYPE,
+    self, check_instruction_total, discover_created_context_files, file_stamp,
+    governing_instruction_files, is_plugin_context, reload_changed_context_files,
+    render_nested_instructions, NESTED_INSTRUCTIONS_CUSTOM_TYPE,
 };
 use crate::prompt::manifest::hash_text;
 use crate::Agent;
@@ -41,7 +41,11 @@ impl Agent {
     /// re-adds those afterwards.
     pub fn load_instruction_files(&mut self, enabled: bool) {
         self.instruction_files_enabled = enabled;
-        self.context_files = context::load_context_files(&self.cwd, enabled);
+        // A file that cannot be admitted leaves the set empty and the error
+        // standing: the next request is refused until it is fixed.
+        let loaded = context::load_context_files_checked(&self.cwd, enabled);
+        self.instruction_error = loaded.as_ref().err().cloned();
+        self.context_files = loaded.unwrap_or_default();
         self.context_file_stamps = self
             .context_files
             .iter()
@@ -61,14 +65,25 @@ impl Agent {
         if !self.instruction_files_enabled {
             return;
         }
+        let mut error = None;
         let edited =
-            reload_changed_context_files(&mut self.context_files, &mut self.context_file_stamps);
+            reload_changed_context_files(&mut self.context_files, &mut self.context_file_stamps)
+                .unwrap_or_else(|refused| {
+                    error = Some(refused);
+                    false
+                });
         let created = discover_created_context_files(
             &mut self.context_files,
             &mut self.context_file_stamps,
             &self.instruction_chain,
-        );
+        )
+        .unwrap_or_else(|refused| {
+            error.get_or_insert(refused);
+            false
+        });
         let edited = edited || created;
+        self.instruction_error =
+            error.or_else(|| check_instruction_total(&self.context_files).err());
         let delivered = self.deliver_nested_instructions();
         if edited || delivered {
             self.invalidate_context_image();

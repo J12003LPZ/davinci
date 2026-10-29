@@ -1196,6 +1196,11 @@ impl PermissionPolicy {
                     }
                 }
             };
+        if let Some(reason) =
+            linked_read_denial(tool, args, cwd, self.filesystem_boundary.root.as_deref())
+        {
+            return PermissionVerdict::Deny { reason };
+        }
         let (subject, outside_project) = if targets.is_empty() {
             subject_of_with_boundary(tool, args, cwd, Some(&self.filesystem_boundary))
         } else {
@@ -1607,6 +1612,38 @@ impl PermissionPolicy {
 
 /// What a rule is matched against, and whether a file target lies outside
 /// the project.
+/// `read` and `grep` of a file inside the workspace that is named by more than
+/// one hard link. The other name may sit outside the workspace, where a path
+/// check cannot see it, so the read is refused before the file is consumed. A
+/// file that cannot be opened or inspected is left to the tool to report.
+fn linked_read_denial(tool: &str, args: &Value, cwd: &Path, root: Option<&Path>) -> Option<String> {
+    if !matches!(tool, "read" | "grep") {
+        return None;
+    }
+    let raw = args.get("path").and_then(Value::as_str).unwrap_or(".");
+    let target = if Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        cwd.join(raw)
+    };
+    if check_path_boundary(root.unwrap_or(cwd), &target).0 {
+        return None;
+    }
+    let file = std::fs::File::open(&target).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    match davinci_sys::fs::ensure_single_link(&file) {
+        Err(error) if davinci_sys::fs::is_hard_link_refusal(&error) => Some(format!(
+            "Permission denied: `{raw}` has more than one hard link and may alias a file outside the workspace."
+        )),
+        Err(error) => Some(format!(
+            "Permission denied: cannot verify that `{raw}` is a single-link file: {error}."
+        )),
+        Ok(()) => None,
+    }
+}
+
 pub fn subject_of(tool: &str, args: &Value, cwd: &Path) -> (String, bool) {
     subject_of_with_boundary(tool, args, cwd, None)
 }

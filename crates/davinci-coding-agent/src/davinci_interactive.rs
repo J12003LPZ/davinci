@@ -7404,7 +7404,13 @@ fn open_diff_sheet(shell: &mut Shell<'_>) -> Next {
         return Next::Go;
     }
     let numstat: Vec<(String, u32, u32)> = crate::davinci_sources::host_git(cwd)
-        .args(["diff", "--numstat", "HEAD"])
+        .args([
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--numstat",
+            "HEAD",
+        ])
         .output()
         .ok()
         .filter(|output| output.status.success())
@@ -7422,7 +7428,15 @@ fn open_diff_sheet(shell: &mut Shell<'_>) -> Next {
         .unwrap_or_default();
     let hunk_of = |path: &str| -> (Vec<Hunk>, String, String) {
         let output = crate::davinci_sources::host_git(cwd)
-            .args(["diff", "--unified=2", "HEAD", "--", path])
+            .args([
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--unified=2",
+                "HEAD",
+                "--",
+                path,
+            ])
             .output();
         let Ok(output) = output else {
             return (Vec::new(), String::new(), String::new());

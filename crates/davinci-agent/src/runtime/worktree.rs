@@ -2,10 +2,10 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use davinci_sys::process::isolated_git_command;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -15,8 +15,7 @@ use super::bus::RuntimeBus;
 /// checkout. Worktree leases must be rooted here: rooting them at a
 /// subdirectory the user launched from produced leases of the wrong tree.
 pub fn git_toplevel(path: &Path) -> Option<PathBuf> {
-    let output = Command::new("git")
-        .args(["-c", "safe.bareRepository=explicit"])
+    let output = isolated_git_command()
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(path)
         .output()
@@ -75,9 +74,8 @@ fn now_ms() -> i64 {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, WorktreeError> {
-    let output = Command::new("git")
+    let output = isolated_git_command()
         .current_dir(cwd)
-        .args(["-c", "safe.bareRepository=explicit"])
         .args(args)
         .output()
         .map_err(|e| WorktreeError::GitError(format!("Failed to execute git: {e}")))?;
@@ -241,9 +239,8 @@ impl WorktreeManager {
             .ok_or_else(|| WorktreeError::IoError("Worktree path is not valid unicode".into()))?;
 
         // Check if branch already exists in git
-        let branch_exists = Command::new("git")
+        let branch_exists = isolated_git_command()
             .current_dir(&self.repo_root)
-            .args(["-c", "safe.bareRepository=explicit"])
             .args(["rev-parse", "--verify", &branch])
             .output()
             .map(|o| o.status.success())
@@ -306,10 +303,9 @@ impl WorktreeManager {
         }
         let _index_file = IndexFile(index.clone());
         let git = |args: &[&str]| -> Result<String, WorktreeError> {
-            let output = Command::new("git")
+            let output = isolated_git_command()
                 .current_dir(&lease.path)
                 .env("GIT_INDEX_FILE", &index)
-                .args(["-c", "safe.bareRepository=explicit"])
                 .args(args)
                 .output()
                 .map_err(|e| WorktreeError::GitError(e.to_string()))?;
@@ -423,9 +419,8 @@ impl WorktreeManager {
         if current_head.is_empty() || current_head == lease.base_head {
             return Ok(false);
         }
-        let integrated = Command::new("git")
+        let integrated = isolated_git_command()
             .current_dir(&self.repo_root)
-            .args(["-c", "safe.bareRepository=explicit"])
             .args(["merge-base", "--is-ancestor", &current_head, "HEAD"])
             .output()
             .map(|o| o.status.success())
@@ -562,6 +557,7 @@ impl WorktreeLease {
 mod tests {
     use super::*;
     use crate::runtime::bus::{RuntimeDecision, RuntimeSubscriber};
+    use std::process::Command;
     use std::sync::Mutex;
     use tempfile::tempdir;
 
@@ -949,5 +945,63 @@ mod tests {
         git_in(repo_dir.path(), &["commit", "-m", "squashed"]);
         assert!(!manager.is_dirty(&lease));
         manager.release_lease(&lease, false).unwrap();
+    }
+
+    /// Serializes tests that mutate the process environment.
+    static GIT_ENV: Mutex<()> = Mutex::new(());
+
+    fn slashed(path: &Path) -> String {
+        path.display().to_string().replace('\\', "/")
+    }
+
+    #[test]
+    fn audit_wp01_b003_repository_fsmonitor_is_never_run() {
+        let _env = GIT_ENV.lock().unwrap_or_else(|poison| poison.into_inner());
+        let repo = init_temp_git_repo();
+        let canary = repo.path().join("fsmonitor-ran");
+        let env_canary = repo.path().join("env-fsmonitor-ran");
+        git_in(
+            repo.path(),
+            &[
+                "config",
+                "core.fsmonitor",
+                &format!("echo ran > {} #", slashed(&canary)),
+            ],
+        );
+        std::fs::write(repo.path().join("dirty.txt"), "x").unwrap();
+
+        // Positive control: plain git does run the planted hook, so a missing
+        // canary below proves the isolation and not a broken fixture.
+        Command::new("git")
+            .current_dir(repo.path())
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        if !canary.exists() {
+            eprintln!("git here does not run core.fsmonitor shell hooks: skipping");
+            return;
+        }
+        std::fs::remove_file(&canary).unwrap();
+
+        std::env::set_var("GIT_CONFIG_COUNT", "1");
+        std::env::set_var("GIT_CONFIG_KEY_0", "core.fsmonitor");
+        std::env::set_var(
+            "GIT_CONFIG_VALUE_0",
+            format!("echo ran > {} #", slashed(&env_canary)),
+        );
+        let dirty = has_uncommitted_changes(repo.path());
+        let status = run_git(repo.path(), &["status", "--porcelain"]);
+        std::env::remove_var("GIT_CONFIG_COUNT");
+        std::env::remove_var("GIT_CONFIG_KEY_0");
+        std::env::remove_var("GIT_CONFIG_VALUE_0");
+
+        assert!(dirty, "status must still report the real change");
+        assert!(status.unwrap().contains("dirty.txt"));
+        assert!(!canary.exists(), "repository core.fsmonitor was run");
+        assert!(!env_canary.exists(), "inherited GIT_CONFIG_* was honored");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("dirty.txt")).unwrap(),
+            "x"
+        );
     }
 }

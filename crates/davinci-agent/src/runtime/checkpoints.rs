@@ -74,6 +74,25 @@ pub fn may_mutate_with_checkpoint(
     authorized && (durable_checkpoint || explicit_nonrewindable_exception)
 }
 
+/// Read a file to capture, admitting it on the opened handle: a file named by
+/// more than one hard link could alias content outside the workspace, and a
+/// file larger than a blob is refused after at most `MAX_BLOB_BYTES + 1` bytes.
+fn read_preimage(path: &Path) -> Result<Vec<u8>, CheckpointError> {
+    let mut file = std::fs::File::open(path)?;
+    davinci_sys::fs::ensure_single_link(&file)?;
+    match davinci_sys::fs::read_bounded(&mut file, MAX_BLOB_BYTES as u64) {
+        Err(err) if err.kind() == std::io::ErrorKind::FileTooLarge => {
+            let declared = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+            Err(CheckpointError::BlobTooLarge {
+                size: usize::try_from(declared)
+                    .unwrap_or(usize::MAX)
+                    .max(MAX_BLOB_BYTES + 1),
+            })
+        }
+        other => Ok(other?),
+    }
+}
+
 pub fn compute_sha256(bytes: &[u8]) -> String {
     format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(bytes)))
 }
@@ -193,7 +212,7 @@ impl BlobStore {
                     let hash = self.store_blob_for_task(task_id, target_bytes)?;
                     (Some(hash), target_bytes.len() as u64)
                 } else if meta.is_file() {
-                    let bytes = std::fs::read(&full_path)?;
+                    let bytes = read_preimage(&full_path)?;
                     let size = bytes.len() as u64;
                     let hash = self.store_blob_for_task(task_id, &bytes)?;
                     (Some(hash), size)
@@ -316,5 +335,74 @@ mod tests {
                 .unwrap(),
             b"original dirty content"
         );
+    }
+
+    fn blob_files(store: &BlobStore) -> usize {
+        store.blobs.read().unwrap().len()
+    }
+
+    #[test]
+    fn audit_wp01_b006_oversized_preimage_is_refused_before_a_blob_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::new();
+        let task_id = TaskId::new();
+        let over = dir.path().join("big.bin");
+        let file = std::fs::File::create(&over).unwrap();
+        file.set_len(MAX_BLOB_BYTES as u64 + 1).unwrap();
+        let err = store
+            .capture_file(task_id, dir.path(), "big.bin")
+            .unwrap_err();
+        assert!(matches!(err, CheckpointError::BlobTooLarge { .. }), "{err}");
+        assert_eq!(blob_files(&store), 0);
+
+        // Exactly at the limit round-trips.
+        let exact = dir.path().join("exact.bin");
+        std::fs::write(&exact, vec![7u8; MAX_BLOB_BYTES]).unwrap();
+        let capture = store
+            .capture_file(task_id, dir.path(), "exact.bin")
+            .unwrap();
+        assert_eq!(capture.size, MAX_BLOB_BYTES as u64);
+        let hash = capture.blob_hash.unwrap();
+        assert_eq!(store.get_blob(&hash).unwrap().len(), MAX_BLOB_BYTES);
+    }
+
+    #[test]
+    fn audit_wp01_b006_growing_preimage_is_bounded_at_the_cap() {
+        // The bounded reader is what stops a file that grows after the metadata
+        // check: it never takes more than cap + 1 bytes from the handle.
+        struct Growing(usize);
+        impl std::io::Read for Growing {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0 += buf.len();
+                buf.fill(1);
+                Ok(buf.len())
+            }
+        }
+        let mut growing = Growing(0);
+        let err = davinci_sys::fs::read_capped(&mut growing, 0, MAX_BLOB_BYTES as u64).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+        assert_eq!(growing.0, MAX_BLOB_BYTES + 1);
+    }
+
+    #[test]
+    fn audit_wp01_b001_capture_refuses_a_hard_linked_preimage() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let canary = outside.path().join("canary.txt");
+        std::fs::write(&canary, "outside secret").unwrap();
+        std::fs::hard_link(&canary, dir.path().join("alias.txt")).unwrap();
+        std::fs::write(dir.path().join("plain.txt"), "fine").unwrap();
+        let store = BlobStore::new();
+        let task_id = TaskId::new();
+
+        let err = store
+            .capture_file(task_id, dir.path(), "alias.txt")
+            .unwrap_err();
+        assert!(matches!(err, CheckpointError::Io(_)), "{err}");
+        assert_eq!(blob_files(&store), 0, "no outside bytes were stored");
+        store
+            .capture_file(task_id, dir.path(), "plain.txt")
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&canary).unwrap(), "outside secret");
     }
 }
