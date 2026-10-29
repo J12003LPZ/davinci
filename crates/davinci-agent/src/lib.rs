@@ -4780,7 +4780,7 @@ impl Agent {
         for skill in &self.skills {
             account.add(
                 format!("skill::{}", skill.name),
-                skill.body.clone(),
+                skill.read_body(),
                 true,
                 ContextPriority::Deferred,
             );

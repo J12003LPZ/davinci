@@ -221,7 +221,8 @@ fn compaction_keeps_pending_verification_state() {
     let mut agent = Agent::new("test");
     agent.session = Some(crate::JsonlSession::create(dir.path(), "compaction", None).unwrap());
     agent.prompt_user_with(&"context line for compaction ".repeat(80), &[]);
-    agent.record_assistant(&"answer line for compaction ".repeat(80));
+    agent.record_assistant(&"answer line for compaction ".repeat(400));
+    agent.prompt_user_with("continue", &[]);
     agent.record_successful_mutation_paths(vec!["src/cache.rs".into()]);
     let mut events = Vec::new();
     agent.emit_verification_notice(&mut events);

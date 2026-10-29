@@ -78,6 +78,11 @@ pub struct WorkflowArtifact {
     /// SHA-256 of the overflow file contents, checked on every full read.
     #[serde(default)]
     pub overflow_sha256: Option<String>,
+    /// The source tree this artifact was committed against (git HEAD plus the
+    /// working-tree changes). `None` when the store has no source root, the
+    /// root is not a git repository, or the artifact predates fingerprints.
+    #[serde(default)]
+    pub source_fingerprint: Option<String>,
     pub created_ms: i64,
 }
 
@@ -180,6 +185,9 @@ pub struct WorkflowStateStore {
     phase_index: Arc<RwLock<PhaseArtifactMap>>,
     /// Workflows whose manifest has been read into memory.
     loaded: Arc<RwLock<HashSet<WorkflowId>>>,
+    /// The repository artifacts are stamped against; see
+    /// [`WorkflowArtifact::source_fingerprint`].
+    source_root: Option<PathBuf>,
 }
 
 impl Default for WorkflowStateStore {
@@ -205,7 +213,21 @@ impl WorkflowStateStore {
             artifacts: Arc::new(RwLock::new(HashMap::new())),
             phase_index: Arc::new(RwLock::new(HashMap::new())),
             loaded: Arc::new(RwLock::new(HashSet::new())),
+            source_root: None,
         }
+    }
+
+    /// Stamp every artifact committed from now on with the state of the git
+    /// tree at `root`, so a resume can tell whether the source changed.
+    pub fn with_source_root(mut self, root: PathBuf) -> Self {
+        self.source_root = Some(root);
+        self
+    }
+
+    /// The fingerprint of the source tree now, `None` without a source root or
+    /// outside a git repository (resume then keeps its earlier behavior).
+    pub fn current_source_fingerprint(&self) -> Option<String> {
+        super::source_fingerprint::source_fingerprint(self.source_root.as_deref()?)
     }
 
     fn manifest_path(&self, workflow_id: WorkflowId) -> PathBuf {
@@ -425,6 +447,7 @@ impl WorkflowStateStore {
             byte_size,
             overflow_path,
             overflow_sha256,
+            source_fingerprint: self.current_source_fingerprint(),
             created_ms: now,
         };
 

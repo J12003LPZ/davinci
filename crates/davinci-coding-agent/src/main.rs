@@ -3254,7 +3254,8 @@ fn complete_prompt_with_host(
     let wf_store = davinci_agent::WorkflowStateStore::with_options(
         davinci_agent::runtime::workflow::state::DEFAULT_MAX_INLINE_ARTIFACT_BYTES,
         default_agent_dir().join("workflow_artifacts"),
-    );
+    )
+    .with_source_root(agent.cwd.clone());
     runtime_handle = match runtime_host::configure_session_workflow_with_journal(
         runtime_handle,
         &agent.cwd,
@@ -3804,7 +3805,11 @@ fn complete_prompt_with_host(
         for skill in &agent.skills {
             let tag = format!("<skill name=\"{}\"", skill.name);
             if latest_user_text.contains(&tag) {
-                host.native_record_skill_outcome_for_skill(&skill.name, &skill.body, skill_outcome);
+                host.native_record_skill_outcome_for_skill(
+                    &skill.name,
+                    &skill.read_body(),
+                    skill_outcome,
+                );
             }
         }
 

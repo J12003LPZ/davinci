@@ -489,7 +489,8 @@ fn a_chat_entry_keeps_the_message_extras() {
 fn queues_and_compaction_match_ts_modes() {
     let mut agent = Agent::new(default_system_prompt());
     agent.prompt(&"aaaaaaaaaa bbbbbbbbbb ".repeat(80));
-    agent.record_assistant(&"cccccccccc ".repeat(80));
+    agent.record_assistant(&"cccccccccc ".repeat(400));
+    agent.prompt("go on");
     agent.queues.enqueue_steer("steer me");
     agent.queues.enqueue_follow_up("follow");
     assert_eq!(agent.queues.steer.len(), 1);
@@ -6162,7 +6163,7 @@ fn a_full_context_with_failed_auto_compaction_blocks_the_request() {
     agent.compaction.keep_recent_tokens = 1;
     agent.summarizer = Some(Summarizer::new(|_| Err("provider timed out".into())));
     for i in 0..6 {
-        agent.prompt(&format!("request {i}: {}", "background ".repeat(400)));
+        agent.prompt(&format!("request {i}: {}", "background ".repeat(250)));
         agent.record_assistant(&format!("reply {i}: {}", "detail ".repeat(400)));
     }
     let before = agent.messages.len();

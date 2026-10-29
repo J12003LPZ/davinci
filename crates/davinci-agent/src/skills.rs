@@ -11,6 +11,8 @@ pub struct Skill {
     pub name: String,
     pub path: PathBuf,
     pub description: String,
+    /// Inline fallback text for a skill built without a file. Discovery leaves
+    /// it empty; [`Skill::read_body`] reads the file lazily.
     pub body: String,
     #[serde(default)]
     pub base_dir: PathBuf,
@@ -154,8 +156,79 @@ pub fn discover_skills(roots: &[PathBuf]) -> Vec<Skill> {
     skills
 }
 
+/// Most bytes discovery reads of one skill file: enough for the frontmatter and
+/// a first line, never the body.
+pub const SKILL_DISCOVERY_MAX_BYTES: usize = 16 * 1024;
+
+/// What decides a cached body is stale: the file's modification time and length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SkillFileKey {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+fn skill_file_key(path: &Path) -> Option<SkillFileKey> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(SkillFileKey {
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
+    })
+}
+
+type BodyCache = std::collections::HashMap<PathBuf, (SkillFileKey, std::sync::Arc<str>)>;
+
+/// The whole skill file, read when a skill is selected and cached by path
+/// until its key changes. `None` when the file cannot be read.
+fn cached_skill_file(path: &Path) -> Option<std::sync::Arc<str>> {
+    static BODIES: std::sync::OnceLock<std::sync::Mutex<BodyCache>> = std::sync::OnceLock::new();
+    let key = skill_file_key(path)?;
+    let mut bodies = BODIES.get_or_init(Default::default).lock().ok()?;
+    if let Some((cached, text)) = bodies.get(path) {
+        if *cached == key {
+            return Some(text.clone());
+        }
+    }
+    let text: std::sync::Arc<str> = fs::read_to_string(path).ok()?.into();
+    bodies.insert(path.to_path_buf(), (key, text.clone()));
+    Some(text)
+}
+
+impl Skill {
+    /// The whole skill file. Discovery does not read it; this does, on
+    /// selection, and re-reads when the file changed. A skill built without a
+    /// readable file answers with its inline `body`.
+    pub fn read_body(&self) -> String {
+        match cached_skill_file(&self.path) {
+            Some(text) => text.to_string(),
+            None => self.body.clone(),
+        }
+    }
+}
+
+/// At most `SKILL_DISCOVERY_MAX_BYTES` of the file, and whether more follows.
+fn read_skill_prefix(path: &Path) -> Option<(String, bool)> {
+    use std::io::Read;
+    let mut buffer = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(SKILL_DISCOVERY_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut buffer)
+        .ok()?;
+    let truncated = buffer.len() > SKILL_DISCOVERY_MAX_BYTES;
+    buffer.truncate(SKILL_DISCOVERY_MAX_BYTES);
+    Some((String::from_utf8_lossy(&buffer).into_owned(), truncated))
+}
+
 fn load_skill(path: &Path) -> Option<Skill> {
-    let raw = fs::read_to_string(path).ok()?;
+    let (raw, truncated) = read_skill_prefix(path)?;
+    let unbom = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+    if truncated && unbom.starts_with("---") && !unbom[3..].contains("\n---") {
+        eprintln!(
+            "skipping skill {}: frontmatter does not fit in the first {SKILL_DISCOVERY_MAX_BYTES} bytes",
+            path.display()
+        );
+        return None;
+    }
     let (frontmatter, body) = crate::templates::parse_frontmatter(&raw);
     let parent_name = path
         .parent()
@@ -192,7 +265,7 @@ fn load_skill(path: &Path) -> Option<Skill> {
         name,
         path: path.to_path_buf(),
         description,
-        body: raw,
+        body: String::new(),
         base_dir: path.parent().unwrap_or(path).to_path_buf(),
         namespace: None,
     })
@@ -225,7 +298,7 @@ fn expand_skill_command_with(
     let Some(skill) = find_skill_command(command, skills, templates) else {
         return (text.to_string(), None);
     };
-    let raw = fs::read_to_string(&skill.path).unwrap_or_else(|_| skill.body.clone());
+    let raw = skill.read_body();
     let body = strip_frontmatter(&raw).trim().to_string();
     let location = skill.path.display();
     let base = if skill.base_dir.as_os_str().is_empty() {
@@ -563,6 +636,88 @@ mod tests {
         let res = expand_user_text_with_metadata("/skill:debug-sqlx run check", &skills, &[]);
         assert_eq!(res.skills, vec!["debug-sqlx".to_string()]);
         assert!(res.text.contains("Fix sqlx."));
+    }
+
+    fn write_skill(dir: &Path, name: &str, text: &str) -> PathBuf {
+        let skill_dir = dir.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let path = skill_dir.join("SKILL.md");
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn discovery_reads_only_bounded_frontmatter() {
+        let dir = tempdir().unwrap();
+        let huge = format!(
+            "---\nname: huge\ndescription: Huge body\n---\n\nHEAD\n{}\nPAST_CAP_MARKER\n",
+            "x".repeat(SKILL_DISCOVERY_MAX_BYTES * 3)
+        );
+        write_skill(dir.path(), "huge", &huge);
+        let skills = discover_skills(&[dir.path().join("huge")]);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "huge");
+        assert_eq!(skills[0].description, "Huge body");
+        assert!(skills[0].body.is_empty(), "discovery kept a body");
+        let json = serde_json::to_string(&skills[0]).unwrap();
+        assert!(!json.contains("PAST_CAP_MARKER") && !json.contains("xxxx"));
+
+        // Frontmatter that does not fit in the cap is skipped, not read on.
+        let long_frontmatter = format!(
+            "---\nname: wide\ndescription: {}\n---\n\nbody\n",
+            "d".repeat(SKILL_DISCOVERY_MAX_BYTES * 2)
+        );
+        write_skill(dir.path(), "wide", &long_frontmatter);
+        assert!(discover_skills(&[dir.path().join("wide")]).is_empty());
+    }
+
+    #[test]
+    fn invocation_loads_the_body() {
+        let dir = tempdir().unwrap();
+        let path = write_skill(
+            dir.path(),
+            "lazy",
+            "---\nname: lazy\ndescription: Lazy\n---\n\nLAZY_BODY_SENTINEL\n",
+        );
+        let skills = discover_skills(&[path.parent().unwrap().to_path_buf()]);
+        assert!(!skills[0].body.contains("LAZY_BODY_SENTINEL"));
+        assert!(skills[0].read_body().contains("LAZY_BODY_SENTINEL"));
+        let expanded = expand_user_text("/skill:lazy go", &skills, &[]);
+        assert!(expanded.contains("LAZY_BODY_SENTINEL"), "{expanded}");
+        assert!(expanded.ends_with("go"));
+    }
+
+    #[test]
+    fn invocation_reloads_body_after_file_change() {
+        let dir = tempdir().unwrap();
+        let path = write_skill(
+            dir.path(),
+            "moving",
+            "---\nname: moving\ndescription: Moving\n---\n\nFIRST_BODY\n",
+        );
+        let skills = discover_skills(&[path.parent().unwrap().to_path_buf()]);
+        assert!(expand_user_text("/skill:moving", &skills, &[]).contains("FIRST_BODY"));
+        std::fs::write(
+            &path,
+            "---\nname: moving\ndescription: Moving\n---\n\nSECOND_BODY_IS_LONGER\n",
+        )
+        .unwrap();
+        let again = expand_user_text("/skill:moving", &skills, &[]);
+        assert!(again.contains("SECOND_BODY_IS_LONGER"), "{again}");
+        assert!(!again.contains("FIRST_BODY"));
+    }
+
+    #[test]
+    fn a_constructed_skill_without_a_file_falls_back_to_its_inline_body() {
+        let skill = Skill {
+            name: "inline".into(),
+            path: PathBuf::from("/virtual/missing/SKILL.md"),
+            description: String::new(),
+            body: "INLINE".into(),
+            base_dir: PathBuf::new(),
+            namespace: None,
+        };
+        assert_eq!(skill.read_body(), "INLINE");
     }
 
     #[test]

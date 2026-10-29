@@ -369,6 +369,20 @@ pub fn compact_messages_with_options(
     let details = compute_file_lists(&file_ops);
     let tokens_before = estimate_context_tokens(messages);
 
+    let carried = user_requirements_to_carry(previous_summary, &messages[..cut_index]);
+    let carried_bytes: usize = carried.iter().map(String::len).sum();
+    if carried_bytes > USER_REQUIREMENTS_MAX_BYTES {
+        return unchanged_result(
+            messages,
+            details,
+            tokens_before,
+            format!(
+                "Compaction skipped: the user requirements to carry ({carried_bytes} bytes) exceed the {USER_REQUIREMENTS_MAX_BYTES} byte limit; the history is unchanged"
+            ),
+            None,
+        );
+    }
+
     let env = env_summarizer();
     let (mut summary, usage) = if let Some(summarizer) = summarizer.or(env.as_ref()) {
         match generate_compaction_summary(
@@ -409,8 +423,18 @@ pub fn compact_messages_with_options(
         &details.read_files,
         &details.modified_files,
     ));
+    summary.push_str(&render_user_requirements(&carried));
 
     let mut compacted = vec![compaction_context_message(&summary)];
+    if let Err(reason) = verify_user_requirements(&compacted[0], &carried) {
+        return unchanged_result(
+            messages,
+            details,
+            tokens_before,
+            format!("Compaction rejected: {reason}; the history is unchanged"),
+            usage,
+        );
+    }
     compacted.extend(messages[cut_index..].iter().cloned());
     let tokens_after = estimate_context_tokens(&compacted);
     // Admission gate: a checkpoint that does not shrink the context only adds
@@ -584,6 +608,120 @@ pub fn branch_summary_context_message(summary: &str) -> ChatMessage {
         "user",
         format!("{BRANCH_SUMMARY_PREFIX}{summary}{BRANCH_SUMMARY_SUFFIX}"),
     )
+}
+
+pub const USER_REQUIREMENTS_OPEN: &str = "<user-requirements-carried-verbatim>";
+const USER_REQUIREMENTS_CLOSE: &str = "</user-requirements-carried-verbatim>";
+/// Most bytes of user text a compaction summary carries. Past it the history is
+/// kept instead: user requirements are never truncated to fit.
+pub const USER_REQUIREMENTS_MAX_BYTES: usize = 24 * 1024;
+
+/// The block appended to a compaction summary: every entry verbatim, each behind
+/// a `[n len=bytes]` header so entry text that quotes the tags cannot end it.
+fn render_user_requirements(entries: &[String]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    let mut block = format!("\n\n{USER_REQUIREMENTS_OPEN}\n");
+    for (index, entry) in entries.iter().enumerate() {
+        block.push_str(&format!("[{} len={}]\n{entry}\n", index + 1, entry.len()));
+    }
+    block.push_str(USER_REQUIREMENTS_CLOSE);
+    block
+}
+
+fn parse_user_requirements_body(rest: &str) -> Option<Vec<String>> {
+    let mut rest = rest.strip_prefix('\n')?;
+    let mut entries = Vec::new();
+    loop {
+        if rest.starts_with(USER_REQUIREMENTS_CLOSE) {
+            return Some(entries);
+        }
+        let (header, after) = rest.strip_prefix('[')?.split_once("]\n")?;
+        let (index, len) = header.split_once(" len=")?;
+        if index.parse::<usize>().ok()? != entries.len() + 1 {
+            return None;
+        }
+        let len: usize = len.parse().ok()?;
+        entries.push(after.get(..len)?.to_string());
+        rest = after[len..].strip_prefix('\n')?;
+    }
+}
+
+/// The entries of the first well-formed requirements block in `text`.
+fn parse_user_requirements(text: &str) -> Option<Vec<String>> {
+    text.match_indices(USER_REQUIREMENTS_OPEN)
+        .find_map(|(at, _)| {
+            parse_user_requirements_body(&text[at + USER_REQUIREMENTS_OPEN.len()..])
+        })
+}
+
+/// What a summary must carry for `compacted`: the entries an earlier summary
+/// carried, then each real user message, in order, exact duplicates dropped.
+fn user_requirements_to_carry(
+    previous_summary: Option<&str>,
+    compacted: &[ChatMessage],
+) -> Vec<String> {
+    fn push_unique(entries: &mut Vec<String>, entry: String) {
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    let mut entries = Vec::new();
+    for carried in previous_summary
+        .and_then(parse_user_requirements)
+        .unwrap_or_default()
+    {
+        push_unique(&mut entries, carried);
+    }
+    for message in compacted {
+        let text = content_text(&message.content);
+        let is_summary = message.role == "compactionSummary"
+            || (message.role == "user" && text.starts_with(COMPACTION_SUMMARY_PREFIX));
+        if is_summary {
+            for carried in parse_user_requirements(&text).unwrap_or_default() {
+                push_unique(&mut entries, carried);
+            }
+        } else if message.role == "user"
+            && !text.trim().is_empty()
+            && user_role_label(message) == "User"
+        {
+            push_unique(&mut entries, text);
+        }
+    }
+    entries
+}
+
+/// Every carried entry must appear, exactly and in order, in the message that
+/// would replace the history.
+fn verify_user_requirements(message: &ChatMessage, expected: &[String]) -> Result<(), String> {
+    if expected.is_empty() {
+        return Ok(());
+    }
+    match parse_user_requirements(&content_text(&message.content)) {
+        Some(found) if found == expected => Ok(()),
+        _ => Err("the summary does not carry every user requirement verbatim".to_string()),
+    }
+}
+
+/// A compaction that is refused: the history is unchanged and `reason` says why.
+fn unchanged_result(
+    messages: &[ChatMessage],
+    details: CompactionDetails,
+    tokens_before: u64,
+    reason: String,
+    usage: Option<Usage>,
+) -> CompactionResult {
+    CompactionResult {
+        summary: reason,
+        messages: messages.to_vec(),
+        compacted: false,
+        details,
+        first_kept_entry_id: String::new(),
+        tokens_before,
+        tokens_after: tokens_before,
+        usage,
+    }
 }
 
 /// The local fallback keeps at most this fraction (1/N) of the history it replaces.
@@ -1648,9 +1786,134 @@ mod tests {
             "## Goal
 ship the csv import",
         );
-        assert!(
-            compact_messages_with_options(&messages, None, 1, 100, None, Some(&good)).compacted
+        let accepted = compact_messages_with_options(&messages, None, 1, 100, None, Some(&good));
+        assert!(accepted.compacted);
+        // The committed summary carries the compacted user request verbatim.
+        let request = "original request ".repeat(100);
+        assert!(content_text(&accepted.messages[0].content).contains(&request));
+    }
+
+    fn context_text(message: &ChatMessage) -> String {
+        content_text(&message.content)
+    }
+
+    #[test]
+    fn compaction_preserves_compacted_user_messages_verbatim() {
+        let restriction = format!(
+            "Never touch `src/legacy`.\nKeep tabs\tand unicode é ✓.\n{USER_REQUIREMENTS_CLOSE}\n[2 len=3]\nabc"
         );
+        let assistant = "work done ".repeat(100);
+        let messages = vec![
+            ChatMessage::text("user", restriction.clone()),
+            ChatMessage::text("assistant", assistant.clone()),
+            ChatMessage::text("user", "recent"),
+        ];
+        let summarizer = fixed_summarizer("## Goal\nship the csv import");
+        let result =
+            compact_messages_with_options(&messages, None, 1, 100, None, Some(&summarizer));
+        assert!(result.compacted, "{}", result.summary);
+        let text = context_text(&result.messages[0]);
+        assert!(text.contains(&restriction), "{text}");
+        assert!(!text.contains(&assistant));
+        assert_eq!(parse_user_requirements(&text), Some(vec![restriction]));
+        assert!(result.summary.contains(USER_REQUIREMENTS_OPEN));
+    }
+
+    #[test]
+    fn repeated_compaction_carries_forward_user_requirements() {
+        let restriction = "NEVER delete the vendor directory".to_string();
+        let summarizer = fixed_summarizer("## Goal\nship the csv import");
+        let mut messages = vec![
+            ChatMessage::text("user", restriction.clone()),
+            ChatMessage::text("assistant", "work done ".repeat(200)),
+            ChatMessage::text("user", "ask 0"),
+        ];
+        for round in 1..=5 {
+            let result =
+                compact_messages_with_options(&messages, None, 1, 100, None, Some(&summarizer));
+            assert!(result.compacted, "round {round}: {}", result.summary);
+            messages = result.messages;
+            messages.push(ChatMessage::text("assistant", "work done ".repeat(200)));
+            messages.push(ChatMessage::text("user", format!("ask {round}")));
+        }
+        let text = context_text(&messages[0]);
+        let carried = parse_user_requirements(&text).expect("block");
+        assert_eq!(carried[0], restriction);
+        assert_eq!(&carried[1..], ["ask 0", "ask 1", "ask 2", "ask 3"]);
+    }
+
+    #[test]
+    fn previous_summary_requirements_are_carried_and_deduped() {
+        let previous = format!(
+            "## Goal\nold{}",
+            render_user_requirements(&["keep A".into(), "keep B".into()])
+        );
+        let messages = vec![
+            ChatMessage::text("user", "keep B"),
+            ChatMessage::text("assistant", "work done ".repeat(100)),
+            ChatMessage::text("user", "recent"),
+        ];
+        let summarizer = fixed_summarizer("## Goal\nship the csv import");
+        let result = compact_messages_with_options(
+            &messages,
+            None,
+            1,
+            100,
+            Some(&previous),
+            Some(&summarizer),
+        );
+        assert!(result.compacted, "{}", result.summary);
+        assert_eq!(
+            parse_user_requirements(&result.summary),
+            Some(vec!["keep A".to_string(), "keep B".to_string()])
+        );
+    }
+
+    #[test]
+    fn summary_missing_user_requirement_is_rejected() {
+        let expected = vec!["keep A".to_string(), "keep B".to_string()];
+        let intact = compaction_context_message(&format!(
+            "## Goal\nx{}",
+            render_user_requirements(&expected)
+        ));
+        assert!(verify_user_requirements(&intact, &expected).is_ok());
+        let dropped = compaction_context_message(&format!(
+            "## Goal\nx{}",
+            render_user_requirements(&expected[..1])
+        ));
+        assert!(verify_user_requirements(&dropped, &expected).is_err());
+        let corrupted = compaction_context_message(&format!(
+            "## Goal\nx{}",
+            render_user_requirements(&expected).replace("keep B", "keep b")
+        ));
+        assert!(verify_user_requirements(&corrupted, &expected).is_err());
+        let no_block = compaction_context_message("## Goal\nkeep A keep B");
+        assert!(verify_user_requirements(&no_block, &expected).is_err());
+    }
+
+    #[test]
+    fn oversized_user_requirements_block_keeps_original_history() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let summarizer = counting_summarizer(1_000_000, Arc::clone(&seen));
+        let messages = vec![
+            ChatMessage::text(
+                "user",
+                "requirement ".repeat(USER_REQUIREMENTS_MAX_BYTES / 6),
+            ),
+            ChatMessage::text("assistant", "work done ".repeat(5_000)),
+            ChatMessage::text("user", "recent"),
+        ];
+        let result =
+            compact_messages_with_options(&messages, None, 1, 2_000, None, Some(&summarizer));
+        assert!(!result.compacted);
+        assert!(
+            result.summary.contains("user requirements"),
+            "{}",
+            result.summary
+        );
+        assert_eq!(result.messages, messages);
+        assert_eq!(result.tokens_after, result.tokens_before);
+        assert!(seen.lock().unwrap().is_empty(), "no model call is spent");
     }
 
     #[test]
@@ -1728,12 +1991,12 @@ the user said hi and the assistant said hello and then the user said ok",
         // A history whose own user text is over the budget cannot be capped
         // (it is the authority): nothing is sent and nothing is lost.
         let messages = vec![
-            ChatMessage::text("user", "requirement ".repeat(20_000)),
+            ChatMessage::text("user", "requirement ".repeat(1_700)),
             ChatMessage::text("assistant", "ok"),
             ChatMessage::text("user", "continue"),
         ];
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let summarizer = counting_summarizer(8_000, Arc::clone(&seen));
+        let summarizer = counting_summarizer(4_000, Arc::clone(&seen));
         let result =
             compact_messages_with_options(&messages, None, 1, 2_000, None, Some(&summarizer));
         assert!(!result.compacted);
@@ -1812,7 +2075,7 @@ ship the csv import",
 
         let split_messages = vec![
             ChatMessage::text("user", "original request ".repeat(20)),
-            ChatMessage::text("assistant", "early work ".repeat(20)),
+            ChatMessage::text("assistant", "early work ".repeat(200)),
             ChatMessage::text("assistant", "recent suffix"),
         ];
         let split =

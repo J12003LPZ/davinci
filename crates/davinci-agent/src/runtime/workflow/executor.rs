@@ -172,6 +172,9 @@ pub struct WorkflowExecutor {
     tokens: Arc<RwLock<HashMap<WorkflowId, CancellationToken>>>,
     specs: Arc<RwLock<HashMap<WorkflowId, WorkflowSpec>>>,
     launches: Arc<RwLock<HashMap<WorkflowId, WorkflowLaunch>>>,
+    /// Artifacts a resume found stored against a different source tree. They
+    /// satisfy no phase and mark no worker done, so their workers run again.
+    stale_artifacts: Arc<RwLock<HashMap<WorkflowId, HashSet<uuid::Uuid>>>>,
     /// Each worker's live activity (tool uses, tokens, recent calls) for
     /// the workflows view.
     progress: Arc<RwLock<HashMap<AgentId, crate::subagent_progress::ProgressReporter>>>,
@@ -198,6 +201,7 @@ impl WorkflowExecutor {
             tokens: Arc::new(RwLock::new(HashMap::new())),
             specs: Arc::new(RwLock::new(HashMap::new())),
             launches: Arc::new(RwLock::new(HashMap::new())),
+            stale_artifacts: Arc::new(RwLock::new(HashMap::new())),
             progress: Arc::new(RwLock::new(HashMap::new())),
             agent_tokens: Arc::new(RwLock::new(HashMap::new())),
             join_grace: DEFAULT_JOIN_GRACE,
@@ -600,8 +604,19 @@ impl WorkflowExecutor {
         let mut phase_states = HashMap::new();
         let mut grants = Vec::new();
 
+        // An artifact stored against another source tree, or against none on
+        // record, is not evidence about this one: its worker runs again. A
+        // store with no fingerprint to compare (no source root, or not a git
+        // repository) keeps the earlier behavior and reuses every artifact.
+        let stale = self.stale_artifact_ids(wf_id, &spec);
+        self.stale_artifacts
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(wf_id, stale.clone());
+
         for phase in &spec.phases {
-            let existing_artifacts = self.store.list_phase_artifacts(wf_id, &phase.id);
+            let mut existing_artifacts = self.store.list_phase_artifacts(wf_id, &phase.id);
+            existing_artifacts.retain(|artifact| !stale.contains(&artifact.id));
             let is_phase_satisfied = phase_satisfied_by(phase, &existing_artifacts);
 
             if is_phase_satisfied {
@@ -725,11 +740,33 @@ impl WorkflowExecutor {
         ))
     }
 
-    /// Spec workers of `phase` whose output is already stored.
+    /// Ids of the artifacts of `spec`'s phases that were not committed against
+    /// the current source tree. Empty when there is no current fingerprint.
+    fn stale_artifact_ids(&self, wf_id: WorkflowId, spec: &WorkflowSpec) -> HashSet<uuid::Uuid> {
+        let Some(current) = self.store.current_source_fingerprint() else {
+            return HashSet::new();
+        };
+        spec.phases
+            .iter()
+            .flat_map(|phase| self.store.list_phase_artifacts(wf_id, &phase.id))
+            .filter(|artifact| artifact.source_fingerprint.as_deref() != Some(current.as_str()))
+            .map(|artifact| artifact.id)
+            .collect()
+    }
+
+    /// Spec workers of `phase` whose output is already stored (and not stale).
     fn persisted_workers(&self, wf_id: &WorkflowId, phase: &WorkflowPhaseSpec) -> HashSet<String> {
+        let stale = self
+            .stale_artifacts
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(wf_id)
+            .cloned()
+            .unwrap_or_default();
         self.store
             .list_phase_artifacts(*wf_id, &phase.id)
             .iter()
+            .filter(|artifact| !stale.contains(&artifact.id))
             .filter_map(|a| a.value.get("worker").and_then(|v| v.as_str()))
             .filter(|id| phase.workers.iter().any(|w| w.id == *id))
             .map(str::to_string)
@@ -3883,6 +3920,108 @@ mod tests {
         assert_eq!(resume_runs(phase_spec("all", &["a", "b"]), &["a", "b"]), 0);
         // With only `a` stored, only `b` runs again (WOR-124).
         assert_eq!(resume_runs(phase_spec("all", &["a", "b"]), &["a"]), 1);
+    }
+
+    /// An executor whose artifacts are stamped with the state of the git
+    /// fixture at `<tmp>/repo`, and the runs its runner counts.
+    fn sourced_executor() -> (
+        WorkflowExecutor,
+        tempfile::TempDir,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&runs);
+        let runner = SubagentRunner::new(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("ran".into())
+        });
+        let (mut executor, tmp) = setup_executor(Some(runner));
+        executor.store = executor
+            .store
+            .clone()
+            .with_source_root(tmp.path().join("repo"));
+        (executor, tmp, runs)
+    }
+
+    fn store_outputs(executor: &WorkflowExecutor, wf_id: WorkflowId, workers: &[&str]) {
+        for worker in workers {
+            executor
+                .store
+                .put_artifact(
+                    wf_id,
+                    "work",
+                    AgentId::new(),
+                    serde_json::json!({"worker": worker, "output": "done"}),
+                    None,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn resume_reruns_artifacts_when_source_fingerprint_changes() {
+        let (executor, tmp, runs) = sourced_executor();
+        let (unchanged, changed) = (WorkflowId::new(), WorkflowId::new());
+        store_outputs(&executor, unchanged, &["a", "b"]);
+        store_outputs(&executor, changed, &["a", "b"]);
+        let spec = phase_spec("all", &["a", "b"]);
+
+        // The tree is as the artifacts left it: they are reused.
+        executor
+            .resume_execution(unchanged, spec.clone(), &HashSet::new())
+            .unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // A different tree: nothing stored against the old one is reused.
+        std::fs::write(tmp.path().join("repo").join("edited.txt"), "new").unwrap();
+        executor
+            .resume_execution(changed, spec, &HashSet::new())
+            .unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn legacy_artifact_without_fingerprint_is_rerun() {
+        let (mut executor, tmp, runs) = sourced_executor();
+        let rooted = executor.store.clone();
+        executor.store = WorkflowStateStore::with_options(32 * 1024, tmp.path().to_path_buf());
+        let wf_id = WorkflowId::new();
+        // Stored before fingerprints existed (no source root, no stamp).
+        store_outputs(&executor, wf_id, &["a", "b"]);
+        assert!(executor
+            .store
+            .list_phase_artifacts(wf_id, "work")
+            .iter()
+            .all(|artifact| artifact.source_fingerprint.is_none()));
+        executor.store = rooted;
+        executor
+            .resume_execution(wf_id, phase_spec("all", &["a", "b"]), &HashSet::new())
+            .unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn source_fingerprint_follows_content_and_ignores_runtime_state() {
+        use super::super::source_fingerprint::source_fingerprint;
+        let (_executor, tmp, _) = sourced_executor();
+        let repo = tmp.path().join("repo");
+        let clean = source_fingerprint(&repo).expect("a git repo has a fingerprint");
+        assert_eq!(source_fingerprint(&repo).as_deref(), Some(clean.as_str()));
+        std::fs::write(repo.join("x.txt"), "one").unwrap();
+        let one = source_fingerprint(&repo).unwrap();
+        // Same status line (`?? x.txt`), different bytes.
+        std::fs::write(repo.join("x.txt"), "two").unwrap();
+        let two = source_fingerprint(&repo).unwrap();
+        assert!(clean != one && one != two);
+        // Runtime state under .davinci is not source.
+        std::fs::create_dir_all(repo.join(".davinci")).unwrap();
+        std::fs::write(repo.join(".davinci").join("state.json"), "{}").unwrap();
+        assert_eq!(source_fingerprint(&repo), Some(two));
+        // Not a git repository: no fingerprint, today's behavior.
+        assert_eq!(
+            source_fingerprint(tmp.path().join("nowhere").as_path()),
+            None
+        );
     }
 
     #[test]

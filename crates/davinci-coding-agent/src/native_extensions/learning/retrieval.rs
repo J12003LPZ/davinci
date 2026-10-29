@@ -346,7 +346,9 @@ pub fn select_graph_skill_candidates_with_embeddings(
         let content_hash = record
             .map(|r| r.content_hash.clone())
             .filter(|h| !h.is_empty())
-            .unwrap_or_else(|| crate::native_extensions::vector_memory::content_hash(&skill.body));
+            .unwrap_or_else(|| {
+                crate::native_extensions::vector_memory::content_hash(&skill.read_body())
+            });
 
         let role_boost = role_bias(role, &skill.name, &skill.description);
         let applicability = record
@@ -380,7 +382,8 @@ pub fn select_graph_skill_candidates_with_embeddings(
         if selected_names.contains(&c.skill.name) {
             continue;
         }
-        let est_tokens = c.skill.body.chars().count().div_ceil(4);
+        let body = c.skill.read_body();
+        let est_tokens = body.chars().count().div_ceil(4);
         if accumulated_tokens + est_tokens > token_cap {
             continue;
         }
@@ -390,7 +393,7 @@ pub fn select_graph_skill_candidates_with_embeddings(
             name: c.skill.name.clone(),
             version: c.version,
             content_hash: c.content_hash,
-            body: c.skill.body.clone(),
+            body,
             score: c.score,
             estimated_tokens: est_tokens,
         });
