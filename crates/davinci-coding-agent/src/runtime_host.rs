@@ -248,6 +248,9 @@ fn warn_about_orphans_once(
                 .map(|orphan| match orphan {
                     WorktreeOrphan::Directory(path) => format!("directory {}", path.display()),
                     WorktreeOrphan::Branch(branch) => format!("branch {branch}"),
+                    WorktreeOrphan::Registration(path) => {
+                        format!("git registration {}", path.display())
+                    }
                 })
                 .collect();
             warn(format!(
