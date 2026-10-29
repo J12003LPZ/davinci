@@ -16,13 +16,14 @@ const EXCLUDED_ROOTS: [&str; 3] = [".git", ".davinci", ".pi"];
 /// What is known of the source tree under a root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SourceState {
-    /// Not a git repository with a commit: no evidence either way, so the
-    /// caller keeps its behavior from before fingerprints existed.
+    /// Git definitively reports no work tree here (or git is not installed):
+    /// no evidence either way, so the caller keeps its behavior from before
+    /// fingerprints existed.
     NotGit,
     /// A git workspace whose state cannot be fingerprinted (git or a file read
-    /// failed, the changes are too many or too large, or a directory entry such
-    /// as a dirty submodule hides its own changes). Nothing stored against it
-    /// can be shown to still match.
+    /// failed, HEAD does not resolve, the changes are too many or too large,
+    /// or a directory entry such as a dirty submodule hides its own changes).
+    /// Nothing stored against it can be shown to still match.
     Unavailable,
     /// Git HEAD plus a digest of the working-tree status and of the contents of
     /// every modified or untracked file.
@@ -38,17 +39,80 @@ pub(crate) fn source_fingerprint(root: &Path) -> Option<String> {
 }
 
 pub(crate) fn source_state(root: &Path) -> SourceState {
+    match probe_work_tree(root) {
+        WorkTree::Inside => {}
+        WorkTree::Outside => return SourceState::NotGit,
+        WorkTree::Unknown => return SourceState::Unavailable,
+    }
     let git =
         |args: &[&str], limit: usize| crate::runtime::transactions::observe_git(root, args, limit);
+    // Inside a work tree, a HEAD that does not resolve (unborn, corrupt) is a
+    // tree that cannot be fingerprinted, not a tree without git.
     let (Ok(head), Ok(top)) = (
         git(&["rev-parse", "HEAD"], 256),
         git(&["rev-parse", "--show-toplevel"], 8192),
     ) else {
-        return SourceState::NotGit;
+        return SourceState::Unavailable;
     };
     match digest_working_tree(root, &head, &top) {
         Some(digest) => SourceState::Digest(digest),
         None => SourceState::Unavailable,
+    }
+}
+
+enum WorkTree {
+    Inside,
+    /// Git definitively reports there is no work tree here.
+    Outside,
+    /// Git could not answer, or failed for a reason other than "no repository".
+    Unknown,
+}
+
+/// Ask git whether `root` is inside a work tree. `Outside` only when `root` is
+/// not a directory, git is not installed, git prints `false`, or git says "not a
+/// git repository" and no `.git` entry exists at or above `root`. A `.git` entry
+/// that git rejects (a corrupt `.git/HEAD` also reads as "not a git repository")
+/// is a damaged workspace, so it is `Unknown`, as is every other failure.
+fn probe_work_tree(root: &Path) -> WorkTree {
+    if !root.is_dir() {
+        return WorkTree::Outside;
+    }
+    let mut command = std::process::Command::new("git");
+    command
+        .current_dir(root)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        // The "not a git repository" message is matched below: keep it untranslated.
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "C")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let output = match command.output() {
+        Ok(output) => output,
+        // git is not on PATH: nothing can be fingerprinted, which is the
+        // behavior from before fingerprints existed.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return WorkTree::Outside,
+        Err(_) => return WorkTree::Unknown,
+    };
+    if output.status.success() {
+        return match output.stdout.trim_ascii() {
+            b"true" => WorkTree::Inside,
+            b"false" => WorkTree::Outside,
+            _ => WorkTree::Unknown,
+        };
+    }
+    let message = String::from_utf8_lossy(&output.stderr);
+    let has_git_entry = root
+        .ancestors()
+        .any(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok());
+    if message.contains("not a git repository") && !has_git_entry {
+        WorkTree::Outside
+    } else {
+        WorkTree::Unknown
     }
 }
 
@@ -126,4 +190,48 @@ fn hash_content(hasher: &mut Sha256, path: &Path, total: &mut u64) -> Option<()>
         hasher.update(b"other");
     }
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+    }
+
+    #[test]
+    fn a_plain_directory_is_not_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(source_state(tmp.path()), SourceState::NotGit);
+        assert_eq!(
+            source_state(&tmp.path().join("nowhere")),
+            SourceState::NotGit
+        );
+    }
+
+    #[test]
+    fn a_repository_without_a_resolvable_head_is_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        git(tmp.path(), &["init", "-q"]);
+        // Unborn HEAD: a git workspace with no commit to fingerprint.
+        assert_eq!(source_state(tmp.path()), SourceState::Unavailable);
+        git(tmp.path(), &["commit", "-q", "--allow-empty", "-m", "init"]);
+        assert!(matches!(source_state(tmp.path()), SourceState::Digest(_)));
+    }
+
+    #[test]
+    fn a_corrupt_git_head_is_unavailable_not_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        git(tmp.path(), &["init", "-q"]);
+        git(tmp.path(), &["commit", "-q", "--allow-empty", "-m", "init"]);
+        std::fs::write(tmp.path().join(".git").join("HEAD"), "garbage\n").unwrap();
+        assert_eq!(source_state(tmp.path()), SourceState::Unavailable);
+    }
 }

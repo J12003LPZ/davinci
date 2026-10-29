@@ -5960,6 +5960,67 @@ fn wor21_repeated_compaction_reloads_the_same_branch_history() {
     assert_eq!(chat_texts(&messages_from_session(&reopened)), live);
 }
 
+/// An agent whose only compaction entry predates the carried-requirements
+/// metadata: its summary text is the sole record of what the user restricted.
+fn agent_with_legacy_compaction(dir: &std::path::Path, restriction: &str) -> Agent {
+    let mut agent = legacy_compaction_agent(dir);
+    agent.summarizer = Some(Summarizer::new(|_| {
+        Ok(crate::compaction::SummarizeResponse {
+            text: "## Goal\nship the import".into(),
+            usage: Default::default(),
+            stop_reason: Some(davinci_ai::StopReason::Stop),
+            error_message: None,
+            has_tool_call: false,
+        })
+    }));
+    agent.prompt(&format!("{restriction} {}", "x".repeat(400)));
+    agent.record_assistant(&format!("answer {}", "y".repeat(400)));
+    for turn in 0..3 {
+        agent.prompt(&format!("question {turn} {}", "x".repeat(400)));
+        agent.record_assistant(&format!("answer {turn} {}", "y".repeat(400)));
+    }
+    let first = agent.compact(None);
+    assert!(first.compacted, "{}", first.summary);
+    let session = agent.session.as_mut().unwrap();
+    let entry = session
+        .entries
+        .iter_mut()
+        .find(|entry| entry.entry_type == "compaction")
+        .unwrap();
+    entry.extra.remove("carriedUserRequirements");
+    agent.messages = messages_from_session(agent.session.as_ref().unwrap());
+    for turn in 0..3 {
+        agent.prompt(&format!("later question {turn} {}", "x".repeat(400)));
+        agent.record_assistant(&format!("later answer {turn} {}", "y".repeat(400)));
+    }
+    agent
+}
+
+#[test]
+fn a_restriction_recorded_only_in_a_legacy_compaction_summary_survives_the_next_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = agent_with_legacy_compaction(dir.path(), "Never delete vendor/");
+    let second = agent.compact(None);
+    assert!(second.compacted, "{}", second.summary);
+    let carried = crate::compaction_summary_meta(&agent.messages[0])
+        .expect("generated summary metadata")
+        .carried_user_requirements;
+    assert!(
+        carried
+            .iter()
+            .any(|entry| entry.contains("Never delete vendor/")),
+        "{carried:?}"
+    );
+    // And it keeps surviving: the entry is now ordinary carried metadata.
+    let path = agent.session.as_ref().unwrap().path.clone();
+    let reopened = JsonlSession::open(&path).unwrap();
+    let reloaded = messages_from_session(&reopened)
+        .iter()
+        .find_map(crate::compaction_summary_meta)
+        .unwrap();
+    assert_eq!(reloaded.carried_user_requirements, carried);
+}
+
 #[test]
 fn compaction_metadata_survives_a_session_reopen_and_legacy_entries_load_without_it() {
     let dir = tempfile::tempdir().unwrap();

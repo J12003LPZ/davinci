@@ -5536,11 +5536,8 @@ impl Agent {
                     .rev()
                     .find(|entry| entry.entry_type == "compaction")
                     .and_then(|entry| {
-                        entry
-                            .extra
-                            .get("summary")
-                            .and_then(|value| value.as_str())
-                            .map(str::to_string)
+                        let text = entry.extra.get("summary")?.as_str()?.to_string();
+                        Some((text, compaction_entry_meta(entry)))
                     })
             });
             let provider = self.provider.clone();
@@ -5566,7 +5563,9 @@ impl Agent {
                 custom_instructions,
                 self.compaction.keep_recent_tokens,
                 self.compaction.reserve_tokens,
-                previous_summary.as_deref(),
+                previous_summary
+                    .as_ref()
+                    .map(|(text, meta)| crate::compaction::PreviousSummary { text, meta }),
                 bound.as_ref(),
             );
             self.finish_auxiliary_observations(
@@ -6275,17 +6274,28 @@ pub(crate) fn is_legacy_verification_notice(message: &ChatMessage) -> bool {
 /// its summary carries. The summary text only displays them.
 const COMPACTION_CARRIED_KEY: &str = "carriedUserRequirements";
 
+/// The requirements a `compaction` entry records. An entry saved before the
+/// metadata existed, or whose list does not parse, is `legacy`: its list is
+/// unknown, not empty, and its summary text is the only record.
+fn compaction_entry_meta(entry: &SessionEntry) -> crate::compaction::CompactionSummaryMeta {
+    let carried: Option<Vec<String>> = entry
+        .extra
+        .get(COMPACTION_CARRIED_KEY)
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    crate::compaction::CompactionSummaryMeta {
+        legacy: carried.is_none(),
+        carried_user_requirements: carried.unwrap_or_default(),
+    }
+}
+
 pub(crate) fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
     match entry.entry_type.as_str() {
         "compaction" => {
             let summary = entry.extra.get("summary")?.as_str()?;
-            // Entries saved before the metadata existed carry none.
-            let carried: Vec<String> = entry
-                .extra
-                .get(COMPACTION_CARRIED_KEY)
-                .and_then(|value| serde_json::from_value(value.clone()).ok())
-                .unwrap_or_default();
-            Some(compaction_context_message_carrying(summary, &carried))
+            Some(crate::compaction::compaction_context_message_with_meta(
+                summary,
+                &compaction_entry_meta(entry),
+            ))
         }
         "branch_summary" => {
             let summary = entry.extra.get("summary")?.as_str()?;

@@ -328,12 +328,20 @@ pub fn compact_messages_with(
     )
 }
 
+/// The summary an update-style compaction builds on: its text for the
+/// summarizer and its trusted metadata for the requirements it carries.
+#[derive(Debug, Clone, Copy)]
+pub struct PreviousSummary<'a> {
+    pub text: &'a str,
+    pub meta: &'a CompactionSummaryMeta,
+}
+
 pub fn compact_messages_with_options(
     messages: &[ChatMessage],
     custom_instructions: Option<&str>,
     keep_recent_tokens: u64,
     reserve_tokens: u64,
-    previous_summary: Option<&str>,
+    previous_summary: Option<PreviousSummary<'_>>,
     summarizer: Option<&Summarizer>,
 ) -> CompactionResult {
     if messages.len() < 2 {
@@ -369,7 +377,7 @@ pub fn compact_messages_with_options(
     let details = compute_file_lists(&file_ops);
     let tokens_before = estimate_context_tokens(messages);
 
-    let carried = user_requirements_to_carry(&messages[..cut_index]);
+    let carried = user_requirements_to_carry(previous_summary, &messages[..cut_index]);
     let carried_bytes = render_user_requirements(&carried).len();
     if carried_bytes > USER_REQUIREMENTS_MAX_BYTES {
         return unchanged_result(
@@ -389,7 +397,7 @@ pub fn compact_messages_with_options(
             history,
             turn_prefix,
             custom_instructions,
-            previous_summary,
+            previous_summary.map(|previous| previous.text),
             reserve_tokens,
             summarizer,
         ) {
@@ -615,18 +623,33 @@ pub const COMPACTION_META_KEY: &str = "davinciCompaction";
 pub struct CompactionSummaryMeta {
     #[serde(default)]
     pub carried_user_requirements: Vec<String>,
+    /// The summary was saved before the requirements were recorded as
+    /// metadata: its list is unknown, not empty, and its text is the only
+    /// record of the constraints it summarized.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy: bool,
 }
 
 /// A generated compaction summary. `carried` is recorded as metadata and is
 /// what the next compaction carries on; the summary text only displays it.
 pub fn compaction_context_message_carrying(summary: &str, carried: &[String]) -> ChatMessage {
+    compaction_context_message_with_meta(
+        summary,
+        &CompactionSummaryMeta {
+            carried_user_requirements: carried.to_vec(),
+            legacy: false,
+        },
+    )
+}
+
+pub fn compaction_context_message_with_meta(
+    summary: &str,
+    meta: &CompactionSummaryMeta,
+) -> ChatMessage {
     let mut message = ChatMessage::text(
         "user",
         format!("{COMPACTION_SUMMARY_PREFIX}{summary}{COMPACTION_SUMMARY_SUFFIX}"),
     );
-    let meta = CompactionSummaryMeta {
-        carried_user_requirements: carried.to_vec(),
-    };
     if let Ok(value) = serde_json::to_value(meta) {
         message.extra.insert(COMPACTION_META_KEY.into(), value);
     }
@@ -679,21 +702,46 @@ fn escape_user_requirements_markers(text: &str) -> String {
     )
 }
 
-/// What a summary must carry for `compacted`: the entries earlier generated
-/// summaries record in their metadata, then each real user message, in order,
-/// exact duplicates dropped. Summary text is never parsed.
-fn user_requirements_to_carry(compacted: &[ChatMessage]) -> Vec<String> {
+/// What a summary must carry for `compacted`: the entries the previous summary
+/// and earlier generated summaries record in their metadata, then each real user
+/// message, in order, exact duplicates dropped. A legacy summary has no such
+/// record: its whole text is carried as one entry. Summary text is otherwise
+/// never parsed.
+fn user_requirements_to_carry(
+    previous: Option<PreviousSummary<'_>>,
+    compacted: &[ChatMessage],
+) -> Vec<String> {
     fn push_unique(entries: &mut Vec<String>, entry: String) {
         if !entries.contains(&entry) {
             entries.push(entry);
         }
     }
+    fn push_summary(entries: &mut Vec<String>, meta: CompactionSummaryMeta, text: &str) {
+        if meta.legacy {
+            push_unique(
+                entries,
+                format!(
+                    "[legacy compaction summary, the only record of earlier constraints]\n{text}"
+                ),
+            );
+        }
+        for carried in meta.carried_user_requirements {
+            push_unique(entries, carried);
+        }
+    }
     let mut entries = Vec::new();
+    if let Some(previous) = previous {
+        push_summary(&mut entries, previous.meta.clone(), previous.text);
+    }
     for message in compacted {
         if let Some(meta) = compaction_summary_meta(message) {
-            for carried in meta.carried_user_requirements {
-                push_unique(&mut entries, carried);
-            }
+            let text = content_text(&message.content);
+            // The same text the previous summary holds, so one copy is carried.
+            let summary = text
+                .strip_prefix(COMPACTION_SUMMARY_PREFIX)
+                .and_then(|rest| rest.strip_suffix(COMPACTION_SUMMARY_SUFFIX))
+                .unwrap_or(&text);
+            push_summary(&mut entries, meta, summary);
         } else if message.role == "user" && user_role_label(message) == "User" {
             let text = content_text(&message.content);
             if !text.is_empty() {
@@ -1933,6 +1981,76 @@ ship the csv import",
             .carried_user_requirements
     }
 
+    fn compact_over_previous(
+        previous: PreviousSummary<'_>,
+        messages: &[ChatMessage],
+    ) -> CompactionResult {
+        let summarizer = fixed_summarizer("## Goal\nship the csv import");
+        compact_messages_with_options(messages, None, 1, 100, Some(previous), Some(&summarizer))
+    }
+
+    fn later_messages(first_user: &str) -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::text("user", first_user),
+            ChatMessage::text("assistant", "work done ".repeat(100)),
+            ChatMessage::text("user", "recent"),
+        ]
+    }
+
+    #[test]
+    fn requirements_in_the_previous_summary_argument_are_collected_first_and_deduped() {
+        let expected = vec!["keep A".to_string(), "keep B".to_string()];
+        let meta = CompactionSummaryMeta {
+            carried_user_requirements: expected.clone(),
+            legacy: false,
+        };
+        let previous = PreviousSummary {
+            text: "## Goal\nold",
+            meta: &meta,
+        };
+        let result = compact_over_previous(previous, &later_messages("keep B"));
+        assert!(result.compacted, "{}", result.summary);
+        assert_eq!(carried_of(&result.messages[0]), expected);
+    }
+
+    #[test]
+    fn a_legacy_previous_summary_is_carried_whole_not_as_an_empty_list() {
+        let meta = CompactionSummaryMeta {
+            carried_user_requirements: Vec::new(),
+            legacy: true,
+        };
+        let previous = PreviousSummary {
+            text: "## Constraints\nNever delete vendor/",
+            meta: &meta,
+        };
+        let result = compact_over_previous(previous, &later_messages("keep B"));
+        assert!(result.compacted, "{}", result.summary);
+        let carried = carried_of(&result.messages[0]);
+        assert_eq!(carried.len(), 2, "{carried:?}");
+        assert!(carried[0].contains("legacy compaction summary"));
+        assert!(carried[0].ends_with("## Constraints\nNever delete vendor/"));
+        assert_eq!(carried[1], "keep B");
+        assert!(context_text(&result.messages[0]).contains("Never delete vendor/"));
+    }
+
+    #[test]
+    fn an_oversized_legacy_previous_summary_refuses_compaction() {
+        let meta = CompactionSummaryMeta {
+            carried_user_requirements: Vec::new(),
+            legacy: true,
+        };
+        let text = "x".repeat(USER_REQUIREMENTS_MAX_BYTES + 1);
+        let previous = PreviousSummary {
+            text: &text,
+            meta: &meta,
+        };
+        let messages = later_messages("keep B");
+        let result = compact_over_previous(previous, &messages);
+        assert!(!result.compacted);
+        assert_eq!(result.messages.len(), messages.len());
+        assert_eq!(result.tokens_after, result.tokens_before);
+    }
+
     #[test]
     fn previous_summary_metadata_requirements_are_carried_and_deduped() {
         let expected = vec!["keep A".to_string(), "keep B".to_string()];
@@ -1972,7 +2090,7 @@ ship the csv import",
         let result = compact_with(&messages, "## Goal\nship the csv import");
         assert!(result.compacted, "{}", result.summary);
         assert!(carried_of(&result.messages[0]).is_empty());
-        let carried = user_requirements_to_carry(std::slice::from_ref(&legacy));
+        let carried = user_requirements_to_carry(None, std::slice::from_ref(&legacy));
         // Without metadata it is only ever user text, carried whole and verbatim.
         assert_eq!(carried, vec![content_text(&legacy.content)]);
     }
