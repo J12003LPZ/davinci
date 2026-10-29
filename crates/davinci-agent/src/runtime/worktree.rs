@@ -568,8 +568,8 @@ impl WorktreeManager {
                 });
             }
             Ok(true) => {
-                if let Err(error) = run_git(&self.repo_root, &["worktree", "prune"]) {
-                    details.push(error.to_string());
+                if let Err(error) = self.remove_registration(&lease.path, wt_path_str) {
+                    details.push(error);
                 }
                 match self.is_registered(&lease.path) {
                     Ok(false) => {}
@@ -726,6 +726,45 @@ impl WorktreeManager {
             output.status.code(),
             String::from_utf8_lossy(&output.stderr).trim()
         )))
+    }
+
+    /// Drop the registration of one worktree whose directory is gone. Never
+    /// `git worktree prune`: it deletes every stale registration in the
+    /// repository, including a worktree whose directory is only temporarily
+    /// missing. Asks git first; failing that, deletes the one admin directory
+    /// whose `gitdir` file points at `path`, unless it is locked.
+    fn remove_registration(&self, path: &Path, path_str: &str) -> Result<(), String> {
+        let refused = match run_git(
+            &self.repo_root,
+            &["worktree", "remove", "--force", path_str],
+        ) {
+            Ok(_) => return Ok(()),
+            Err(error) => error.to_string(),
+        };
+        let common = run_git(&self.repo_root, &["rev-parse", "--git-common-dir"])
+            .map_err(|error| format!("{refused}; {error}"))?;
+        let admin_root = self.repo_root.join(common).join("worktrees");
+        let wanted = path_key(path);
+        let entries = std::fs::read_dir(&admin_root)
+            .map_err(|error| format!("{refused}; cannot read {}: {error}", admin_root.display()))?;
+        for admin in entries.flatten().map(|entry| entry.path()) {
+            let Ok(gitdir) = std::fs::read(admin.join("gitdir")) else {
+                continue;
+            };
+            let gitdir = gitdir.trim_ascii_end();
+            let points_here = path_from_git_bytes(gitdir)
+                .parent()
+                .is_some_and(|dir| path_key(dir) == wanted);
+            if !points_here {
+                continue;
+            }
+            if admin.join("locked").exists() {
+                return Err(format!("{refused}; the registration is locked"));
+            }
+            return std::fs::remove_dir_all(&admin)
+                .map_err(|error| format!("{refused}; cannot delete {}: {error}", admin.display()));
+        }
+        Err(format!("{refused}; no registration points at the lease"))
     }
 
     /// Whether git still lists `path` as a worktree of the repository.
@@ -1198,9 +1237,8 @@ mod tests {
         let wt_dir = tempdir().unwrap();
         // A user-level `core.quotePath=false` would hide the quoting.
         git_in(repo_dir.path(), &["config", "core.quotePath", "true"]);
-        // Git always quotes a control character such as TAB in plain
-        // `--porcelain` on unix (a space, quote or non-ASCII character is not
-        // quoted on every version). Windows filenames cannot hold one.
+        // A TAB is the character most likely to be quoted in plain
+        // `--porcelain` on unix. Windows filenames cannot hold one.
         let name = if cfg!(unix) {
             "sp ace\tq \u{e9}\u{4e16}"
         } else {
@@ -1211,11 +1249,8 @@ mod tests {
         let lease = manager
             .create_lease(RunId::new(), AgentId::new(), None)
             .unwrap();
-        #[cfg(unix)]
-        {
-            let plain = run_git(repo_dir.path(), &["worktree", "list", "--porcelain"]).unwrap();
-            assert!(plain.contains("\\t"), "git must quote this path: {plain}");
-        }
+        // Whether plain `--porcelain` quotes the path depends on the git
+        // version; the `-z` listing is parsed independent of that policy.
         assert!(manager.is_registered(&lease.path).unwrap());
         git_in(
             repo_dir.path(),
@@ -1313,6 +1348,37 @@ mod tests {
         assert!(!manager.is_registered(&lease.path).unwrap());
         assert!(!branch_exists(repo_dir.path(), &lease.branch));
         assert!(manager.get_lease(&lease.path).is_none());
+    }
+
+    /// Releasing one lease whose directory is gone must not delete the
+    /// registration of an unrelated worktree that is merely missing too.
+    #[test]
+    fn releasing_a_lease_with_a_missing_directory_keeps_unrelated_registrations() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        let bystander = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        std::fs::remove_dir_all(&lease.path).unwrap();
+        std::fs::remove_dir_all(&bystander.path).unwrap();
+
+        manager.release_lease(&lease, true).unwrap();
+
+        assert!(!manager.is_registered(&lease.path).unwrap());
+        assert!(!branch_exists(repo_dir.path(), &lease.branch));
+        assert!(
+            manager.is_registered(&bystander.path).unwrap(),
+            "the other worktree keeps its registration"
+        );
+        assert!(branch_exists(repo_dir.path(), &bystander.branch));
+        assert_eq!(
+            manager.get_lease(&bystander.path).as_ref(),
+            Some(&bystander)
+        );
     }
 
     /// A git command that fails is not evidence that the thing is gone.
