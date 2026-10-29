@@ -160,69 +160,92 @@ pub fn discover_skills(roots: &[PathBuf]) -> Vec<Skill> {
 /// a first line, never the body.
 pub const SKILL_DISCOVERY_MAX_BYTES: usize = 16 * 1024;
 
-/// What decides a cached body is stale: the file's modification time and length.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SkillFileKey {
-    modified: Option<std::time::SystemTime>,
-    len: u64,
-}
-
-fn skill_file_key(path: &Path) -> Option<SkillFileKey> {
-    let metadata = fs::metadata(path).ok()?;
-    Some(SkillFileKey {
-        modified: metadata.modified().ok(),
-        len: metadata.len(),
-    })
-}
-
-type BodyCache = std::collections::HashMap<PathBuf, (SkillFileKey, std::sync::Arc<str>)>;
-
-/// The whole skill file, read when a skill is selected and cached by path
-/// until its key changes. `None` when the file cannot be read.
-fn cached_skill_file(path: &Path) -> Option<std::sync::Arc<str>> {
-    static BODIES: std::sync::OnceLock<std::sync::Mutex<BodyCache>> = std::sync::OnceLock::new();
-    let key = skill_file_key(path)?;
-    let mut bodies = BODIES.get_or_init(Default::default).lock().ok()?;
-    if let Some((cached, text)) = bodies.get(path) {
-        if *cached == key {
-            return Some(text.clone());
-        }
-    }
-    let text: std::sync::Arc<str> = fs::read_to_string(path).ok()?.into();
-    bodies.insert(path.to_path_buf(), (key, text.clone()));
-    Some(text)
-}
-
 impl Skill {
-    /// The whole skill file. Discovery does not read it; this does, on
-    /// selection, and re-reads when the file changed. A skill built without a
-    /// readable file answers with its inline `body`.
-    pub fn read_body(&self) -> String {
-        match cached_skill_file(&self.path) {
-            Some(text) => text.to_string(),
-            None => self.body.clone(),
+    /// Bytes the skill file holds, from file metadata; the inline body's length
+    /// for a skill without a readable file. Never reads the body.
+    pub fn size_hint(&self) -> usize {
+        match fs::metadata(&self.path) {
+            Ok(metadata) => metadata.len() as usize,
+            Err(_) => self.body.len(),
         }
+    }
+
+    /// The whole skill file, read fresh on every call: invocation is rare and
+    /// an edit must show on the next one. Discovery does not read it; this
+    /// does, on selection. A skill built without a readable file answers with
+    /// its inline `body`.
+    pub fn read_body(&self) -> String {
+        fs::read_to_string(&self.path).unwrap_or_else(|_| self.body.clone())
     }
 }
 
-/// At most `SKILL_DISCOVERY_MAX_BYTES` of the file, and whether more follows.
-fn read_skill_prefix(path: &Path) -> Option<(String, bool)> {
-    use std::io::Read;
-    let mut buffer = Vec::new();
-    fs::File::open(path)
-        .ok()?
-        .take(SKILL_DISCOVERY_MAX_BYTES as u64 + 1)
-        .read_to_end(&mut buffer)
-        .ok()?;
-    let truncated = buffer.len() > SKILL_DISCOVERY_MAX_BYTES;
-    buffer.truncate(SKILL_DISCOVERY_MAX_BYTES);
-    Some((String::from_utf8_lossy(&buffer).into_owned(), truncated))
+/// One line, through its `\n` or `\r`, read a byte at a time so nothing past it
+/// is consumed. `budget` bounds the bytes still allowed; `None` at end of input.
+fn read_skill_line(reader: &mut impl std::io::Read, budget: &mut usize) -> Option<Vec<u8>> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    while *budget > 0 {
+        match reader.read(&mut byte) {
+            Ok(1) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            _ => break,
+        }
+        *budget -= 1;
+        line.push(byte[0]);
+        if byte[0] == b'\n' || byte[0] == b'\r' {
+            break;
+        }
+    }
+    (!line.is_empty()).then_some(line)
+}
+
+/// What discovery reads of a skill file: the frontmatter through its closing
+/// delimiter line and, only when it declares no description, lines up to the
+/// first non-blank one. Never the rest, and never more than
+/// `SKILL_DISCOVERY_MAX_BYTES`. The flag is true when the cap ended the read
+/// before the frontmatter closed.
+fn read_skill_head(mut reader: impl std::io::Read) -> (String, bool) {
+    let mut budget = SKILL_DISCOVERY_MAX_BYTES;
+    let mut head = Vec::new();
+    let mut unclosed = false;
+    if let Some(first) = read_skill_line(&mut reader, &mut budget) {
+        let unbom = first.strip_prefix("\u{feff}".as_bytes()).unwrap_or(&first);
+        unclosed = unbom.starts_with(b"---");
+        head.extend_from_slice(&first);
+        while unclosed {
+            let Some(line) = read_skill_line(&mut reader, &mut budget) else {
+                break;
+            };
+            unclosed = !line.starts_with(b"---");
+            head.extend_from_slice(&line);
+        }
+    }
+    let capped = unclosed && budget == 0;
+    loop {
+        let text = String::from_utf8_lossy(&head);
+        let (fields, body) = crate::templates::parse_frontmatter(&text);
+        let described = fields
+            .get("description")
+            .is_some_and(|value| !value.trim().is_empty())
+            || body.lines().any(|line| !line.trim().is_empty());
+        if described {
+            break;
+        }
+        match read_skill_line(&mut reader, &mut budget) {
+            Some(line) => head.extend_from_slice(&line),
+            None => break,
+        }
+    }
+    (String::from_utf8_lossy(&head).into_owned(), capped)
 }
 
 fn load_skill(path: &Path) -> Option<Skill> {
-    let (raw, truncated) = read_skill_prefix(path)?;
-    let unbom = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
-    if truncated && unbom.starts_with("---") && !unbom[3..].contains("\n---") {
+    load_skill_from(path, fs::File::open(path).ok()?)
+}
+
+fn load_skill_from(path: &Path, reader: impl std::io::Read) -> Option<Skill> {
+    let (raw, capped) = read_skill_head(reader);
+    if capped {
         eprintln!(
             "skipping skill {}: frontmatter does not fit in the first {SKILL_DISCOVERY_MAX_BYTES} bytes",
             path.display()
@@ -669,6 +692,115 @@ mod tests {
         );
         write_skill(dir.path(), "wide", &long_frontmatter);
         assert!(discover_skills(&[dir.path().join("wide")]).is_empty());
+    }
+
+    /// A reader that counts the bytes it hands out.
+    struct Counting<R> {
+        inner: R,
+        read: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl<R: std::io::Read> std::io::Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read.set(self.read.get() + n);
+            Ok(n)
+        }
+    }
+
+    fn bytes_read_loading(text: &str) -> (usize, Option<Skill>) {
+        let read = std::rc::Rc::new(std::cell::Cell::new(0));
+        let reader = Counting {
+            inner: std::io::Cursor::new(text.as_bytes().to_vec()),
+            read: read.clone(),
+        };
+        let skill = load_skill_from(Path::new("/virtual/sized/SKILL.md"), reader);
+        (read.get(), skill)
+    }
+
+    #[test]
+    fn discovery_stops_reading_at_the_closing_frontmatter_delimiter() {
+        let frontmatter = "---\nname: sized\ndescription: Sized\n---\n";
+        let text = format!("{frontmatter}BODY_STARTS_HERE\n{}", "b".repeat(10_000));
+        let (read, skill) = bytes_read_loading(&text);
+        assert_eq!(skill.unwrap().description, "Sized");
+        assert!(
+            read <= frontmatter.len() + "BODY_STARTS_HERE\n".len(),
+            "read {read} bytes of a {}-byte frontmatter",
+            frontmatter.len()
+        );
+        // No description: the first non-blank body line is read, and no more.
+        let bare = "---\nname: bare\n---\n\nFirst line\nSecond line\n";
+        let (read, skill) = bytes_read_loading(bare);
+        assert_eq!(skill.unwrap().description, "First line");
+        assert!(read <= bare.find("Second").unwrap(), "read {read}");
+        // Without frontmatter the first line names it.
+        let plain = format!("Plain first line\n{}", "p".repeat(10_000));
+        let (read, skill) = bytes_read_loading(&plain);
+        assert_eq!(skill.unwrap().description, "Plain first line");
+        assert!(read <= "Plain first line\n".len(), "read {read}");
+        // Carriage-return files and a BOM keep working.
+        let (_, skill) =
+            bytes_read_loading("\u{feff}---\rname: cr\rdescription: Crlf\r---\rbody\r");
+        assert_eq!(skill.unwrap().description, "Crlf");
+    }
+
+    #[test]
+    fn discovery_never_reads_past_the_cap_for_an_unclosed_frontmatter() {
+        let text = format!(
+            "---\nname: open\n{}",
+            "k: v\n".repeat(SKILL_DISCOVERY_MAX_BYTES)
+        );
+        let (read, skill) = bytes_read_loading(&text);
+        assert!(skill.is_none());
+        assert!(read <= SKILL_DISCOVERY_MAX_BYTES + 1, "read {read}");
+    }
+
+    #[test]
+    fn a_same_size_same_time_edit_is_seen_on_the_next_invocation() {
+        let dir = tempdir().unwrap();
+        let path = write_skill(
+            dir.path(),
+            "stamped",
+            "---\nname: stamped\ndescription: S\n---\n\nAAAA_BODY\n",
+        );
+        let skills = discover_skills(&[path.parent().unwrap().to_path_buf()]);
+        assert!(expand_user_text("/skill:stamped", &skills, &[]).contains("AAAA_BODY"));
+        let stamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(
+            &path,
+            "---\nname: stamped\ndescription: S\n---\n\nBBBB_BODY\n",
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+        let again = expand_user_text("/skill:stamped", &skills, &[]);
+        assert!(
+            again.contains("BBBB_BODY") && !again.contains("AAAA_BODY"),
+            "{again}"
+        );
+    }
+
+    #[test]
+    fn size_hint_comes_from_file_metadata_without_reading_the_body() {
+        let dir = tempdir().unwrap();
+        let text = "---\nname: hinted\ndescription: H\n---\n\nHINT_BODY\n";
+        let path = write_skill(dir.path(), "hinted", text);
+        let skills = discover_skills(&[path.parent().unwrap().to_path_buf()]);
+        assert_eq!(skills[0].size_hint(), text.len());
+        let inline = Skill {
+            name: "inline".into(),
+            path: PathBuf::from("/virtual/missing/SKILL.md"),
+            description: String::new(),
+            body: "INLINE".into(),
+            base_dir: PathBuf::new(),
+            namespace: None,
+        };
+        assert_eq!(inline.size_hint(), 6);
     }
 
     #[test]

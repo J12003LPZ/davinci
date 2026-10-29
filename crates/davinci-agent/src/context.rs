@@ -165,6 +165,38 @@ impl RootContextAccount {
         });
     }
 
+    /// Like [`add`](Self::add) for content that is not loaded: `identity`
+    /// stands for the body in dedupe and hashing, and `size_bytes` (from file
+    /// metadata) in the token estimate.
+    pub fn add_unloaded(
+        &mut self,
+        source: impl Into<String>,
+        identity: impl Into<String>,
+        size_bytes: usize,
+        stable: bool,
+        priority: ContextPriority,
+    ) {
+        let identity = identity.into();
+        let content_hash = crate::prompt::manifest::hash_text(&identity);
+        let duplicate = self.entries.iter().any(|entry| entry.body == identity);
+        self.entries.push(RootContextEntry {
+            contribution: ContextContribution {
+                source: source.into(),
+                stable,
+                priority,
+                estimated_tokens: if duplicate {
+                    0
+                } else {
+                    size_bytes.div_ceil(4) as u64
+                },
+                content_hash,
+                included: !duplicate,
+                selected: true,
+            },
+            body: identity,
+        });
+    }
+
     pub fn report(&self) -> ContextBudgetReport {
         self.report_for_budget(u64::MAX)
     }

@@ -741,15 +741,22 @@ impl WorkflowExecutor {
     }
 
     /// Ids of the artifacts of `spec`'s phases that were not committed against
-    /// the current source tree. Empty when there is no current fingerprint.
+    /// the current source tree. Empty outside a git workspace. In a git
+    /// workspace whose state cannot be fingerprinted every artifact is stale:
+    /// nothing shows that the tree still matches.
     fn stale_artifact_ids(&self, wf_id: WorkflowId, spec: &WorkflowSpec) -> HashSet<uuid::Uuid> {
-        let Some(current) = self.store.current_source_fingerprint() else {
-            return HashSet::new();
+        use super::source_fingerprint::SourceState;
+        let current = match self.store.current_source_state() {
+            SourceState::NotGit => return HashSet::new(),
+            SourceState::Unavailable => None,
+            SourceState::Digest(digest) => Some(digest),
         };
         spec.phases
             .iter()
             .flat_map(|phase| self.store.list_phase_artifacts(wf_id, &phase.id))
-            .filter(|artifact| artifact.source_fingerprint.as_deref() != Some(current.as_str()))
+            .filter(|artifact| {
+                current.is_none() || artifact.source_fingerprint.as_deref() != current.as_deref()
+            })
             .map(|artifact| artifact.id)
             .collect()
     }
@@ -3981,6 +3988,52 @@ mod tests {
     }
 
     #[test]
+    fn resume_reruns_artifacts_when_a_git_workspace_cannot_be_fingerprinted() {
+        let (executor, tmp, runs) = sourced_executor();
+        let repo = tmp.path().join("repo");
+        let wf_id = WorkflowId::new();
+        store_outputs(&executor, wf_id, &["a", "b"]);
+
+        // An untracked file past the byte limit: git works, the digest cannot.
+        std::fs::File::create(repo.join("huge.bin"))
+            .unwrap()
+            .set_len(64 * 1024 * 1024 + 1)
+            .unwrap();
+        assert_eq!(
+            super::super::source_fingerprint::source_fingerprint(&repo),
+            None
+        );
+        executor
+            .resume_execution(wf_id, phase_spec("all", &["a", "b"]), &HashSet::new())
+            .unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_nested_repository_or_directory_entry_makes_the_fingerprint_unavailable() {
+        use super::super::source_fingerprint::source_fingerprint;
+        let (_executor, tmp, _) = sourced_executor();
+        let repo = tmp.path().join("repo");
+        assert!(source_fingerprint(&repo).is_some());
+        // An embedded repository shows in the parent's status as one directory
+        // entry: its own changes are invisible to a content hash.
+        let nested = repo.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&nested)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        assert_eq!(source_fingerprint(&repo), None);
+    }
+
+    #[test]
     fn legacy_artifact_without_fingerprint_is_rerun() {
         let (mut executor, tmp, runs) = sourced_executor();
         let rooted = executor.store.clone();
@@ -4021,6 +4074,10 @@ mod tests {
         assert_eq!(
             source_fingerprint(tmp.path().join("nowhere").as_path()),
             None
+        );
+        assert_eq!(
+            super::super::source_fingerprint::source_state(tmp.path().join("nowhere").as_path()),
+            super::super::source_fingerprint::SourceState::NotGit
         );
     }
 

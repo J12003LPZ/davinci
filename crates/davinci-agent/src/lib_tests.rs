@@ -858,6 +858,33 @@ fn root_context_report_includes_provider_system_suffix() {
 }
 
 #[test]
+fn root_context_report_sizes_skills_from_metadata_without_reading_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("SKILL.md");
+    // Not UTF-8: reading the body fails and would answer with the tiny inline
+    // text, so only the file's size can explain the estimate.
+    std::fs::write(&path, vec![0xff_u8; 4_000]).unwrap();
+    let mut agent = Agent::new("base");
+    agent.skills.push(crate::Skill {
+        name: "big".into(),
+        path,
+        description: String::new(),
+        body: "tiny".into(),
+        base_dir: dir.path().to_path_buf(),
+        namespace: None,
+    });
+
+    let report = agent.root_context_budget_report(u64::MAX);
+    let skill = report
+        .contributions
+        .iter()
+        .find(|entry| entry.source == "skill::big")
+        .unwrap();
+    assert_eq!(skill.estimated_tokens, 1_000);
+    assert_eq!(skill.priority, ContextPriority::Deferred);
+}
+
+#[test]
 fn context_overhead_triggers_pruning_before_the_provider_request() {
     let dir = tempfile::tempdir().unwrap();
     let mut agent = Agent::new("x".repeat(24_000));
@@ -5931,6 +5958,43 @@ fn wor21_repeated_compaction_reloads_the_same_branch_history() {
     let path = agent.session.as_ref().unwrap().path.clone();
     let reopened = JsonlSession::open(&path).unwrap();
     assert_eq!(chat_texts(&messages_from_session(&reopened)), live);
+}
+
+#[test]
+fn compaction_metadata_survives_a_session_reopen_and_legacy_entries_load_without_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = legacy_compaction_agent(dir.path());
+    for turn in 0..4 {
+        agent.prompt(&format!("question {turn} {}", "x".repeat(400)));
+        agent.record_assistant(&format!("answer {turn} {}", "y".repeat(400)));
+    }
+    let result = agent.compact(None);
+    assert!(result.compacted, "{}", result.summary);
+    let live = crate::compaction_summary_meta(&agent.messages[0]).expect("live metadata");
+    assert!(!live.carried_user_requirements.is_empty());
+
+    let path = agent.session.as_ref().unwrap().path.clone();
+    let reopened = JsonlSession::open(&path).unwrap();
+    let messages = messages_from_session(&reopened);
+    let reloaded = messages
+        .iter()
+        .find_map(crate::compaction_summary_meta)
+        .expect("reloaded metadata");
+    assert_eq!(reloaded, live);
+
+    // An entry written before the metadata existed still loads, carrying none.
+    let mut entry = reopened
+        .entries
+        .iter()
+        .find(|entry| entry.entry_type == "compaction")
+        .unwrap()
+        .clone();
+    entry.extra.remove("carriedUserRequirements");
+    let legacy = crate::entry_to_chat(&entry).expect("legacy entry loads");
+    assert!(crate::compaction_summary_meta(&legacy)
+        .unwrap()
+        .carried_user_requirements
+        .is_empty());
 }
 
 #[test]

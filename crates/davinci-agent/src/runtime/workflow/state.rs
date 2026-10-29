@@ -230,6 +230,15 @@ impl WorkflowStateStore {
         super::source_fingerprint::source_fingerprint(self.source_root.as_deref()?)
     }
 
+    /// What is known of the source tree now. Without a source root, or outside
+    /// a git repository, resume keeps its earlier behavior.
+    pub(crate) fn current_source_state(&self) -> super::source_fingerprint::SourceState {
+        match self.source_root.as_deref() {
+            Some(root) => super::source_fingerprint::source_state(root),
+            None => super::source_fingerprint::SourceState::NotGit,
+        }
+    }
+
     fn manifest_path(&self, workflow_id: WorkflowId) -> PathBuf {
         self.overflow_dir
             .join(workflow_id.to_string())

@@ -67,12 +67,13 @@ pub use branch::{
 pub use compaction::{
     branch_summary_context_message, build_history_prompt, calculate_context_tokens,
     compact_messages, compact_messages_with, compact_messages_with_options,
-    compact_messages_with_summary, compaction_context_message, compaction_threshold,
-    compute_file_lists, convert_to_llm, env_summarizer, estimate_context_tokens, estimate_tokens,
-    extract_file_ops, find_cut_point, format_file_operations, generate_summary_with_usage,
-    get_summarization_failure, serialize_conversation, should_compact, CompactionDetails,
-    CompactionResult, CompactionSettings, CompactionThreshold, CutPointResult, FileOperations,
-    SummarizeRequest, SummarizeResponse, Summarizer, BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX,
+    compact_messages_with_summary, compaction_context_message, compaction_context_message_carrying,
+    compaction_summary_meta, compaction_threshold, compute_file_lists, convert_to_llm,
+    env_summarizer, estimate_context_tokens, estimate_tokens, extract_file_ops, find_cut_point,
+    format_file_operations, generate_summary_with_usage, get_summarization_failure,
+    serialize_conversation, should_compact, CompactionDetails, CompactionResult,
+    CompactionSettings, CompactionThreshold, CutPointResult, FileOperations, SummarizeRequest,
+    SummarizeResponse, Summarizer, BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX,
     COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, CONTEXT_VM_FOLD_PROMPT,
     CONTEXT_VM_FOLD_SYSTEM_PROMPT, DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_RESERVE_TOKENS,
     SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT,
@@ -4778,9 +4779,13 @@ impl Agent {
             );
         }
         for skill in &self.skills {
-            account.add(
+            // Accounting needs a size, not the text: a skill's body is read
+            // only when it is selected or invoked.
+            let size = skill.size_hint();
+            account.add_unloaded(
                 format!("skill::{}", skill.name),
-                skill.read_body(),
+                format!("skill-file:{}:{size}", skill.path.display()),
+                size,
                 true,
                 ContextPriority::Deferred,
             );
@@ -5607,6 +5612,12 @@ impl Agent {
                 serde_json::to_value(&result.details).unwrap_or_default(),
             );
             extra.insert("fromHook".into(), serde_json::json!(false));
+            if let Some(meta) = result.messages.first().and_then(compaction_summary_meta) {
+                extra.insert(
+                    COMPACTION_CARRIED_KEY.into(),
+                    serde_json::json!(meta.carried_user_requirements),
+                );
+            }
             if let Some(usage) = &result.usage {
                 extra.insert(
                     "usage".into(),
@@ -6260,11 +6271,21 @@ pub(crate) fn is_legacy_verification_notice(message: &ChatMessage) -> bool {
     message.extra.contains_key("davinciVerificationStatus")
 }
 
+/// `extra` key of a `compaction` session entry holding the user requirements
+/// its summary carries. The summary text only displays them.
+const COMPACTION_CARRIED_KEY: &str = "carriedUserRequirements";
+
 pub(crate) fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
     match entry.entry_type.as_str() {
         "compaction" => {
             let summary = entry.extra.get("summary")?.as_str()?;
-            Some(compaction_context_message(summary))
+            // Entries saved before the metadata existed carry none.
+            let carried: Vec<String> = entry
+                .extra
+                .get(COMPACTION_CARRIED_KEY)
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .unwrap_or_default();
+            Some(compaction_context_message_carrying(summary, &carried))
         }
         "branch_summary" => {
             let summary = entry.extra.get("summary")?.as_str()?;

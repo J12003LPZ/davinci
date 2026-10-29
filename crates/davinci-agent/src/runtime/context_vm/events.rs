@@ -167,7 +167,7 @@ pub(super) fn event_from_message(
     }
     // A compaction or branch summary rides in a user message, but its words
     // are the summarizer's: never a user requirement.
-    let summary = visible_text.starts_with(crate::COMPACTION_SUMMARY_PREFIX)
+    let summary = crate::compaction_summary_meta(message).is_some()
         || visible_text.starts_with(crate::BRANCH_SUMMARY_PREFIX);
     let (kind, provenance_kind) = match message.role.as_str() {
         "user" if !summary => match internal_user_message(message) {

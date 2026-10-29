@@ -13,18 +13,49 @@ const GIT_STATUS_LIMIT: usize = 2 * 1024 * 1024;
 /// Runtime state and VCS metadata: not source, and it churns on its own.
 const EXCLUDED_ROOTS: [&str; 3] = [".git", ".davinci", ".pi"];
 
-/// Git HEAD plus a digest of the working-tree status and of the contents of
-/// every modified or untracked file under `root`. `None` when `root` is not a
-/// git repository with a commit, or when the changes are too many or too large
-/// to hash: the caller then has no evidence either way and keeps its behavior
-/// from before fingerprints existed.
+/// What is known of the source tree under a root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SourceState {
+    /// Not a git repository with a commit: no evidence either way, so the
+    /// caller keeps its behavior from before fingerprints existed.
+    NotGit,
+    /// A git workspace whose state cannot be fingerprinted (git or a file read
+    /// failed, the changes are too many or too large, or a directory entry such
+    /// as a dirty submodule hides its own changes). Nothing stored against it
+    /// can be shown to still match.
+    Unavailable,
+    /// Git HEAD plus a digest of the working-tree status and of the contents of
+    /// every modified or untracked file.
+    Digest(String),
+}
+
+/// The digest of [`SourceState::Digest`]; `None` for every other state.
 pub(crate) fn source_fingerprint(root: &Path) -> Option<String> {
+    match source_state(root) {
+        SourceState::Digest(digest) => Some(digest),
+        SourceState::NotGit | SourceState::Unavailable => None,
+    }
+}
+
+pub(crate) fn source_state(root: &Path) -> SourceState {
     let git =
         |args: &[&str], limit: usize| crate::runtime::transactions::observe_git(root, args, limit);
-    let head = git(&["rev-parse", "HEAD"], 256).ok()?;
-    let top = git(&["rev-parse", "--show-toplevel"], 8192).ok()?;
-    let top = PathBuf::from(std::str::from_utf8(&top).ok()?.trim());
-    let status = git(
+    let (Ok(head), Ok(top)) = (
+        git(&["rev-parse", "HEAD"], 256),
+        git(&["rev-parse", "--show-toplevel"], 8192),
+    ) else {
+        return SourceState::NotGit;
+    };
+    match digest_working_tree(root, &head, &top) {
+        Some(digest) => SourceState::Digest(digest),
+        None => SourceState::Unavailable,
+    }
+}
+
+fn digest_working_tree(root: &Path, head: &[u8], top: &[u8]) -> Option<String> {
+    let top = PathBuf::from(std::str::from_utf8(top).ok()?.trim());
+    let status = crate::runtime::transactions::observe_git(
+        root,
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
         GIT_STATUS_LIMIT,
     )
@@ -59,7 +90,9 @@ pub(crate) fn source_fingerprint(root: &Path) -> Option<String> {
 }
 
 /// Feed `path`'s identity into `hasher`: its bytes, its link target, or a
-/// marker for a path that is gone (a deletion) or is a directory.
+/// marker for a path that is gone (a deletion). `None` when it cannot be
+/// hashed, including a directory: a submodule or nested repository shows in
+/// status as one entry whose own changes a placeholder would hide.
 fn hash_content(hasher: &mut Sha256, path: &Path, total: &mut u64) -> Option<()> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -87,6 +120,8 @@ fn hash_content(hasher: &mut Sha256, path: &Path, total: &mut u64) -> Option<()>
             }
             hasher.update(&buffer[..read]);
         }
+    } else if metadata.is_dir() {
+        return None;
     } else {
         hasher.update(b"other");
     }
