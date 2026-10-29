@@ -430,10 +430,10 @@ impl ToolCallLedger {
     pub(crate) fn execution_authority(
         &self,
         call_id: &str,
-        builtin_capability: bool,
+        journal_eligible: bool,
         journal_configured: bool,
     ) -> ToolCallExecutionAuthority {
-        if builtin_capability && journal_configured {
+        if journal_eligible && journal_configured {
             if self.records.contains_key(call_id) {
                 ToolCallExecutionAuthority::LegacyObservationBlocked
             } else {
@@ -1858,6 +1858,18 @@ mod tests {
         assert_eq!(
             ledger.execution_authority("new-call", true, true),
             ToolCallExecutionAuthority::OperationJournal
+        );
+        // An ineligible capability (unregistered tool) never reaches the
+        // journal route, even when a journal is configured, and a legacy
+        // record on it stays on the compatibility ledger.
+        assert_eq!(
+            ledger.execution_authority("legacy-call", false, true),
+            ToolCallExecutionAuthority::CompatibilityLedger
+        );
+        // Eligibility without a configured journal stays on the ledger too.
+        assert_eq!(
+            ledger.execution_authority("legacy-call", true, false),
+            ToolCallExecutionAuthority::CompatibilityLedger
         );
     }
 

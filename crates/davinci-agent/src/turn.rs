@@ -2113,25 +2113,57 @@ Issue the call again if it is still needed.";
             .unwrap_or_else(|| crate::tool_ledger::classify_side_effect(name))
     }
 
+    /// Registered extension/MCP capabilities use the same journal facade as
+    /// built-ins.  The planner applies conservative external-mutation effects
+    /// for non-built-in sources; unknown tools still use the legacy
+    /// compatibility ledger and cannot silently become journal operations.
+    fn journal_eligible_capability(&self, name: &str) -> bool {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.capability_registry.get(name))
+            .is_some_and(|capability| {
+                matches!(
+                    capability.source,
+                    crate::runtime::CapabilitySource::Builtin
+                        | crate::runtime::CapabilitySource::JsExtension
+                        | crate::runtime::CapabilitySource::NativeExtension
+                        | crate::runtime::CapabilitySource::Mcp
+                )
+            })
+    }
+
     fn operation_runtime_for_tool(
         &self,
         name: &str,
     ) -> Option<crate::runtime::operations::ToolOperationRuntime> {
         let runtime = self.runtime.as_ref()?;
-        let capability = runtime.capability_registry.get(name)?;
-        // Registered extension/MCP capabilities use the same journal facade as
-        // built-ins.  The planner applies conservative external-mutation
-        // effects for non-built-in sources; unknown tools still use the legacy
-        // compatibility ledger and cannot silently become journal operations.
-        runtime.operations.clone().filter(|_| {
-            matches!(
-                capability.source,
-                crate::runtime::CapabilitySource::Builtin
-                    | crate::runtime::CapabilitySource::JsExtension
-                    | crate::runtime::CapabilitySource::NativeExtension
-                    | crate::runtime::CapabilitySource::Mcp
-            )
-        })
+        runtime
+            .operations
+            .clone()
+            .filter(|_| self.journal_eligible_capability(name))
+    }
+
+    /// Which authority owns this call: eligibility comes from the tool's own
+    /// capability, configuration from the runtime's journal.
+    fn tool_execution_authority(
+        &self,
+        id: &str,
+        name: &str,
+    ) -> crate::tool_ledger::ToolCallExecutionAuthority {
+        let journal_configured = self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.operations.is_some());
+        self.tool_ledger
+            .lock()
+            .map(|ledger| {
+                ledger.execution_authority(
+                    id,
+                    self.journal_eligible_capability(name),
+                    journal_configured,
+                )
+            })
+            .unwrap_or(crate::tool_ledger::ToolCallExecutionAuthority::CompatibilityLedger)
     }
 
     fn current_operation_plan(
@@ -2320,12 +2352,7 @@ Issue the call again if it is still needed.";
             }
         }
         let operation_runtime = self.operation_runtime_for_tool(name);
-        let journal_configured = operation_runtime.is_some();
-        let route = self
-            .tool_ledger
-            .lock()
-            .map(|ledger| ledger.execution_authority(id, journal_configured, journal_configured))
-            .unwrap_or(crate::tool_ledger::ToolCallExecutionAuthority::CompatibilityLedger);
+        let route = self.tool_execution_authority(id, name);
         if route == crate::tool_ledger::ToolCallExecutionAuthority::LegacyObservationBlocked {
             return immediate(
                 "Legacy tool-ledger record was migrated as an observation; operation recovery must reconcile it before dispatch.".into(),
@@ -2566,29 +2593,39 @@ Issue the call again if it is still needed.";
             }
             return immediate(reason, true);
         }
-        let journal_permission_revision =
-            if route == crate::tool_ledger::ToolCallExecutionAuthority::OperationJournal {
-                match self.stable_permission_revision(cwd, id, name, args) {
-                    Ok(revision) => Some(revision),
-                    Err(reason) => {
-                        // `denied` marks a call that never ran, for the hosts'
-                        // rows and post-tool hooks, without sniffing the text.
-                        cancel_persisted_intent(journal_pending.as_ref(), &reason);
-                        if let Ok(mut ledger) = self.tool_ledger.lock() {
-                            ledger.record_blocked(id, &reason);
-                        }
-                        return immediate(reason, true);
-                    }
+        // Both routes authorize under a revision; the journal commits it with
+        // the admission, the compatibility route re-checks it before the adapter.
+        let authorized = if route
+            == crate::tool_ledger::ToolCallExecutionAuthority::OperationJournal
+        {
+            self.stable_permission_revision(cwd, id, name, args)
+        } else {
+            // One evaluation, as before: the first one writes session state
+            // and moves the revision, and a retry would ask the user twice.
+            // `permission_denial` already refuses a policy that changed while
+            // its own approval was pending.
+            match self.permission_denial(cwd, id, name, args) {
+                Some(reason) => Err(reason),
+                None => self
+                    .permissions
+                    .lock()
+                    .ok()
+                    .and_then(|permissions| permissions.revision())
+                    .ok_or_else(|| "Permission denied: policy revision is exhausted.".to_owned()),
+            }
+        };
+        let authorized_revision = match authorized {
+            Ok(revision) => revision,
+            Err(reason) => {
+                // `denied` marks a call that never ran, for the hosts'
+                // rows and post-tool hooks, without sniffing the text.
+                cancel_persisted_intent(journal_pending.as_ref(), &reason);
+                if let Ok(mut ledger) = self.tool_ledger.lock() {
+                    ledger.record_blocked(id, &reason);
                 }
-            } else {
-                if let Some(reason) = self.permission_denial(cwd, id, name, args) {
-                    if let Ok(mut ledger) = self.tool_ledger.lock() {
-                        ledger.record_blocked(id, &reason);
-                    }
-                    return immediate(reason, true);
-                }
-                None
-            };
+                return immediate(reason, true);
+            }
+        };
         let class = self
             .permissions
             .lock()
@@ -2605,21 +2642,10 @@ Issue the call again if it is still needed.";
                     true,
                 );
             };
-            let Some(permission_revision) = journal_permission_revision else {
-                cancel_persisted_intent(
-                    Some(&pending),
-                    "permission policy revision is unavailable",
-                );
-                self.approval_registry.take_dispatch(id);
-                return immediate(
-                    "Operation denied: permission policy revision is unavailable.".into(),
-                    true,
-                );
-            };
             pending.admitted = match pending
                 .runtime
                 .dispatcher()
-                .authorize_and_queue(&pending.admitted, permission_revision)
+                .authorize_and_queue(&pending.admitted, authorized_revision)
             {
                 Ok(admitted) => admitted,
                 Err(error) => {
@@ -2649,8 +2675,47 @@ Issue the call again if it is still needed.";
                 }
             };
             pending_calls.insert(id.to_owned(), pending);
+        } else {
+            self.prepared_permission_revisions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(id.to_owned(), authorized_revision);
         }
         Preparation::Ready { lane }
+    }
+
+    /// Last check before a compatibility-route adapter runs: the run was not
+    /// cancelled and the permission policy is the one the call was authorized
+    /// under. The journal route has the same checks in its dispatch callback.
+    fn pre_dispatch_gate(&self, authorized_revision: Option<u64>) -> Result<(), crate::ToolResult> {
+        let refuse = |content: &str, marker: &str| crate::ToolResult {
+            content: content.into(),
+            is_error: true,
+            details: Some(serde_json::json!({ "denied": true, marker: true })),
+        };
+        if self.abort_requested()
+            || self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.is_cancelled())
+        {
+            return Err(refuse(
+                "Tool call was cancelled before dispatch; no adapter was run.",
+                "cancelled",
+            ));
+        }
+        let current = self
+            .permissions
+            .lock()
+            .ok()
+            .and_then(|permissions| permissions.revision());
+        if current.is_none() || current != authorized_revision {
+            return Err(refuse(
+                "Permission policy changed before dispatch; no adapter was run. Retry the call to authorize it again.",
+                "permission_policy_changed",
+            ));
+        }
+        Ok(())
     }
 
     /// Stage two: the call itself. Takes `&self` only, so it may run on a
@@ -2683,17 +2748,23 @@ Issue the call again if it is still needed.";
             .remove(id);
         let mut pending_operation = PendingToolOperationGuard::new(pending);
         let journal_authoritative = pending_operation.as_ref().is_some();
+        // A call that skipped preparation has no recorded revision; it is
+        // held to the policy in force now.
+        let authorized_revision = self
+            .prepared_permission_revisions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(id)
+            .or_else(|| {
+                self.permissions
+                    .lock()
+                    .ok()
+                    .and_then(|permissions| permissions.revision())
+            });
 
         if !journal_authoritative
-            && self.operation_runtime_for_tool(name).is_some()
-            && self
-                .tool_ledger
-                .lock()
-                .map(|ledger| {
-                    ledger.execution_authority(id, true, true)
-                        == crate::tool_ledger::ToolCallExecutionAuthority::OperationJournal
-                })
-                .unwrap_or(false)
+            && self.tool_execution_authority(id, name)
+                == crate::tool_ledger::ToolCallExecutionAuthority::OperationJournal
         {
             return crate::ToolResult {
                 content: "Operation was not admitted before dispatch; no adapter was run.".into(),
@@ -3466,7 +3537,8 @@ Issue the call again if it is still needed.";
             }
             result
         } else {
-            execute()
+            self.pre_dispatch_gate(authorized_revision)
+                .map_or_else(|refused| refused, |()| execute())
         };
         pending_operation.disarm();
         if !journal_authoritative {
@@ -8962,6 +9034,84 @@ mod operation_dispatch_tests {
     }
 
     #[test]
+    fn execution_authority_follows_each_tools_own_capability_and_the_journal() {
+        use crate::tool_ledger::ToolCallExecutionAuthority::{
+            CompatibilityLedger, LegacyObservationBlocked, OperationJournal,
+        };
+        let register = |agent: &Agent, name: &str, source| {
+            agent
+                .runtime
+                .as_ref()
+                .unwrap()
+                .capability_registry
+                .register(crate::RuntimeCapability::new(
+                    name,
+                    source,
+                    crate::ToolClass::Other,
+                    false,
+                    &json!({"type": "object"}),
+                    None,
+                ));
+        };
+        let sources = [
+            ("builtin_tool", crate::CapabilitySource::Builtin),
+            ("js_tool", crate::CapabilitySource::JsExtension),
+            ("native_tool", crate::CapabilitySource::NativeExtension),
+            ("mcp__srv__tool", crate::CapabilitySource::Mcp),
+        ];
+
+        let (journaled, _workspace, _journal) = configured_agent();
+        for (name, source) in sources {
+            register(&journaled, name, source);
+            assert!(journaled.journal_eligible_capability(name), "{name}");
+            assert_eq!(
+                journaled.tool_execution_authority("fresh", name),
+                OperationJournal,
+                "{name} with a journal"
+            );
+        }
+        assert!(!journaled.journal_eligible_capability("unregistered_tool"));
+        assert_eq!(
+            journaled.tool_execution_authority("fresh", "unregistered_tool"),
+            CompatibilityLedger
+        );
+        // A legacy record blocks an eligible tool and cannot capture an
+        // ineligible one.
+        for name in ["mcp__srv__tool", "unregistered_tool"] {
+            journaled
+                .tool_ledger
+                .lock()
+                .unwrap()
+                .record_start("legacy", name, &json!({}));
+        }
+        assert_eq!(
+            journaled.tool_execution_authority("legacy", "mcp__srv__tool"),
+            LegacyObservationBlocked
+        );
+        assert_eq!(
+            journaled.tool_execution_authority("legacy", "unregistered_tool"),
+            CompatibilityLedger
+        );
+
+        // Same capabilities, no journal configured: compatibility ledger.
+        let mut plain = Agent::new("");
+        plain.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+        for (name, source) in sources {
+            register(&plain, name, source);
+            assert!(plain.journal_eligible_capability(name), "{name}");
+            assert_eq!(
+                plain.tool_execution_authority("fresh", name),
+                CompatibilityLedger,
+                "{name} without a journal"
+            );
+        }
+    }
+
+    #[test]
     fn permission_revision_change_after_admission_stops_before_dispatch() {
         let (agent, workspace, journal) = configured_agent();
         let args = json!({"path": "input.txt"});
@@ -8985,6 +9135,179 @@ mod operation_dispatch_tests {
             attempt.effect_status(),
             crate::runtime::operations::EffectStatus::NotStarted
         );
+    }
+
+    /// A runtime without a journal: every call takes the compatibility route.
+    fn compat_agent() -> (Agent, tempfile::TempDir) {
+        let workspace = tempfile::tempdir().unwrap();
+        for name in ["input.txt", "second.txt"] {
+            std::fs::write(workspace.path().join(name), "dispatch fixture").unwrap();
+        }
+        let mut agent = Agent::new("");
+        agent.tools = vec!["read".into(), "batch".into()];
+        agent.tool_execution_mode = ToolExecutionMode::Sequential;
+        agent.cwd = workspace.path().to_path_buf();
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+        (agent, workspace)
+    }
+
+    fn adapter_runs(agent: &Agent) -> u64 {
+        agent
+            .counters
+            .executed_leaf_operations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn assert_policy_stop(result: &crate::ToolResult) {
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("Permission policy changed"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn compat_route_stops_when_permission_revision_changes_after_preparation() {
+        let (agent, workspace) = compat_agent();
+        let args = json!({"path": "input.txt"});
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), "compat-policy", "read", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        agent.permissions.lock().unwrap().mode = crate::PermissionMode::Ask;
+
+        let result = agent.run_prepared_call(workspace.path(), "compat-policy", "read", &args, 0);
+        assert_policy_stop(&result);
+        assert_eq!(adapter_runs(&agent), 0, "the adapter must not run");
+        let ledger = agent.tool_ledger.lock().unwrap();
+        assert!(
+            !ledger.is_already_executed("compat-policy"),
+            "no successful execution is recorded"
+        );
+    }
+
+    #[test]
+    fn compat_route_stops_when_cancelled_after_preparation() {
+        let (agent, workspace) = compat_agent();
+        let args = json!({"path": "input.txt"});
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), "compat-cancel", "read", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        agent.runtime.as_ref().unwrap().cancel();
+
+        let result = agent.run_prepared_call(workspace.path(), "compat-cancel", "read", &args, 0);
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("cancelled before dispatch"),
+            "{}",
+            result.content
+        );
+        assert_eq!(adapter_runs(&agent), 0, "the adapter must not run");
+        assert!(!agent
+            .tool_ledger
+            .lock()
+            .unwrap()
+            .is_already_executed("compat-cancel"));
+    }
+
+    #[test]
+    fn batch_child_stops_when_permission_revision_changes_before_it_runs() {
+        let (mut agent, workspace) = compat_agent();
+        // The batch prepares every child before running any, so the hook on
+        // the second child moves the policy after the first was authorized.
+        let permissions = agent.permissions.clone();
+        agent.pre_tool = Some(crate::PreToolHook(Arc::new(move |_, args| {
+            if args["path"] == "second.txt" {
+                permissions.lock().unwrap().mode = crate::PermissionMode::Ask;
+            }
+            None
+        })));
+        let result = agent.run_batch(
+            workspace.path(),
+            "batch-policy",
+            &json!({"operations": [
+                {"tool": "read", "args": {"path": "input.txt"}},
+                {"tool": "read", "args": {"path": "second.txt"}},
+            ]}),
+        );
+        // Child 1 was authorized before the change and is refused; child 2 was
+        // authorized under the new policy and runs.
+        assert_eq!(adapter_runs(&agent), 1, "{}", result.content);
+        let rows = &result.details.as_ref().unwrap()["operations"];
+        assert_eq!(rows[0]["status"], "error", "{}", result.content);
+        assert_eq!(rows[1]["status"], "ok", "{}", result.content);
+        assert!(
+            result.content.contains("Permission policy changed"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn plan_batch_call_stops_when_permission_revision_changes_before_commit() {
+        let (mut agent, workspace) = compat_agent();
+        // `ToolExecutionStart` fires after preparation and before the run.
+        let permissions = agent.permissions.clone();
+        agent.event_sink = Some(crate::EventSink(Arc::new(move |event| {
+            if matches!(event, crate::AgentEvent::ToolExecutionStart { .. }) {
+                permissions.lock().unwrap().mode = crate::PermissionMode::Ask;
+            }
+        })));
+        let mut events = Vec::new();
+        let messages = agent.execute_plan_batch(
+            workspace.path(),
+            vec![(
+                "plan-policy".into(),
+                "read".into(),
+                json!({"path": "input.txt"}),
+            )],
+            &mut events,
+        );
+        assert_eq!(adapter_runs(&agent), 0);
+        let rendered = format!("{:?}", messages[0].content);
+        assert!(rendered.contains("Permission policy changed"), "{rendered}");
+    }
+
+    #[test]
+    fn codemode_child_stops_when_permission_revision_changes_before_it_runs() {
+        let (agent, workspace) = compat_agent();
+        let args = json!({"path": "input.txt"});
+        // Same two steps `dispatch_script_child` performs for a child.
+        assert!(matches!(
+            agent.prepare_tool_call_with_origin(
+                workspace.path(),
+                "script-policy",
+                "read",
+                &args,
+                1,
+                crate::ToolOperationOrigin::ProviderCall,
+            ),
+            Preparation::Ready { .. }
+        ));
+        agent.permissions.lock().unwrap().mode = crate::PermissionMode::Ask;
+        let mut structured = None;
+        let result = agent.run_prepared_call_with_structured(
+            workspace.path(),
+            "script-policy",
+            "read",
+            &args,
+            1,
+            Some(&mut structured),
+        );
+        assert_policy_stop(&result);
+        assert_eq!(adapter_runs(&agent), 0);
+
+        // A child nobody changed still runs through `dispatch_script_child`.
+        let (ok, _, _) =
+            agent.dispatch_script_child(workspace.path(), "script-ok", "read", &args, None, 0);
+        assert!(!ok.is_error, "{}", ok.content);
+        assert_eq!(adapter_runs(&agent), 1);
     }
 
     #[test]

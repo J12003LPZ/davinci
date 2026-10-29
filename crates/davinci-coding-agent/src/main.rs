@@ -5702,17 +5702,26 @@ fn run_stop_hooks_for(parsed: &Args, cwd: &Path) {
     davinci_coding_agent::plugins::run_session_end(&default_agent_dir(), cwd);
 }
 
+/// The exit cleanup, once per process and bounded by
+/// `shutdown::CLEANUP_DEADLINE`, whether the normal exit or a signal gets here
+/// first. A step that hangs is abandoned at the deadline, not waited for.
 fn emit_session_shutdown(parsed: &Args) {
-    loaded_extension_host(parsed).emit(ExtensionEvent::SessionShutdown {
-        reason: "quit".into(),
+    let parsed = parsed.clone();
+    // Thread-locals do not follow the work to its thread.
+    let startup = WORKER_STARTUP_CONTEXT.with(|context| context.borrow().clone());
+    shutdown::session_cleanup().run(shutdown::CLEANUP_DEADLINE, move || {
+        WORKER_STARTUP_CONTEXT.with(|context| *context.borrow_mut() = startup);
+        loaded_extension_host(&parsed).emit(ExtensionEvent::SessionShutdown {
+            reason: "quit".into(),
+        });
+        crate::js_host::shutdown_js_pool();
+        // `process::exit` follows: nothing below runs a destructor, so the
+        // children are reaped here.
+        davinci_agent::jobs::kill_every_job();
+        davinci_agent::McpRegistry::shutdown_all();
+        let cwd = std::env::current_dir().unwrap_or_default();
+        run_stop_hooks_for(&parsed, &cwd);
     });
-    crate::js_host::shutdown_js_pool();
-    // `process::exit` follows: nothing below runs a destructor, so the
-    // children are reaped here.
-    davinci_agent::jobs::kill_every_job();
-    davinci_agent::McpRegistry::shutdown_all();
-    let cwd = std::env::current_dir().unwrap_or_default();
-    run_stop_hooks_for(parsed, &cwd);
 }
 
 fn immediate_shutdown_if_fixture(parsed: &Args) -> Option<i32> {

@@ -766,6 +766,9 @@ pub struct Agent {
     pub(crate) pending_tool_operations:
         Arc<Mutex<std::collections::HashMap<String, PendingToolOperation>>>,
     pub(crate) operation_presentations: Arc<Mutex<std::collections::HashMap<String, ToolResult>>>,
+    /// Permission revision each compatibility-route call was authorized under,
+    /// checked again right before its adapter runs.
+    pub(crate) prepared_permission_revisions: Arc<Mutex<std::collections::HashMap<String, u64>>>,
     /// Tool-call ids whose results are pruned from the provider view. Only
     /// grows; the session file keeps every body.
     pruned_tool_results: std::collections::HashSet<String>,
@@ -975,6 +978,7 @@ impl Agent {
             tool_ledger: Arc::new(std::sync::Mutex::new(ToolCallLedger::default())),
             pending_tool_operations: Arc::new(Mutex::new(std::collections::HashMap::new())),
             operation_presentations: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            prepared_permission_revisions: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pruned_tool_results: std::collections::HashSet::new(),
             pruned_evidence: std::collections::HashMap::new(),
             base_system_prompt: system_prompt,
