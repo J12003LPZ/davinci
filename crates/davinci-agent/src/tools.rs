@@ -881,20 +881,85 @@ fn write_stdin_tool(
     }
 }
 
+/// A host callback can block in external UI code indefinitely. Rust cannot
+/// safely kill that thread, so retain a process-wide cap on outstanding
+/// callbacks; their permits are returned only after the callback exits.
+#[derive(Default)]
+struct DecisionWorkerSlots {
+    active: std::sync::atomic::AtomicUsize,
+}
+
+struct DecisionWorkerPermit(std::sync::Arc<DecisionWorkerSlots>);
+
+impl DecisionWorkerSlots {
+    fn reserve(self: &std::sync::Arc<Self>, capacity: usize) -> Option<DecisionWorkerPermit> {
+        use std::sync::atomic::Ordering;
+        self.active
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                (count < capacity).then_some(count + 1)
+            })
+            .ok()
+            .map(|_| DecisionWorkerPermit(self.clone()))
+    }
+}
+
+impl Drop for DecisionWorkerPermit {
+    fn drop(&mut self) {
+        self.0
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 fn wait_for_decision_host(
     responder: DecisionResponder,
     request: DecisionHostRequest,
     context: &ToolContext,
 ) -> DecisionHostResponse {
+    const MAX_DECISION_WORKERS: usize = 32;
+    static SLOTS: std::sync::OnceLock<std::sync::Arc<DecisionWorkerSlots>> =
+        std::sync::OnceLock::new();
+    wait_for_decision_host_with_slots(
+        responder,
+        request,
+        context,
+        SLOTS
+            .get_or_init(|| std::sync::Arc::new(DecisionWorkerSlots::default()))
+            .clone(),
+        MAX_DECISION_WORKERS,
+    )
+}
+
+fn wait_for_decision_host_with_slots(
+    responder: DecisionResponder,
+    request: DecisionHostRequest,
+    context: &ToolContext,
+    slots: std::sync::Arc<DecisionWorkerSlots>,
+    capacity: usize,
+) -> DecisionHostResponse {
     use std::sync::mpsc::RecvTimeoutError;
     const DEFAULT_DECISION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
     const POLL: std::time::Duration = std::time::Duration::from_millis(25);
+    if context.is_aborted() {
+        return DecisionHostResponse::Cancelled;
+    }
+    let Some(permit) = slots.reserve(capacity) else {
+        return DecisionHostResponse::Unavailable;
+    };
     let deadline = context.decision_timeout.unwrap_or(DEFAULT_DECISION_TIMEOUT);
     let started = std::time::Instant::now();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let _ = sender.send(responder.respond(request));
-    });
+    if std::thread::Builder::new()
+        .name("davinci-decision-host".into())
+        .spawn(move || {
+            let _permit = permit;
+            let _ = sender.send(responder.respond(request));
+        })
+        .is_err()
+    {
+        // On spawn failure the closure (including its permit) is dropped.
+        return DecisionHostResponse::Unavailable;
+    }
     loop {
         if context.is_aborted() {
             return DecisionHostResponse::Cancelled;
@@ -5142,6 +5207,60 @@ mod tests {
         );
         assert!(started.elapsed() < std::time::Duration::from_millis(150));
         assert_eq!(*timeout_context.living_plan.lock().unwrap(), before);
+    }
+
+    #[test]
+    fn timed_out_decision_hosts_cannot_spawn_unbounded_waiters() {
+        let slots = std::sync::Arc::new(DecisionWorkerSlots::default());
+        let (release, rx) = std::sync::mpsc::channel::<()>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let blocked = DecisionResponder::new(move |_| {
+            let _ = rx.lock().unwrap().recv();
+            DecisionHostResponse::Unavailable
+        });
+        let request = DecisionHostRequest {
+            questions: Vec::new(),
+        };
+        let context = ToolContext {
+            decision_timeout: Some(std::time::Duration::from_millis(25)),
+            ..ToolContext::default()
+        };
+
+        let first = wait_for_decision_host_with_slots(
+            blocked.clone(),
+            request.clone(),
+            &context,
+            slots.clone(),
+            1,
+        );
+        assert_eq!(first, DecisionHostResponse::Timeout);
+        assert_eq!(slots.active.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let second =
+            wait_for_decision_host_with_slots(blocked, request.clone(), &context, slots.clone(), 1);
+        assert_eq!(second, DecisionHostResponse::Unavailable);
+        assert_eq!(slots.active.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while slots.active.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "decision slot was not reclaimed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_in_worker = called.clone();
+        let ready = DecisionResponder::new(move |_| {
+            called_in_worker.store(true, std::sync::atomic::Ordering::SeqCst);
+            DecisionHostResponse::Unavailable
+        });
+        assert_eq!(
+            wait_for_decision_host_with_slots(ready, request, &context, slots, 1),
+            DecisionHostResponse::Unavailable
+        );
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
