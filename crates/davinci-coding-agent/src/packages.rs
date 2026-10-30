@@ -1279,16 +1279,16 @@ mod tests {
         fs::create_dir_all(&agent).unwrap();
         let project = project_with_packages(dir.path());
         let settings = project.join(".pi").join("settings.json");
-        let before = fs::read_to_string(&settings).unwrap();
         let args = vec!["-l".to_string(), "npm:project-owned".to_string()];
 
-        // The real entry point, as `davinci remove -l <pkg>` reaches it.
-        let error = handle_package_command_in("remove", &args, &agent, &project).unwrap_err();
-        assert!(error.starts_with("UNTRUSTED_PROJECT: "), "{error}");
-        assert_eq!(
-            fs::read_to_string(&settings).unwrap(),
-            before,
-            "an untrusted project's settings were rewritten"
+        // Removal runs no package code, so an untrusted project can still be
+        // cleaned up after trust is revoked.
+        handle_package_command_in("remove", &args, &agent, &project).unwrap();
+        assert!(
+            !fs::read_to_string(&settings)
+                .unwrap()
+                .contains("project-owned"),
+            "the registration survived an untrusted removal"
         );
     }
 

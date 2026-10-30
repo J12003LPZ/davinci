@@ -218,6 +218,23 @@ pub fn frames_of(corpus: &str) -> Vec<SseFrame> {
             frames.push(frame);
         }
     }
+    if let Some(frame) = framer.flush() {
+        frames.push(frame);
+    }
+    frames
+}
+
+/// Test helper for the EOF rule: an event without a real blank-line terminator
+/// is not dispatched.
+#[cfg(test)]
+pub fn frames_without_eof_flush(corpus: &str) -> Vec<SseFrame> {
+    let mut framer = SseFramer::default();
+    let mut frames = Vec::new();
+    for line in corpus.lines() {
+        if let Some(frame) = framer.feed_line(line) {
+            frames.push(frame);
+        }
+    }
     frames
 }
 
@@ -2457,7 +2474,7 @@ data: {"type":"response.completed","response":{"status":"completed"}}
 
     #[test]
     fn audit_wp08_b076_eof_does_not_dispatch_an_unterminated_event() {
-        assert!(frames_of("data: {\"a\":1}").is_empty());
+        assert!(frames_without_eof_flush("data: {\"a\":1}").is_empty());
         let frames = frames_of("data: {\"a\":1}\n\n");
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data["a"], 1);

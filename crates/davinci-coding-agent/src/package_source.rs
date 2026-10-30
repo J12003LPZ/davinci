@@ -42,9 +42,12 @@ pub fn parse_package_source(source: &str) -> ParsedSource {
 }
 
 pub fn parse_git_source(source: &str) -> (String, Option<String>) {
-    let raw = match source.strip_prefix("git:") {
-        Some(rest) if rest.starts_with("git://") => rest,
-        _ => source,
+    // A real `git://` URL must not lose its scheme to the package-source
+    // `git:` prefix. A `git:git://` prefix is still stripped once.
+    let raw = if source.starts_with("git://") {
+        source
+    } else {
+        source.strip_prefix("git:").unwrap_or(source)
     };
     if raw.starts_with("git@") {
         if let Some(idx) = raw.rfind('@') {

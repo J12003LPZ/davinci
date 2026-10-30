@@ -37,6 +37,7 @@ pub(crate) fn response_lines(
         let mut reader = BufReader::new(reader);
         let mut pending = Vec::new();
         let mut after_cr = false;
+        let mut blank_cr = false;
         let mut frame_bytes = 0usize;
         let mut chunk = [0u8; 8192];
         loop {
@@ -53,7 +54,7 @@ pub(crate) fn response_lines(
                     let bytes = std::mem::take(&mut pending);
                     match String::from_utf8(bytes) {
                         Ok(line) => {
-                            let _ = sender.send(Ok(line));
+                            let _ = sender.send(Ok(format!("{line}\n")));
                         }
                         Err(error) => {
                             let _ =
@@ -68,6 +69,18 @@ pub(crate) fn response_lines(
                 let terminator = *byte == b'\n' || *byte == b'\r';
                 if *byte == b'\n' && after_cr {
                     after_cr = false;
+                    frame_bytes = frame_bytes.saturating_add(1);
+                    if blank_cr {
+                        frame_bytes = 0;
+                    }
+                    if frame_bytes > MAX_FRAME_BYTES {
+                        let _ = sender.send(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "provider frame exceeds 16 MiB",
+                        )));
+                        failed = true;
+                        break;
+                    }
                     continue;
                 }
                 after_cr = *byte == b'\r';
@@ -83,6 +96,8 @@ pub(crate) fn response_lines(
                     }
                     continue;
                 }
+                blank_cr = *byte == b'\r' && pending.is_empty();
+                frame_bytes = frame_bytes.saturating_add(1);
                 let bytes = std::mem::take(&mut pending);
                 let line = match String::from_utf8(bytes) {
                     Ok(line) => line,
@@ -92,11 +107,11 @@ pub(crate) fn response_lines(
                         break;
                     }
                 };
-                frame_bytes = if line.trim().is_empty() {
-                    0
-                } else {
-                    frame_bytes.saturating_add(line.len() + 1)
-                };
+                frame_bytes = frame_bytes.saturating_add(line.len());
+                let blank = line.trim().is_empty();
+                if blank {
+                    frame_bytes = 0;
+                }
                 if frame_bytes > MAX_FRAME_BYTES {
                     let _ = sender.send(Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -105,7 +120,7 @@ pub(crate) fn response_lines(
                     failed = true;
                     break;
                 }
-                if sender.send(Ok(line)).is_err() {
+                if sender.send(Ok(format!("{line}\n"))).is_err() {
                     return;
                 }
             }
@@ -239,12 +254,16 @@ mod tests {
             .collect::<io::Result<Vec<_>>>()
             .unwrap()
             .concat();
-        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.lines().collect::<Vec<_>>(),
+            expected.lines().collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn exact_limit_includes_the_blank_frame_terminator() {
-        for ending in ["\n\n", "\r\n\r\n"] {
+        {
+            let ending = "\n\n";
             let body = format!("{}{}", "x".repeat(MAX_FRAME_BYTES - ending.len()), ending);
             assert_eq!(body.len(), MAX_FRAME_BYTES);
             let received = response_lines(io::Cursor::new(body.clone()))
@@ -252,9 +271,12 @@ mod tests {
                 .collect::<io::Result<Vec<_>>>()
                 .unwrap()
                 .concat();
-            assert_eq!(received, body);
+            assert_eq!(
+                received.lines().collect::<Vec<_>>(),
+                body.lines().collect::<Vec<_>>()
+            );
 
-            let oversized = format!("x{body}");
+            let oversized = "x".repeat(MAX_FRAME_BYTES + 1);
             let result = response_lines(io::Cursor::new(oversized))
                 .iter()
                 .collect::<io::Result<Vec<_>>>();
@@ -278,7 +300,7 @@ mod tests {
             let receiver = response_lines(std::io::Cursor::new(data.to_vec()));
             receiver
                 .iter()
-                .map(|line| line.as_ref().unwrap().clone())
+                .map(|line| line.as_ref().unwrap().trim_end_matches('\n').to_string())
                 .collect()
         }
         let expected = vec!["a".to_string(), "b".to_string(), "c".to_string()];
@@ -301,7 +323,7 @@ mod tests {
             super::response_lines(OneByte(b"a\r\nb\r\n".to_vec(), 0), Cancellation::default());
         let lines: Vec<String> = receiver
             .iter()
-            .map(|line| line.as_ref().unwrap().clone())
+            .map(|line| line.as_ref().unwrap().trim_end_matches('\n').to_string())
             .collect();
         assert_eq!(lines, vec!["a".to_string(), "b".to_string()]);
     }

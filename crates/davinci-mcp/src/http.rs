@@ -176,29 +176,63 @@ impl HttpTransport {
     }
 
     fn read_sse_response(&self, reader: impl Read, want: Option<&Value>) -> Result<Value> {
-        let text = read_response_body(reader, MAX_BODY_BYTES)?;
+        // Incremental so a reply is returned before the server closes its
+        // stream; EOF itself never dispatches an unterminated event.
+        let mut reader = reader.take((MAX_BODY_BYTES + 1) as u64);
+        let mut byte = [0u8; 1];
+        let mut line = Vec::new();
+        let mut data = String::new();
+        let mut total = 0usize;
         let mut last = None;
-        for event in sse_events(&text) {
-            let Ok(value) = serde_json::from_str::<Value>(&event) else {
+        let mut after_cr = false;
+        let mut started = false;
+        loop {
+            let read = reader
+                .read(&mut byte)
+                .map_err(|err| Error::Transport(format!("mcp http SSE: {err}")))?;
+            if read == 0 {
+                break;
+            }
+            let byte = byte[0];
+            total = total.saturating_add(1);
+            if total > MAX_BODY_BYTES {
+                return Err(Error::Transport(format!(
+                    "mcp http body exceeds {MAX_BODY_BYTES} bytes"
+                )));
+            }
+            if byte == b'\n' && after_cr {
+                after_cr = false;
                 continue;
-            };
-            // Answer every server request before selecting our response:
-            // a later batch member still requires a reply.
-            self.answer_batch_requests(&value)?;
-            // A 2025-03-26 server may send a JSON-RPC batch as one event.
-            for message in flatten_batch(value) {
-                if message.get("id").is_some()
-                    && message.get("method").and_then(Value::as_str).is_some()
-                {
-                    continue;
-                }
-                match want {
-                    Some(id) if message.get("id") == Some(id) => {
-                        validate_response(&message, id)?;
-                        return Ok(message);
+            }
+            after_cr = byte == b'\r';
+            if byte == b'\r' || byte == b'\n' {
+                if !started {
+                    started = true;
+                    if line.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                        line.drain(..3);
                     }
-                    Some(_) => {}
-                    None => last = Some(message),
+                }
+                let text = String::from_utf8_lossy(&line);
+                if text.is_empty() {
+                    if !data.is_empty() {
+                        if let Some(reply) = self.handle_sse_event(&data, want, &mut last)? {
+                            return Ok(reply);
+                        }
+                    }
+                    data.clear();
+                } else if let Some(rest) = text.strip_prefix("data:") {
+                    if !data.is_empty() {
+                        data.push('\n');
+                    }
+                    data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+                }
+                line.clear();
+            } else {
+                line.push(byte);
+                if line.len() > MAX_BODY_BYTES {
+                    return Err(Error::Transport(format!(
+                        "mcp http body exceeds {MAX_BODY_BYTES} bytes"
+                    )));
                 }
             }
         }
@@ -208,6 +242,34 @@ impl HttpTransport {
             ))),
             None => last.ok_or_else(|| Error::Transport("SSE body had no data frame".into())),
         }
+    }
+
+    fn handle_sse_event(
+        &self,
+        data: &str,
+        want: Option<&Value>,
+        last: &mut Option<Value>,
+    ) -> Result<Option<Value>> {
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            return Ok(None);
+        };
+        self.answer_batch_requests(&value)?;
+        for message in flatten_batch(value) {
+            if message.get("id").is_some()
+                && message.get("method").and_then(Value::as_str).is_some()
+            {
+                continue;
+            }
+            match want {
+                Some(id) if message.get("id") == Some(id) => {
+                    validate_response(&message, id)?;
+                    return Ok(Some(message));
+                }
+                Some(_) => {}
+                None => *last = Some(message),
+            }
+        }
+        Ok(None)
     }
 
     fn fixture_answer(fixture: &Value, method: &str) -> Result<Value> {

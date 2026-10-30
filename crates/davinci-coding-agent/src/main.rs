@@ -851,7 +851,10 @@ fn apply_tool_admission(parsed: &Args, agent: &mut Agent) -> Result<(), String> 
         let unknown: Vec<&String> = parsed
             .tools
             .iter()
-            .filter(|name| !agent.tool_registry.iter().any(|known| known == *name))
+            .filter(|name| {
+                !agent.tool_registry.iter().any(|known| known == *name)
+                    && !davinci_agent::tools::BUILTIN_TOOLS.contains(&name.as_str())
+            })
             .collect();
         if !unknown.is_empty() {
             return Err(format!(
@@ -4449,17 +4452,19 @@ fn run_print_turns(
             )
         })
         .unwrap_or_default();
-    for action in tool_event_denials(&all_events) {
-        let call_id = action
-            .get("tool_call_id")
-            .and_then(serde_json::Value::as_str);
-        if !denied.iter().any(|known| {
-            known
+    if parsed.fail_on_denied && parsed.approval_policy != ApprovalPolicy::DenyContinue {
+        for action in tool_event_denials(&all_events) {
+            let call_id = action
                 .get("tool_call_id")
-                .and_then(serde_json::Value::as_str)
-                == call_id
-        }) {
-            denied.push(action);
+                .and_then(serde_json::Value::as_str);
+            if !denied.iter().any(|known| {
+                known
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str)
+                    == call_id
+            }) {
+                denied.push(action);
+            }
         }
     }
     // Written before any approval_required, which stays the final line.
