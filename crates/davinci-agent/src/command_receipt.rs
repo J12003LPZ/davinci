@@ -77,7 +77,8 @@ impl CommandReceiptCapture {
             stdout_hash: Some(crate::runtime::checkpoints::compute_sha256(&output.stdout)),
             stderr_hash: Some(crate::runtime::checkpoints::compute_sha256(&output.stderr)),
             process_evidence,
-            assertion_counts: crate::verification::discovery::counts(
+            assertion_counts: crate::verification::discovery::counts_in(
+                Some(&cwd),
                 command,
                 &output.stdout,
                 &output.stderr,
@@ -135,8 +136,12 @@ impl CommandReceiptCapture {
         receipt.stdout_hash = Some(crate::runtime::checkpoints::compute_sha256(stdout));
         receipt.stderr_hash = Some(crate::runtime::checkpoints::compute_sha256(stderr));
         if let [command] = receipt.argv.as_slice() {
-            receipt.assertion_counts =
-                crate::verification::discovery::counts(command, stdout, stderr);
+            receipt.assertion_counts = crate::verification::discovery::counts_in(
+                Some(std::path::Path::new(&evidence.cwd)),
+                command,
+                stdout,
+                stderr,
+            );
         }
         receipt.process_evidence = Some(evidence);
         *slot = Some(receipt);

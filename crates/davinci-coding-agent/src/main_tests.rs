@@ -5720,3 +5720,107 @@ fn a_refresh_that_errors_is_reported_not_swallowed() {
         None
     );
 }
+
+/// The status a worker reports is the model it was built with, for an omitted
+/// launch provider, a bare override, a qualified override, a profile's model
+/// and the inherited model alike. Registration cannot know it; the builder
+/// publishes it.
+#[test]
+fn audit_wp02_b034_registered_worker_reports_the_model_it_runs_on() {
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let workspace = dir.path().join("workspace");
+    let (_lead, base) = lead_and_worker_request(&workspace, &["read"], false);
+    let id = base.runtime_agent_id.expect("a registered worker");
+    let registry = base
+        .runtime
+        .as_ref()
+        .expect("worker runtime")
+        .registry
+        .clone();
+    assert!(
+        registry.get(&id).unwrap().provider.is_empty(),
+        "premise: registration does not know it"
+    );
+    let models = davinci_ai::load_builtin_models();
+    let configured = models
+        .iter()
+        .find(|m| {
+            models
+                .iter()
+                .any(|o| o.provider == m.provider && o.id != m.id)
+        })
+        .expect("a provider with two models");
+    // The worker's own configured model (launch flags), with no provider
+    // passed down by the parent.
+    let parsed = Args {
+        project_trust_override: Some(true),
+        provider: Some(configured.provider.clone()),
+        model: Some(configured.id.clone()),
+        ..offline_args()
+    };
+    let mcp = davinci_agent::McpRegistry::default();
+    let reported = || {
+        let record = registry.get(&id).unwrap();
+        let serialized = serde_json::to_string(&record).unwrap();
+        assert!(serialized.contains(&record.provider) && serialized.contains(&record.model_id));
+        (record.provider, record.model_id)
+    };
+    let build = |request: &davinci_agent::SubagentRequest| {
+        let (child, _) = build_worker(&parsed, &workspace, &mcp, request).unwrap();
+        (child.provider.clone(), child.model_id.clone())
+    };
+
+    // Inherited: no override, no launch provider.
+    let inherited = build(&base);
+    assert_eq!(reported(), inherited);
+    assert_eq!(
+        inherited,
+        (configured.provider.clone(), configured.id.clone())
+    );
+
+    let other = models
+        .iter()
+        .find(|m| m.provider == inherited.0 && m.id != inherited.1)
+        .expect("a second model of the inherited provider");
+
+    // A bare override with the launch provider omitted resolves against the
+    // worker's own provider.
+    let mut bare = base.clone();
+    bare.provider = None;
+    bare.model_id = None;
+    bare.model_override = Some(other.id.clone());
+    let built = build(&bare);
+    assert_eq!(built, (other.provider.clone(), other.id.clone()));
+    assert_eq!(reported(), built);
+
+    // The same model, qualified.
+    let mut qualified = base.clone();
+    qualified.model_override = Some(format!("{}/{}", other.provider, other.id));
+    let built = build(&qualified);
+    assert_eq!(built, (other.provider.clone(), other.id.clone()));
+    assert_eq!(reported(), built);
+
+    // Back to the inherited model: the record follows the worker, not history.
+    assert_eq!(build(&base), inherited);
+    assert_eq!(reported(), inherited);
+
+    // A profile that names a model.
+    let profiles = workspace.join(".davinci/agents");
+    std::fs::create_dir_all(&profiles).unwrap();
+    std::fs::write(
+        profiles.join("pinned.md"),
+        format!(
+            "---\nname: pinned\nmodel: {}/{}\ntools: [read]\n---\nPinned fixture",
+            other.provider, other.id
+        ),
+    )
+    .unwrap();
+    let mut profiled = base.clone();
+    profiled.agent = Some("pinned".into());
+    profiled.parent_tools = Some(vec!["read".into()]);
+    let built = build(&profiled);
+    assert_eq!(built, (other.provider.clone(), other.id.clone()));
+    assert_eq!(reported(), built);
+}

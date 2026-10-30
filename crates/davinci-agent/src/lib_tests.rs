@@ -7884,3 +7884,159 @@ fn audit_wp02_b029_malformed_message_fails_import_and_changes_nothing() {
     agent.load_from_session(valid).unwrap();
     assert!(!agent.messages.is_empty());
 }
+
+fn b029_text(role: &str, text: &str) -> SessionEntry {
+    SessionEntry::message(role, serde_json::json!([{"type": "text", "text": text}]))
+}
+
+fn b029_broken() -> SessionEntry {
+    SessionEntry::message("assistant", serde_json::json!([{"type": "no_such_part"}]))
+}
+
+/// A malformed message is refused wherever it sits: on an abandoned branch,
+/// or in history a compaction hides. Neither is visible at initial load, but
+/// both come back (navigation, a later compaction rewrite).
+#[test]
+fn audit_wp02_b029_malformed_messages_off_the_active_path_fail_the_load() {
+    let good_dir = tempfile::tempdir().unwrap();
+    let mut good = JsonlSession::create(good_dir.path(), "fixture", Some("good")).unwrap();
+    good.append_entry(b029_text("user", "keep me")).unwrap();
+    let mut agent = Agent::new("fixture");
+    let good_id = good.header.id.clone();
+    agent.load_from_session(good).unwrap();
+    let messages_before = agent.messages.clone();
+
+    // 1. Malformed message on a branch that is not the selected one.
+    let dir = tempfile::tempdir().unwrap();
+    let mut branched = JsonlSession::create(dir.path(), "fixture", Some("branched")).unwrap();
+    branched.append_entry(b029_text("user", "root")).unwrap();
+    let root = branched.entries.last().unwrap().id.clone();
+    branched
+        .append_entry(b029_text("assistant", "active"))
+        .unwrap();
+    let active = branched.entries.last().unwrap().id.clone();
+    branched.set_leaf(Some(root));
+    branched.append_entry(b029_broken()).unwrap();
+    let abandoned = branched.entries.last().unwrap().id.clone();
+    branched.set_leaf(Some(active));
+    // The selected context is clean, so the old active-path check admitted it.
+    assert!(
+        !davinci_session::build_context_entries(&branched.entries, branched.leaf_id.as_deref())
+            .iter()
+            .any(|entry| entry.id == abandoned),
+        "premise: the broken message is off the active path"
+    );
+    let error = agent.load_from_session(branched).unwrap_err();
+    assert!(
+        error.contains(&abandoned) && error.contains("malformed message"),
+        "{error}"
+    );
+
+    // 2. Malformed message before a compaction: the context starts after it.
+    let dir = tempfile::tempdir().unwrap();
+    let mut compacted = JsonlSession::create(dir.path(), "fixture", Some("compacted")).unwrap();
+    compacted.append_entry(b029_broken()).unwrap();
+    let hidden = compacted.entries.last().unwrap().id.clone();
+    compacted.append_entry(b029_text("user", "kept")).unwrap();
+    let kept = compacted.entries.last().unwrap().id.clone();
+    let mut compaction = SessionEntry::message("user", serde_json::json!(""));
+    compaction.entry_type = "compaction".into();
+    compaction.message = None;
+    compaction
+        .extra
+        .insert("summary".into(), serde_json::json!("earlier work"));
+    compaction
+        .extra
+        .insert("firstKeptEntryId".into(), serde_json::json!(kept));
+    compacted.append_entry(compaction).unwrap();
+    let context: Vec<_> =
+        davinci_session::build_context_entries(&compacted.entries, compacted.leaf_id.as_deref())
+            .into_iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+    assert!(
+        !context.contains(&hidden),
+        "premise: the compaction hides it"
+    );
+    let error = agent.load_from_session(compacted).unwrap_err();
+    assert!(
+        error.contains(&hidden) && error.contains("malformed message"),
+        "{error}"
+    );
+
+    // 3. A summary entry that is not text would vanish from the context too.
+    let dir = tempfile::tempdir().unwrap();
+    let mut summarized = JsonlSession::create(dir.path(), "fixture", Some("summary")).unwrap();
+    let mut hollow = SessionEntry::message("user", serde_json::json!(""));
+    hollow.entry_type = "branch_summary".into();
+    hollow.message = None;
+    summarized.append_entry(hollow).unwrap();
+    assert!(agent
+        .load_from_session(summarized)
+        .unwrap_err()
+        .contains("summary"));
+
+    // A failed load changes nothing.
+    assert_eq!(agent.messages, messages_before);
+    assert_eq!(agent.session.as_ref().unwrap().header.id, good_id);
+}
+
+/// Navigation to a branch that would silently drop a message is refused before
+/// anything moves: not the leaf, not the persisted entries, not the messages.
+#[test]
+fn audit_wp02_b029_navigation_refuses_a_branch_with_a_malformed_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = JsonlSession::create(dir.path(), "fixture", Some("nav")).unwrap();
+    session.append_entry(b029_text("user", "root")).unwrap();
+    let root = session.entries.last().unwrap().id.clone();
+    session
+        .append_entry(b029_text("assistant", "active"))
+        .unwrap();
+    let active = session.entries.last().unwrap().id.clone();
+    let mut agent = Agent::new("fixture");
+    agent.load_from_session(session).unwrap();
+
+    // A sibling branch is added after the load (another writer, a repair
+    // tool): one valid reply and one that cannot be read.
+    let (valid, broken) = {
+        let session = agent.session.as_mut().unwrap();
+        session.set_leaf(Some(root.clone()));
+        session
+            .append_entry(b029_text("assistant", "sibling"))
+            .unwrap();
+        let valid = session.entries.last().unwrap().id.clone();
+        session.set_leaf(Some(root));
+        session.append_entry(b029_broken()).unwrap();
+        let broken = session.entries.last().unwrap().id.clone();
+        session.set_leaf(Some(active.clone()));
+        (valid, broken)
+    };
+    let entries_before = agent.session.as_ref().unwrap().entries.clone();
+    let messages_before = agent.messages.clone();
+    let id_before = agent.session.as_ref().unwrap().header.id.clone();
+
+    for summarize in [false, true] {
+        let error = agent
+            .navigate_tree_entry(&broken, summarize, None, false, 0)
+            .unwrap_err();
+        assert!(
+            error.contains(&broken) && error.contains("malformed message"),
+            "{error}"
+        );
+        let session = agent.session.as_ref().unwrap();
+        assert_eq!(session.leaf_id.as_deref(), Some(active.as_str()));
+        assert_eq!(session.entries, entries_before, "nothing was appended");
+        assert_eq!(session.header.id, id_before);
+        assert_eq!(agent.messages, messages_before);
+    }
+
+    // The readable sibling is still reachable.
+    agent
+        .navigate_tree_entry(&valid, false, None, false, 0)
+        .unwrap();
+    assert_eq!(
+        agent.session.as_ref().unwrap().leaf_id.as_deref(),
+        Some(valid.as_str())
+    );
+    assert_ne!(agent.messages, messages_before);
+}

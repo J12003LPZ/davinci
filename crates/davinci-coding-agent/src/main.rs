@@ -2815,6 +2815,14 @@ fn build_worker(
             progress.observe(event)
         })));
     }
+    // The registered worker record learns what it really runs on: the override,
+    // the profile's model or the inherited one, resolved above. This happens
+    // before the worker's first provider request.
+    if let (Some(runtime), Some(id)) = (&req.runtime, req.runtime_agent_id) {
+        runtime
+            .registry
+            .set_model_identity(id, &child.provider, &child.model_id);
+    }
     Ok((child, profile_allows_codemode))
 }
 

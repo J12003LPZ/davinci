@@ -101,6 +101,18 @@ impl RuntimeRegistry {
         }
     }
 
+    /// Publish the provider and model a worker actually runs on, once its
+    /// launch has resolved them (an override, a profile or the inherited
+    /// model). Registration cannot know them: the worker builder resolves them.
+    pub fn set_model_identity(&self, id: AgentId, provider: &str, model_id: &str) {
+        if let Ok(mut records) = self.records.write() {
+            if let Some(record) = records.get_mut(&id) {
+                record.provider = provider.to_owned();
+                record.model_id = model_id.to_owned();
+            }
+        }
+    }
+
     /// Record why an agent is unhealthy without changing its state.
     pub fn set_failure_reason(&self, id: AgentId, reason: impl Into<String>) {
         if let Ok(mut records) = self.records.write() {

@@ -524,6 +524,22 @@ pub(crate) struct HybridCompactionStats {
     pub context_tokens_after: u64,
 }
 
+/// Stand-ins the retry tests inject: the clock the run deadline is read from
+/// and the pool a request queues in.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct TestHooks {
+    pub(crate) clock: Option<std::sync::Arc<dyn Fn() -> u64 + Send + Sync>>,
+    pub(crate) capacity: Option<std::sync::Arc<runtime::capacity::RequestCapacity>>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for TestHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestHooks")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub(crate) codemode: Option<codemode::CodeModeBinding>,
@@ -561,6 +577,9 @@ pub struct Agent {
     /// Where the provider call leaves the server's `Retry-After` for the
     /// request that just failed (see [`Agent::retry_after_sink`]).
     retry_after_sink: davinci_ai::RetryAfterSink,
+    /// Test clock and capacity pool for the retry deadline checks.
+    #[cfg(test)]
+    pub(crate) test_hooks: TestHooks,
     /// Maximum provider model turns in one run; `Some(0)` disables the limit.
     pub max_model_turns: Option<u32>,
     pub provider_timeout_ms: Option<u64>,
@@ -815,6 +834,8 @@ impl Agent {
             retry_attempts: 3,
             retry_base_delay_ms: 2_000,
             retry_after_sink: davinci_ai::RetryAfterSink::default(),
+            #[cfg(test)]
+            test_hooks: TestHooks::default(),
             max_model_turns: Some(200),
             provider_timeout_ms: None,
             provider_max_retries: None,
@@ -5759,6 +5780,10 @@ impl Agent {
         let (collected, _) =
             collect_entries_for_branch_summary(&session.entries, old_leaf.as_deref(), target_id);
         let (new_leaf, editor_text) = navigation_target(&target);
+        // The branch about to become active must read back whole. A message
+        // that would silently drop out of its context stops the move here,
+        // before the leaf, the summary entry or the agent's messages change.
+        validate_branch_messages(session, new_leaf.as_deref())?;
         let mut summary_text = None;
         if summarize && !collected.is_empty() {
             let provider = self.provider.clone();
@@ -6105,40 +6130,56 @@ fn history_provenance(message: &ChatMessage) -> runtime::context_manifest::Prove
         )
 }
 
-/// Every message-bearing entry on the active branch must deserialize.
-/// `entry_to_chat` drops what it cannot read, which is right for non-message
-/// entry types but would hide a damaged or hostile message from the model's
-/// context. Entry types that carry no message (custom state, labels, plans)
-/// are not checked.
+/// Every message-bearing entry must deserialize, on every branch and before any
+/// compaction. `entry_to_chat` drops what it cannot read, which is right for
+/// non-message entry types but would hide a damaged or hostile message from the
+/// model's context the moment its branch became active or its history became
+/// visible again. Entry types that carry no message (custom state, labels,
+/// plans) are not checked.
 fn validate_session_messages(session: &JsonlSession) -> Result<(), String> {
-    let malformed = |entry: &SessionEntry, detail: String| {
+    session.entries.iter().try_for_each(validate_entry_message)
+}
+
+/// The context `leaf` would give the model, if every message-bearing entry on
+/// its path is readable. Nothing is changed; callers use it to refuse a
+/// navigation before moving.
+fn validate_branch_messages(session: &JsonlSession, leaf: Option<&str>) -> Result<(), String> {
+    davinci_session::build_context_entries(&session.entries, leaf)
+        .into_iter()
+        .try_for_each(validate_entry_message)
+}
+
+fn validate_entry_message(entry: &SessionEntry) -> Result<(), String> {
+    let malformed = |detail: String| {
         format!(
             "session entry {} (seq {}, type {}) has malformed message content: {detail}",
             entry.id, entry.seq, entry.entry_type
         )
     };
-    for entry in
-        davinci_session::build_context_entries(&session.entries, session.leaf_id.as_deref())
-    {
-        match entry.entry_type.as_str() {
-            "message" => {
-                let message = entry
-                    .message
-                    .as_ref()
-                    .ok_or_else(|| malformed(entry, "no message".into()))?;
-                serde_json::from_value::<ChatMessage>(message.clone())
-                    .map_err(|error| malformed(entry, error.to_string()))?;
-            }
-            "custom_message" => match entry.extra.get("content").or(entry.message.as_ref()) {
-                None | Some(Value::String(_)) => {}
-                Some(content @ Value::Array(_)) => {
-                    serde_json::from_value::<Vec<MessageContent>>(content.clone())
-                        .map_err(|error| malformed(entry, error.to_string()))?;
-                }
-                Some(_) => return Err(malformed(entry, "content is not text or a list".into())),
-            },
-            _ => {}
+    match entry.entry_type.as_str() {
+        "message" => {
+            let message = entry
+                .message
+                .as_ref()
+                .ok_or_else(|| malformed("no message".into()))?;
+            serde_json::from_value::<ChatMessage>(message.clone())
+                .map_err(|error| malformed(error.to_string()))?;
         }
+        "custom_message" => match entry.extra.get("content").or(entry.message.as_ref()) {
+            None | Some(Value::String(_)) => {}
+            Some(content @ Value::Array(_)) => {
+                serde_json::from_value::<Vec<MessageContent>>(content.clone())
+                    .map_err(|error| malformed(error.to_string()))?;
+            }
+            Some(_) => return Err(malformed("content is not text or a list".into())),
+        },
+        // Summaries stand in for the history they replaced.
+        "compaction" | "branch_summary" => {
+            if entry.extra.get("summary").and_then(Value::as_str).is_none() {
+                return Err(malformed("summary is missing or not text".into()));
+            }
+        }
+        _ => {}
     }
     Ok(())
 }

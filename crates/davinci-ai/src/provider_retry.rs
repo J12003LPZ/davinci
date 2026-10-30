@@ -26,6 +26,12 @@ pub struct ProviderError {
     pub headers: HashMap<String, String>,
     pub message: String,
     pub phase: RequestPhase,
+    /// The server asked to be retried after more than the configured maximum
+    /// delay. This layer stopped, and a caller with its own retry loop must
+    /// stop too: the message still reads like a rate limit, which that loop
+    /// would otherwise retry on its ordinary backoff. The original status and
+    /// headers are kept so the delay asked for stays available.
+    pub retry_refused: bool,
 }
 
 impl ProviderError {
@@ -35,6 +41,7 @@ impl ProviderError {
             headers: HashMap::new(),
             message: message.into(),
             phase: RequestPhase::Response,
+            retry_refused: false,
         }
     }
 
@@ -82,18 +89,24 @@ pub fn is_retryable_provider_error(error: &ProviderError) -> bool {
 fn validate_server_retry_delay_ms(
     delay_ms: f64,
     max_retry_delay_ms: Option<u64>,
-    provider_error_message: &str,
+    error: &ProviderError,
 ) -> Result<u64, ProviderError> {
     let max_delay_ms = max_retry_delay_ms.unwrap_or(DEFAULT_MAX_RETRY_DELAY_MS);
     if max_delay_ms > 0 && delay_ms > max_delay_ms as f64 {
-        return Err(ProviderError::new(
-            None,
-            format!(
-                "Server requested {}s retry delay (max: {}s). {provider_error_message}",
+        // The refusal keeps what the server sent (status, headers) and says it
+        // is a refusal, so nothing downstream has to read it back out of text.
+        return Err(ProviderError {
+            status: error.status,
+            headers: error.headers.clone(),
+            message: format!(
+                "Server requested {}s retry delay (max: {}s). {}",
                 (delay_ms / 1000.0).ceil() as u64,
-                (max_delay_ms as f64 / 1000.0).ceil() as u64
+                (max_delay_ms as f64 / 1000.0).ceil() as u64,
+                error.message
             ),
-        ));
+            phase: error.phase,
+            retry_refused: true,
+        });
     }
     Ok(delay_ms.max(0.0) as u64)
 }
@@ -120,24 +133,40 @@ pub fn server_retry_delay_ms(error: &ProviderError, now_ms: i64) -> Option<u64> 
     server_delay_ms(error, now_ms).map(|delay_ms| delay_ms.max(0.0) as u64)
 }
 
-/// Where a provider call leaves the delay the server asked for on its final
+/// What a failed provider call tells the caller's own retry loop about the
+/// server's `Retry-After`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryAdvice {
+    /// Retry no sooner than this many milliseconds from now.
+    Wait(u64),
+    /// The server asked for this many milliseconds, more than the maximum this
+    /// run accepts: do not retry.
+    Stop(u64),
+}
+
+/// Where a provider call leaves the server's retry advice on its final
 /// failure. The error type that call returns is a message string; this keeps
-/// the header value typed instead of making the caller parse it back out.
+/// the header value and the stop decision typed instead of making the caller
+/// parse them back out.
 #[derive(Debug, Clone, Default)]
-pub struct RetryAfterSink(std::sync::Arc<std::sync::Mutex<Option<u64>>>);
+pub struct RetryAfterSink(std::sync::Arc<std::sync::Mutex<Option<RetryAdvice>>>);
 
 impl RetryAfterSink {
     pub fn record(&self, delay_ms: u64) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(delay_ms);
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(RetryAdvice::Wait(delay_ms));
     }
 
-    /// The recorded delay, once: reading clears it.
-    pub fn take(&self) -> Option<u64> {
+    pub fn record_stop(&self, requested_ms: u64) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(RetryAdvice::Stop(requested_ms));
+    }
+
+    /// The recorded advice, once: reading clears it.
+    pub fn take_advice(&self) -> Option<RetryAdvice> {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 }
 
-/// Record the server's requested delay for `error`, if it asked for one.
+/// Record the server's retry advice for `error`, if it gave any.
 pub(crate) fn note_server_retry_delay(sink: Option<&RetryAfterSink>, error: &ProviderError) {
     let Some(sink) = sink else {
         return;
@@ -146,8 +175,13 @@ pub(crate) fn note_server_retry_delay(sink: Option<&RetryAfterSink>, error: &Pro
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    if let Some(delay_ms) = server_retry_delay_ms(error, now_ms) {
-        sink.record(delay_ms);
+    match server_retry_delay_ms(error, now_ms) {
+        Some(delay_ms) if error.retry_refused => sink.record_stop(delay_ms),
+        Some(delay_ms) => sink.record(delay_ms),
+        // A refusal always came from a delay; if the headers cannot be read
+        // back the stop still stands.
+        None if error.retry_refused => sink.record_stop(0),
+        None => {}
     }
 }
 
@@ -159,7 +193,7 @@ pub fn retry_delay_from_headers(
     now_ms: i64,
 ) -> Result<u64, ProviderError> {
     if let Some(delay_ms) = server_delay_ms(error, now_ms) {
-        return validate_server_retry_delay_ms(delay_ms, max_retry_delay_ms, &error.message);
+        return validate_server_retry_delay_ms(delay_ms, max_retry_delay_ms, error);
     }
     let exponential = (0.5 * 2_f64.powi(retry_index as i32)).min(8.0) * 1000.0;
     let jitter = if cfg!(test) {
@@ -385,6 +419,7 @@ pub fn provider_error_from_ureq(err: ureq::Error) -> ProviderError {
                 headers: HashMap::new(),
                 message: format!("Provider request failed: {transport}"),
                 phase,
+                retry_refused: false,
             }
         }
     }
@@ -411,6 +446,7 @@ pub(crate) fn provider_error_from_status(
         headers,
         message: format!("Provider request failed: {message}"),
         phase: RequestPhase::Response,
+        retry_refused: false,
     }
 }
 
@@ -745,10 +781,47 @@ mod tests {
 
         let sink = RetryAfterSink::default();
         note_server_retry_delay(Some(&sink), &both);
-        assert_eq!(sink.take(), Some(250));
-        assert_eq!(sink.take(), None, "reading clears the sink");
+        assert_eq!(sink.take_advice(), Some(RetryAdvice::Wait(250)));
+        assert_eq!(sink.take_advice(), None, "reading clears the sink");
         note_server_retry_delay(Some(&sink), &ProviderError::new(Some(500), "boom"));
-        assert_eq!(sink.take(), None);
+        assert_eq!(sink.take_advice(), None);
         note_server_retry_delay(None, &both);
+    }
+
+    /// The cap refusal keeps what the server sent and says it is a refusal, so
+    /// the caller's own retry loop is told to stop instead of reading a rate
+    /// limit out of the message and backing off on its own schedule.
+    #[test]
+    fn audit_wp02_b033_a_cap_refusal_keeps_the_servers_delay_and_says_stop() {
+        let error = ProviderError::new(Some(429), "rate limited")
+            .with_header("retry-after", "120")
+            .with_header("x-request-id", "abc");
+        let refusal = retry_delay_from_headers(&error, 0, Some(60_000), 0).unwrap_err();
+        assert!(refusal.retry_refused);
+        assert_eq!(refusal.status, Some(429));
+        assert_eq!(
+            refusal.headers.get("retry-after").map(String::as_str),
+            Some("120")
+        );
+        assert!(refusal
+            .message
+            .contains("Server requested 120s retry delay (max: 60s)"));
+        assert_eq!(server_retry_delay_ms(&refusal, 0), Some(120_000));
+
+        let sink = RetryAfterSink::default();
+        note_server_retry_delay(Some(&sink), &refusal);
+        assert_eq!(sink.take_advice(), Some(RetryAdvice::Stop(120_000)));
+        // Within the cap nothing is refused and the advice is a wait.
+        let fine = retry_delay_from_headers(&error, 0, Some(300_000), 0).unwrap();
+        assert_eq!(fine, 120_000);
+        note_server_retry_delay(Some(&sink), &error);
+        assert_eq!(sink.take_advice(), Some(RetryAdvice::Wait(120_000)));
+        // A refusal is a refusal even if its headers cannot be read back.
+        let bare = ProviderError {
+            retry_refused: true,
+            ..ProviderError::new(None, "x")
+        };
+        note_server_retry_delay(Some(&sink), &bare);
+        assert_eq!(sink.take_advice(), Some(RetryAdvice::Stop(0)));
     }
 }

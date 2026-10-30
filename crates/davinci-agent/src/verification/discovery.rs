@@ -72,6 +72,18 @@ pub(crate) fn runner_words(words: &[String]) -> Option<&'static str> {
 }
 
 pub(crate) fn counts(command: &str, stdout: &[u8], stderr: &[u8]) -> Option<AssertionCounts> {
+    counts_in(None, command, stdout, stderr)
+}
+
+/// [`counts`] for a command that ran in `cwd`. A package-manager `test` script
+/// only has an identity on disk, so without the directory it ran in that
+/// wrapper yields no evidence at all.
+pub(crate) fn counts_in(
+    cwd: Option<&std::path::Path>,
+    command: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Option<AssertionCounts> {
     if stdout.len().checked_add(stderr.len())? > 4 * 1024 * 1024 {
         return None;
     }
@@ -157,7 +169,7 @@ pub(crate) fn counts(command: &str, stdout: &[u8], stderr: &[u8]) -> Option<Asse
             counts.total = number.parse().ok()?;
             counts.passed = counts.total.checked_sub(counts.skipped)?;
         }
-        "package-script" => return package_script_unittest(stderr),
+        "package-script" => return package_script_unittest(cwd?, stderr),
         "pytest" => {
             // Only pytest's final terminal summary; earlier lines can be test output.
             let end = stdout.lines().map(str::trim).rfind(|s| !s.is_empty())?;
@@ -169,18 +181,38 @@ pub(crate) fn counts(command: &str, stdout: &[u8], stderr: &[u8]) -> Option<Asse
 }
 
 /// A package-manager `test` script that ran Python's standard unittest runner.
-/// The runner writes its report to stderr, ending in a rule of 70 dashes, a
-/// `Ran N tests in S.SSSs` line and the `OK` verdict. All of it must close the
-/// stream, so a summary printed to stdout, or one without the rule and the
-/// runner's timing format, proves nothing. Any other runner stays unknown.
-fn package_script_unittest(stderr: &str) -> Option<AssertionCounts> {
+///
+/// Output alone cannot say which program wrote it: any script can print a
+/// unittest-shaped footer. So three independent things must hold.
+///
+/// 1. Identity, from the file the package manager ran. `package.json` sits in
+///    the directory the command ran in, its `test` script is exactly the
+///    unittest runner (no chaining, no other program), and it defines no
+///    `pretest` or `posttest`, which npm and pnpm also run and which would
+///    write to the same streams around it.
+/// 2. Discovery, from the runner's own progress records: a line of one
+///    character per test (`.` passed, `s` skipped) before the rule, or one
+///    `name ... ok` line per test in verbose mode. The number of records must
+///    equal the `Ran N tests` count, and the skipped records must equal the
+///    verdict's `skipped=` count. A footer without the tests it summarizes
+///    proves nothing.
+/// 3. The footer: a rule of 70 dashes, `Ran N tests in S.SSSs` and the `OK`
+///    verdict closing stderr.
+///
+/// Any other runner, or any mismatch, stays unknown. An exit status other than
+/// zero is the receipt's concern: it never reaches a passing check.
+fn package_script_unittest(cwd: &std::path::Path, stderr: &str) -> Option<AssertionCounts> {
     static RAN: OnceLock<regex::Regex> = OnceLock::new();
+    static RESULT: OnceLock<regex::Regex> = OnceLock::new();
+    if !script_is_unittest(cwd) {
+        return None;
+    }
     let lines: Vec<_> = stderr
         .lines()
         .map(str::trim_end)
         .filter(|s| !s.is_empty())
         .collect();
-    let [.., rule, summary, verdict] = lines.as_slice() else {
+    let [before @ .., rule, summary, verdict] = lines.as_slice() else {
         return None;
     };
     if *rule != "-".repeat(70) {
@@ -200,12 +232,67 @@ fn package_script_unittest(stderr: &str) -> Option<AssertionCounts> {
             .expect("static unittest summary pattern")
     });
     let total: u32 = pattern.captures(summary)?[1].parse().ok()?;
+    let passed = total.checked_sub(skipped)?;
+
+    let (recorded, recorded_skips) = match before.last() {
+        // One character per test, written as each finished.
+        Some(progress)
+            if !progress.is_empty() && progress.bytes().all(|b| matches!(b, b'.' | b's')) =>
+        {
+            let skips = progress.bytes().filter(|b| *b == b's').count();
+            (progress.len(), skips)
+        }
+        // Verbose: one `name ... outcome` line per test.
+        _ => {
+            let result = RESULT.get_or_init(|| {
+                regex::Regex::new(r"^.+ \.\.\. (ok|skipped\b.*)$")
+                    .expect("static unittest result pattern")
+            });
+            let results: Vec<_> = before
+                .iter()
+                .filter_map(|line| result.captures(line))
+                .collect();
+            let skips = results
+                .iter()
+                .filter(|captures| captures[1].starts_with("skipped"))
+                .count();
+            (results.len(), skips)
+        }
+    };
+    if recorded != usize::try_from(total).ok()?
+        || recorded_skips != usize::try_from(skipped).ok()?
+    {
+        return None;
+    }
     Some(AssertionCounts {
         total,
-        passed: total.checked_sub(skipped)?,
+        passed,
         failed: 0,
         skipped,
     })
+}
+
+/// The `test` script of the `package.json` in `cwd` is the standard unittest
+/// runner and nothing else runs around it.
+fn script_is_unittest(cwd: &std::path::Path) -> bool {
+    const MAX_PACKAGE_JSON: u64 = 1024 * 1024;
+    let Ok(bytes) = davinci_sys::fs::read_path_bounded(&cwd.join("package.json"), MAX_PACKAGE_JSON)
+    else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let scripts = &manifest["scripts"];
+    if scripts.get("pretest").is_some() || scripts.get("posttest").is_some() {
+        return false;
+    }
+    let Some(script) = scripts["test"].as_str() else {
+        return false;
+    };
+    super::literal_words(script, true)
+        .and_then(|words| runner_words(&words))
+        .is_some_and(|runner| runner == "unittest")
 }
 
 fn pytest_summary(line: &str) -> Option<AssertionCounts> {
@@ -507,46 +594,222 @@ mod tests {
         assert!(counts("pytest", b"unknown format", b"").is_none());
     }
 
-    fn unittest_stderr(summary: &str) -> Vec<u8> {
-        format!("...\n{}\n{summary}\n", "-".repeat(70)).into_bytes()
+    /// A tempdir holding a `package.json` whose `test` script is `script`.
+    fn package(script: &str, extra: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            format!(r#"{{"name":"app","scripts":{{"test":{script:?}{extra}}}}}"#),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn unittest_stderr(progress: &str, summary: &str) -> Vec<u8> {
+        format!("{progress}\n{}\n{summary}\n", "-".repeat(70)).into_bytes()
     }
 
     #[test]
     fn audit_wp02_b032_npm_wrapper_accepts_only_real_unittest_evidence() {
         let npm = "npm test";
         let stdout = b"> app@1.0.0 test\n> python -m unittest\n";
-        let real = unittest_stderr("Ran 3 tests in 0.002s\n\nOK");
-        let counts = counts(npm, stdout, &real).expect("real unittest evidence");
-        assert_eq!((counts.total, counts.passed, counts.failed), (3, 3, 0));
-        assert!(crate::verification::tests_passed(&counts));
+        let dir = package("python -m unittest", "");
+        let at = |command: &str, err: &[u8]| counts_in(Some(dir.path()), command, stdout, err);
+
+        let real = unittest_stderr("...", "Ran 3 tests in 0.002s\n\nOK");
+        let result = at(npm, &real).expect("real unittest evidence");
+        assert_eq!((result.total, result.passed, result.failed), (3, 3, 0));
+        assert!(crate::verification::tests_passed(&result));
         for wrapper in ["pnpm test", "yarn test --silent"] {
-            assert!(super::counts(wrapper, stdout, &real).is_some(), "{wrapper}");
+            assert!(at(wrapper, &real).is_some(), "{wrapper}");
         }
-        let skipped = unittest_stderr("Ran 4 tests in 0.010s\n\nOK (skipped=1)");
-        let counts = super::counts(npm, stdout, &skipped).unwrap();
-        assert_eq!((counts.total, counts.passed, counts.skipped), (4, 3, 1));
+        let skipped = unittest_stderr("..s.", "Ran 4 tests in 0.010s\n\nOK (skipped=1)");
+        let result = at(npm, &skipped).unwrap();
+        assert_eq!((result.total, result.passed, result.skipped), (4, 3, 1));
+        let verbose = unittest_stderr(
+            "test_a (t.T.test_a) ... ok\ntest_b (t.T.test_b) ... skipped 'later'",
+            "Ran 2 tests in 0.001s\n\nOK (skipped=1)",
+        );
+        let result = at(npm, &verbose).unwrap();
+        assert_eq!((result.total, result.passed, result.skipped), (2, 1, 1));
 
         // Zero tests run: counted, but never a passing check.
-        let none = unittest_stderr("Ran 0 tests in 0.000s\n\nOK");
-        let zero = super::counts(npm, stdout, &none).unwrap();
-        assert!(!crate::verification::tests_passed(&zero));
+        let none = unittest_stderr("", "Ran 0 tests in 0.000s\n\nOK");
+        assert!(!crate::verification::tests_passed(&at(npm, &none).unwrap()));
         // A failing run carries no OK verdict.
-        let failed = unittest_stderr("Ran 3 tests in 0.002s\n\nFAILED (failures=1)");
-        assert!(super::counts(npm, stdout, &failed).is_none());
+        let failed = unittest_stderr("F..", "Ran 3 tests in 0.002s\n\nFAILED (failures=1)");
+        assert!(at(npm, &failed).is_none());
+    }
 
-        // Printed text without the runner's report: stdout, no rule, wrong timing.
-        let spoofs: [(&[u8], &[u8]); 5] = [
-            (b"Ran 3 tests in 0.002s\n\nOK\n", b""),
-            (b"", b"Ran 3 tests in 0.002s\n\nOK\n"),
-            (b"", b"----------\nRan 3 tests in 0.002s\n\nOK\n"),
-            (b"", b"----------------------------------------------------------------------\nRan 3 tests in 0.1s\n\nOK\n"),
-            (b"", b"----------------------------------------------------------------------\nRan 3 tests in 0.002s\n\nOK\nextra line\n"),
-        ];
-        for (out, err) in spoofs {
-            assert!(super::counts(npm, out, err).is_none(), "{err:?}");
+    /// The review's exact bypass: a script that exits zero and prints only the
+    /// footer to stderr ran no tests and must not count as three passing ones.
+    #[test]
+    fn audit_wp02_b032_a_printed_footer_is_not_discovery() {
+        let footer = unittest_stderr_footer_only();
+        let stdout = b"";
+        // The exact three lines, with every other safeguard in place: the
+        // package really names the unittest runner.
+        let unittest_dir = package("python -m unittest", "");
+        assert!(counts_in(Some(unittest_dir.path()), "npm test", stdout, &footer).is_none());
+        // And with no package at all, or no directory.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(counts_in(Some(empty.path()), "npm test", stdout, &footer).is_none());
+        assert!(counts("npm test", stdout, &footer).is_none());
+
+        // Footer plus a plausible progress line, but the script is `echo`:
+        // identity fails.
+        let with_progress = unittest_stderr("...", "Ran 3 tests in 0.002s\n\nOK");
+        for script in [
+            "echo spoof",
+            "python -m unittest && echo ok",
+            "python -m unittest || true",
+            "node fake.js",
+            "python -m pytest",
+        ] {
+            let dir = package(script, "");
+            assert!(
+                counts_in(Some(dir.path()), "npm test", stdout, &with_progress).is_none(),
+                "{script}"
+            );
         }
+        // Hooks that run around the script write to the same streams.
+        for hook in [r#","posttest":"echo done""#, r#","pretest":"echo start""#] {
+            let dir = package("python -m unittest", hook);
+            assert!(counts_in(Some(dir.path()), "npm test", stdout, &with_progress).is_none());
+        }
+        // The progress records must reconcile with the summary.
+        for (progress, summary) in [
+            ("..", "Ran 3 tests in 0.002s\n\nOK"),
+            ("....", "Ran 3 tests in 0.002s\n\nOK"),
+            ("..s", "Ran 3 tests in 0.002s\n\nOK"),
+            ("...", "Ran 3 tests in 0.002s\n\nOK (skipped=1)"),
+            ("", "Ran 3 tests in 0.002s\n\nOK"),
+        ] {
+            assert!(
+                counts_in(
+                    Some(unittest_dir.path()),
+                    "npm test",
+                    stdout,
+                    &unittest_stderr(progress, summary)
+                )
+                .is_none(),
+                "{progress:?} {summary:?}"
+            );
+        }
+        assert!(counts_in(
+            Some(unittest_dir.path()),
+            "npm test",
+            stdout,
+            &unittest_stderr("test_a (t.T.test_a) ... ok", "Ran 3 tests in 0.002s\n\nOK")
+        )
+        .is_none());
+        // Printed text without the runner's report: stdout, no rule, wrong timing.
+        let spoofs: [&[u8]; 4] = [
+            b"",
+            b"----------\nRan 3 tests in 0.002s\n\nOK\n",
+            b"...\n----------------------------------------------------------------------\nRan 3 tests in 0.1s\n\nOK\n",
+            b"...\n----------------------------------------------------------------------\nRan 3 tests in 0.002s\n\nOK\nextra line\n",
+        ];
+        for err in spoofs {
+            assert!(
+                counts_in(Some(unittest_dir.path()), "npm test", stdout, err).is_none(),
+                "{err:?}"
+            );
+        }
+        assert!(counts_in(
+            Some(unittest_dir.path()),
+            "npm test",
+            b"Ran 3 tests in 0.002s\n\nOK\n",
+            b""
+        )
+        .is_none());
         // The wrapper does not weaken other runners or the direct command.
-        assert!(super::counts("go test ./...", stdout, &real).is_none());
-        assert!(super::counts("python -m unittest", b"", &real).is_some());
+        assert!(counts_in(
+            Some(unittest_dir.path()),
+            "go test ./...",
+            stdout,
+            &with_progress
+        )
+        .is_none());
+        assert!(counts("python -m unittest", b"", &with_progress).is_some());
+    }
+
+    fn unittest_stderr_footer_only() -> Vec<u8> {
+        format!("{}\nRan 3 tests in 0.002s\n\nOK\n", "-".repeat(70)).into_bytes()
+    }
+
+    /// A wrapper that fails cannot be verified execution, however good its
+    /// discovery output looks: the receipt gate is the exit status.
+    #[test]
+    fn audit_wp02_b032_a_nonzero_wrapper_exit_is_never_a_verified_check() {
+        let dir = package("python -m unittest", "");
+        let stderr = unittest_stderr("...", "Ran 3 tests in 0.002s\n\nOK");
+        let counts = counts_in(Some(dir.path()), "npm test", b"", &stderr).unwrap();
+        let receipt =
+            |exit: Option<i32>, started: bool| crate::runtime::evidence_store::ExecutionReceipt {
+                argv: vec!["npm test".into()],
+                started,
+                exit_code: exit,
+                assertion_counts: Some(counts.clone()),
+                ..Default::default()
+            };
+        assert!(receipt(Some(0), true).is_verified_check());
+        for broken in [
+            receipt(Some(1), true),
+            receipt(None, true),
+            receipt(Some(0), false),
+        ] {
+            assert!(!broken.is_verified_check());
+        }
+    }
+
+    /// Positive control from a real `npm test` that runs a real unittest suite.
+    /// Skipped, and said so, where npm or python is not installed.
+    #[test]
+    fn audit_wp02_b032_a_real_npm_run_of_unittest_is_verified() {
+        let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let present = |program: &str, flag: &str| {
+            std::process::Command::new(program)
+                .arg(flag)
+                .output()
+                .is_ok_and(|out| out.status.success())
+        };
+        if !present(npm, "--version") || !present(python, "--version") {
+            eprintln!("npm or python missing; real npm-to-unittest fixture not executed");
+            return;
+        }
+        let dir = package(&format!("{python} -m unittest"), "");
+        std::fs::write(
+            dir.path().join("test_app.py"),
+            "import unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n        self.assertTrue(True)\n    @unittest.skip('later')\n    def test_b(self):\n        pass\n    def test_c(self):\n        self.assertEqual(1, 1)\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new(npm)
+            .arg("test")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result = counts_in(Some(dir.path()), "npm test", &output.stdout, &output.stderr)
+            .expect("a real unittest run through npm");
+        assert_eq!(
+            (result.total, result.passed, result.skipped, result.failed),
+            (3, 2, 1, 0)
+        );
+        assert!(crate::verification::tests_passed(&result));
+        // The same real output, replayed where the package names another script.
+        let other = package("echo hi", "");
+        assert!(counts_in(
+            Some(other.path()),
+            "npm test",
+            &output.stdout,
+            &output.stderr
+        )
+        .is_none());
     }
 }

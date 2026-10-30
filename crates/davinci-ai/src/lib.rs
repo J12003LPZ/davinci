@@ -18,7 +18,9 @@ pub(crate) fn final_tool_arguments(raw: &str) -> serde_json::Value {
         return serde_json::Value::Object(serde_json::Map::new());
     }
 
-    match serde_json::from_str::<serde_json::Value>(raw) {
+    // Integers written as `1.0` or `1e3` are held exactly, so the tools never
+    // see a rounded float where the model wrote an integer.
+    match davinci_protocol::json_number::parse_exact(raw) {
         Ok(value @ serde_json::Value::Object(_)) => value,
         _ => invalid_arguments(raw),
     }
@@ -191,7 +193,7 @@ pub use openai_siwc::{
 pub use provider_retry::{
     is_retryable_provider_error, provider_error_from_ureq, retry_delay_from_headers,
     retry_provider_request, server_retry_delay_ms, ProviderError, ProviderRetryOptions,
-    RetryAfterSink,
+    RetryAdvice, RetryAfterSink,
 };
 pub use providers::{builtin_providers, Provider, ProviderSpec, KNOWN_APIS, PROVIDER_SPECS};
 pub use responses_ledger::{
@@ -452,5 +454,42 @@ mod tests {
             let url = request_url(&model, &auth);
             assert!(url.starts_with("https://example.test"), "{api} -> {url}");
         }
+    }
+}
+
+#[cfg(test)]
+mod audit_wp02_b023_tests {
+    use davinci_protocol::json_number::as_u64_exact;
+
+    /// The model's tool-call text reaches the tools through
+    /// `final_tool_arguments`: exact integral decimals arrive as that integer,
+    /// and a fraction an `f64` would round onto an integer never does.
+    #[test]
+    fn audit_wp02_b023_final_tool_arguments_keep_integers_exact() {
+        let args = |raw: &str| crate::final_tool_arguments(raw);
+        let read = |raw: &str| as_u64_exact(&args(raw)["expected_revision"]);
+        assert_eq!(read(r#"{"expected_revision":1.0}"#), Some(1));
+        assert_eq!(read(r#"{"expected_revision":1e0}"#), Some(1));
+        assert_eq!(
+            read(r#"{"expected_revision":9007199254740993.0}"#),
+            Some(9_007_199_254_740_993)
+        );
+        assert_eq!(
+            read(r#"{"expected_revision":18446744073709551615.0}"#),
+            Some(u64::MAX)
+        );
+        assert_eq!(read(r#"{"expected_revision":1.0000000000000001}"#), None);
+        assert_eq!(
+            read(r#"{"expected_revision":18446744073709551616.0}"#),
+            None
+        );
+        assert_eq!(read(r#"{"expected_revision":-1.0}"#), None);
+        // Fractional parameters of other tools are untouched.
+        assert_eq!(
+            args(r#"{"temperature":0.25}"#)["temperature"].as_f64(),
+            Some(0.25)
+        );
+        // Text that is not an object is still the invalid-arguments sentinel.
+        assert!(args("[1.0]").get(crate::INVALID_ARGUMENTS_KEY).is_some());
     }
 }

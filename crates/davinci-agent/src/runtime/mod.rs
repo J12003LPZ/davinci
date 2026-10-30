@@ -313,6 +313,37 @@ impl RuntimeHandle {
         }
     }
 
+    /// Implementation evidence for `task_id` at `attempt`: one receipt per
+    /// operation whose recorded file effects changed the workspace, built from
+    /// the effect ledger the mutating tools write. A rewound or reverted effect
+    /// is no longer in the ledger and no longer counts. The ledger carries no
+    /// attempt stamp, so the caller names the attempt it is evaluating; effects
+    /// from earlier attempts of the same task are therefore still visible to it.
+    pub fn mutation_receipts(
+        &self,
+        task_id: TaskId,
+        attempt: u32,
+    ) -> Vec<evidence_store::ExecutionReceipt> {
+        let ledger = self
+            .effect_ledger
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut operations: Vec<&str> = Vec::new();
+        for effect in ledger.iter().filter(|effect| effect.task_id == task_id) {
+            if !operations.contains(&effect.operation_id.as_str()) {
+                operations.push(&effect.operation_id);
+            }
+        }
+        operations
+            .into_iter()
+            .filter_map(|operation| {
+                evidence_store::ExecutionReceipt::from_file_effects(
+                    operation, task_id, attempt, &ledger,
+                )
+            })
+            .collect()
+    }
+
     /// The reason normal-conversation rewind stopped recording, if any.
     pub fn prompt_rewind_fault(&self) -> Option<String> {
         self.prompt_rewind_fault

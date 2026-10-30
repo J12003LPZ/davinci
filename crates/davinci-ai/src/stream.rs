@@ -5299,6 +5299,131 @@ mod tests {
         );
     }
 
+    /// With provider retries enabled, a 429 asking for more than the cap makes
+    /// one request, and the sink (filled by the adapter itself, not by the test)
+    /// tells the caller's retry loop to stop. The message still reads like a
+    /// rate limit, which is what that loop would otherwise retry.
+    #[test]
+    fn audit_wp02_b033_an_over_cap_retry_after_stops_the_callers_loop_non_streaming() {
+        over_cap_retry_after_fixture(false);
+    }
+
+    #[test]
+    fn audit_wp02_b033_an_over_cap_retry_after_stops_the_callers_loop_streaming() {
+        over_cap_retry_after_fixture(true);
+    }
+
+    fn over_cap_retry_after_fixture(streaming: bool) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        use crate::auth::ResolvedAuth;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let hits = Arc::new(AtomicU32::new(0));
+        let server_hits = hits.clone();
+        let server = std::thread::spawn(move || {
+            // Serve until nothing else connects for a moment: a retry would.
+            let mut idle = 0;
+            while idle < 40 {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(_) => {
+                        idle += 1;
+                        std::thread::sleep(Duration::from_millis(25));
+                        continue;
+                    }
+                };
+                idle = 0;
+                stream.set_nonblocking(false).unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                let header_end = loop {
+                    let n = match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break request.len(),
+                        Ok(n) => n,
+                    };
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let content_length = String::from_utf8_lossy(&request[..header_end])
+                    .to_ascii_lowercase()
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                server_hits.fetch_add(1, Ordering::SeqCst);
+                let body = r#"{"error":"rate limited"}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 120\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api.contains("openai"))
+            .expect("openai");
+        model.base_url = Some(format!("http://{addr}"));
+        let auth = ResolvedAuth {
+            api_key: Some("test".into()),
+            headers: Default::default(),
+            source: "test".into(),
+        };
+        let sink = crate::RetryAfterSink::default();
+        let options = StreamOptions {
+            max_retries: Some(3),
+            max_retry_delay_ms: Some(60_000),
+            retry_after_sink: Some(sink.clone()),
+            ..StreamOptions::default()
+        };
+        let messages = [ChatMessage::text("user", "hi")];
+        let error = if streaming {
+            live_complete_streaming_with_sink_envelope(
+                &model,
+                &messages,
+                &auth,
+                None,
+                &[],
+                &options,
+                &mut |_| {},
+            )
+            .map(|_| ())
+            .unwrap_err()
+        } else {
+            live_complete_with(&model, &messages, &auth, None, &[], &options)
+                .map(|_| ())
+                .unwrap_err()
+        };
+        server.join().unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the refused delay must not be retried: {error}"
+        );
+        assert!(
+            error.contains("Server requested 120s retry delay (max: 60s)"),
+            "{error}"
+        );
+        // The message alone would be retried by the caller's loop...
+        assert!(crate::is_retryable_error_text(&error), "{error}");
+        // ...so the typed advice is what stops it.
+        assert_eq!(sink.take_advice(), Some(crate::RetryAdvice::Stop(120_000)));
+    }
+
     #[test]
     fn anthropic_body_places_cache_control_breakpoints() {
         let anthropic = load_builtin_models()

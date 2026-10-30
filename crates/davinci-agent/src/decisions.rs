@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::LivingPlan;
 
 const MAX_TEXT_BYTES: usize = 8_192;
-const MAX_ID_BYTES: usize = 64;
+pub(crate) const MAX_ID_BYTES: usize = 64;
 const MAX_EVIDENCE_REFS: usize = 16;
 /// Most questions one `ask_user_question` call may put to the user at once.
 pub const MAX_BATCH_QUESTIONS: usize = 4;
@@ -638,7 +638,10 @@ pub fn validate_question_batch(
     Ok(questions)
 }
 
-fn valid_id(value: &str, field: &str) -> Result<(), String> {
+/// The decision-ID grammar every surface shares: 1 to `MAX_ID_BYTES` ASCII
+/// letters, digits, hyphens or underscores. ASCII only, so bytes and
+/// characters count the same and a schema `maxLength` agrees with the check.
+pub(crate) fn valid_id(value: &str, field: &str) -> Result<(), String> {
     if value.is_empty()
         || value.len() > MAX_ID_BYTES
         || !value

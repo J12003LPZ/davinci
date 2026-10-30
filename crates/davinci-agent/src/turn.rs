@@ -1481,20 +1481,35 @@ Issue the call again if it is still needed.";
     }
 
     /// Milliseconds to wait before retry `attempt + 1`, or `None` when the
-    /// retry should not happen. Reads the server's `Retry-After` once.
+    /// retry should not happen. Reads the server's retry advice once.
     fn retry_wait_ms(&self, attempt: u32) -> Option<u64> {
-        let remaining_ms = self.root_budget.as_ref().map(|budget| {
-            budget
-                .limits()
-                .deadline_unix_ms
-                .saturating_sub(u64::try_from(crate::command_receipt::now()).unwrap_or(0))
-        });
         plan_retry_wait(
             retry_delay_ms(self.retry_base_delay_ms, attempt),
-            self.retry_after_sink.take(),
+            self.retry_after_sink.take_advice(),
             self.provider_max_retry_delay_ms,
-            remaining_ms,
+            self.deadline_remaining_ms(),
         )
+    }
+
+    /// Milliseconds left before the run deadline of the budget bound to this
+    /// agent or its runtime, or `None` when no budget is bound.
+    fn deadline_remaining_ms(&self) -> Option<u64> {
+        let deadline = self.root_budget()?.limits().deadline_unix_ms;
+        Some(deadline.saturating_sub(self.retry_clock_ms()))
+    }
+
+    fn retry_clock_ms(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(clock) = &self.test_hooks.clock {
+            return clock();
+        }
+        u64::try_from(crate::command_receipt::now()).unwrap_or(0)
+    }
+
+    /// The bound run deadline has passed. No provider request starts, and no
+    /// retry wait or queueing continues, once it has.
+    fn deadline_expired(&self) -> bool {
+        self.deadline_remaining_ms() == Some(0)
     }
 
     #[allow(clippy::type_complexity)]
@@ -1524,13 +1539,41 @@ Issue the call again if it is still needed.";
         let attempts = max_retries.saturating_add(1);
         let mut last_error = None;
         let mut scheduled_attempt = 0_u32;
+        #[cfg(test)]
+        let capacity_override = self.test_hooks.capacity.clone();
+        #[cfg(not(test))]
+        let capacity_override: Option<
+            std::sync::Arc<crate::runtime::capacity::RequestCapacity>,
+        > = None;
+        let capacity = capacity_override
+            .as_deref()
+            .unwrap_or(&crate::runtime::capacity::REQUEST_CAPACITY);
         for attempt in 0..attempts {
             let queue_started = std::time::Instant::now();
-            let permit = crate::runtime::capacity::REQUEST_CAPACITY
+            // Queueing for capacity ends at the run deadline too.
+            let permit = capacity
                 .acquire(crate::runtime::capacity::RequestClass::Foreground, || {
-                    self.abort_requested() || self.retry_aborted
+                    self.abort_requested() || self.retry_aborted || self.deadline_expired()
                 });
             crate::RunStats::add_elapsed(&mut self.stats.queue_ms, queue_started.elapsed());
+            // The deadline may pass while waiting for capacity (or in the retry
+            // wait before it): check after acquiring, before any provider work.
+            if self.deadline_expired() && !(self.abort_requested() || self.retry_aborted) {
+                drop(permit);
+                if scheduled_attempt > 0 {
+                    self.push_event(
+                        events,
+                        AgentEvent::AutoRetryEnd {
+                            success: false,
+                            attempt: scheduled_attempt,
+                            final_error: Some("Run deadline reached".into()),
+                        },
+                    );
+                }
+                return Err(last_error.unwrap_or_else(|| {
+                    "Run deadline reached before the provider request could start".into()
+                }));
+            }
             if permit.is_none() {
                 if scheduled_attempt > 0 {
                     self.push_event(
@@ -1562,8 +1605,8 @@ Issue the call again if it is still needed.";
                 self.stats.provider_retries += 1;
             }
             let provider_started = std::time::Instant::now();
-            // A delay left by an earlier request says nothing about this one.
-            self.retry_after_sink.take();
+            // Advice left by an earlier request says nothing about this one.
+            self.retry_after_sink.take_advice();
             let result = complete(self);
             crate::RunStats::add_elapsed(&mut self.stats.provider_ms, provider_started.elapsed());
             drop(permit);
@@ -1603,7 +1646,9 @@ Issue the call again if it is still needed.";
                             },
                         );
                         let retry_started = std::time::Instant::now();
-                        sleep_retry_delay(delay, || self.abort_requested() || self.retry_aborted);
+                        sleep_retry_delay(delay, || {
+                            self.abort_requested() || self.retry_aborted || self.deadline_expired()
+                        });
                         crate::RunStats::add_elapsed(
                             &mut self.stats.retry_wait_ms,
                             retry_started.elapsed(),
@@ -1653,7 +1698,9 @@ Issue the call again if it is still needed.";
                             },
                         );
                         let retry_started = std::time::Instant::now();
-                        sleep_retry_delay(delay, || self.abort_requested() || self.retry_aborted);
+                        sleep_retry_delay(delay, || {
+                            self.abort_requested() || self.retry_aborted || self.deadline_expired()
+                        });
                         crate::RunStats::add_elapsed(
                             &mut self.stats.retry_wait_ms,
                             retry_started.elapsed(),
@@ -5609,25 +5656,30 @@ fn tool_result_message(
 
 /// TS `baseDelayMs * 2 ** (attempt - 1)` with attempt starting at 1.
 /// The wait before a retry. The server's `Retry-After` can only lengthen the
-/// ordinary backoff, never shorten it. It does not stretch the limits around
-/// the run: a request for more than `max_server_ms` (when that is not zero) or
-/// for more time than `remaining_ms` before the run deadline means the retry
-/// would not be allowed to start, so there is no wait and no retry. The
-/// attempt cap stays with the caller.
+/// ordinary backoff, never shorten it. Advice to stop (the provider layer
+/// refused a delay past its maximum) and a request for more than `max_server_ms`
+/// (when that is not zero) mean no retry. The run deadline bounds the final
+/// wait, whatever set it: a retry whose wait would reach `remaining_ms` could
+/// not start, so there is no wait and no retry. The attempt cap stays with the
+/// caller.
 pub(crate) fn plan_retry_wait(
     exponential_ms: u64,
-    server_ms: Option<u64>,
+    advice: Option<davinci_ai::RetryAdvice>,
     max_server_ms: u64,
     remaining_ms: Option<u64>,
 ) -> Option<u64> {
-    let Some(server_ms) = server_ms else {
-        return Some(exponential_ms);
+    let server_ms = match advice {
+        Some(davinci_ai::RetryAdvice::Stop(_)) => return None,
+        Some(davinci_ai::RetryAdvice::Wait(ms)) => {
+            if max_server_ms > 0 && ms > max_server_ms {
+                return None;
+            }
+            ms
+        }
+        None => 0,
     };
-    if max_server_ms > 0 && server_ms > max_server_ms {
-        return None;
-    }
     let delay = exponential_ms.max(server_ms);
-    if delay > exponential_ms && remaining_ms.is_some_and(|remaining| delay >= remaining) {
+    if remaining_ms.is_some_and(|remaining| delay >= remaining) {
         return None;
     }
     Some(delay)
@@ -5777,35 +5829,63 @@ mod tests {
 
     #[test]
     fn audit_wp02_b033_plan_retry_wait_honors_server_delay_within_limits() {
-        // No server delay: the ordinary backoff, untouched.
+        use davinci_ai::RetryAdvice::{Stop, Wait};
+        // No server delay: the ordinary backoff.
         assert_eq!(plan_retry_wait(2_000, None, 60_000, None), Some(2_000));
         // The server can only lengthen it.
         assert_eq!(
-            plan_retry_wait(2_000, Some(5_000), 60_000, None),
+            plan_retry_wait(2_000, Some(Wait(5_000)), 60_000, None),
             Some(5_000)
         );
         assert_eq!(
-            plan_retry_wait(4_000, Some(1_000), 60_000, None),
+            plan_retry_wait(4_000, Some(Wait(1_000)), 60_000, None),
             Some(4_000)
         );
-        assert_eq!(plan_retry_wait(2_000, Some(0), 60_000, None), Some(2_000));
-        // Past the configured maximum it gives up instead of waiting.
-        assert_eq!(plan_retry_wait(2_000, Some(61_000), 60_000, None), None);
-        assert_eq!(plan_retry_wait(2_000, Some(61_000), 0, None), Some(61_000));
-        // It never reaches past the run deadline: the retry could not start.
         assert_eq!(
-            plan_retry_wait(2_000, Some(5_000), 60_000, Some(5_000)),
+            plan_retry_wait(2_000, Some(Wait(0)), 60_000, None),
+            Some(2_000)
+        );
+        // Past the configured maximum it gives up instead of waiting.
+        assert_eq!(
+            plan_retry_wait(2_000, Some(Wait(61_000)), 60_000, None),
             None
         );
         assert_eq!(
-            plan_retry_wait(2_000, Some(5_000), 60_000, Some(5_001)),
+            plan_retry_wait(2_000, Some(Wait(61_000)), 0, None),
+            Some(61_000)
+        );
+        // A refusal from the provider layer is final whatever the delay was.
+        assert_eq!(plan_retry_wait(2_000, Some(Stop(120_000)), 0, None), None);
+        assert_eq!(
+            plan_retry_wait(2_000, Some(Stop(0)), 60_000, Some(1_000_000)),
+            None
+        );
+        // The run deadline bounds the final wait of EVERY retry: the server's
+        // delay, the ordinary backoff, and a server delay shorter than backoff.
+        assert_eq!(
+            plan_retry_wait(2_000, Some(Wait(5_000)), 60_000, Some(5_000)),
+            None
+        );
+        assert_eq!(
+            plan_retry_wait(2_000, Some(Wait(5_000)), 60_000, Some(5_001)),
             Some(5_000)
         );
-        assert_eq!(plan_retry_wait(2_000, Some(5_000), 60_000, Some(0)), None);
-        // The ordinary backoff is not changed by the deadline rule.
-        assert_eq!(plan_retry_wait(2_000, None, 60_000, Some(1)), Some(2_000));
         assert_eq!(
-            plan_retry_wait(9_000, Some(1_000), 60_000, Some(1)),
+            plan_retry_wait(2_000, Some(Wait(5_000)), 60_000, Some(0)),
+            None
+        );
+        assert_eq!(plan_retry_wait(2_000, None, 60_000, Some(1)), None);
+        assert_eq!(plan_retry_wait(2_000, None, 60_000, Some(2_000)), None);
+        assert_eq!(
+            plan_retry_wait(2_000, None, 60_000, Some(2_001)),
+            Some(2_000)
+        );
+        assert_eq!(
+            plan_retry_wait(9_000, Some(Wait(1_000)), 60_000, Some(1)),
+            None
+        );
+        assert_eq!(
+            plan_retry_wait(9_000, Some(Wait(1_000)), 60_000, Some(9_001)),
             Some(9_000)
         );
     }
@@ -5907,6 +5987,180 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(calls.get(), 3);
         assert_eq!(retry_delays(&mut agent, &events), vec![1, 2]);
+    }
+
+    /// An agent whose bound root budget expires `remaining_ms` after the
+    /// injected clock's current time. The clock is shared so a test (or a
+    /// thread) can move it.
+    fn deadline_agent(
+        remaining_ms: u64,
+        base_delay_ms: u64,
+    ) -> (
+        Agent,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+        u64,
+        tempfile::TempDir,
+    ) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        const DEADLINE: u64 = 10_000_000;
+        let directory = tempfile::tempdir().unwrap();
+        let budget = crate::runtime::capacity::RootBudget::open(
+            directory.path().join("budget.json"),
+            "root",
+            crate::runtime::capacity::BudgetLimits {
+                max_requests: 100,
+                max_output_tokens: Some(1_000),
+                max_cost_microusd: None,
+                codex_subscription: None,
+                deadline_unix_ms: DEADLINE,
+            },
+        )
+        .unwrap();
+        let now = std::sync::Arc::new(AtomicU64::new(DEADLINE - remaining_ms));
+        let mut agent = Agent::new("deadline fixture");
+        agent.auto_retry = true;
+        agent.retry_attempts = 3;
+        agent.retry_base_delay_ms = base_delay_ms;
+        agent.bind_root_budget(budget).unwrap();
+        let clock = now.clone();
+        agent.test_hooks.clock = Some(std::sync::Arc::new(move || clock.load(Ordering::SeqCst)));
+        agent.prompt("deadline");
+        (agent, now, DEADLINE, directory)
+    }
+
+    /// The deadline decides every retry wait: the ordinary backoff when the
+    /// server sent nothing, and a server delay shorter than the backoff. Before
+    /// the fix both slept past the deadline and called the provider again.
+    #[test]
+    fn audit_wp02_b033_the_deadline_bounds_every_retry_wait() {
+        use davinci_ai::AssistantMessage;
+        for (remaining, base, advice) in [
+            (3, 5, None),
+            (5, 5, None),
+            (4, 5, Some(davinci_ai::RetryAdvice::Wait(1))),
+            (40, 100, Some(davinci_ai::RetryAdvice::Wait(0))),
+        ] {
+            let (mut agent, _now, _deadline, _dir) = deadline_agent(remaining, base);
+            let calls = std::cell::Cell::new(0);
+            let started = std::time::Instant::now();
+            let _ = agent.run_loop(|agent| {
+                calls.set(calls.get() + 1);
+                if let Some(davinci_ai::RetryAdvice::Wait(ms)) = advice {
+                    agent.retry_after_sink().record(ms);
+                }
+                Ok::<AssistantMessage, String>(overloaded())
+            });
+            assert_eq!(
+                calls.get(),
+                1,
+                "remaining {remaining} ms, backoff {base} ms"
+            );
+            assert!(started.elapsed() < std::time::Duration::from_millis(90));
+        }
+        // Control: with room before the deadline the retries run.
+        let (mut agent, _now, _deadline, _dir) = deadline_agent(60_000, 1);
+        let calls = std::cell::Cell::new(0);
+        let _ = agent.run_loop(|_| {
+            calls.set(calls.get() + 1);
+            Ok::<AssistantMessage, String>(overloaded())
+        });
+        assert_eq!(calls.get(), 4);
+    }
+
+    /// The deadline passes while the retry is waiting: the wait ends at once
+    /// and the provider is not called again.
+    #[test]
+    fn audit_wp02_b033_a_deadline_that_passes_during_the_wait_stops_the_retry() {
+        use davinci_ai::AssistantMessage;
+        use std::sync::atomic::Ordering;
+        let (mut agent, now, deadline, _dir) = deadline_agent(60_000, 400);
+        let calls = std::cell::Cell::new(0);
+        let started = std::time::Instant::now();
+        let result = agent.run_loop(|_| {
+            calls.set(calls.get() + 1);
+            // The 400 ms wait is planned (it fits in 60 s); the clock then
+            // jumps past the deadline while it runs.
+            let now = now.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                now.store(deadline + 1, Ordering::SeqCst);
+            });
+            Ok::<AssistantMessage, String>(overloaded())
+        });
+        assert_eq!(
+            calls.get(),
+            1,
+            "no provider call after the deadline: {result:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(300),
+            "the wait ran its full length: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The deadline passes while the request is queued for capacity: the queue
+    /// is left and the provider is never called.
+    #[test]
+    fn audit_wp02_b033_a_deadline_that_passes_in_the_capacity_queue_stops_the_request() {
+        use crate::runtime::capacity::{RequestCapacity, RequestClass};
+        use davinci_ai::AssistantMessage;
+        use std::sync::atomic::Ordering;
+        let pool = std::sync::Arc::new(RequestCapacity::new());
+        let held: Vec<_> = (0..64)
+            .map_while(|_| {
+                let polls = std::cell::Cell::new(0);
+                pool.acquire(RequestClass::Foreground, || {
+                    polls.set(polls.get() + 1);
+                    polls.get() > 1
+                })
+            })
+            .collect();
+        assert!(!held.is_empty(), "premise: the pool filled up");
+        let (mut agent, now, deadline, _dir) = deadline_agent(60_000, 1);
+        agent.test_hooks.capacity = Some(pool.clone());
+        let calls = std::cell::Cell::new(0);
+        let started = std::time::Instant::now();
+        let clock = now.clone();
+        let mover = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            clock.store(deadline + 1, Ordering::SeqCst);
+        });
+        let result = agent.run_loop(|_| {
+            calls.set(calls.get() + 1);
+            Ok::<AssistantMessage, String>(overloaded())
+        });
+        mover.join().unwrap();
+        assert_eq!(
+            calls.get(),
+            0,
+            "the provider must not be called: {result:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        drop(held);
+    }
+
+    /// The provider layer refused the server's delay (past the configured
+    /// maximum): the caller's loop stops even though the message reads like a
+    /// rate limit it would retry.
+    #[test]
+    fn audit_wp02_b033_a_stop_advice_from_the_provider_layer_prevents_the_retry() {
+        use davinci_ai::AssistantMessage;
+        let mut agent = Agent::new("stop advice fixture");
+        agent.auto_retry = true;
+        agent.retry_attempts = 3;
+        agent.retry_base_delay_ms = 1;
+        agent.prompt("stop");
+        let calls = std::cell::Cell::new(0);
+        let _ = agent.run_loop(|agent| {
+            calls.set(calls.get() + 1);
+            agent.retry_after_sink().record_stop(120_000);
+            // The message reads like a rate limit; only the advice says stop.
+            Err::<AssistantMessage, String>(
+                "429 rate limit: Server requested 120s retry delay".into(),
+            )
+        });
+        assert_eq!(calls.get(), 1);
     }
 
     fn model_turn_read_call(turn: usize) -> davinci_ai::AssistantMessage {
@@ -6170,6 +6424,101 @@ mod tests {
                 .is_error
         );
         assert!(!root.join("next.txt").exists());
+    }
+
+    /// Implementation evidence from a real admitted write: the host builds it
+    /// from the effect ledger, an unchanged rewrite and a read produce none, and
+    /// the evaluator accepts only the former.
+    #[test]
+    fn audit_wp02_b025_implementation_evidence_comes_from_an_admitted_write() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        )
+        .with_session("mutation-evidence");
+        let mut agent = Agent::new("mutation evidence fixture").with_runtime(runtime.clone());
+        agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+        let run = |id: &str, name: &str, args: serde_json::Value| {
+            assert!(matches!(
+                agent.prepare_tool_call(root.path(), id, name, &args, 0),
+                Preparation::Ready { .. }
+            ));
+            let result = agent.run_prepared_call(root.path(), id, name, &args, 0);
+            assert!(!result.is_error, "{}", result.content);
+        };
+        let manifest = crate::runtime::source_manifest::SourceManifestBuilder::new(root.path())
+            .build()
+            .unwrap();
+        let evaluate = |task: &crate::runtime::TaskRecord| {
+            crate::runtime::completion::evaluate_task_completion(
+                task,
+                None,
+                &runtime.mutation_receipts(task.id, 0),
+                &manifest,
+                0,
+            )
+        };
+        let mut task = crate::runtime::TaskRecord::new(crate::RunId::new(), "implement");
+        // Without a task contract every operation is recorded under its own
+        // task id, so the checks below take the id from the ledger.
+        let ledger = |index: usize| runtime.effect_ledger.read().unwrap()[index].clone();
+
+        // Nothing has run: no evidence, not complete.
+        assert!(runtime.mutation_receipts(task.id, 0).is_empty());
+        assert!(!evaluate(&task).allowed);
+
+        // A read changes nothing.
+        std::fs::write(root.path().join("seed.txt"), "seed").unwrap();
+        run("read-1", "read", serde_json::json!({"path":"seed.txt"}));
+        assert!(runtime.effect_ledger.read().unwrap().is_empty());
+        assert!(!evaluate(&task).allowed);
+
+        // A write that leaves the file exactly as it was changes nothing either.
+        run(
+            "same-1",
+            "write",
+            serde_json::json!({"path":"seed.txt","content":"seed"}),
+        );
+        let unchanged = ledger(0);
+        assert_eq!(
+            unchanged.before_blob, unchanged.after_blob,
+            "premise: the ledger holds the no-op"
+        );
+        task.id = unchanged.task_id;
+        assert!(runtime.mutation_receipts(task.id, 0).is_empty());
+        assert!(!evaluate(&task).allowed);
+
+        // A write that creates a file is implementation evidence, bound to the
+        // operation that made it.
+        run(
+            "write-1",
+            "write",
+            serde_json::json!({"path":"new.txt","content":"applied"}),
+        );
+        let created = ledger(1);
+        task.id = created.task_id;
+        let receipts = runtime.mutation_receipts(task.id, 0);
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].operation_id, created.operation_id);
+        assert!(receipts[0].is_applied_mutation());
+        assert!(evaluate(&task).allowed);
+        // For another task, or another attempt, the same ledger proves nothing.
+        assert!(!{
+            let other = crate::runtime::TaskRecord::new(crate::RunId::new(), "other");
+            evaluate(&other).allowed
+        });
+        assert!(
+            !crate::runtime::completion::evaluate_task_completion(
+                &task,
+                None,
+                &runtime.mutation_receipts(task.id, 0),
+                &manifest,
+                1
+            )
+            .allowed
+        );
     }
 
     #[test]

@@ -1,15 +1,17 @@
 //! Exact reading of JSON numbers that stand for integers.
 //!
 //! A schema `integer` may legally be written `1.0` or `1e0`. `serde_json`
-//! keeps those as `f64`, so `Value::as_u64` refuses them, while a blind cast
-//! through `f64` rounds integers above 2^53. These helpers accept exactly the
-//! values that are non-negative integers and that no rounding could have
-//! changed, and refuse everything else.
+//! rounds every such token to an `f64` while parsing, and after that nothing can
+//! tell `1.0` from `1.0000000000000001` or `9007199254740993.0` from
+//! `9007199254740992.0`. So the decision is made on the text, before parsing:
+//! [`normalize_integral_tokens`] rewrites each number token whose exact decimal
+//! value is a non-negative integer that fits a `u64` to a plain integer
+//! literal, which `serde_json` keeps as a `u64`. [`as_u64_exact`] then reads
+//! only `u64`s. Every `f64` still in a value is therefore a fraction, a
+//! negative or something out of range, and is refused.
 
 use serde_json::Value;
-
-/// Largest integer such that it and every smaller one is exact in an `f64`.
-const MAX_EXACT_F64_INTEGER: f64 = 9_007_199_254_740_992.0; // 2^53
+use std::borrow::Cow;
 
 /// Longest number text [`normalized_decimal`] looks at.
 const MAX_DECIMAL_TEXT_BYTES: usize = 1024;
@@ -18,22 +20,73 @@ const MAX_DECIMAL_EXPONENT: i64 = 4096;
 
 /// The value of a JSON number as a `u64`, if it is a non-negative integer.
 ///
-/// Integers that `serde_json` holds as `u64` are returned as they are (so
-/// `u64::MAX` survives). A number held as `f64` is accepted only when it has
-/// no fractional part and is at most 2^53, where an `f64` stands for exactly
-/// one integer; a larger float could be a rounded form of another integer.
-/// Fractions, negatives, non-numbers and out-of-range values are `None`.
+/// Only a number `serde_json` holds as a `u64` is accepted (so `u64::MAX`
+/// survives). A number held as `f64` is refused whatever its value: it was
+/// rounded from text that [`normalize_integral_tokens`] did not find to be an
+/// exact integer, and a rounded float must never pass for the integer it lands
+/// on. Text that reaches a value without that normalization (`json!(1.0)`, a
+/// plain `serde_json::from_str("1.0")`) is therefore refused too; parse model
+/// and wire text with [`parse_exact`].
 pub fn as_u64_exact(value: &Value) -> Option<u64> {
-    let number = value.as_number()?;
-    if let Some(integer) = number.as_u64() {
-        return Some(integer);
+    value.as_number()?.as_u64()
+}
+
+/// Parse JSON text so that every number written as an exact non-negative
+/// integer (`1.0`, `1e3`, `18446744073709551615.0`) is held as that integer.
+pub fn parse_exact(text: &str) -> serde_json::Result<Value> {
+    serde_json::from_str(&normalize_integral_tokens(text))
+}
+
+/// Rewrite each number token of JSON `text` whose exact decimal value is a
+/// non-negative integer within `u64` to a plain integer literal, without any
+/// float arithmetic. Strings are skipped; every other token (fractions,
+/// negatives, out of range, malformed) is left as written for the JSON parser
+/// to judge. A token grows to at most 20 digits.
+pub fn normalize_integral_tokens(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let mut out: Option<String> = None;
+    let mut copied = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'"' => {
+                at += 1;
+                while at < bytes.len() {
+                    match bytes[at] {
+                        b'\\' => at += 2,
+                        b'"' => break,
+                        _ => at += 1,
+                    }
+                }
+                at += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = at;
+                while at < bytes.len()
+                    && matches!(bytes[at], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                {
+                    at += 1;
+                }
+                let token = &text[start..at];
+                if token.contains(['.', 'e', 'E']) {
+                    if let Some(integer) = normalized_decimal(token).and_then(|n| n.to_u64()) {
+                        let out = out.get_or_insert_with(|| String::with_capacity(text.len()));
+                        out.push_str(&text[copied..start]);
+                        out.push_str(&integer.to_string());
+                        copied = at;
+                    }
+                }
+            }
+            _ => at += 1,
+        }
     }
-    let float = number.as_f64()?;
-    // `as_u64` was `None`, so this is a negative integer or a float form.
-    if !float.is_finite() || float < 0.0 || float.fract() != 0.0 || float > MAX_EXACT_F64_INTEGER {
-        return None;
+    match out {
+        Some(mut out) => {
+            out.push_str(&text[copied.min(text.len())..]);
+            Cow::Owned(out)
+        }
+        None => Cow::Borrowed(text),
     }
-    Some(float as u64)
 }
 
 /// A decimal number in canonical form: `digits` has no leading or trailing
@@ -151,26 +204,63 @@ mod tests {
             ("0", Some(0)),
             ("-0.0", Some(0)),
             ("9007199254740992.0", Some(9_007_199_254_740_992)),
+            // Integral decimals past 2^53 are exact in text and stay exact.
+            ("9007199254740993.0", Some(9_007_199_254_740_993)),
+            ("9007199254740994.0", Some(9_007_199_254_740_994)),
             ("18446744073709551615", Some(u64::MAX)),
+            ("18446744073709551615.0", Some(u64::MAX)),
+            ("1844674407370955161.5e1", Some(u64::MAX)),
+            ("1e19", Some(10_000_000_000_000_000_000)),
+            // A fraction that rounds to an integer in an f64 is still a fraction.
+            ("1.0000000000000001", None),
+            ("0.9999999999999999999", None),
+            ("9007199254740993.5", None),
             ("1.5", None),
             ("-1", None),
             ("-1.0", None),
             ("1e-1", None),
-            // Above 2^53 a float no longer names one integer.
-            ("9007199254740994.0", None),
             ("18446744073709551616", None),
+            ("18446744073709551616.0", None),
+            ("1e20", None),
             ("1e30", None),
             ("1e400", None),
         ] {
-            // `1e400` is not valid for serde_json at all; both are refusals.
-            let got = serde_json::from_str::<Value>(text)
+            let got = parse_exact(text)
                 .ok()
                 .and_then(|value| as_u64_exact(&value));
             assert_eq!(got, expected, "{text}");
         }
+        // A value that never saw the normalization keeps no float.
+        assert_eq!(as_u64_exact(&parse("1.0")), None);
+        assert_eq!(as_u64_exact(&json!(1.0)), None);
         assert_eq!(as_u64_exact(&json!("1")), None);
         assert_eq!(as_u64_exact(&json!(null)), None);
         assert_eq!(as_u64_exact(&parse("18446744073709551615")), Some(u64::MAX));
+    }
+
+    #[test]
+    fn audit_wp02_b023_normalization_rewrites_only_number_tokens() {
+        // Strings, escapes and keys that look like numbers are not touched.
+        let text = r#"{"a":"1.0","b\"1.0":2.0,"c":[1e2,"x\\",3.0],"d":1.5,"e":-2.0}"#;
+        let value = parse_exact(text).unwrap();
+        assert_eq!(value["a"], "1.0");
+        assert_eq!(as_u64_exact(&value["b\"1.0"]), Some(2));
+        assert_eq!(as_u64_exact(&value["c"][0]), Some(100));
+        assert_eq!(value["c"][1], "x\\");
+        assert_eq!(as_u64_exact(&value["c"][2]), Some(3));
+        assert_eq!(value["d"].as_f64(), Some(1.5));
+        assert_eq!(as_u64_exact(&value["d"]), None);
+        assert_eq!(as_u64_exact(&value["e"]), None);
+        // Text with nothing to rewrite is returned as it came.
+        assert!(matches!(
+            normalize_integral_tokens(r#"{"a":1,"b":"x"}"#),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(normalize_integral_tokens("[1.0,2e0]"), "[1,2]");
+        // Malformed text is left for the parser to refuse.
+        for bad in ["{\"a\":1.0", "[1..0]", "[1e]", "{\"a\":\"unterminated"] {
+            assert!(parse_exact(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
