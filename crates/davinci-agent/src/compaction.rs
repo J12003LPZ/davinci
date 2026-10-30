@@ -412,7 +412,7 @@ pub fn compact_messages_within(
     let cannot_fit = |mandatory_tokens: u64| {
         let max = max_tokens.filter(|max| mandatory_tokens > *max)?;
         Some(format!(
-            "Compaction skipped: the summary with the user requirements to carry needs ~{mandatory_tokens} tokens, more than the ~{max} the context has left; the history is unchanged"
+            "{CONTEXT_ADMISSION_FAILED}: the summary with the user requirements to carry needs ~{mandatory_tokens} tokens, more than the ~{max} the context has left; nothing was sent and the history is unchanged"
         ))
     };
     // The carried block alone is a lower bound: refuse before paying for a summary.
