@@ -1018,6 +1018,13 @@ mod tests {
             .args(["config", "user.email", "test@davinci.local"])
             .output()
             .unwrap();
+        // Status here runs with the global config replaced by the null file, so a
+        // host-wide core.autocrlf would make a checkout by plain git look modified.
+        Command::new("git")
+            .current_dir(path)
+            .args(["config", "core.autocrlf", "false"])
+            .output()
+            .unwrap();
 
         let readme = path.join("README.md");
         std::fs::write(&readme, "# Main Repo\n").unwrap();
