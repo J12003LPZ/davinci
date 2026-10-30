@@ -115,7 +115,7 @@ To guarantee that parallel agents do not corrupt working trees or produce race c
 ### 3.4 Permission Ceilings and Project Trust
 
 - **No Privilege Escalation**: Subagents, team workers, and workflow phases inherit the parent session's `PermissionMode`. A session in `ReadOnly` mode rejects mutating workflows and removes mutating tools from scoped agent requests. Outside Plan Mode, shared workers read and edit files (no shell) and take turns through the shared-write lease; an allowed profile may set its own mode within the parent permission ceiling.
-- **Untrusted Projects**: In an untrusted checkout, project-level workflows (`.davinci/workflows/*.json`) and custom agent profiles cannot be loaded or executed until the user explicitly runs `/trust`.
+- **Untrusted Projects**: In an untrusted checkout, project-level workflows (`.davinci/workflows/*.json`) and custom agent profiles cannot be loaded or executed until the user explicitly runs `/setup trust`.
 
 ## 4. Worker Messaging and Recovery
 

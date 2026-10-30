@@ -493,7 +493,7 @@ fn conversation_body(model: &Model, height: usize) -> (Vec<Line<'static>>, Optio
         let cc = model.theme.cc();
         let fresh = model.transcript.len().saturating_sub(scroll.entries);
         let below = format!(
-            "  ↓ Jump to bottom · {}{offset} {} below · click, End or pgdn",
+            "  ↓ Jump to bottom · {}{offset} {} below · click, Ctrl+End or pgdn",
             match fresh {
                 0 => String::new(),
                 1 => "1 new message · ".to_owned(),

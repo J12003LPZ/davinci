@@ -32,13 +32,13 @@ Trusting only lets DaVinci load it. Tool approvals and the sandbox stay on.
 - `Yes` stores trust and continues.
 - With `defaultProjectTrust: "never"` in your global settings nothing is asked:
   the project's resources stay unloaded, one line says how to trust the folder
-  (`/trust`, or `trustedProjects`), and DaVinci opens. A stored grant or
+  (`/setup trust`, or `trustedProjects`), and DaVinci opens. A stored grant or
   `--approve` still wins.
 - "Trust parent folder" is not offered when the parent is a drive or filesystem
   root or your home directory, or when the home directory cannot be determined.
 - A stored decision is never asked again. A stored denial keeps the project's
   resources unloaded on later launches (DaVinci still opens, without them);
-  `/trust` and `/setup trust` change the decision.
+  `/setup trust` and `/setup trust` change the decision.
 - A nearer entry wins over a parent's: a saved "Do not trust" on a folder
   survives "Trust parent folder".
 - Symlinks, junctions, the Windows drive-letter case, `\\?\` prefixes and
@@ -79,7 +79,7 @@ that is not trusted DaVinci does not read or write it: the memory tools answer
 Qdrant recovery and the repair that follows an Ollama start are skipped, and a
 clear the folder owes is not delivered. Starting the local Ollama is a
 user-level service and still follows its own consent. Trust is re-read at every
-turn, so granting it with `/trust` loads the store at the next turn and revoking
+turn, so granting it with `/setup trust` loads the store at the next turn and revoking
 it drops what was read. The recovery threads are decided at launch; a grant
 given mid-session starts them at the next launch.
 
@@ -92,10 +92,10 @@ untrusted project gets no `verifyCommands` and no commands inferred from
 
 ## Changing a decision in a running session
 
-`/trust` writes the same store. `/reload` re-reads it: project skills, prompts,
+`/setup trust` writes the same store. `/reload` re-reads it: project skills, prompts,
 agent profiles and context files load or drop at once, per working directory,
 so nothing from a previous project root or a revoked grant stays. After a
-denial, `/trust` stops the project's MCP servers at once and `/reload` does the
+denial, `/setup trust` stops the project's MCP servers at once and `/reload` does the
 same. Which servers are the project's is recorded when they connect (their
 origin), not read back from `mcp.json`, so a renamed or broken file still
 stops them, and a user or plugin server with the same name is never touched.
@@ -131,6 +131,6 @@ project root.
 ## Rollback and opt-out
 
 Revert the phase 1 commits to return to the previous behaviour (silent
-filtering, `/trust` only). To skip the question for a folder you control, run
+filtering, `/setup trust` only). To skip the question for a folder you control, run
 `/setup trust` there once, pass `--approve`, or list it under `trustedProjects`
 in the global settings.
