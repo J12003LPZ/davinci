@@ -33,6 +33,10 @@ pub struct ServerConfig {
     pub url: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// Bounded deadline for MCP initialization, tool calls and resource reads.
+    /// A project cannot configure an infinite or zero timeout.
+    #[serde(default, rename = "callTimeoutSeconds")]
+    pub call_timeout_seconds: Option<u64>,
     #[serde(default)]
     pub disabled: bool,
     /// Where this MCP server is allowed to execute. Local commands default
@@ -52,6 +56,19 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    pub fn call_timeout(&self) -> Result<std::time::Duration> {
+        const MAX_CALL_TIMEOUT_SECONDS: u64 = 30 * 60;
+        match self.call_timeout_seconds {
+            None => Ok(crate::CALL_TIMEOUT),
+            Some(seconds @ 1..=MAX_CALL_TIMEOUT_SECONDS) => {
+                Ok(std::time::Duration::from_secs(seconds))
+            }
+            Some(_) => Err(Error::Protocol(format!(
+                "callTimeoutSeconds must be between 1 and {MAX_CALL_TIMEOUT_SECONDS}"
+            ))),
+        }
+    }
+
     pub fn execution_policy(&self) -> Result<McpExecutionPolicy> {
         if self.disabled || self.execution == Some(McpExecutionPolicy::Disabled) {
             return Ok(McpExecutionPolicy::Disabled);
@@ -245,6 +262,31 @@ mod tests {
         let local_remote =
             parse(r#"{"mcpServers":{"x":{"command":"tool","execution":"remote"}}}"#).unwrap();
         assert!(local_remote.mcp_servers["x"].execution_policy().is_err());
+    }
+
+    #[test]
+    fn remote_tool_timeout_defaults_to_one_minute_and_rejects_out_of_range_values() {
+        let default = parse(r#"{"mcpServers":{"remote":{"url":"https://example.com/mcp"}}}"#)
+            .unwrap();
+        assert_eq!(
+            default.mcp_servers["remote"].call_timeout().unwrap(),
+            std::time::Duration::from_secs(60)
+        );
+        let custom = parse(
+            r#"{"mcpServers":{"remote":{"url":"https://example.com/mcp","callTimeoutSeconds":120}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            custom.mcp_servers["remote"].call_timeout().unwrap(),
+            std::time::Duration::from_secs(120)
+        );
+        for seconds in [0, 1801, u64::MAX] {
+            let config = parse(&format!(
+                r#"{{"mcpServers":{{"remote":{{"url":"https://example.com/mcp","callTimeoutSeconds":{seconds}}}}}}}"#
+            ))
+            .unwrap();
+            assert!(config.mcp_servers["remote"].call_timeout().is_err());
+        }
     }
 
     #[test]

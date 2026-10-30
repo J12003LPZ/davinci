@@ -683,6 +683,20 @@ impl Inner {
             });
             return;
         }
+        let call_timeout = match server.call_timeout() {
+            Ok(timeout) => timeout,
+            Err(err) => {
+                self.rows.push(McpServerRow {
+                    name: name.to_string(),
+                    transport: transport_label.into(),
+                    status: "error".into(),
+                    tools: 0,
+                    error: Some(err.to_string()),
+                    skipped: Vec::new(),
+                });
+                return;
+            }
+        };
         if policy == davinci_mcp::McpExecutionPolicy::Sandboxed {
             let Some((host, sandbox)) = executor else {
                 self.rows.push(McpServerRow {
@@ -700,7 +714,11 @@ impl Inner {
             };
             let client = sandboxed::SupervisedMcpTransport::spawn(host, server, cwd, sandbox)
                 .and_then(|transport| {
-                    davinci_mcp::Client::connect_transport(name, Box::new(transport))
+                    davinci_mcp::Client::connect_transport_with_timeout(
+                        name,
+                        Box::new(transport),
+                        call_timeout,
+                    )
                 });
             self.finish_connection(name, server, "sandboxed-stdio", client);
             return;
@@ -719,7 +737,7 @@ impl Inner {
                 return;
             }
         };
-        let client = davinci_mcp::Client::connect(name, transport, cwd);
+        let client = davinci_mcp::Client::connect_with_timeout(name, transport, cwd, call_timeout);
         self.finish_connection(name, server, transport_label, client);
     }
 
@@ -988,6 +1006,31 @@ mod tests {
             policy.decide("fixture", name, &json!({}), dir.path()),
             PermissionVerdict::Deny { .. }
         ));
+    }
+
+    #[test]
+    fn invalid_remote_mcp_call_timeout_fails_before_connecting() {
+        let (dir, _) = http_fixture(
+            r#"{
+                "initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
+                "tools/list":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]}
+            }"#,
+        );
+        let path = dir.path().join("mcp-fixture.json");
+        let config = davinci_mcp::parse_config(&format!(
+            r#"{{"mcpServers":{{"memory":{{"url":{},"callTimeoutSeconds":1801}}}}}}"#,
+            serde_json::to_string(&format!("fixture:{}", path.display())).unwrap()
+        ))
+        .unwrap();
+        let registry = McpRegistry::connect(&config, dir.path());
+        assert!(registry.tool_names().is_empty());
+        assert_eq!(registry.rows()[0].status, "error");
+        assert!(
+            registry.rows()[0]
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("callTimeoutSeconds"))
+        );
     }
 
     #[test]

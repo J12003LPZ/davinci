@@ -184,7 +184,18 @@ impl Client {
         })
     }
 
-    pub fn connect_transport(name: &str, mut transport: Box<dyn RpcTransport>) -> Result<Self> {
+    pub fn connect_transport(name: &str, transport: Box<dyn RpcTransport>) -> Result<Self> {
+        Self::connect_transport_with_timeout(name, transport, CALL_TIMEOUT)
+    }
+
+    /// Apply the deadline before the first initialize RPC, not after the
+    /// connection has already waited for an unresponsive MCP server.
+    pub fn connect_transport_with_timeout(
+        name: &str,
+        mut transport: Box<dyn RpcTransport>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        transport.set_call_timeout(timeout);
         let handshake = handshake(transport.as_mut())?;
         Ok(Self {
             name: name.to_string(),
@@ -593,6 +604,41 @@ mod tests {
         assert_eq!(client.tools.len(), 1);
         assert_eq!(client.tools[0].name, "echo");
         assert_eq!(client.call_tool("echo", json!({})).unwrap().text(), "ok");
+    }
+
+    #[test]
+    fn external_transport_receives_custom_timeout_before_initialize() {
+        struct TimedRpc {
+            observed: Arc<Mutex<Option<Duration>>>,
+            delegate: FixtureRpc,
+        }
+        impl RpcTransport for TimedRpc {
+            fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+                assert!(
+                    self.observed.lock().unwrap().is_some(),
+                    "timeout must be set before the handshake"
+                );
+                self.delegate.call(method, params)
+            }
+            fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+                self.delegate.notify(method, params)
+            }
+            fn set_call_timeout(&mut self, timeout: Duration) {
+                *self.observed.lock().unwrap() = Some(timeout);
+            }
+        }
+        let observed = Arc::new(Mutex::new(None));
+        let client = Client::connect_transport_with_timeout(
+            "fixture",
+            Box::new(TimedRpc {
+                observed: observed.clone(),
+                delegate: FixtureRpc { calls: Vec::new() },
+            }),
+            Duration::from_secs(120),
+        )
+        .unwrap();
+        assert_eq!(client.tools.len(), 1);
+        assert_eq!(*observed.lock().unwrap(), Some(Duration::from_secs(120)));
     }
 
     #[test]
