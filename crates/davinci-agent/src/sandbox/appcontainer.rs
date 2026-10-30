@@ -90,27 +90,80 @@ impl LaunchPlan {
     }
 }
 
-/// The capability name a mount's grant is keyed to: stable for an exact path
-/// and an access level, so the grant is reused. The key is the full SHA-256 of
-/// the path's UTF-16LE code units, with no case folding: lowercasing maps
-/// distinct paths (`İ` and `i` + combining dot) to one name, and a shared name
-/// is a shared grant. Case aliases of one directory just get separate grants.
-pub fn mount_capability(path: &str, write: bool) -> String {
-    let utf16: Vec<u8> = path.encode_utf16().flat_map(u16::to_le_bytes).collect();
+/// The capability name a mount's grant is keyed to: stable for one directory
+/// (its path and its volume and file identity) and an access level, so the
+/// grant is reused only for that directory. The key is the full SHA-256 of the
+/// path's UTF-16LE code units followed by the identity, with no case folding:
+/// lowercasing maps distinct paths (`İ` and `i` + combining dot) to one name,
+/// and a shared name is a shared grant. Case aliases of one directory just get
+/// separate grants. Binding the identity means a directory that was renamed
+/// away and a new one created under the old name do not share a capability, so
+/// the persistent ACL left on the first never reaches the second.
+pub fn mount_capability(
+    path: &str,
+    write: bool,
+    identity: &davinci_sys::fs::FileIdentity,
+) -> String {
+    let mut utf16: Vec<u8> = path.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    utf16.extend_from_slice(&identity.volume.to_le_bytes());
+    utf16.extend_from_slice(&identity.index.to_le_bytes());
     let digest = Sha256::digest(&utf16);
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     format!("davinciSandbox{}{hex}", if write { "W" } else { "R" })
 }
 
+/// A mount directory held open from admission to the end of the launch. The
+/// handle forbids renaming or deleting the directory meanwhile where the
+/// platform allows it, and [`PinnedMount::recheck`] proves the name still
+/// reaches the same directory where it does not.
+#[derive(Debug)]
+pub struct PinnedMount {
+    path: String,
+    handle: std::fs::File,
+    identity: davinci_sys::fs::FileIdentity,
+}
+
+impl PinnedMount {
+    pub fn identity(&self) -> &davinci_sys::fs::FileIdentity {
+        &self.identity
+    }
+
+    /// The name must still reach the pinned directory: the same identity on a
+    /// fresh open and the same final path on the pinned handle. Run after the
+    /// path-based ACL change so a replacement made during it is an error.
+    pub fn recheck(&self) -> Result<(), String> {
+        let fresh = davinci_sys::fs::open_directory(Path::new(&self.path))
+            .and_then(|file| davinci_sys::fs::file_identity(&file))
+            .map_err(|error| format!("AppContainer mount {} changed: {error}", self.path))?;
+        let same = fresh.volume == self.identity.volume && fresh.index == self.identity.index;
+        let there = davinci_sys::fs::final_path(&self.handle)
+            .map(|real| {
+                crate::permission::strip_verbatim_prefix(&real).as_os_str()
+                    == Path::new(&self.path).as_os_str()
+            })
+            .unwrap_or(false);
+        if same && there {
+            Ok(())
+        } else {
+            Err(format!(
+                "AppContainer mount {} was replaced during the launch",
+                self.path
+            ))
+        }
+    }
+}
+
 /// A mount path as it may be granted: it must already be the canonical form of
-/// an existing path. An alias (link, junction, `..`, other spelling) that
-/// resolves elsewhere than it names is refused before any grant is made, so a
-/// capability is only ever derived from, and applied to, the one resolved target.
-pub fn admitted_mount_path(path: &str) -> Result<(), String> {
+/// an existing directory. An alias (link, junction, `..`, other spelling) that
+/// resolves elsewhere than it names is refused before any grant is made. The
+/// returned [`PinnedMount`] carries the opened directory's identity, which the
+/// capability is keyed to, so a capability is only ever derived from, and
+/// applied to, the one directory that was admitted.
+pub fn admitted_mount_path(path: &str) -> Result<PinnedMount, String> {
     let canonical = Path::new(path)
         .canonicalize()
         .map_err(|error| format!("AppContainer mount path unavailable: {error}"))?;
-    // Planned paths are shown without the `\?\` prefix `canonicalize` adds.
+    // Planned paths are shown without the `\\?\` prefix `canonicalize` adds.
     let resolved = crate::permission::strip_verbatim_prefix(&canonical);
     if resolved.as_os_str() != Path::new(path).as_os_str() {
         return Err(format!(
@@ -118,7 +171,17 @@ pub fn admitted_mount_path(path: &str) -> Result<(), String> {
             resolved.display()
         ));
     }
-    Ok(())
+    let handle = davinci_sys::fs::open_directory_pinned(Path::new(path))
+        .map_err(|error| format!("AppContainer mount path unavailable: {error}"))?;
+    let identity = davinci_sys::fs::file_identity(&handle)
+        .map_err(|error| format!("AppContainer mount {path} has no identity: {error}"))?;
+    let pinned = PinnedMount {
+        path: path.to_owned(),
+        handle,
+        identity,
+    };
+    pinned.recheck()?;
+    Ok(pinned)
 }
 
 #[derive(Debug, Clone)]
@@ -835,8 +898,10 @@ mod native {
 
     pub(super) fn launch(plan: LaunchPlan) -> Result<i32, String> {
         plan.validate()?;
+        // Held until the launch ends: each mount is the directory admitted here.
+        let mut pins = std::collections::HashMap::new();
         for path in plan.read.iter().chain(&plan.write) {
-            admitted_mount_path(path)?;
+            pins.insert(path.clone(), admitted_mount_path(path)?);
         }
         let everyone = string_sid(ALL_APP_PACKAGES)?;
         for path in &plan.read {
@@ -846,13 +911,16 @@ mod native {
         let mut capabilities = Vec::new();
         for (paths, write) in [(&plan.read, false), (&plan.write, true)] {
             for path in paths {
-                let cap = capability_sid(&mount_capability(path, write))?;
+                let pin = &pins[path];
+                let cap = capability_sid(&mount_capability(path, write, pin.identity()))?;
                 let mask = if write {
                     FILE_TEMP_ACCESS
                 } else {
                     FILE_READ_EXECUTE
                 };
                 grant(path, &cap, &everyone, mask)?;
+                // The ACL change was by pathname: prove it landed on the pin.
+                pin.recheck()?;
                 capabilities.push(cap);
             }
         }
@@ -1181,12 +1249,20 @@ mod tests {
         assert!(LaunchPlan::decode("not base64!").is_err());
     }
 
+    fn id(index: u128) -> davinci_sys::fs::FileIdentity {
+        davinci_sys::fs::FileIdentity {
+            volume: 7,
+            index,
+            links: 1,
+        }
+    }
+
     #[test]
     fn mount_capabilities_are_stable_per_path_and_access() {
-        let read = mount_capability(r"C:\Runtime\Node", false);
-        assert_eq!(read, mount_capability(r"C:\Runtime\Node", false));
-        assert_ne!(read, mount_capability(r"C:\Runtime\Node", true));
-        assert_ne!(read, mount_capability(r"C:\Runtime\Other", false));
+        let read = mount_capability(r"C:\Runtime\Node", false, &id(1));
+        assert_eq!(read, mount_capability(r"C:\Runtime\Node", false, &id(1)));
+        assert_ne!(read, mount_capability(r"C:\Runtime\Node", true, &id(1)));
+        assert_ne!(read, mount_capability(r"C:\Runtime\Other", false, &id(1)));
         assert!(read.starts_with("davinciSandboxR") && read.len() == 15 + 64);
     }
 
@@ -1197,17 +1273,17 @@ mod tests {
         let decomposed = "C:\\work\\i\u{307}";
         assert_eq!(dotted.to_lowercase(), decomposed.to_lowercase());
         assert_ne!(
-            mount_capability(dotted, false),
-            mount_capability(decomposed, false)
+            mount_capability(dotted, false, &id(1)),
+            mount_capability(decomposed, false, &id(1))
         );
         assert_ne!(
-            mount_capability(dotted, false),
-            mount_capability(dotted, true)
+            mount_capability(dotted, false, &id(1)),
+            mount_capability(dotted, true, &id(1))
         );
         // Case aliases are separate (redundant) grants, never a merged one.
         assert_ne!(
-            mount_capability(r"C:\Runtime\Node", false),
-            mount_capability(r"c:\runtime\node", false)
+            mount_capability(r"C:\Runtime\Node", false, &id(1)),
+            mount_capability(r"c:\runtime\node", false, &id(1))
         );
     }
 
@@ -1225,5 +1301,53 @@ mod tests {
         assert!(err.contains("not canonical"), "{err}");
         let missing = real.join("missing");
         assert!(admitted_mount_path(&missing.to_string_lossy()).is_err());
+    }
+
+    /// Review finding 2: the capability follows the directory, not the name.
+    /// Grant P, move it to Q, create a new P: the new P must not be handed the
+    /// capability that still guards Q's persistent ACL.
+    #[test]
+    fn audit_wp01_b002_a_replacement_directory_gets_a_different_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let p =
+            crate::permission::strip_verbatim_prefix(&dir.path().canonicalize().unwrap()).join("p");
+        let q = p.with_file_name("q");
+        std::fs::create_dir(&p).unwrap();
+        let name = p.to_string_lossy().into_owned();
+
+        let first = admitted_mount_path(&name).unwrap();
+        let first_cap = mount_capability(&name, true, first.identity());
+        // While it is pinned the directory cannot be renamed away (Windows);
+        // elsewhere the swap below is caught by the identity in the key.
+        let blocked = std::fs::rename(&p, &q).is_err();
+        if cfg!(windows) {
+            assert!(blocked, "a pinned mount must not be renamable");
+        }
+        drop(first);
+        if blocked {
+            std::fs::rename(&p, &q).unwrap();
+        }
+        std::fs::create_dir_all(&p).unwrap();
+        let second = admitted_mount_path(&name).unwrap();
+        let second_cap = mount_capability(&name, true, second.identity());
+        assert_ne!(first_cap, second_cap, "same name, different directory");
+        second.recheck().unwrap();
+
+        // Replacing the directory while a pin from before exists is detected.
+        let held = admitted_mount_path(&name).unwrap();
+        if !cfg!(windows) {
+            std::fs::remove_dir(&p).unwrap();
+            std::fs::create_dir(&p).unwrap();
+            assert!(
+                held.recheck().is_err(),
+                "a swapped directory must be refused"
+            );
+        } else {
+            assert!(
+                std::fs::remove_dir(&p).is_err(),
+                "a pinned mount cannot be removed"
+            );
+            held.recheck().unwrap();
+        }
     }
 }

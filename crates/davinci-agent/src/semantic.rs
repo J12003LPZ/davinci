@@ -305,20 +305,32 @@ struct Source {
 }
 
 /// Read `path` on its opened handle, admitting only a regular, singly linked
-/// file and reading at most `FALLBACK_MAX_FILE_BYTES + 1` bytes of it.
-fn read_source(path: &Path) -> Result<Source, &'static str> {
+/// file that resolves beneath `root`, and reading at most
+/// `FALLBACK_MAX_FILE_BYTES + 1` bytes of it. The confinement is judged on the
+/// handle that supplies the bytes, so a link or junction put in place of the
+/// file or one of its directories after discovery cannot redirect the read.
+fn read_source(root: &Path, path: &Path, allow_linked: bool) -> Result<Source, &'static str> {
     use std::io::Read;
     let file = fs::File::open(path).map_err(|_| INCOMPLETE_UNREADABLE)?;
     if !file.metadata().is_ok_and(|meta| meta.is_file()) {
         return Err(INCOMPLETE_UNREADABLE);
     }
-    davinci_sys::fs::ensure_single_link(&file).map_err(|error| {
-        if davinci_sys::fs::is_hard_link_refusal(&error) {
-            INCOMPLETE_LINKED
-        } else {
-            INCOMPLETE_UNREADABLE
-        }
-    })?;
+    let root = fs::canonicalize(root).map_err(|_| INCOMPLETE_UNREADABLE)?;
+    match davinci_sys::fs::final_path(&file) {
+        Ok(real) if real.starts_with(&root) => {}
+        Ok(_) => return Err(INCOMPLETE_UNSAFE_ENTRY),
+        // Where the platform cannot name the object, do not read it.
+        Err(_) => return Err(INCOMPLETE_UNSAFE_ENTRY),
+    }
+    if !allow_linked {
+        davinci_sys::fs::ensure_single_link(&file).map_err(|error| {
+            if davinci_sys::fs::is_hard_link_refusal(&error) {
+                INCOMPLETE_LINKED
+            } else {
+                INCOMPLETE_UNREADABLE
+            }
+        })?;
+    }
     let mut bytes = Vec::new();
     file.take(FALLBACK_MAX_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -346,7 +358,12 @@ fn is_identifier_char(ch: char) -> bool {
 /// The protocol column of byte offset `byte` in `line`: protocol positions
 /// count UTF-16 code units, not bytes.
 fn utf16_column(line: &str, byte: usize) -> u32 {
-    u32::try_from(line[..byte].encode_utf16().count()).unwrap_or(u32::MAX)
+    // Callers pass character boundaries; a bad offset must still not panic.
+    let mut end = byte.min(line.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    u32::try_from(line[..end].encode_utf16().count()).unwrap_or(u32::MAX)
 }
 
 /// The range of `line[start..end]` on zero-based line `line_idx`.
@@ -397,6 +414,19 @@ pub fn text_fallback_definition(
     target_path: Option<&Path>,
     aborted: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<SemanticResult, String> {
+    text_fallback_definition_authorized(cwd, symbol, target_path, aborted, false)
+}
+
+/// [`text_fallback_definition`] for a caller whose permission policy already
+/// authorizes reads outside the workspace (`allow_linked`), so a hard-linked
+/// file is scanned instead of reported as skipped.
+pub fn text_fallback_definition_authorized(
+    cwd: &Path,
+    symbol: &str,
+    target_path: Option<&Path>,
+    aborted: Option<&std::sync::atomic::AtomicBool>,
+    allow_linked: bool,
+) -> Result<SemanticResult, String> {
     if is_aborted(aborted) {
         return Err("Operation aborted".into());
     }
@@ -427,7 +457,7 @@ pub fn text_fallback_definition(
         if is_aborted(aborted) {
             return Err("Operation aborted".into());
         }
-        let source = match read_source(&file) {
+        let source = match read_source(cwd, &file, allow_linked) {
             Ok(source) => source,
             Err(reason) => {
                 incomplete.note(reason);
@@ -439,13 +469,17 @@ pub fn text_fallback_definition(
         }
         for (line_idx, line) in source.text.lines().enumerate() {
             let trimmed = line.trim();
-            let stripped = trimmed
+            // Offsets are taken from slices that keep the line's own end, so
+            // `rest` is always a suffix of `line` (trailing whitespace would
+            // otherwise shift every column).
+            let leading = line.trim_start();
+            let stripped = leading
                 .strip_prefix("pub(crate) ")
-                .or_else(|| trimmed.strip_prefix("pub "))
-                .or_else(|| trimmed.strip_prefix("export default "))
-                .or_else(|| trimmed.strip_prefix("export "))
-                .or_else(|| trimmed.strip_prefix("async "))
-                .unwrap_or(trimmed);
+                .or_else(|| leading.strip_prefix("pub "))
+                .or_else(|| leading.strip_prefix("export default "))
+                .or_else(|| leading.strip_prefix("export "))
+                .or_else(|| leading.strip_prefix("async "))
+                .unwrap_or(leading);
             let stripped_async = stripped.strip_prefix("async ").unwrap_or(stripped);
             let declared_symbol = def_keywords.iter().find_map(|keyword| {
                 let rest = stripped_async.strip_prefix(keyword)?.trim_start();
@@ -498,6 +532,17 @@ pub fn text_fallback_references(
     target_path: Option<&Path>,
     aborted: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<SemanticResult, String> {
+    text_fallback_references_authorized(cwd, symbol, target_path, aborted, false)
+}
+
+/// [`text_fallback_references`] for an outside-read authorized caller.
+pub fn text_fallback_references_authorized(
+    cwd: &Path,
+    symbol: &str,
+    target_path: Option<&Path>,
+    aborted: Option<&std::sync::atomic::AtomicBool>,
+    allow_linked: bool,
+) -> Result<SemanticResult, String> {
     if is_aborted(aborted) {
         return Err("Operation aborted".into());
     }
@@ -517,7 +562,7 @@ pub fn text_fallback_references(
         if is_aborted(aborted) {
             return Err("Operation aborted".into());
         }
-        let source = match read_source(&file) {
+        let source = match read_source(cwd, &file, allow_linked) {
             Ok(source) => source,
             Err(reason) => {
                 incomplete.note(reason);
@@ -583,8 +628,17 @@ pub fn text_fallback_references(
 
 /// Fallback outline extracting top-level symbols via syntax patterns.
 pub fn text_fallback_outline(cwd: &Path, file_path: &str) -> Result<SemanticResult, String> {
+    text_fallback_outline_authorized(cwd, file_path, false)
+}
+
+/// [`text_fallback_outline`] for an outside-read authorized caller.
+pub fn text_fallback_outline_authorized(
+    cwd: &Path,
+    file_path: &str,
+    allow_linked: bool,
+) -> Result<SemanticResult, String> {
     let full = safe_workspace_path(cwd, Path::new(file_path))?;
-    let source = read_source(&full)
+    let source = read_source(cwd, &full, allow_linked)
         .map_err(|reason| format!("Could not read file {file_path}: {reason}"))?;
     let mut incomplete = Incomplete::default();
     if source.prefix_only {
@@ -1020,6 +1074,39 @@ fn helper() {
         assert!(big.fallback_reason.unwrap().contains("4 MiB"));
     }
 
+    /// Review finding 10: declaration columns come from the line itself, so
+    /// trailing whitespace neither shifts them nor lands inside a character.
+    #[test]
+    fn audit_wp01_b009_declaration_columns_ignore_trailing_whitespace() {
+        let dir = tempdir().unwrap();
+        for (source, symbol, expected) in [
+            // The panic case: a two-byte identifier and a trailing space.
+            ("fn \u{e9}() {} \n", "\u{e9}", (0, 3, 4)),
+            ("fn target() {}   \n", "target", (0, 3, 9)),
+            ("fn target() {}\t\t\n", "target", (0, 3, 9)),
+            ("    pub fn target() {} \n", "target", (0, 11, 17)),
+            ("\u{3000}fn target() {}\u{3000}\n", "target", (0, 4, 10)),
+            (
+                "export default function caf\u{e9}() { /* \u{1F600} */ }  \n",
+                "caf\u{e9}",
+                (0, 24, 28),
+            ),
+            ("let \u{1F600} = 1; fn x() {}\n", "x", (0, 0, 0)),
+        ] {
+            let name = "d.rs";
+            fs::write(dir.path().join(name), source).unwrap();
+            let defined = text_fallback_definition(dir.path(), symbol, Some(Path::new(name)), None)
+                .unwrap_or_else(|error| panic!("{source:?}: {error}"));
+            if expected == (0, 0, 0) {
+                // Not a declaration at the line start: no hit, and no panic.
+                assert!(defined.locations.is_empty(), "{source:?}");
+                continue;
+            }
+            assert_eq!(defined.locations.len(), 1, "{source:?}");
+            assert_eq!(range_of(&defined.locations[0]), expected, "{source:?}");
+        }
+    }
+
     #[test]
     fn audit_wp01_b009_columns_are_utf16_code_units() {
         let dir = tempdir().unwrap();
@@ -1184,6 +1271,80 @@ fn helper() {
         assert_eq!(
             fs::read_to_string(outside.path().join("canary.rs")).unwrap(),
             canary_source
+        );
+    }
+
+    /// Review finding 5: the file or its directory is swapped for a link after
+    /// discovery. The confinement check runs on the handle that is read, so the
+    /// canary behind the link is refused, not scanned.
+    #[test]
+    fn audit_wp01_b013_a_link_swapped_in_after_discovery_is_refused_on_the_read_handle() {
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("a.rs"), "fn canary() {}\n").unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        let collected = workspace.path().join("src").join("a.rs");
+        fs::write(&collected, "fn inside() {}\n").unwrap();
+        // A collected, in-workspace file reads normally.
+        let source = read_source(workspace.path(), &collected, false).unwrap();
+        assert!(source.text.contains("inside"));
+
+        // Replace the parent directory with a link to the outside directory.
+        fs::remove_dir_all(workspace.path().join("src")).unwrap();
+        if !link_directory(&workspace.path().join("src"), outside.path()) {
+            eprintln!("directory links are unavailable here: swap case not executed");
+            return;
+        }
+        // The pathname still looks workspace-relative and the file is a regular,
+        // single-link file, but the handle resolves outside the workspace.
+        assert!(collected.is_file());
+        assert_eq!(
+            read_source(workspace.path(), &collected, false).err(),
+            Some(INCOMPLETE_UNSAFE_ENTRY)
+        );
+        // Scanning through the public entry point never surfaces the canary.
+        let found = text_fallback_definition(
+            workspace.path(),
+            "canary",
+            Some(Path::new("src/a.rs")),
+            None,
+        );
+        match found {
+            Ok(result) => assert!(result.locations.is_empty(), "{:?}", result.locations),
+            Err(error) => assert!(!error.contains("fn canary"), "{error}"),
+        }
+        let outline = text_fallback_outline(workspace.path(), "src/a.rs");
+        if let Ok(outline) = outline {
+            assert!(outline.symbols.is_empty(), "{:?}", outline.symbols);
+        }
+    }
+
+    #[test]
+    fn audit_wp01_b001_an_outside_read_grant_lets_the_fallback_scan_a_linked_file() {
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("o.rs"), "fn linked_symbol() {}\n").unwrap();
+        fs::hard_link(outside.path().join("o.rs"), workspace.path().join("a.rs")).unwrap();
+        let found = |allow| {
+            text_fallback_definition_authorized(
+                workspace.path(),
+                "linked_symbol",
+                Some(Path::new("a.rs")),
+                None,
+                allow,
+            )
+            .unwrap()
+            .locations
+            .len()
+        };
+        assert_eq!(found(false), 0, "restricted callers skip the linked file");
+        assert_eq!(found(true), 1, "an authorized caller scans it");
+        assert!(text_fallback_outline(workspace.path(), "a.rs").is_err());
+        assert!(
+            !text_fallback_outline_authorized(workspace.path(), "a.rs", true)
+                .unwrap()
+                .symbols
+                .is_empty()
         );
     }
 

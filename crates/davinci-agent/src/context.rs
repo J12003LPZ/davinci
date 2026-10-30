@@ -259,27 +259,52 @@ pub const MAX_INSTRUCTION_TOTAL_BYTES: u64 = 1024 * 1024;
 /// [`MAX_INSTRUCTION_FILE_BYTES`], or it has more than one hard link and may
 /// alias a file outside the checkout. Instruction files are mandatory prompt
 /// context, so the caller refuses the turn rather than dropping them.
-fn read_instruction_file(path: &Path) -> Result<Option<String>, String> {
+///
+/// `allow_linked` waives the hard-link refusal when the caller is authorized
+/// to read outside the workspace anyway. `allowance` is how many bytes the
+/// total budget still has: the read stops there, so a file is never held in
+/// memory beyond what the budget could admit.
+fn read_instruction_file(
+    path: &Path,
+    allow_linked: bool,
+    allowance: u64,
+) -> Result<Option<String>, String> {
     let Ok(mut file) = fs::File::open(path) else {
         return Ok(None);
     };
     if !file.metadata().is_ok_and(|meta| meta.is_file()) {
         return Ok(None);
     }
-    davinci_sys::fs::ensure_single_link(&file).map_err(|error| {
-        format!(
-            "Instruction file {} was not loaded: {error}. Replace it with a regular, singly linked file.",
-            path.display()
-        )
-    })?;
-    match davinci_sys::fs::read_bounded(&mut file, MAX_INSTRUCTION_FILE_BYTES) {
+    if !allow_linked {
+        davinci_sys::fs::ensure_single_link(&file).map_err(|error| {
+            format!(
+                "Instruction file {} was not loaded: {error}. Replace it with a regular, singly linked file.",
+                path.display()
+            )
+        })?;
+    }
+    let cap = allowance.min(MAX_INSTRUCTION_FILE_BYTES);
+    match davinci_sys::fs::read_bounded(&mut file, cap) {
         Ok(bytes) => Ok(String::from_utf8(bytes).ok()),
-        Err(error) if error.kind() == std::io::ErrorKind::FileTooLarge => Err(format!(
-            "Instruction file {} is larger than the {MAX_INSTRUCTION_FILE_BYTES} byte limit. Shrink it or move detail into nested AGENTS.md files.",
-            path.display()
-        )),
+        Err(error) if error.kind() == std::io::ErrorKind::FileTooLarge => {
+            Err(if cap < MAX_INSTRUCTION_FILE_BYTES {
+                total_limit_error(path)
+            } else {
+                format!(
+                    "Instruction file {} is larger than the {MAX_INSTRUCTION_FILE_BYTES} byte limit. Shrink it or move detail into nested AGENTS.md files.",
+                    path.display()
+                )
+            })
+        }
         Err(_) => Ok(None),
     }
+}
+
+fn total_limit_error(path: &Path) -> String {
+    format!(
+        "Instruction files total over the {MAX_INSTRUCTION_TOTAL_BYTES} byte limit once {} is read. Shrink them or move detail into nested AGENTS.md files.",
+        path.display()
+    )
 }
 
 /// Fail when the loaded on-disk instruction files together exceed
@@ -305,13 +330,29 @@ pub(crate) fn check_instruction_total(files: &[ContextFile]) -> Result<(), Strin
 ///
 /// A file that is over its size limit or hard-linked, or a set that is over
 /// the total limit, is an error naming the file and the limit.
+#[cfg(test)]
 pub fn load_context_files_checked(cwd: &Path, enabled: bool) -> Result<Vec<ContextFile>, String> {
+    load_context_files_checked_with(cwd, enabled, false)
+}
+
+/// [`load_context_files_checked`] for a caller whose permission policy already
+/// authorizes reading outside the workspace (`allow_linked`). Each read is
+/// bounded by what is left of the total budget and the first overflow stops
+/// the load, so at most the budget (plus one refused probe) is ever held.
+pub fn load_context_files_checked_with(
+    cwd: &Path,
+    enabled: bool,
+    allow_linked: bool,
+) -> Result<Vec<ContextFile>, String> {
     if !enabled {
         return Ok(Vec::new());
     }
     let mut files = Vec::new();
+    let mut used = 0u64;
     for path in instruction_chain(cwd) {
-        if let Some(body) = read_instruction_file(&path)? {
+        let allowance = MAX_INSTRUCTION_TOTAL_BYTES - used;
+        if let Some(body) = read_instruction_file(&path, allow_linked, allowance)? {
+            used += body.len() as u64;
             files.push(ContextFile {
                 path,
                 name: INSTRUCTION_FILE.to_string(),
@@ -329,10 +370,13 @@ pub fn load_context_files(cwd: &Path, enabled: bool) -> Vec<ContextFile> {
     if !enabled {
         return Vec::new();
     }
+    let mut used = 0u64;
     instruction_chain(cwd)
         .into_iter()
         .filter_map(|path| {
-            let body = read_instruction_file(&path).ok()??;
+            let body =
+                read_instruction_file(&path, false, MAX_INSTRUCTION_TOTAL_BYTES - used).ok()??;
+            used += body.len() as u64;
             Some(ContextFile {
                 path,
                 name: INSTRUCTION_FILE.to_string(),
@@ -400,12 +444,27 @@ pub(crate) fn is_plugin_context(file: &ContextFile) -> bool {
 /// `plugin:` pseudo-files) untouched. Returns whether any body changed, so a
 /// caller that sees `false` knows the system prompt is byte-identical. A file
 /// that can no longer be admitted keeps its last body and is an error.
+#[cfg(test)]
 pub(crate) fn reload_changed_context_files(
     files: &mut Vec<ContextFile>,
     stamps: &mut HashMap<PathBuf, FileStamp>,
 ) -> Result<bool, String> {
+    reload_changed_context_files_with(files, stamps, false)
+}
+
+pub(crate) fn reload_changed_context_files_with(
+    files: &mut Vec<ContextFile>,
+    stamps: &mut HashMap<PathBuf, FileStamp>,
+    allow_linked: bool,
+) -> Result<bool, String> {
     let mut changed = false;
     let mut refused = None;
+    // What the other loaded bodies already hold; a re-read may use the rest.
+    let mut held: u64 = files
+        .iter()
+        .filter(|file| !is_plugin_context(file))
+        .map(|file| file.body.len() as u64)
+        .sum();
     files.retain_mut(|file| {
         if is_plugin_context(file) {
             return true;
@@ -427,9 +486,12 @@ pub(crate) fn reload_changed_context_files(
         if stamps.get(&file.path) == Some(&stamp) && !is_racy(stamp.0) {
             return true;
         }
-        match read_instruction_file(&file.path) {
+        let others = held.saturating_sub(file.body.len() as u64);
+        let allowance = MAX_INSTRUCTION_TOTAL_BYTES.saturating_sub(others);
+        match read_instruction_file(&file.path, allow_linked, allowance) {
             Ok(Some(body)) => {
                 if body != file.body {
+                    held = others + body.len() as u64;
                     file.body = body;
                     changed = true;
                 }
@@ -448,17 +510,33 @@ pub(crate) fn reload_changed_context_files(
 /// files are inserted in chain order, ahead of `plugin:` pseudo-files.
 /// Returns whether any file was added; a created file that cannot be admitted
 /// is an error.
+#[cfg(test)]
 pub(crate) fn discover_created_context_files(
     files: &mut Vec<ContextFile>,
     stamps: &mut HashMap<PathBuf, FileStamp>,
     chain: &[PathBuf],
+) -> Result<bool, String> {
+    discover_created_context_files_with(files, stamps, chain, false)
+}
+
+pub(crate) fn discover_created_context_files_with(
+    files: &mut Vec<ContextFile>,
+    stamps: &mut HashMap<PathBuf, FileStamp>,
+    chain: &[PathBuf],
+    allow_linked: bool,
 ) -> Result<bool, String> {
     let mut added = false;
     for (rank, path) in chain.iter().enumerate() {
         if files.iter().any(|file| &file.path == path) || !path.is_file() {
             continue;
         }
-        let Some(body) = read_instruction_file(path)? else {
+        let held: u64 = files
+            .iter()
+            .filter(|file| !is_plugin_context(file))
+            .map(|file| file.body.len() as u64)
+            .sum();
+        let allowance = MAX_INSTRUCTION_TOTAL_BYTES.saturating_sub(held);
+        let Some(body) = read_instruction_file(path, allow_linked, allowance)? else {
             continue;
         };
         if let Some(stamp) = file_stamp(path) {
@@ -509,10 +587,20 @@ const EXCLUDED_INSTRUCTION_DIRS: [&str; 11] = [
 /// nearest existing directory of the target, outermost first. Empty when the
 /// target is outside the checkout of `cwd`. Paths are canonical. Files in
 /// `loaded` are left out before their bodies are read.
+#[cfg(test)]
 pub(crate) fn governing_instruction_files(
     cwd: &Path,
     target: &Path,
     loaded: &HashSet<PathBuf>,
+) -> Vec<ContextFile> {
+    governing_instruction_files_with(cwd, target, loaded, false)
+}
+
+pub(crate) fn governing_instruction_files_with(
+    cwd: &Path,
+    target: &Path,
+    loaded: &HashSet<PathBuf>,
+    allow_linked: bool,
 ) -> Vec<ContextFile> {
     let Some(root) = repository_root(cwd) else {
         return Vec::new();
@@ -581,7 +669,8 @@ pub(crate) fn governing_instruction_files(
                 return None;
             }
             // Nested files are advisory: one that cannot be admitted is skipped.
-            let body = read_instruction_file(&path).ok()??;
+            let body = read_instruction_file(&path, allow_linked, MAX_INSTRUCTION_FILE_BYTES)
+                .ok()??;
             Some(ContextFile {
                 path,
                 name: INSTRUCTION_FILE.to_string(),
@@ -1205,8 +1294,17 @@ mod tests {
     /// Run one prompt whose provider must never be reached; returns the error
     /// the turn was refused with and whether the provider was called.
     fn refused_turn(cwd: &Path) -> (String, bool) {
+        refused_turn_under(cwd, crate::ReadOutsideRootPolicy::Ask)
+    }
+
+    fn refused_turn_under(cwd: &Path, policy: crate::ReadOutsideRootPolicy) -> (String, bool) {
         let mut agent = crate::Agent::new("base");
         agent.cwd = cwd.to_path_buf();
+        agent
+            .permissions
+            .lock()
+            .unwrap()
+            .set_read_outside_root_policy(policy);
         agent.load_instruction_files(true);
         agent.prompt("go");
         let mut called = false;
@@ -1287,6 +1385,80 @@ mod tests {
         assert!(!called);
     }
 
+    /// Review finding 11: the total budget bounds what is held while loading,
+    /// not only what is reported afterwards. A deep chain of maximum-size files
+    /// stops at the first file that cannot fit.
+    #[test]
+    fn audit_wp01_b017_a_deep_chain_is_cut_off_at_the_total_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        checkout(dir.path());
+        let big = vec![b'z'; MAX_INSTRUCTION_FILE_BYTES as usize];
+        let mut cwd = dir.path().to_path_buf();
+        fs::write(cwd.join(INSTRUCTION_FILE), &big).unwrap();
+        for level in 0..39 {
+            cwd = cwd.join(format!("d{level}"));
+            fs::create_dir(&cwd).unwrap();
+            fs::write(cwd.join(INSTRUCTION_FILE), &big).unwrap();
+        }
+        // The primitive: the fifth file is read with an allowance of zero.
+        let path = cwd.join(INSTRUCTION_FILE);
+        let error = read_instruction_file(&path, false, 0).unwrap_err();
+        assert!(error.contains("total over the"), "{error}");
+        assert!(read_instruction_file(&path, false, 10).is_err());
+        let ok = read_instruction_file(&path, false, MAX_INSTRUCTION_FILE_BYTES).unwrap();
+        assert_eq!(ok.unwrap().len() as u64, MAX_INSTRUCTION_FILE_BYTES);
+
+        // The loader stops at the first overflow and names that file.
+        let error = load_context_files_checked(&cwd, true).unwrap_err();
+        assert!(error.contains("total over the"), "{error}");
+        assert!(error.contains("d3"), "stopped at the fifth file: {error}");
+        assert!(
+            !error.contains("d4"),
+            "later files were not touched: {error}"
+        );
+        // The lenient loader keeps what fit.
+        assert_eq!(load_context_files(&cwd, true).len(), 4);
+    }
+
+    /// Refresh and discovery respect the same budget.
+    #[test]
+    fn audit_wp01_b017_refresh_and_discovery_use_the_remaining_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        checkout(dir.path());
+        let big = vec![b'q'; MAX_INSTRUCTION_FILE_BYTES as usize];
+        let mut cwd = dir.path().to_path_buf();
+        fs::write(cwd.join(INSTRUCTION_FILE), &big).unwrap();
+        for level in 0..3 {
+            cwd = cwd.join(format!("d{level}"));
+            fs::create_dir(&cwd).unwrap();
+        }
+        // The chain is derived the way the agent derives it, so the loaded
+        // paths and the chain paths name files the same way.
+        let chain = instruction_chain(&cwd);
+        assert_eq!(chain.len(), 4);
+        for path in &chain[1..3] {
+            fs::write(path, &big).unwrap();
+        }
+        let mut files = load_context_files_checked(chain[2].parent().unwrap(), true).unwrap();
+        let mut stamps = HashMap::new();
+        assert_eq!(files.len(), 3);
+        // A fourth file appears; the budget (3 x cap used) leaves one more cap.
+        fs::write(&chain[3], &big).unwrap();
+        assert!(discover_created_context_files(&mut files, &mut stamps, &chain).unwrap());
+        assert_eq!(files.len(), 4);
+        // Growing the first file by a byte would push the set past the total.
+        let mut grown = big.clone();
+        grown.push(b'!');
+        fs::write(&chain[0], &grown).unwrap();
+        let held: u64 = files.iter().map(|f| f.body.len() as u64).sum();
+        assert_eq!(held, MAX_INSTRUCTION_TOTAL_BYTES);
+        let before = files[0].body.len();
+        // Over the per-file cap for the first file: refused, last body kept.
+        stamps.clear();
+        assert!(reload_changed_context_files(&mut files, &mut stamps).is_err());
+        assert_eq!(files[0].body.len(), before);
+    }
+
     #[test]
     fn audit_wp01_b001_a_hard_linked_instruction_file_is_not_loaded() {
         let dir = tempfile::tempdir().unwrap();
@@ -1302,6 +1474,21 @@ mod tests {
         let (error, called) = refused_turn(dir.path());
         assert!(error.contains("not loaded") && !called, "{error}");
         assert_eq!(fs::read_to_string(&canary).unwrap(), "outside secret");
+
+        // Review finding 6: the same linked file loads once the policy lets the
+        // agent read outside the workspace anyway.
+        let mut authorized = crate::Agent::new("base");
+        authorized.cwd = dir.path().to_path_buf();
+        authorized
+            .permissions
+            .lock()
+            .unwrap()
+            .set_read_outside_root_policy(crate::ReadOutsideRootPolicy::Allow);
+        authorized.load_instruction_files(true);
+        assert!(authorized.instruction_error.is_none());
+        assert_eq!(authorized.context_files.len(), 1);
+        assert_eq!(authorized.context_files[0].body, "outside secret");
+        assert!(load_context_files_checked_with(dir.path(), true, true).is_ok());
 
         // A single-link file still loads.
         let plain = tempfile::tempdir().unwrap();

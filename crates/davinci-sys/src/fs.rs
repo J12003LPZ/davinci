@@ -275,6 +275,115 @@ fn windows_identity(file: &fs::File) -> io::Result<FileIdentity> {
     })
 }
 
+/// The path an opened file or directory actually resolves to, as the
+/// operating system reports it for the handle (symlinks, junctions and
+/// renames already applied). Checking this on the handle that is read closes
+/// the gap between confining a path and opening it. `Unsupported` where the
+/// platform cannot say, so a protected caller can fail closed.
+pub fn final_path(file: &fs::File) -> io::Result<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+        use std::os::windows::ffi::OsStringExt;
+        use std::os::windows::io::AsRawHandle;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetFinalPathNameByHandleW(
+                file: *mut c_void,
+                path: *mut u16,
+                len: u32,
+                flags: u32,
+            ) -> u32;
+        }
+        let handle = file.as_raw_handle();
+        let mut buffer = vec![0u16; 512];
+        loop {
+            // SAFETY: `handle` is live and `buffer` has `len` writable units.
+            let written = unsafe {
+                GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0)
+            } as usize;
+            if written == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if written < buffer.len() {
+                buffer.truncate(written);
+                return Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+                    &buffer,
+                )));
+            }
+            buffer.resize(written + 1, 0);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let mut buffer = [0u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes a NUL-terminated path of at most PATH_MAX.
+        let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) };
+        if rc == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let end = buffer.iter().position(|b| *b == 0).unwrap_or(buffer.len());
+        Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+            &buffer[..end],
+        )))
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = file;
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
+/// Open a directory for inspection of its identity or final path. On Windows
+/// that needs backup semantics; a reparse point is opened as the link itself
+/// is not wanted, so one that resolves elsewhere shows in [`final_path`].
+pub fn open_directory(path: &Path) -> io::Result<fs::File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::File::open(path)
+    }
+}
+
+/// [`open_directory`] that also forbids deleting or renaming the directory (or
+/// any ancestor) while the handle is open. A caller that checks a directory's
+/// identity and then acts on its pathname holds this across both steps, so the
+/// name cannot be pointed at another directory in between. Where the platform
+/// has no such sharing mode the handle is a plain one and the caller must
+/// re-check identity after acting.
+pub fn open_directory_pinned(path: &Path) -> io::Result<fs::File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::File::open(path)
+    }
+}
+
 /// Why [`ensure_single_link`] refused a file: it is named by `0` entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HardLinked(pub u64);
@@ -652,6 +761,30 @@ mod tests {
         line.clear();
         assert_eq!(read_line_bounded(&mut exact, &mut line, 7).unwrap(), 8);
         assert_eq!(line, b"1234567");
+    }
+
+    #[test]
+    fn audit_wp01_final_path_names_the_object_the_handle_reached() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let handle = fs::File::open(&file).unwrap();
+        let real = final_path(&handle).unwrap();
+        assert_eq!(real, std::fs::canonicalize(&file).unwrap());
+        let directory = open_directory(dir.path()).unwrap();
+        assert_eq!(
+            final_path(&directory).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+        // A rename after opening is followed by the handle, not by the old name.
+        let moved = dir.path().join("b.txt");
+        std::fs::rename(&file, &moved).unwrap_or(());
+        if moved.exists() {
+            assert_eq!(
+                final_path(&handle).unwrap(),
+                std::fs::canonicalize(&moved).unwrap()
+            );
+        }
     }
 
     #[test]

@@ -102,20 +102,36 @@ pub fn set_own_process_group(command: &mut Command) {
 }
 
 /// `git` for inspecting a repository the user does not fully trust. Repository
-/// config can name programs (`core.fsmonitor`), so `core.fsmonitor` is forced
-/// off, system and global config are replaced by the null file, and inherited
-/// environment overrides that inject config or reroute the repository are
-/// removed. Discovery from the working directory and the normal index are kept.
-/// Callers add their own `current_dir`, arguments and, if they need one,
-/// `GIT_INDEX_FILE` (set after this call, so it wins).
+/// config can name programs, so the ones Git would start on its own are turned
+/// off: `core.fsmonitor`, hooks (`core.hooksPath` is the null file, which also
+/// stops `post-index-change` after a status refresh), the user and system
+/// attributes files, lazy fetching of missing objects, and every transport.
+/// System and global config are replaced by the null file, and inherited
+/// environment overrides that inject config, reroute the repository or its
+/// objects, or change the visible refs are removed. Discovery from the working
+/// directory and the normal index are kept. Callers add their own
+/// `current_dir`, arguments and, if they need one, `GIT_INDEX_FILE` (set after
+/// this call, so it wins).
+///
+/// What this does not stop: a clean/smudge/process filter that the repository's
+/// own `.git/config` defines and its attributes select. Git has no switch for
+/// "every filter", so inspecting a repository whose `.git` is hostile still
+/// needs a sandbox or an in-process implementation. Do not describe this
+/// constructor as safe execution for such a repository.
 pub fn isolated_git_command() -> Command {
+    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
     let mut command = Command::new("git");
     command.args([
         "-c",
         "safe.bareRepository=explicit",
         "-c",
         "core.fsmonitor=false",
+        "-c",
     ]);
+    command.arg(format!("core.hooksPath={null}"));
+    command.arg("-c");
+    command.arg(format!("core.attributesFile={null}"));
+    command.args(["-c", "protocol.allow=never"]);
     for (key, _) in std::env::vars_os() {
         let Some(key_str) = key.to_str() else {
             continue;
@@ -132,13 +148,20 @@ pub fn isolated_git_command() -> Command {
         "GIT_WORK_TREE",
         "GIT_INDEX_FILE",
         "GIT_EXTERNAL_DIFF",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
     ] {
         command.env_remove(name);
     }
-    command.env("GIT_CONFIG_NOSYSTEM", "1").env(
-        "GIT_CONFIG_GLOBAL",
-        if cfg!(windows) { "NUL" } else { "/dev/null" },
-    );
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null)
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "");
     command
 }
 
@@ -686,7 +709,19 @@ mod tests {
                 "-c",
                 "safe.bareRepository=explicit",
                 "-c",
-                "core.fsmonitor=false"
+                "core.fsmonitor=false",
+                "-c",
+                &format!(
+                    "core.hooksPath={}",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" }
+                ),
+                "-c",
+                &format!(
+                    "core.attributesFile={}",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" }
+                ),
+                "-c",
+                "protocol.allow=never",
             ]
             .map(OsStr::new)
         );
@@ -706,8 +741,180 @@ mod tests {
             "GIT_DIR",
             "GIT_WORK_TREE",
             "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
         ] {
             assert_eq!(envs[OsStr::new(removed)], None, "{removed} must be removed");
         }
+        for (name, value) in [
+            ("GIT_ATTR_NOSYSTEM", "1"),
+            ("GIT_OPTIONAL_LOCKS", "0"),
+            ("GIT_NO_LAZY_FETCH", "1"),
+            ("GIT_ALLOW_PROTOCOL", ""),
+        ] {
+            assert_eq!(envs[OsStr::new(name)], Some(OsStr::new(value)), "{name}");
+        }
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+        let mut command = Command::new("git");
+        command
+            .current_dir(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        let output = command.output().expect("git is available");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn commit_repo(dir: &std::path::Path, content: &str) -> String {
+        git_in(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("f.txt"), content).unwrap();
+        git_in(dir, &["add", "."]);
+        git_in(dir, &["commit", "-q", "-m", "c"]);
+        git_in(dir, &["rev-parse", "HEAD"])
+    }
+
+    /// Serializes tests that edit this process's `GIT_*` environment.
+    static GIT_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Review finding 1 (environment half): inherited repository-routing
+    /// variables must not change which repository is inspected. The assertions
+    /// read the repository's actual revision and status, not the command.
+    #[test]
+    fn audit_wp01_isolated_git_ignores_a_hostile_inherited_environment() {
+        let _guard = GIT_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let victim = tempfile::tempdir().unwrap();
+        let decoy = tempfile::tempdir().unwrap();
+        let victim_head = commit_repo(victim.path(), "one\n");
+        let decoy_head = commit_repo(decoy.path(), "decoy\n");
+        assert_ne!(victim_head, decoy_head);
+        std::fs::write(victim.path().join("f.txt"), "changed\n").unwrap();
+
+        // GIT_COMMON_DIR only matters beside GIT_DIR, which is stripped too; the
+        // two below change what a plain `git` resolves from the same directory.
+        let names = [
+            (
+                "GIT_OBJECT_DIRECTORY",
+                decoy.path().join(".git").join("objects"),
+            ),
+            ("GIT_NAMESPACE", std::path::PathBuf::from("hostile")),
+        ];
+        // Control: the hostile environment does change plain Git's answer.
+        for (name, value) in &names {
+            std::env::set_var(name, value);
+        }
+        let plain = Command::new("git")
+            .current_dir(victim.path())
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .args(["rev-parse", "--verify", "-q", "refs/heads/main^{commit}"])
+            .output()
+            .unwrap();
+        let plain_head = String::from_utf8_lossy(&plain.stdout).trim().to_owned();
+        let isolated_head = isolated_git_command()
+            .current_dir(victim.path())
+            .args(["rev-parse", "--verify", "-q", "refs/heads/main^{commit}"])
+            .output()
+            .unwrap();
+        let isolated_status = isolated_git_command()
+            .current_dir(victim.path())
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        for (name, _) in &names {
+            std::env::remove_var(name);
+        }
+        assert_ne!(
+            plain_head, victim_head,
+            "control: the hostile environment must change plain git's answer"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&isolated_head.stdout).trim(),
+            victim_head
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&isolated_status.stdout).trim(),
+            "M f.txt"
+        );
+    }
+
+    /// Review finding 1 (hook half): a `post-index-change` hook runs when a
+    /// status refresh writes the index. It must not under the isolated command,
+    /// and must under plain Git, or the canary proves nothing.
+    #[test]
+    fn audit_wp01_isolated_git_does_not_run_repository_hooks() {
+        let repo = tempfile::tempdir().unwrap();
+        commit_repo(repo.path(), "one\n");
+        let hooks = repo.path().join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let marker = repo.path().join("hook-ran");
+        let hook = hooks.join("post-index-change");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\necho ran > '{}'\n",
+                marker.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let stale = |dir: &std::path::Path| {
+            // A same-length rewrite makes the stat data stale so status must
+            // refresh and write the index.
+            std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+            let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+            let file = std::fs::File::options()
+                .write(true)
+                .open(dir.join("f.txt"))
+                .unwrap();
+            file.set_modified(later).unwrap();
+        };
+
+        stale(repo.path());
+        let isolated = isolated_git_command()
+            .current_dir(repo.path())
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(isolated.status.success(), "{isolated:?}");
+        assert!(
+            !marker.exists(),
+            "the repository hook ran under the isolated command"
+        );
+
+        // Positive control: plain Git runs the hook for the same repository.
+        stale(repo.path());
+        let plain = Command::new("git")
+            .current_dir(repo.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(plain.status.success(), "{plain:?}");
+        assert!(
+            marker.exists(),
+            "control: plain git must run post-index-change"
+        );
     }
 }

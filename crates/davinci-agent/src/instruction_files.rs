@@ -26,14 +26,24 @@ use davinci_ai::{ChatMessage, MessageContent};
 use serde_json::Value;
 
 use crate::context::{
-    self, check_instruction_total, discover_created_context_files, file_stamp,
-    governing_instruction_files, is_plugin_context, reload_changed_context_files,
+    self, check_instruction_total, discover_created_context_files_with, file_stamp,
+    governing_instruction_files_with, is_plugin_context, reload_changed_context_files_with,
     render_nested_instructions, NESTED_INSTRUCTIONS_CUSTOM_TYPE,
 };
 use crate::prompt::manifest::hash_text;
 use crate::Agent;
 
 impl Agent {
+    /// Whether the current permission policy already lets this agent read
+    /// outside the workspace, which is what makes a hard-linked file readable.
+    /// A poisoned lock fails closed.
+    pub(crate) fn linked_files_allowed(&self) -> bool {
+        self.permissions
+            .lock()
+            .map(|policy| policy.linked_files_allowed())
+            .unwrap_or(false)
+    }
+
     /// Load the repository instruction files for `cwd` and arm the
     /// request-boundary upkeep (edit refresh, nested delivery). `enabled` is
     /// the host's no-context-files switch: when false nothing is loaded now
@@ -43,7 +53,11 @@ impl Agent {
         self.instruction_files_enabled = enabled;
         // A file that cannot be admitted leaves the set empty and the error
         // standing: the next request is refused until it is fixed.
-        let loaded = context::load_context_files_checked(&self.cwd, enabled);
+        let loaded = context::load_context_files_checked_with(
+            &self.cwd,
+            enabled,
+            self.linked_files_allowed(),
+        );
         self.instruction_error = loaded.as_ref().err().cloned();
         self.context_files = loaded.unwrap_or_default();
         self.context_file_stamps = self
@@ -66,16 +80,21 @@ impl Agent {
             return;
         }
         let mut error = None;
-        let edited =
-            reload_changed_context_files(&mut self.context_files, &mut self.context_file_stamps)
-                .unwrap_or_else(|refused| {
-                    error = Some(refused);
-                    false
-                });
-        let created = discover_created_context_files(
+        let allow_linked = self.linked_files_allowed();
+        let edited = reload_changed_context_files_with(
+            &mut self.context_files,
+            &mut self.context_file_stamps,
+            allow_linked,
+        )
+        .unwrap_or_else(|refused| {
+            error = Some(refused);
+            false
+        });
+        let created = discover_created_context_files_with(
             &mut self.context_files,
             &mut self.context_file_stamps,
             &self.instruction_chain,
+            allow_linked,
         )
         .unwrap_or_else(|refused| {
             error.get_or_insert(refused);
@@ -106,7 +125,12 @@ impl Agent {
         let mut fresh = Vec::new();
         for target in &targets {
             // A delivered file is still read: an edit shows only in its hash.
-            for file in governing_instruction_files(&self.cwd, Path::new(target), &loaded) {
+            for file in governing_instruction_files_with(
+                &self.cwd,
+                Path::new(target),
+                &loaded,
+                self.linked_files_allowed(),
+            ) {
                 let key = file.path.to_string_lossy().into_owned();
                 if file.body.trim().is_empty()
                     || !seen.insert(key.clone())

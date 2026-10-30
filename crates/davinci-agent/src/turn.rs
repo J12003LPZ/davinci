@@ -3006,6 +3006,7 @@ Issue the call again if it is still needed.";
                     .map(|c| c.task_id)
                     .unwrap_or_default();
 
+                let allow_linked = self.linked_files_allowed();
                 let coordinated = crate::tools::is_coordinated_mutation(name);
                 // Without a task contract the captures only serve prompt
                 // rewind, which degrades instead of refusing the edit.
@@ -3021,7 +3022,14 @@ Issue the call again if it is still needed.";
                         }
                         Some(runtime) => match targets
                             .iter()
-                            .map(|target| runtime.blob_store.capture_file(task_id, cwd, target))
+                            .map(|target| {
+                                runtime.blob_store.capture_file_with(
+                                    task_id,
+                                    cwd,
+                                    target,
+                                    allow_linked,
+                                )
+                            })
                             .collect::<Result<Vec<_>, _>>()
                         {
                             Ok(captures) => captures,
@@ -3055,6 +3063,7 @@ Issue the call again if it is still needed.";
                         .map(|operations| operations.with_parent_operation(parent));
                 }
                 context.tool_call_id = Some(id.to_owned());
+                context.linked_files_allowed = allow_linked;
                 context.command_receipt = matches!(name, "bash" | "powershell" | "exec_command")
                     .then(|| {
                         let capture = crate::command_receipt::CommandReceiptCapture::new(
@@ -3277,7 +3286,12 @@ Issue the call again if it is still needed.";
                 if mutating && !executed.is_error {
                     if let Some(runtime) = &self.runtime {
                         for pre in preimages {
-                            match runtime.blob_store.capture_file(task_id, cwd, &pre.path) {
+                            match runtime.blob_store.capture_file_with(
+                                task_id,
+                                cwd,
+                                &pre.path,
+                                allow_linked,
+                            ) {
                                 Ok(post) => {
                                     let kind = if !pre.exists && post.exists {
                                         crate::runtime::effects::FileEffectKind::Created

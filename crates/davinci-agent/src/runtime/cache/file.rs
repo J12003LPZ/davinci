@@ -19,7 +19,7 @@ pub fn read_current_file(
     max_bytes: usize,
     authorize: impl Fn() -> Result<(), CacheError>,
 ) -> Result<FileSnapshot, CacheError> {
-    let mut snapshot = read_bytes(root, relative, max_bytes, &authorize)?;
+    let mut snapshot = read_bytes(root, relative, max_bytes, false, &authorize)?;
     snapshot.content_hash = digest(&snapshot.bytes);
     Ok(snapshot)
 }
@@ -34,7 +34,22 @@ impl CacheRuntime {
         max_bytes: usize,
         authorize: impl Fn() -> Result<(), CacheError>,
     ) -> Result<FileSnapshot, CacheError> {
-        let mut snapshot = read_bytes(root, relative, max_bytes, &authorize)?;
+        self.read_current_file_with(root, relative, max_bytes, false, authorize)
+    }
+
+    /// [`Self::read_current_file`] for a caller whose policy authorizes reading
+    /// outside the workspace (`allow_linked`), so a hard-linked file is
+    /// readable. Otherwise the link count is checked on the very handle that
+    /// supplies the bytes, never on an earlier open of the same name.
+    pub fn read_current_file_with(
+        &self,
+        root: &Path,
+        relative: &Path,
+        max_bytes: usize,
+        allow_linked: bool,
+        authorize: impl Fn() -> Result<(), CacheError>,
+    ) -> Result<FileSnapshot, CacheError> {
+        let mut snapshot = read_bytes(root, relative, max_bytes, allow_linked, &authorize)?;
         self.record_source_read(CacheNamespace::File, snapshot.bytes.len());
         let request = CacheRequest::new(
             CacheKey::new(
@@ -66,6 +81,7 @@ fn read_bytes(
     root: &Path,
     relative: &Path,
     max_bytes: usize,
+    allow_linked: bool,
     authorize: impl Fn() -> Result<(), CacheError>,
 ) -> Result<FileSnapshot, CacheError> {
     authorize()?;
@@ -85,6 +101,10 @@ fn read_bytes(
     let dir = Directory::open(parent, false).map_err(|_| CacheError::Denied)?;
     let file = dir.source_file(name).map_err(|_| CacheError::Denied)?;
     let metadata = file.metadata().map_err(|_| CacheError::Denied)?;
+    if !allow_linked && metadata.is_file() {
+        // Refused before one source byte is read or counted.
+        davinci_sys::fs::ensure_single_link(&file).map_err(|_| CacheError::Denied)?;
+    }
     if metadata.len() > max_bytes as u64 {
         return Err(CacheError::Compute("file exceeds cache read limit".into()));
     }

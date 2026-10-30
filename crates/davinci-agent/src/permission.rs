@@ -1028,6 +1028,14 @@ impl PermissionPolicy {
         self.filesystem_boundary.read_outside_root = policy;
     }
 
+    /// Whether reads may follow a hard link out of the workspace. The link
+    /// refusal exists because a path check cannot see the other name; once the
+    /// policy lets the agent read outside the workspace anyway, refusing the
+    /// link protects nothing and only makes the grant ineffective.
+    pub fn linked_files_allowed(&self) -> bool {
+        self.filesystem_boundary.read_outside_root == ReadOutsideRootPolicy::Allow
+    }
+
     pub fn is_git_metadata_call(&self, tool: &str, args: &Value, cwd: &Path) -> bool {
         if !self.filesystem_boundary.allow_git_metadata {
             return false;
@@ -1196,10 +1204,12 @@ impl PermissionPolicy {
                     }
                 }
             };
-        if let Some(reason) =
-            linked_read_denial(tool, args, cwd, self.filesystem_boundary.root.as_deref())
-        {
-            return PermissionVerdict::Deny { reason };
+        if !self.linked_files_allowed() {
+            if let Some(reason) =
+                linked_read_denial(tool, args, cwd, self.filesystem_boundary.root.as_deref())
+            {
+                return PermissionVerdict::Deny { reason };
+            }
         }
         let (subject, outside_project) = if targets.is_empty() {
             subject_of_with_boundary(tool, args, cwd, Some(&self.filesystem_boundary))
