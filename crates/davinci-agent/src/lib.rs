@@ -69,13 +69,13 @@ pub use branch::{
 pub use compaction::{
     branch_summary_context_message, build_history_prompt, calculate_context_tokens,
     compact_messages, compact_messages_with, compact_messages_with_options,
-    compact_messages_with_summary, compaction_context_message, compaction_context_message_carrying,
-    compaction_summary_meta, compaction_threshold, compute_file_lists, convert_to_llm,
-    env_summarizer, estimate_context_tokens, estimate_tokens, extract_file_ops, find_cut_point,
-    format_file_operations, generate_summary_with_usage, get_summarization_failure,
-    serialize_conversation, should_compact, CompactionDetails, CompactionResult,
-    CompactionSettings, CompactionThreshold, CutPointResult, FileOperations, SummarizeRequest,
-    SummarizeResponse, Summarizer, BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX,
+    compact_messages_with_summary, compact_messages_within, compaction_context_message,
+    compaction_context_message_carrying, compaction_summary_meta, compaction_threshold,
+    compute_file_lists, convert_to_llm, env_summarizer, estimate_context_tokens, estimate_tokens,
+    extract_file_ops, find_cut_point, format_file_operations, generate_summary_with_usage,
+    get_summarization_failure, serialize_conversation, should_compact, CompactionDetails,
+    CompactionResult, CompactionSettings, CompactionThreshold, CutPointResult, FileOperations,
+    SummarizeRequest, SummarizeResponse, Summarizer, BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX,
     COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, CONTEXT_VM_FOLD_PROMPT,
     CONTEXT_VM_FOLD_SYSTEM_PROMPT, DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_RESERVE_TOKENS,
     SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT,
@@ -5605,7 +5605,10 @@ impl Agent {
                 .with_input_budget(budget)
             });
             let observations = self.provider_observation_scope("compaction");
-            let result = compact_messages_with_options(
+            // The user requirements a summary carries are never truncated, so
+            // the replacement is admitted against the context that is left.
+            let max_tokens = (window > 0).then(|| self.hybrid_replacement_budget(true));
+            let result = crate::compaction::compact_messages_within(
                 &self.messages,
                 custom_instructions,
                 self.compaction.keep_recent_tokens,
@@ -5614,6 +5617,7 @@ impl Agent {
                     .as_ref()
                     .map(|(text, meta)| crate::compaction::PreviousSummary { text, meta }),
                 bound.as_ref(),
+                max_tokens,
             );
             self.finish_auxiliary_observations(
                 observations,
