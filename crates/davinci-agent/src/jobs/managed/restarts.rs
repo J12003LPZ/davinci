@@ -81,13 +81,16 @@ pub(super) fn callback(
 }
 
 fn finish_shared(shared: &Shared, exit: &ProcessExit) {
+    // The supervisor has reaped the process and completed cleanup. Release its
+    // workspace ownership before publishing the terminal status: consumers may
+    // immediately start another writer when they observe an exited job.
+    shared.release_shared_write();
+    *shared.finished_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     *shared.status.lock().unwrap_or_else(|e| e.into_inner()) = if exit.stopped {
         JobStatus::Killed
     } else {
         JobStatus::Exited(exit.code.unwrap_or(-1))
     };
-    *shared.finished_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
-    shared.release_shared_write();
 }
 
 fn finish(shared: &Shared, record: &Record, mut exit: ProcessExit) {
@@ -249,4 +252,67 @@ pub(super) fn supervise(
             job.pid = next.child_pid();
         };
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::supervisor::{ProcessIdentity, ProcessLaunchState};
+    use std::sync::Barrier;
+
+    #[test]
+    fn exit_status_is_not_published_until_shared_write_is_released() {
+        let runtime = crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        );
+        let lease = runtime.team.acquire_shared_write(None).unwrap();
+        lease.hand_to_job(1, "test process");
+        let shared = Arc::new(Shared {
+            status: Mutex::new(JobStatus::Running),
+            workspace_write: Mutex::new((false, Some(lease))),
+            output: Mutex::new(OutputBuffer::default()),
+            child: Mutex::new(None),
+            stdin: Mutex::new(None),
+            finished_at: Mutex::new(None),
+            supports_stdin: false,
+            supervisor: Mutex::new(None),
+        });
+        // Hold the release lock to expose the terminal-status publication race.
+        let held_release = shared.workspace_write.lock().unwrap();
+        let started = Arc::new(Barrier::new(2));
+        let callback_shared = Arc::clone(&shared);
+        let callback_started = Arc::clone(&started);
+        let finisher = std::thread::spawn(move || {
+            callback_started.wait();
+            finish_shared(
+                &callback_shared,
+                &ProcessExit {
+                    identity: ProcessIdentity {
+                        operation: None,
+                        lifetime: uuid::Uuid::new_v4(),
+                    },
+                    launch_state: ProcessLaunchState::Exited,
+                    sandbox: None,
+                    code: Some(0),
+                    stopped: false,
+                    error: None,
+                    output_complete: true,
+                },
+            );
+        });
+        started.wait();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            *shared.status.lock().unwrap(),
+            JobStatus::Running,
+            "terminal job status was visible while workspace release was blocked"
+        );
+
+        drop(held_release);
+        finisher.join().unwrap();
+        assert_eq!(*shared.status.lock().unwrap(), JobStatus::Exited(0));
+        assert!(runtime.team.acquire_shared_write(None).is_ok());
+    }
 }
