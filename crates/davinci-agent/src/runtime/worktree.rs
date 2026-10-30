@@ -405,13 +405,11 @@ impl WorktreeManager {
     ///
     /// A failing `git status` or `rev-parse` is an error, never "clean":
     /// treating unreadable state as clean let a forced cleanup delete
-    /// uncommitted work. Commits made in the worktree count as integrated once
-    /// they are reachable from the repository's current HEAD (the branch they
-    /// were merged into), or once every one of their patches already exists
-    /// there (rebase, cherry-pick or squash). Comparing against the lease's
-    /// recorded `base_head` instead made every worker commit look unmerged
-    /// forever, since a commit made after the lease is never an ancestor of
-    /// the commit the lease started from.
+    /// uncommitted work. Commits count as integrated once reachable from
+    /// the repository's current HEAD, or when virtually merging the worker
+    /// produces exactly the same tree as HEAD. Patch-ID equivalence is unsafe:
+    /// `git cherry` ignores whitespace and merge-only edits. A worker that
+    /// still points to its original `base_head` has no new committed work.
     pub fn check_dirty(&self, lease: &WorktreeLease) -> Result<bool, WorktreeError> {
         if !lease.path.exists() {
             return Ok(false);
@@ -433,9 +431,26 @@ impl WorktreeManager {
         if integrated {
             return Ok(false);
         }
-        // Not an ancestor: still integrated if every patch already landed.
-        let cherry = run_git(&self.repo_root, &["cherry", "HEAD", &current_head])?;
-        Ok(cherry.lines().any(|line| line.starts_with('+')))
+        // Patch IDs used by `git cherry` ignore whitespace and merge-only
+        // changes. Instead, compute the exact result of merging the worker
+        // HEAD into the main checkout. Only a byte-identical tree proves that
+        // cleanup cannot discard committed work. A conflict or unsupported Git
+        // command is ambiguous and must preserve the worker worktree.
+        let merged_tree = match run_git(
+            &self.repo_root,
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--no-messages",
+                "HEAD",
+                &current_head,
+            ],
+        ) {
+            Ok(tree) => tree,
+            Err(_) => return Ok(true),
+        };
+        let main_tree = run_git(&self.repo_root, &["rev-parse", "HEAD^{tree}"])?;
+        Ok(merged_tree != main_tree)
     }
 
     /// Release an existing worktree lease.
@@ -447,11 +462,10 @@ impl WorktreeManager {
         // The manager's record is the authority, not the caller's struct: a
         // newer lease on the same path must survive a stale holder's release,
         // even a forced one.
-        if leases
-            .get(&lease.path)
-            .is_some_and(|recorded| recorded != lease)
-        {
-            return Err(WorktreeError::StaleLease(lease.path.clone()));
+        match leases.get(&lease.path) {
+            Some(recorded) if recorded == lease => {}
+            Some(_) => return Err(WorktreeError::StaleLease(lease.path.clone())),
+            None => return Err(WorktreeError::LeaseNotFound(lease.path.clone())),
         }
         // Unreadable state preserves the worktree unless the caller forces.
         let dirty = match self.check_dirty(lease) {
@@ -472,19 +486,25 @@ impl WorktreeManager {
             .ok_or_else(|| WorktreeError::IoError("Worktree path is not valid unicode".into()))?;
 
         if lease.path.exists() {
-            let _ = run_git(
+            // Do not bypass Git's worktree locks or erase a directory that Git
+            // refused to remove. Keep the lease on any failed cleanup so it
+            // can be inspected and retried safely.
+            run_git(
                 &self.repo_root,
                 &["worktree", "remove", "--force", wt_path_str],
-            );
-            // In case git worktree remove left artifacts, cleanup directory
+            )?;
             if lease.path.exists() {
-                let _ = std::fs::remove_dir_all(&lease.path);
+                return Err(WorktreeError::GitError(format!(
+                    "git removed the worktree registration but {} still exists",
+                    lease.path.display()
+                )));
             }
         }
 
-        // Delete branch if it starts with default prefix and force is true or clean
+        // A failed branch removal is not a successful release: keep the
+        // record so the owner can reconcile the incomplete cleanup.
         if lease.branch.starts_with("davinci/agent/") {
-            let _ = run_git(&self.repo_root, &["branch", "-D", &lease.branch]);
+            run_git(&self.repo_root, &["branch", "-D", &lease.branch])?;
         }
 
         // Remove from leases, then unlock before invoking subscribers.
@@ -949,5 +969,116 @@ mod tests {
         git_in(repo_dir.path(), &["commit", "-m", "squashed"]);
         assert!(!manager.is_dirty(&lease));
         manager.release_lease(&lease, false).unwrap();
+    }
+
+    #[test]
+    fn unregistered_lease_cannot_delete_another_managers_worktree() {
+        let repo = init_temp_git_repo();
+        let trees = tempdir().unwrap();
+        let owner = WorktreeManager::new(repo.path(), trees.path());
+        let stranger = WorktreeManager::new(repo.path(), trees.path());
+        let lease = owner
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        let err = stranger.release_lease(&lease, true).unwrap_err();
+        assert_eq!(err, WorktreeError::LeaseNotFound(lease.path.clone()));
+        assert!(lease.path.join("README.md").exists());
+        assert_eq!(owner.get_lease(&lease.path), Some(lease.clone()));
+        owner.release_lease(&lease, false).unwrap();
+    }
+
+    #[test]
+    fn locked_worktree_cannot_be_removed_even_with_force() {
+        let repo = init_temp_git_repo();
+        let trees = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo.path(), trees.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        let worktree = lease.path.to_str().unwrap();
+        git_in(repo.path(), &["worktree", "lock", worktree]);
+        let err = manager.release_lease(&lease, true).unwrap_err();
+        assert!(matches!(err, WorktreeError::GitError(_)), "{err:?}");
+        assert!(lease.path.join("README.md").exists());
+        assert_eq!(manager.get_lease(&lease.path), Some(lease.clone()));
+        git_in(repo.path(), &["worktree", "unlock", worktree]);
+        manager.release_lease(&lease, false).unwrap();
+    }
+
+    #[test]
+    fn merge_only_changes_are_preserved_even_if_every_non_merge_patch_landed() {
+        let repo = init_temp_git_repo();
+        let trees = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo.path(), trees.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        git_in(&lease.path, &["config", "user.name", "w"]);
+        git_in(&lease.path, &["config", "user.email", "w@x"]);
+
+        git_in(&lease.path, &["checkout", "-b", "side"]);
+        std::fs::write(lease.path.join("side.txt"), "side\n").unwrap();
+        git_in(&lease.path, &["add", "side.txt"]);
+        git_in(&lease.path, &["commit", "-m", "side patch"]);
+        let side = run_git(&lease.path, &["rev-parse", "HEAD"]).unwrap();
+
+        git_in(&lease.path, &["checkout", &lease.branch]);
+        std::fs::write(lease.path.join("worker.txt"), "worker\n").unwrap();
+        git_in(&lease.path, &["add", "worker.txt"]);
+        git_in(&lease.path, &["commit", "-m", "worker patch"]);
+        let worker = run_git(&lease.path, &["rev-parse", "HEAD"]).unwrap();
+
+        git_in(
+            &lease.path,
+            &["merge", "--no-ff", "-m", "worker merge", "side"],
+        );
+        std::fs::write(lease.path.join("merge-only.txt"), "unique merge change\n").unwrap();
+        git_in(&lease.path, &["add", "merge-only.txt"]);
+        git_in(&lease.path, &["commit", "--amend", "--no-edit"]);
+
+        git_in(repo.path(), &["cherry-pick", &worker]);
+        git_in(repo.path(), &["cherry-pick", &side]);
+        assert!(!repo.path().join("merge-only.txt").exists());
+        assert!(
+            manager.is_dirty(&lease),
+            "merge-only edits must survive cleanup"
+        );
+        assert!(matches!(
+            manager.release_lease(&lease, false),
+            Err(WorktreeError::DirtyWorktreePreserved { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(lease.path.join("merge-only.txt")).unwrap(),
+            "unique merge change\n"
+        );
+        manager.release_lease(&lease, true).unwrap();
+    }
+
+    #[test]
+    fn whitespace_different_patch_is_not_equivalent_for_cleanup() {
+        let repo = init_temp_git_repo();
+        let trees = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo.path(), trees.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        git_in(&lease.path, &["config", "user.name", "w"]);
+        git_in(&lease.path, &["config", "user.email", "w@x"]);
+        std::fs::write(lease.path.join("README.md"), "# Main Repo\n\toutput\n").unwrap();
+        git_in(&lease.path, &["add", "README.md"]);
+        git_in(&lease.path, &["commit", "-m", "worker whitespace"]);
+        std::fs::write(repo.path().join("README.md"), "# Main Repo\n    output\n").unwrap();
+        git_in(repo.path(), &["add", "README.md"]);
+        git_in(repo.path(), &["commit", "-m", "main whitespace"]);
+        assert!(
+            manager.is_dirty(&lease),
+            "patch-id ignores whitespace differences"
+        );
+        assert!(matches!(
+            manager.release_lease(&lease, false),
+            Err(WorktreeError::DirtyWorktreePreserved { .. })
+        ));
+        assert!(lease.path.exists());
+        manager.release_lease(&lease, true).unwrap();
     }
 }
