@@ -3578,7 +3578,7 @@ fn rebind_print_extensions_rediscovers_skills_and_emits_session_start() {
         ..Args::default()
     };
     let mut host = ExtensionHost::default();
-    rebind_print_extensions(&parsed, &mut agent, &mut host);
+    rebind_print_extensions(&parsed, &mut agent, &mut host).unwrap();
     assert!(
         agent.skills.iter().any(|skill| skill.name == "demo"),
         "print-mode rebind should rediscover project skills: {:?}",
@@ -5848,7 +5848,7 @@ fn audit_wp05_b046_tools_allowlist_survives_late_registration() {
     let mut agent = build_agent(&parsed, &session_dir, &cwd).unwrap();
     assert_eq!(agent.tools, vec!["write".to_string()]);
     agent.apply_extension_tools(&["native_late".into()]);
-    apply_tool_admission(&parsed, &mut agent).unwrap();
+    apply_tool_admission(&parsed, &mut agent, None).unwrap();
     assert_eq!(agent.tools, vec!["write".to_string()]);
 
     let unknown = Args {
@@ -5874,7 +5874,7 @@ fn audit_wp05_b047_no_tools_covers_late_native_registration() {
     let mut agent = build_agent(&parsed, &session_dir, &cwd).unwrap();
     assert!(agent.tools.is_empty(), "{:?}", agent.tools);
     agent.apply_extension_tools(&["native_late".into(), "js_late".into()]);
-    apply_tool_admission(&parsed, &mut agent).unwrap();
+    apply_tool_admission(&parsed, &mut agent, None).unwrap();
     assert!(agent.tools.is_empty(), "{:?}", agent.tools);
 }
 
@@ -5892,7 +5892,7 @@ fn audit_wp05_b048_excluded_native_tools_stay_uncallable() {
     };
     let mut agent = build_agent(&parsed, &session_dir, &cwd).unwrap();
     agent.apply_extension_tools(&["native_late".into(), "other".into()]);
-    apply_tool_admission(&parsed, &mut agent).unwrap();
+    apply_tool_admission(&parsed, &mut agent, None).unwrap();
     assert!(!agent.tools.iter().any(|name| name == "native_late"));
     assert!(agent.tools.iter().any(|name| name == "other"));
 }
@@ -5915,4 +5915,41 @@ fn audit_wp05_b049_structured_denials_count_for_fail_on_denied() {
     assert_eq!(denied[0]["action"], "write");
     assert_eq!(denied[0]["target"], "outside.txt");
     assert_eq!(denied[0]["permission_mode"], "read-only");
+}
+
+#[test]
+fn audit_review_default_tools_allowlist_survives_reload_and_syncs_authorization() {
+    let mut agent = davinci_agent::Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+    agent.tools = vec!["read".into(), "native_late".into()];
+    agent.tool_registry = vec!["read".into(), "native_late".into()];
+    let defaults = vec!["read".to_string()];
+    let parsed = Args::default();
+    apply_tool_admission(&parsed, &mut agent, Some(&defaults)).unwrap();
+    assert_eq!(agent.tools, vec!["read".to_string()]);
+    let authorized = agent
+        .tool_context
+        .authorized_tools
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone();
+    assert_eq!(
+        authorized.into_iter().collect::<Vec<_>>(),
+        vec!["read".to_string()]
+    );
+
+    // A reload adds another tool, then admission must both filter it and
+    // rebuild the shared authorization view.
+    agent.apply_extension_tools(&["js_late".into()]);
+    apply_tool_admission(&parsed, &mut agent, Some(&defaults)).unwrap();
+    assert_eq!(agent.tools, vec!["read".to_string()]);
+    let authorized = agent
+        .tool_context
+        .authorized_tools
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone();
+    assert_eq!(
+        authorized.into_iter().collect::<Vec<_>>(),
+        vec!["read".to_string()]
+    );
 }

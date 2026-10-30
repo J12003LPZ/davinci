@@ -11,6 +11,9 @@ pub fn find_symbol_in_types(
     symbol: &str,
 ) -> Result<PackageSymbolResult, String> {
     let mut warnings = Vec::new();
+    if symbol.trim().is_empty() {
+        return Err("symbol must not be empty".into());
+    }
 
     let meta = fs::metadata(types_path).map_err(|e| format!("cannot read types file: {e}"))?;
     let truncated = meta.len() > 512 * 1024;
@@ -163,51 +166,83 @@ pub fn find_symbol_in_types(
 }
 
 fn matches_symbol_declaration(line: &str, name: &str) -> bool {
-    let mut found = false;
-    let mut offset = 0;
-    while let Some(index) = line[offset..].find(name) {
-        let start = offset + index;
-        let end = start + name.len();
-        let before_ok = line[..start]
-            .chars()
-            .next_back()
-            .is_none_or(|ch| !(ch.is_alphanumeric() || ch == '_' || ch == '$'));
-        let after_ok = line[end..]
-            .chars()
-            .next()
-            .is_none_or(|ch| !(ch.is_alphanumeric() || ch == '_' || ch == '$'));
-        if before_ok && after_ok {
-            found = true;
-            break;
-        }
-        offset = end;
-    }
-    if !found {
+    let name = name.trim();
+    if name.is_empty() {
         return false;
     }
-    let declaration = [
-        "function",
-        "class",
-        "interface",
-        "type",
-        "const",
-        "let",
-        "var",
-        "namespace",
-        "enum",
-    ]
-    .iter()
-    .any(|keyword| line.split_whitespace().any(|token| token == *keyword));
-    if declaration {
-        return true;
-    }
-    // Object/array shorthand or a property declaration: `name(` or
-    // `name:` without a keyword.
     let trimmed = line.trim_start();
-    trimmed.starts_with(&format!("{name}("))
-        || trimmed.starts_with(&format!("{name}<"))
-        || trimmed.starts_with(&format!("{name}:"))
-        || trimmed.starts_with(&format!("{name} ="))
+    if let Some(declared) = declared_identifier(trimmed) {
+        return declared == name;
+    }
+    // No declaration keyword: accept a method/property form only when the
+    // requested identifier is the first token, not a reference later on.
+    let mut rest = trimmed;
+    for modifier in [
+        "public",
+        "private",
+        "protected",
+        "static",
+        "readonly",
+        "override",
+        "async",
+        "get",
+        "set",
+    ] {
+        if let Some(after) = strip_word(rest, modifier) {
+            rest = after.trim_start();
+        }
+    }
+    let Some(after) = rest.strip_prefix(name) else {
+        return false;
+    };
+    let boundary = after
+        .chars()
+        .next()
+        .is_none_or(|ch| !(ch.is_alphanumeric() || ch == '_' || ch == '$'));
+    boundary
+        && (after.starts_with('(')
+            || after.starts_with('<')
+            || after.starts_with(':')
+            || after.starts_with(" =")
+            || after.trim_start().starts_with('='))
+}
+
+fn declared_identifier(line: &str) -> Option<&str> {
+    let mut tokens = line
+        .split(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '$'))
+        .filter(|token| !token.is_empty());
+    while let Some(token) = tokens.next() {
+        if matches!(
+            token,
+            "function"
+                | "class"
+                | "interface"
+                | "type"
+                | "const"
+                | "let"
+                | "var"
+                | "namespace"
+                | "module"
+                | "enum"
+        ) {
+            for next in tokens.by_ref() {
+                if matches!(next, "async" | "default" | "abstract") {
+                    continue;
+                }
+                return Some(next);
+            }
+            return None;
+        }
+    }
+    None
+}
+
+fn strip_word<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(word)?;
+    rest.chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+        .then_some(rest)
 }
 
 fn infer_kind(line: &str, name: &str) -> String {
@@ -227,5 +262,57 @@ fn infer_kind(line: &str, name: &str) -> String {
         "const".to_string()
     } else {
         "property".to_string()
+    }
+}
+
+#[cfg(test)]
+mod audit_review_tests {
+    use super::*;
+
+    #[test]
+    fn audit_review_empty_symbol_is_rejected_without_looping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.d.ts");
+        std::fs::write(&path, "export class Widget {}\n").unwrap();
+        let error = find_symbol_in_types(&path, "index.d.ts", "pkg", None, "").unwrap_err();
+        assert!(error.contains("must not be empty"), "{error}");
+        assert!(!matches_symbol_declaration("class Widget {}", ""));
+    }
+
+    #[test]
+    fn audit_review_declaration_match_uses_the_declared_identifier() {
+        assert!(matches_symbol_declaration(
+            "export class Widget {}",
+            "Widget"
+        ));
+        assert!(matches_symbol_declaration(
+            "export function MakeWidget() {}",
+            "MakeWidget"
+        ));
+        assert!(!matches_symbol_declaration(
+            "export function MakeWidget() {}",
+            "Widget"
+        ));
+        assert!(!matches_symbol_declaration(
+            "export type Response = UserProfile;",
+            "UserProfile"
+        ));
+        assert!(matches_symbol_declaration(
+            "export type Response = UserProfile;",
+            "Response"
+        ));
+        assert!(!matches_symbol_declaration(
+            "const name: UserProfile = value;",
+            "UserProfile"
+        ));
+        assert!(matches_symbol_declaration(
+            "const UserProfile = value;",
+            "UserProfile"
+        ));
+        assert!(matches_symbol_declaration("UserProfile(", "UserProfile"));
+        assert!(!matches_symbol_declaration(
+            "other UserProfile(",
+            "UserProfile"
+        ));
     }
 }

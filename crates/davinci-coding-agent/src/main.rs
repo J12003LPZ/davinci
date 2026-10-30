@@ -846,7 +846,11 @@ thread_local! {
 /// extension source has merged. `--no-tools` clears the merged set, `--tools`
 /// is an allowlist over it, and `--exclude-tools` removes names from it. The
 /// same predicate is reused after reloads so latency cannot reintroduce a tool.
-fn apply_tool_admission(parsed: &Args, agent: &mut Agent) -> Result<(), String> {
+fn apply_tool_admission(
+    parsed: &Args,
+    agent: &mut Agent,
+    default_tools: Option<&[String]>,
+) -> Result<(), String> {
     if !parsed.tools.is_empty() {
         let unknown: Vec<&String> = parsed
             .tools
@@ -870,12 +874,26 @@ fn apply_tool_admission(parsed: &Args, agent: &mut Agent) -> Result<(), String> 
     }
     if parsed.no_tools {
         agent.tools.clear();
-    } else if !parsed.tools.is_empty() {
-        agent.tools.retain(|name| parsed.tools.contains(name));
+    } else {
+        // The CLI override wins; otherwise the configured default tool list
+        // remains an allowlist over tools added after startup.
+        let effective = if !parsed.tools.is_empty() {
+            Some(parsed.tools.as_slice())
+        } else {
+            default_tools
+        };
+        if let Some(allowed) = effective {
+            agent
+                .tools
+                .retain(|name| allowed.iter().any(|known| known == name));
+        }
     }
     agent
         .tools
         .retain(|name| !parsed.exclude_tools.contains(name));
+    // The rejection above changed the active set, so the shared authorization
+    // view must be rebuilt here as well as in apply_extension_tools.
+    agent.sync_tool_authorization();
     Ok(())
 }
 
@@ -1394,7 +1412,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         let _ = ext.handlers.as_slice();
     }
     agent.apply_extension_tools(&names);
-    apply_tool_admission(parsed, &mut agent)?;
+    apply_tool_admission(parsed, &mut agent, settings.default_tools.as_deref())?;
     sync_visual_verification_availability(&mut agent, &host);
     if let Some(graph_worker) = &graph_worker {
         agent.tool_context.transaction_owner.graph_node = Some(graph_worker.node_id.clone());
@@ -3969,7 +3987,9 @@ fn complete_prompt_with_host(
                 Some("newSession" | "fork" | "switchSession" | "reload")
             )
         }) {
-            rebind_print_extensions(parsed, agent, &mut host);
+            if let Err(error) = rebind_print_extensions(parsed, agent, &mut host) {
+                session_failure = Some(error);
+            }
         }
         // The davinci transcript is the only place those calls can be seen;
         // print mode stays silent about them, as the TS reference is.
@@ -5190,7 +5210,7 @@ fn run_rpc_with_host(
         ) && response.success
         {
             let mut locked = host.lock().unwrap_or_else(|err| err.into_inner());
-            rebind_print_extensions(parsed, &mut runtime.agent, &mut locked);
+            rebind_print_extensions(parsed, &mut runtime.agent, &mut locked)?;
             runtime.invocable_commands = slash::invocable_commands(
                 &locked
                     .js
@@ -10303,7 +10323,11 @@ fn sync_visual_verification_availability(agent: &mut Agent, host: &ExtensionHost
     agent.set_visual_verification_available(host.visual_verification_available());
 }
 
-fn rebind_print_extensions(parsed: &Args, agent: &mut Agent, host: &mut ExtensionHost) {
+fn rebind_print_extensions(
+    parsed: &Args,
+    agent: &mut Agent,
+    host: &mut ExtensionHost,
+) -> Result<(), String> {
     apply_discovered_resources(parsed, agent);
     *host = loaded_extension_host(parsed);
     host.runtime_flag_values = flag_values_json(parsed);
@@ -10314,12 +10338,16 @@ fn rebind_print_extensions(parsed: &Args, agent: &mut Agent, host: &mut Extensio
         names.extend(ext.commands.iter().cloned());
     }
     agent.apply_extension_tools(&names);
-    if let Err(err) = apply_tool_admission(parsed, agent) {
-        eprintln!("Error: {err}");
-    }
+    let settings = load_merged_settings_with_override(
+        &default_agent_dir(),
+        &agent.cwd,
+        parsed.project_trust_override,
+    );
+    apply_tool_admission(parsed, agent, settings.default_tools.as_deref())?;
     sync_visual_verification_availability(agent, host);
     attach_tool_executor(agent, host);
     host.emit(ExtensionEvent::SessionStart);
+    Ok(())
 }
 
 fn show_loaded_resources(
