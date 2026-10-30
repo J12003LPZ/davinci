@@ -399,7 +399,9 @@ pub fn parse_sse_block(block: &str) -> Option<Value> {
     if data.is_empty() || data == "[DONE]" {
         return None;
     }
-    serde_json::from_str(&data).ok()
+    // Exact integral decimals (`1.0`, `1e0`) become integers here, before any
+    // object-valued tool argument is built into a `Value`.
+    davinci_protocol::json_number::parse_exact(&data).ok()
 }
 
 /// Replay a recorded SSE corpus through the decoder its frames call for.
@@ -3295,7 +3297,7 @@ fn response_hit_token_limit(value: &Value) -> bool {
 }
 
 pub(crate) fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
-    let value: Value = match serde_json::from_str(raw) {
+    let value: Value = match davinci_protocol::json_number::parse_exact(raw) {
         Ok(value) => value,
         Err(_) if raw.lines().any(|line| line.starts_with("data:")) => {
             return fixture_complete(model, &[], raw);
@@ -6271,6 +6273,74 @@ mod tests {
         );
         assert!(!request.lines().next().unwrap_or_default().contains("key="));
         assert!(!events.is_empty());
+    }
+
+    /// Object-valued tool arguments in a provider body (OpenAI-compatible,
+    /// Anthropic `input`, Google `args`) and in an SSE event keep exact integral
+    /// decimals as integers; a rounded fraction stays refused by the consumer.
+    #[test]
+    fn audit_wp02_b023_object_arguments_in_provider_bodies_keep_integers_exact() {
+        use davinci_protocol::json_number::as_u64_exact;
+        let model = |api: &str| {
+            load_builtin_models()
+                .into_iter()
+                .find(|m| m.api == api)
+                .unwrap_or_else(|| panic!("no {api} model"))
+        };
+        let args = r#"{"a":1.0,"b":1e0,"c":9007199254740993.0,"d":18446744073709551615,"e":18446744073709551615.0,"f":1.0000000000000001,"g":18446744073709551616.0}"#;
+        let tool_arguments = |api: &str, body: String| {
+            let message = parse_provider_response(&model(api), &body);
+            message
+                .content
+                .into_iter()
+                .find_map(|block| match block {
+                    ContentBlock::ToolCall { arguments, .. } => Some(arguments),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{api}: no tool call"))
+        };
+        let bodies = [
+            (
+                "openai-completions",
+                format!(
+                    r#"{{"choices":[{{"message":{{"tool_calls":[{{"id":"c","function":{{"name":"task","arguments":{args}}}}}]}}}}]}}"#
+                ),
+            ),
+            (
+                "anthropic-messages",
+                format!(
+                    r#"{{"content":[{{"type":"tool_use","id":"c","name":"task","input":{args}}}]}}"#
+                ),
+            ),
+            (
+                "google-generative-ai",
+                format!(
+                    r#"{{"candidates":[{{"content":{{"parts":[{{"functionCall":{{"name":"task","args":{args}}}}}]}}}}]}}"#
+                ),
+            ),
+        ];
+        let check = |origin: &str, arguments: &Value| {
+            let read = |key: &str| as_u64_exact(&arguments[key]);
+            assert_eq!(read("a"), Some(1), "{origin}");
+            assert_eq!(read("b"), Some(1), "{origin}");
+            assert_eq!(read("c"), Some(9_007_199_254_740_993), "{origin}");
+            assert_eq!(read("d"), Some(u64::MAX), "{origin}");
+            assert_eq!(read("e"), Some(u64::MAX), "{origin}");
+            assert_eq!(read("f"), None, "{origin}");
+            assert_eq!(read("g"), None, "{origin}");
+        };
+        for (api, body) in bodies {
+            check(api, &tool_arguments(api, body));
+        }
+        // The SSE frame reader used by the streaming paths.
+        let event = parse_sse_block(&format!(
+            r#"data: {{"candidates":[{{"content":{{"parts":[{{"functionCall":{{"name":"task","args":{args}}}}}]}}}}]}}"#
+        ))
+        .expect("event");
+        check(
+            "sse",
+            &event["candidates"][0]["content"]["parts"][0]["functionCall"]["args"],
+        );
     }
 
     #[test]

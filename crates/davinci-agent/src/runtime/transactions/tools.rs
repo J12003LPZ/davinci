@@ -420,6 +420,7 @@ impl<'a> ToolTransaction<'a> {
                 Ok(mut ledger) => {
                     for mut report in reports {
                         report.effect.owner_generation = applied.sequence;
+                        report.effect.attempt = runtime.task_attempt(report.effect.task_id);
                         // Prompt rewind is best effort: a report failure stops
                         // its recording but is not a handoff failure.
                         runtime.report_prompt_effect(

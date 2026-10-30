@@ -159,6 +159,7 @@ pub(crate) fn applied_mutation_receipt(task_id: TaskId, attempt: u32) -> Executi
         super::effects::FileEffectKind::Created,
         task_id,
     );
+    effect.attempt = attempt;
     effect.after_blob = Some("after".into());
     ExecutionReceipt::from_file_effects(&format!("write-{attempt}"), task_id, attempt, &[effect])
         .unwrap()
@@ -167,7 +168,8 @@ pub(crate) fn applied_mutation_receipt(task_id: TaskId, attempt: u32) -> Executi
 impl ExecutionReceipt {
     /// A receipt for the file changes one admitted operation made, built from
     /// the effect ledger (never from a tool name or an exit code). `effects` are
-    /// the ledger entries of `operation_id` for `task_id`; entries that changed
+    /// the ledger entries of `operation_id` for `task_id` captured during
+    /// `attempt` (an earlier attempt's writes are not this attempt's); entries that changed
     /// nothing are dropped, and `None` comes back when nothing is left, so an
     /// operation that left the workspace as it was produces no receipt.
     pub fn from_file_effects(
@@ -178,7 +180,11 @@ impl ExecutionReceipt {
     ) -> Option<Self> {
         let changed: Vec<MutationEffect> = effects
             .iter()
-            .filter(|effect| effect.operation_id == operation_id && effect.task_id == task_id)
+            .filter(|effect| {
+                effect.operation_id == operation_id
+                    && effect.task_id == task_id
+                    && effect.attempt == attempt
+            })
             .map(|effect| MutationEffect {
                 path: effect.path.clone(),
                 kind: effect.kind,

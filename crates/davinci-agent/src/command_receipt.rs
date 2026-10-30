@@ -9,6 +9,8 @@ pub struct CommandReceiptCapture {
     task_id: Option<TaskId>,
     process_operation_binding: Option<crate::runtime::operations::ProcessOperationBinding>,
     receipt: Arc<Mutex<Option<ExecutionReceipt>>>,
+    /// The package manifest read before the process started.
+    package: Arc<Mutex<Option<crate::verification::discovery::PackageBinding>>>,
 }
 
 impl CommandReceiptCapture {
@@ -19,7 +21,29 @@ impl CommandReceiptCapture {
             task_id,
             process_operation_binding: None,
             receipt: Arc::new(Mutex::new(None)),
+            package: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Read the package a package-manager command in `cwd` will run. Call it
+    /// before the process starts; discovery accepts no other source of identity.
+    pub(crate) fn bind_package(&self, cwd: &std::path::Path) {
+        if let Ok(mut slot) = self.package.lock() {
+            *slot = crate::verification::discovery::PackageBinding::bind(cwd);
+        }
+    }
+
+    /// The binding, when it was made for the directory the command ran in.
+    fn package_for(
+        &self,
+        ran_in: &std::path::Path,
+    ) -> Option<crate::verification::discovery::PackageBinding> {
+        let ran_in = ran_in.canonicalize().ok()?;
+        self.package
+            .lock()
+            .ok()?
+            .clone()
+            .filter(|binding| binding.cwd() == ran_in)
     }
 
     pub(crate) fn with_process_operation_binding(
@@ -78,7 +102,7 @@ impl CommandReceiptCapture {
             stderr_hash: Some(crate::runtime::checkpoints::compute_sha256(&output.stderr)),
             process_evidence,
             assertion_counts: crate::verification::discovery::counts_in(
-                Some(&cwd),
+                self.package_for(&cwd).as_ref(),
                 command,
                 &output.stdout,
                 &output.stderr,
@@ -137,7 +161,8 @@ impl CommandReceiptCapture {
         receipt.stderr_hash = Some(crate::runtime::checkpoints::compute_sha256(stderr));
         if let [command] = receipt.argv.as_slice() {
             receipt.assertion_counts = crate::verification::discovery::counts_in(
-                Some(std::path::Path::new(&evidence.cwd)),
+                self.package_for(std::path::Path::new(&evidence.cwd))
+                    .as_ref(),
                 command,
                 stdout,
                 stderr,
@@ -339,5 +364,86 @@ mod tests {
             assert_eq!(receipt.is_passed(), expected == 0);
             assert!(capture.take().is_none());
         }
+    }
+
+    /// Real `npm test` runs through the production process path. The script that
+    /// rewrites its own `scripts.test` and prints a unittest footer earns no
+    /// discovery; a package that really runs unittest does. Skipped, and said
+    /// so, where npm or python is not installed.
+    #[test]
+    fn audit_wp02_b032_real_npm_runs_bind_the_package_before_the_process() {
+        let present = |program: &str| {
+            std::process::Command::new(program)
+                .arg("--version")
+                .output()
+                .is_ok_and(|out| out.status.success())
+        };
+        let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        if !present(npm) || !present(python) {
+            eprintln!("npm or python missing; real npm fixtures not executed");
+            return;
+        }
+        let run = |dir: &std::path::Path| {
+            let capture = CommandReceiptCapture::new("npm-test", "exec_command", None);
+            let context = ToolContext {
+                foreground_supervisor: Some(test_supervisor()),
+                command_receipt: Some(capture.clone()),
+                ..Default::default()
+            };
+            let result = execute_tool_with(
+                dir,
+                "exec_command",
+                &serde_json::json!({"command":"npm test"}),
+                &context,
+            )
+            .unwrap();
+            assert!(result.content.len() < 1 << 20);
+            capture.take().expect("a receipt")
+        };
+
+        // The script is `node fake.js`; it stores the unittest runner as its own
+        // script, prints a complete unittest footer to stderr and exits zero.
+        let spoof = tempfile::tempdir().unwrap();
+        std::fs::write(
+            spoof.path().join("package.json"),
+            r#"{"name":"spoof","scripts":{"test":"node fake.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            spoof.path().join("fake.js"),
+            r#"require('fs').writeFileSync('package.json', JSON.stringify({scripts:{test:'python -m unittest'}}));
+process.stderr.write('...\n' + '-'.repeat(70) + '\nRan 3 tests in 0.002s\n\nOK\n');
+"#,
+        )
+        .unwrap();
+        let receipt = run(spoof.path());
+        assert_eq!(receipt.exit_code, Some(0), "premise: the spoof exits zero");
+        assert!(
+            std::fs::read_to_string(spoof.path().join("package.json"))
+                .unwrap()
+                .contains("python -m unittest"),
+            "premise: the script rewrote its own manifest"
+        );
+        assert!(receipt.assertion_counts.is_none(), "{receipt:?}");
+        assert!(!receipt.is_verified_check());
+
+        // Positive control: the same path with a package that runs unittest.
+        let real = tempfile::tempdir().unwrap();
+        std::fs::write(
+            real.path().join("package.json"),
+            format!(r#"{{"name":"real","scripts":{{"test":"{python} -m unittest"}}}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            real.path().join("test_app.py"),
+            "import unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n        self.assertTrue(True)\n    def test_b(self):\n        self.assertEqual(1, 1)\n",
+        )
+        .unwrap();
+        let receipt = run(real.path());
+        assert_eq!(receipt.exit_code, Some(0), "{receipt:?}");
+        let counts = receipt.assertion_counts.as_ref().expect("real discovery");
+        assert_eq!((counts.total, counts.passed, counts.failed), (2, 2, 0));
+        assert!(receipt.is_verified_check());
     }
 }

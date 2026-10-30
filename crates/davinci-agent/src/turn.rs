@@ -3347,6 +3347,7 @@ Issue the call again if it is still needed.";
                                         kind,
                                         task_id,
                                     );
+                                    effect.attempt = runtime.task_attempt(task_id);
                                     effect.before_blob = pre.blob_hash;
                                     effect.after_blob = post.blob_hash;
                                     effect.before_mode = pre.mode;
@@ -6519,6 +6520,88 @@ mod tests {
             )
             .allowed
         );
+    }
+
+    /// Evidence is bound to the attempt that produced it: a real task-bound write
+    /// in attempt 0, then a retry, leaves attempt 1 without implementation
+    /// evidence until it writes again, through the normal receipt builder.
+    #[test]
+    fn audit_wp02_b025_a_write_of_an_earlier_attempt_is_not_evidence_for_a_retry() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        let run_id = crate::RunId::new();
+        let runtime =
+            crate::RuntimeHandle::new(run_id, crate::AgentId::new(), crate::RuntimeBus::new())
+                .with_session("attempt-evidence");
+        let task_id = runtime
+            .task_registry
+            .create_task(crate::runtime::TaskRecord::new(run_id, "implement"))
+            .unwrap();
+        let mut agent = Agent::new("attempt evidence fixture").with_runtime(runtime.clone());
+        agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+        agent.set_active_contract(
+            crate::runtime::TaskContract::new(
+                "attempt-evidence",
+                1,
+                task_id,
+                1,
+                vec!["src/".into()],
+                vec![],
+                false,
+                vec![],
+                vec![],
+                vec![],
+            )
+            .unwrap(),
+        );
+        let write = |id: &str, content: &str| {
+            let args = serde_json::json!({"path":"src/a.txt","content":content});
+            assert!(matches!(
+                agent.prepare_tool_call(root.path(), id, "write", &args, 0),
+                Preparation::Ready { .. }
+            ));
+            let result = agent.run_prepared_call(root.path(), id, "write", &args, 0);
+            assert!(!result.is_error, "{}", result.content);
+        };
+        let manifest = crate::runtime::source_manifest::SourceManifestBuilder::new(root.path())
+            .build()
+            .unwrap();
+        let evaluate = |attempt: u32| {
+            let task = runtime.task_registry.get_task(&task_id).unwrap();
+            assert_eq!(task.attempt, attempt);
+            crate::runtime::completion::evaluate_task_completion(
+                &task,
+                None,
+                &runtime.mutation_receipts(task_id, attempt),
+                &manifest,
+                attempt,
+            )
+            .allowed
+        };
+
+        write("write-0", "first");
+        assert_eq!(runtime.effect_ledger.read().unwrap()[0].attempt, 0);
+        assert!(evaluate(0));
+
+        runtime.task_registry.fail_task(task_id, None).unwrap();
+        let revision = runtime.task_registry.get_task(&task_id).unwrap().revision;
+        runtime
+            .task_registry
+            .retry_task(task_id, run_id, revision, None)
+            .unwrap();
+        // The old write is attempt 0's: attempt 1 has no evidence of its own yet.
+        assert!(runtime.mutation_receipts(task_id, 1).is_empty());
+        assert!(!evaluate(1), "attempt 0's write satisfied attempt 1");
+
+        write("write-1", "second");
+        assert_eq!(runtime.effect_ledger.read().unwrap()[1].attempt, 1);
+        let receipts = runtime.mutation_receipts(task_id, 1);
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0].operation_id,
+            runtime.effect_ledger.read().unwrap()[1].operation_id
+        );
+        assert!(evaluate(1));
     }
 
     #[test]

@@ -253,19 +253,29 @@ impl HostBudgetEvidenceAdapter {
         }
     }
 
-    /// Evaluates a task completion incorporating budget reserves.
+    /// Evaluates a task completion incorporating budget reserves. Implementation
+    /// evidence is the host's own: the runtime's file effects for
+    /// `expected_attempt`, added to the supplied command receipts. A caller
+    /// cannot supply a mutation receipt of its own that the ledger does not back.
     pub fn evaluate_task(
         &self,
+        runtime: &davinci_agent::RuntimeHandle,
         task: &davinci_agent::runtime::tasks::TaskRecord,
         contract: Option<&davinci_agent::runtime::contracts::TaskContract>,
         receipts: &[davinci_agent::runtime::evidence_store::ExecutionReceipt],
         manifest: &davinci_agent::runtime::source_manifest::SourceManifest,
         expected_attempt: u32,
     ) -> davinci_agent::runtime::completion::CompletionEvaluation {
+        let mut all: Vec<_> = receipts
+            .iter()
+            .filter(|receipt| receipt.mutation.is_none())
+            .cloned()
+            .collect();
+        all.extend(runtime.mutation_receipts(task.id, expected_attempt));
         davinci_agent::runtime::completion::evaluate_task_completion_with_budget(
             task,
             contract,
-            receipts,
+            &all,
             manifest,
             expected_attempt,
             Some(&self.reservation),
@@ -2085,5 +2095,51 @@ mod tests {
         // 30k spent + 15k verify + 5k handoff = 50k ceiling. Available for impl: 0 tokens!
         assert!(adapter.can_dispatch_implementation(0).is_ok());
         assert!(adapter.can_dispatch_implementation(100).is_err());
+    }
+
+    /// Host evaluation takes implementation evidence from the runtime's own file
+    /// effects for the attempt being evaluated. A mutation receipt supplied by the
+    /// caller, or one backed by an earlier attempt's write, proves nothing.
+    #[test]
+    fn audit_wp02_b025_host_evaluation_uses_the_runtime_file_effects() {
+        use davinci_agent::runtime::effects::{FileEffectKind, OwnedFileEffect};
+        use davinci_agent::runtime::evidence_store::ExecutionReceipt;
+        let root = tempfile::tempdir().unwrap();
+        let manifest =
+            davinci_agent::runtime::source_manifest::SourceManifestBuilder::new(root.path())
+                .build()
+                .unwrap();
+        let runtime = davinci_agent::RuntimeHandle::new(
+            davinci_agent::RunId::new(),
+            davinci_agent::AgentId::new(),
+            davinci_agent::RuntimeBus::new(),
+        );
+        let task = davinci_agent::runtime::TaskRecord::new(runtime.run_id, "implement");
+        let mut effect = OwnedFileEffect::new(
+            "op-1",
+            davinci_agent::AgentId::new(),
+            1,
+            "src/lib.rs",
+            FileEffectKind::Created,
+            task.id,
+        );
+        effect.after_blob = Some("after".into());
+        let adapter = HostBudgetEvidenceAdapter::default();
+        let evaluate = |receipts: &[ExecutionReceipt], attempt: u32| {
+            adapter
+                .evaluate_task(&runtime, &task, None, receipts, &manifest, attempt)
+                .allowed
+        };
+
+        // A receipt built by the caller from an effect the runtime never recorded.
+        let supplied =
+            ExecutionReceipt::from_file_effects("op-1", task.id, 0, &[effect.clone()]).unwrap();
+        assert!(!evaluate(&[supplied], 0));
+        assert!(!evaluate(&[], 0));
+
+        // The runtime recorded it, in attempt 0.
+        runtime.effect_ledger.write().unwrap().push(effect);
+        assert!(evaluate(&[], 0));
+        assert!(!evaluate(&[], 1), "attempt 0's write satisfied attempt 1");
     }
 }

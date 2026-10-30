@@ -328,6 +328,83 @@ impl Directory {
         }
     }
 
+    /// The path this handle resolves to now, never the pathname it was opened by.
+    pub(crate) fn resolved_path(&self) -> io::Result<PathBuf> {
+        #[cfg(unix)]
+        {
+            davinci_sys::fs::final_path(&self.handle)
+        }
+        #[cfg(windows)]
+        {
+            let pin = self
+                ._pins
+                .last()
+                .ok_or_else(|| io::Error::other("directory has no identity handle"))?;
+            davinci_sys::fs::final_path(pin)
+        }
+    }
+
+    /// Owner-only, applied through the handle (a pathname could name a swapped directory).
+    pub(crate) fn restrict_to_owner(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if self.handle.metadata()?.permissions().mode() & 0o077 != 0 {
+                self.handle
+                    .set_permissions(fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Open (or, with `create`, exclusively create) a regular read/write entry of
+    /// this directory. A link at the entry is never followed; on Windows the entry
+    /// is opened exclusively. The directory chain itself was admitted by `open`.
+    pub(crate) fn open_entry(&self, name: &std::ffi::OsStr, create: bool) -> io::Result<File> {
+        valid_source_name(name.to_str().unwrap_or(""))?;
+        #[cfg(unix)]
+        let file = {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            use std::os::unix::ffi::OsStrExt;
+            let name = std::ffi::CString::new(name.as_bytes()).map_err(io::Error::other)?;
+            let flags = libc::O_RDWR
+                | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK
+                | libc::O_CLOEXEC
+                | if create {
+                    libc::O_CREAT | libc::O_EXCL
+                } else {
+                    0
+                };
+            // SAFETY: live directory descriptor and a valid NUL-terminated name.
+            let fd = unsafe { libc::openat(self.handle.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: openat returned a descriptor this File now owns.
+            unsafe { File::from_raw_fd(fd) }
+        };
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(create)
+                .share_mode(0)
+                .custom_flags(0x00200000)
+                .open(self.path.join(name))?;
+            if file.metadata()?.file_attributes() & 0x400 != 0 {
+                return Err(io::Error::other("linked directory entry denied"));
+            }
+            file
+        };
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("directory entry is not a regular file"));
+        }
+        Ok(file)
+    }
+
     pub(crate) fn check_current(&self) -> io::Result<()> {
         let current = Self::open(&self.path, false)?;
         if current.identity()? != self.identity()? {

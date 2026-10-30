@@ -329,7 +329,7 @@ fn fixture_raw_events(corpus: &str) -> Vec<Value> {
             if payload.is_empty() || payload == "[DONE]" || payload.starts_with(':') {
                 return None;
             }
-            serde_json::from_str::<Value>(payload).ok()
+            davinci_protocol::json_number::parse_exact(payload).ok()
         })
         .collect()
 }
@@ -909,7 +909,7 @@ fn read_codex_events(
             OPCODE_TEXT => {
                 let parsed: Value = match std::str::from_utf8(&payload)
                     .ok()
-                    .and_then(|text| serde_json::from_str(text).ok())
+                    .and_then(|text| davinci_protocol::json_number::parse_exact(text).ok())
                     .filter(Value::is_object)
                 {
                     Some(parsed) => parsed,

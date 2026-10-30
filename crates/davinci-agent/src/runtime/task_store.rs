@@ -2,7 +2,7 @@
 //! Native expansion contract: no equivalent task journal in vendor/davinci.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -211,12 +211,12 @@ pub(crate) struct TaskJournal {
 /// opened handle must be a regular file named by one directory entry: a second
 /// hard link could make this write through to a file outside the session.
 ///
-/// Nothing is followed. The directory is pinned and every later operation (the
-/// journal open, the quarantine, the directory sync) names the directory the pin
-/// resolves to, never the original pathname. A symlink or reparse point as the
-/// directory or as the journal entry is refused, an existing journal is opened
-/// without creation, a missing one is created exclusively, and the opened handle
-/// must resolve to `<admitted directory>/<name>`.
+/// Nothing is followed, at any depth. `admit_directory` walks every component of
+/// the directory chain without following a symlink or reparse point, and every
+/// later operation (the journal open, the quarantine, the directory sync) is
+/// relative to that admitted handle, never to a pathname. An existing journal is
+/// opened without creation, a missing one is created exclusively, and the opened
+/// handle must resolve to `<admitted directory>/<name>`.
 fn open_exclusive(path: &Path) -> Result<(File, JournalDir), TaskError> {
     let parent = path
         .parent()
@@ -227,37 +227,27 @@ fn open_exclusive(path: &Path) -> Result<(File, JournalDir), TaskError> {
         .ok_or_else(|| persistence("task journal path has no file name"))?
         .to_owned();
     let directory = admit_directory(parent)?;
-    let entry = directory.path.join(&name);
-    refuse_link_entry(&entry, "task journal")?;
-    let mut options = OpenOptions::new();
-    // Windows append-only access cannot truncate a quarantined torn tail.
-    // The exclusive lease and commit mutex serialize explicit end seeks.
-    options.read(true).write(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(0);
-    }
-    // An existing journal is opened as it is. A missing one is created with
-    // `create_new`, which never follows a link planted at the name.
-    let existing = entry.symlink_metadata().is_ok();
-    if existing {
-        options.create(false);
-    } else {
-        options.create_new(true);
-    }
+    refuse_link_entry(&directory.path.join(&name), "task journal")?;
     // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION: another handle has the
     // journal open. A scanner or indexer lets go within milliseconds, so the
     // same bounded retry as the Unix handoff runs before reporting InUse.
     const HANDOFF_RETRIES: usize = 10;
     let mut attempt = 0;
     let file = loop {
-        match options.open(&entry) {
+        // An existing journal is opened as it is. A missing one is created with
+        // `create_new`, which never follows a link planted at the name.
+        let opened = match directory.handle.open_entry(&name, false) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match directory.handle.open_entry(&name, true) {
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        directory.handle.open_entry(&name, false)
+                    }
+                    other => other,
+                }
+            }
+            other => other,
+        };
+        match opened {
             Ok(file) => break file,
             Err(error) if cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33)) => {
                 if attempt == HANDOFF_RETRIES {
@@ -326,10 +316,11 @@ fn open_exclusive(path: &Path) -> Result<(File, JournalDir), TaskError> {
     Ok((file, directory))
 }
 
-/// The journal's directory as admitted: a pinned handle (on Windows it cannot be
-/// renamed or deleted while held) and the path that handle resolves to.
+/// The journal's directory as admitted: every component opened without following
+/// a link (on Windows each is pinned and cannot be renamed or deleted while held)
+/// and the path that handle resolves to.
 pub(crate) struct JournalDir {
-    pin: File,
+    handle: super::cache::directory::Directory,
     path: PathBuf,
 }
 
@@ -361,27 +352,25 @@ fn refuse_link_entry(path: &Path, what: &str) -> Result<(), TaskError> {
     }
 }
 
-/// Create (owner-only) and pin the directory, refusing a link at its last
-/// component before anything is created or chmod-ed through it.
+/// Create (owner-only) and admit the directory chain. A symlink or reparse point
+/// at any component, not only the last, is refused before anything is created or
+/// chmod-ed through it.
 fn admit_directory(parent: &Path) -> Result<JournalDir, TaskError> {
-    refuse_link_entry(parent, "task journal directory")?;
-    davinci_sys::fs::create_private_dir_all(parent).map_err(persistence)?;
-    let pin = davinci_sys::fs::open_directory_pinned(parent).map_err(persistence)?;
-    let resolved = davinci_sys::fs::final_path(&pin).map_err(|error| {
+    let absolute = std::path::absolute(parent).map_err(persistence)?;
+    let handle = super::cache::directory::Directory::open(&absolute, true).map_err(|error| {
+        persistence(format!(
+            "task journal directory {} is not safe to use: {error}",
+            parent.display()
+        ))
+    })?;
+    handle.restrict_to_owner().map_err(persistence)?;
+    let path = handle.resolved_path().map_err(|error| {
         persistence(format!(
             "cannot resolve task journal directory {}: {error}",
             parent.display()
         ))
     })?;
-    // Opened as itself: a link swapped in after the check above resolves to a
-    // different path than the one just created.
-    if !pin.metadata().map_err(persistence)?.is_dir() {
-        return Err(persistence("task journal directory is not a directory"));
-    }
-    Ok(JournalDir {
-        pin,
-        path: resolved,
-    })
+    Ok(JournalDir { handle, path })
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -411,11 +400,7 @@ impl JournalDir {
     /// Make directory entries (a new journal, a quarantine) durable through the
     /// admitted handle.
     fn sync(&self) -> Result<(), TaskError> {
-        #[cfg(unix)]
-        self.pin.sync_all().map_err(persistence)?;
-        #[cfg(not(unix))]
-        let _ = &self.pin;
-        Ok(())
+        self.handle.sync().map_err(persistence)
     }
 }
 
@@ -667,9 +652,10 @@ impl TaskJournal {
                 .file_name()
                 .map(|name| name.to_owned())
                 .ok_or_else(|| persistence("task journal path has no file name"))?;
-            let tail_path = directory.path.join(&tail_name);
-            let mut quarantine =
-                davinci_sys::fs::create_new_private(&tail_path).map_err(persistence)?;
+            let mut quarantine = directory
+                .handle
+                .open_entry(&tail_name, true)
+                .map_err(persistence)?;
             directory.confirm(&quarantine, &tail_name, "task journal quarantine")?;
             quarantine.write_all(&tail).map_err(persistence)?;
             quarantine.sync_all().map_err(persistence)?;
@@ -1464,6 +1450,7 @@ mod tests {
 
     use super::*;
     use crate::runtime::{RunId, TaskRecord, TaskRegistry, TaskState};
+    use std::fs::OpenOptions;
 
     #[test]
     fn f03_journal_bounds_reject_before_write_without_poisoning() {
@@ -2007,5 +1994,83 @@ mod tests {
 
         let other = File::create(admitted.path().join("other")).unwrap();
         assert!(directory.confirm(&other, &name, "task journal").is_err());
+    }
+    /// A link above the last component: `<safe>/link/real/<journal>` with `link`
+    /// pointing outside and `real` an ordinary directory there. Refused before the
+    /// outside directory is created in, chmod-ed or given a journal.
+    #[test]
+    fn audit_wp02_b024_an_ancestor_link_is_refused_and_outside_directory_untouched() {
+        let outside = tempfile::tempdir().unwrap();
+        let real = outside.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let safe = tempfile::tempdir().unwrap();
+        let link = safe.path().join("link");
+        if !link_directory(outside.path(), &link) {
+            eprintln!("directory links unavailable here; not executed");
+            return;
+        }
+        let path = link.join("real").join("session.tasks.jsonl");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(TaskRegistry::open_session_durable(&path, "source/session").is_err());
+        assert!(TaskRegistry::open_durable(&path, RunId::new()).is_err());
+        assert_eq!(
+            std::fs::read_dir(&real).unwrap().count(),
+            0,
+            "a journal was created through the link"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "the outside directory was chmod-ed");
+        }
+        // The same journal through no link is created normally.
+        let plain = safe
+            .path()
+            .join("plain")
+            .join("real")
+            .join("session.tasks.jsonl");
+        TaskRegistry::open_session_durable(&plain, "source/session").unwrap();
+    }
+
+    /// Substitution of the admitted directory. Windows holds the chain pinned, so
+    /// the directory cannot be renamed away while the journal is open; Unix
+    /// resolves every later operation through the handle, so a different ordinary
+    /// directory put at the same pathname receives nothing.
+    #[test]
+    fn audit_wp02_b024_a_substituted_directory_receives_neither_journal_nor_quarantine() {
+        let root = tempfile::tempdir().unwrap();
+        let session = root.path().join("session");
+        let path = session.join("session.tasks.jsonl");
+        let (registry, _) = TaskRegistry::open_session_durable(&path, "source/session").unwrap();
+        let moved = root.path().join("moved");
+        #[cfg(windows)]
+        {
+            assert!(
+                std::fs::rename(&session, &moved).is_err(),
+                "the admitted directory was swapped out from under the open journal"
+            );
+            drop(registry);
+        }
+        #[cfg(unix)]
+        {
+            drop(registry);
+            let directory = admit_directory(&session).unwrap();
+            std::fs::rename(&session, &moved).unwrap();
+            std::fs::create_dir(&session).unwrap();
+            let name = std::ffi::OsString::from("late.quarantine");
+            directory.handle.open_entry(&name, true).unwrap();
+            assert!(moved.join(&name).exists());
+            assert!(
+                !session.join(&name).exists(),
+                "created through the pathname"
+            );
+        }
+        #[cfg(not(any(unix, windows)))]
+        drop((registry, moved));
     }
 }

@@ -180,7 +180,7 @@ impl SseFramer {
             self.saw_done = true;
             return None;
         }
-        let parsed = match serde_json::from_str::<Value>(&data) {
+        let parsed = match davinci_protocol::json_number::parse_exact(&data) {
             Ok(parsed) => parsed,
             Err(err) => {
                 // The frames that fail to parse are the ones a trace is
