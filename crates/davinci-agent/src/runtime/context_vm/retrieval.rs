@@ -553,7 +553,8 @@ mod tests {
                 "main",
             )
             .unwrap();
-        let events = super::super::events_from_session_branch(&[entry.clone()], Some(&entry.id));
+        let events =
+            super::super::events_from_session_branch(std::slice::from_ref(&entry), Some(&entry.id));
         assert_eq!(events[0].images.len(), 1);
         let vm = runtime();
         vm.bind_session_source(session.info.path.clone(), "img-session".into());

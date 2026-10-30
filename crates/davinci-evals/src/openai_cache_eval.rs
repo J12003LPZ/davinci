@@ -352,27 +352,25 @@ fn build_paired_report_validated(
                 PairDisposition::DuplicateBaseline
             } else if treatments.len() > 1 {
                 PairDisposition::DuplicateTreatment
-            } else if baseline.is_none() {
-                PairDisposition::MissingBaseline
-            } else if treatment.is_none() {
-                PairDisposition::MissingTreatment
-            } else if baseline.unwrap().source != treatment.unwrap().source {
-                PairDisposition::MixedSource
-            } else if baseline.unwrap().outcome != RunOutcome::VerifiedSuccess
-                || treatment.unwrap().outcome != RunOutcome::VerifiedSuccess
-            {
-                PairDisposition::FailedOrBlocked
             } else {
-                included_efficiency_pairs += 1;
-                paired_baseline_raw += baseline
-                    .expect("included pair has baseline")
-                    .metrics
-                    .raw_input_tokens();
-                paired_treatment_raw += treatment
-                    .expect("included pair has treatment")
-                    .metrics
-                    .raw_input_tokens();
-                PairDisposition::IncludedEfficiency
+                match (baseline, treatment) {
+                    (None, _) => PairDisposition::MissingBaseline,
+                    (_, None) => PairDisposition::MissingTreatment,
+                    (Some(baseline), Some(treatment)) => {
+                        if baseline.source != treatment.source {
+                            PairDisposition::MixedSource
+                        } else if baseline.outcome != RunOutcome::VerifiedSuccess
+                            || treatment.outcome != RunOutcome::VerifiedSuccess
+                        {
+                            PairDisposition::FailedOrBlocked
+                        } else {
+                            included_efficiency_pairs += 1;
+                            paired_baseline_raw += baseline.metrics.raw_input_tokens();
+                            paired_treatment_raw += treatment.metrics.raw_input_tokens();
+                            PairDisposition::IncludedEfficiency
+                        }
+                    }
+                }
             };
 
             pair_audit.push(PairAudit {
@@ -579,7 +577,7 @@ mod tests {
         let missing = build_paired_report(
             &manifest,
             BenchmarkSource::OfflineFixture,
-            &[baseline.clone()],
+            std::slice::from_ref(&baseline),
         )
         .unwrap();
         assert_eq!(

@@ -974,13 +974,13 @@ mod tests {
         );
         // Within one directory the PATHEXT order wins.
         assert_eq!(
-            resolve_command_in("npx", &[second.clone()], &exts),
+            resolve_command_in("npx", std::slice::from_ref(&second), &exts),
             Some(second.join("npx.exe"))
         );
         assert_eq!(resolve_command_in("missing", &[first], &exts), None);
         // Explicit extensions and paths are left alone.
         assert_eq!(
-            resolve_command_in("npx.cmd", &[second.clone()], &exts),
+            resolve_command_in("npx.cmd", std::slice::from_ref(&second), &exts),
             Some(PathBuf::from("npx.cmd"))
         );
         assert_eq!(

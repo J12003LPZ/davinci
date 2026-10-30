@@ -509,7 +509,7 @@ mod tests {
                 success: true,
             },
         );
-        assert!(TaskRegistry::legacy_snapshot(&[created.clone()], "session").is_err());
+        assert!(TaskRegistry::legacy_snapshot(std::slice::from_ref(&created), "session").is_err());
 
         let mut recovery = HashMap::new();
         let mut metadata = LegacyTaskRecovery::new("recovered task");
@@ -551,7 +551,7 @@ mod tests {
         );
         decision_recovery.insert(decision_task_id, decision_metadata);
         let decision_snapshot = TaskRegistry::legacy_snapshot_with_recovery(
-            &[decision_created.clone()],
+            std::slice::from_ref(&decision_created),
             "session",
             &decision_recovery,
         )
@@ -578,7 +578,7 @@ mod tests {
         let mut missing = HashMap::new();
         missing.insert(TaskId::new(), LegacyTaskRecovery::new("unused"));
         assert!(TaskRegistry::legacy_snapshot_with_recovery(
-            &[created.clone()],
+            std::slice::from_ref(&created),
             "session",
             &missing
         )

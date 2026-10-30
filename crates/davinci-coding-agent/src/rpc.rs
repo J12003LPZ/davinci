@@ -1596,7 +1596,7 @@ mod tests {
             let id = SessionStartPlugin::session_id(&runtime.agent);
             assert_eq!(
                 SessionStartPlugin::context_session_ids(&runtime.agent),
-                [id.clone()]
+                std::slice::from_ref(&id)
             );
             id
         };

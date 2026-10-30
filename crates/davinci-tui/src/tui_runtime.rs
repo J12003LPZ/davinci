@@ -302,11 +302,7 @@ impl TuiBase {
     }
 
     pub fn request_render(&mut self, force: bool) {
-        if force {
-            self.render_requested = true;
-        } else if self.render_requested {
-            return;
-        } else {
+        if force || !self.render_requested {
             self.render_requested = true;
         }
     }

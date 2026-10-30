@@ -691,7 +691,10 @@ mod tests {
         file.write_all(b"{\"id\":\"trunc").unwrap();
         drop(file);
         let restarted = WorkflowStateStore::with_options(1024, tmp.path().to_path_buf());
-        assert_eq!(restarted.list_phase_artifacts(wf_id, "p"), [kept.clone()]);
+        assert_eq!(
+            restarted.list_phase_artifacts(wf_id, "p"),
+            std::slice::from_ref(&kept)
+        );
 
         // The next append starts a fresh line instead of joining the torn one.
         let next = restarted

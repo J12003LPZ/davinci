@@ -170,7 +170,7 @@ mod tests {
         let different = fingerprint("space grotesk", "#ff6b35", true);
 
         assert_eq!(suite_diversity_score(&[]), 0.0);
-        assert_eq!(suite_diversity_score(&[base.clone()]), 0.0);
+        assert_eq!(suite_diversity_score(std::slice::from_ref(&base)), 0.0);
         assert_eq!(suite_diversity_score(&[base.clone(), similar]), 0.0);
         assert!(suite_diversity_score(&[base, different]) > 0.0);
     }

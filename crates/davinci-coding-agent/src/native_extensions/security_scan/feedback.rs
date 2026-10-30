@@ -88,7 +88,7 @@ mod tests {
             snapshot_side: "worktree".into(),
         };
         assert_eq!(
-            suppressions_still_valid(&[feedback.clone()], "root-1", &snapshot).len(),
+            suppressions_still_valid(std::slice::from_ref(&feedback), "root-1", &snapshot).len(),
             1
         );
         std::fs::write(
@@ -102,7 +102,10 @@ mod tests {
             &ScanConfig::default(),
         )
         .unwrap();
-        assert!(suppressions_still_valid(&[feedback.clone()], "root-1", &changed).is_empty());
+        assert!(
+            suppressions_still_valid(std::slice::from_ref(&feedback), "root-1", &changed)
+                .is_empty()
+        );
         let mut suppressed = serde_json::json!({"fingerprint":{"value":"root-1"},"assessment":{"disposition":"suppressed"}});
         expire_stale_suppressions(std::slice::from_mut(&mut suppressed), &[feedback], &changed);
         assert_eq!(suppressed["assessment"]["disposition"], "deferred");

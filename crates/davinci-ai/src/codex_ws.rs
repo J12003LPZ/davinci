@@ -2436,7 +2436,7 @@ mod tests {
             let messages = [
                 crate::stream::parse_provider_response(&codex_model(), &response.to_string()),
                 crate::fixture_complete(&codex_model(), &[], &format!("data: {event}\n\n")),
-                decode_wire_events(&[event.clone()]),
+                decode_wire_events(std::slice::from_ref(&event)),
             ];
             for message in &messages {
                 assert!(

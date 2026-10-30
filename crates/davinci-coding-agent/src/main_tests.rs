@@ -2781,7 +2781,7 @@ fn f01_rpc_denial_instructions_use_confirmed_bounded_dialogs() {
             rpc_resolve_challenge(&request, &challenge, false, dir.path(), &policy, |call| {
                 calls += 1;
                 assert!(call["timeout"].as_u64().is_some_and(|ms| ms <= 60_000));
-                let wire = rpc::extension_ui_requests_from_calls(&[call.clone()]);
+                let wire = rpc::extension_ui_requests_from_calls(std::slice::from_ref(call));
                 assert_eq!(wire.len(), 1);
                 assert_eq!(wire[0]["method"], call["op"]);
                 match calls {
@@ -4850,7 +4850,7 @@ fn switching_sessions_replaces_the_plugin_context_with_the_new_sessions() {
     let first_id = SessionStartPlugin::session_id(&agent);
     assert_eq!(
         SessionStartPlugin::context_session_ids(&agent),
-        [first_id.clone()]
+        std::slice::from_ref(&first_id)
     );
 
     davinci_coding_agent::plugins::load_session(&mut agent, second).unwrap();

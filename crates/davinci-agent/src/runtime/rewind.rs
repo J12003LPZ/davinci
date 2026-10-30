@@ -244,8 +244,7 @@ pub fn plan_file_rewind(
     let norm_path = path.replace('\\', "/");
 
     // Case 1: Task created the file
-    if before_bytes.is_none() && after_bytes.is_some() {
-        let after = after_bytes.unwrap();
+    if let (None, Some(after)) = (before_bytes, after_bytes) {
         if current_bytes.is_none() {
             return FileRewindPlan::new(norm_path, "already_restored", None, false, None);
         }
@@ -264,8 +263,7 @@ pub fn plan_file_rewind(
     }
 
     // Case 2: Task deleted the file
-    if before_bytes.is_some() && after_bytes.is_none() {
-        let before = before_bytes.unwrap();
+    if let (Some(before), None) = (before_bytes, after_bytes) {
         if current_bytes.is_none() {
             return FileRewindPlan::new(norm_path, "inverse", Some(before.to_vec()), false, None);
         }

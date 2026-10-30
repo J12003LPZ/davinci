@@ -633,7 +633,7 @@ mod tests {
         let eval = evaluate_task_completion(
             &task,
             Some(&contract),
-            &[impl_receipt.clone()],
+            std::slice::from_ref(&impl_receipt),
             &manifest,
             0,
         );

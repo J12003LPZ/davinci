@@ -4345,7 +4345,7 @@ fn interactive_session_commands_replace_the_plugin_session_start_context() {
         assert!(!seen.contains(&id), "{id} is a new session");
         assert_eq!(
             SessionStartPlugin::context_session_ids(&agent),
-            [id.clone()],
+            std::slice::from_ref(&id),
             "stale plugin context survived the switch"
         );
         seen.push(id);

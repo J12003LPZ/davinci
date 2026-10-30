@@ -392,7 +392,7 @@ mod tests {
             "---\nname: test\ndescription: Test skill\n---\n\nUse the skill body.\n",
         )
         .unwrap();
-        let skills = discover_skills(&[skill_dir.clone()]);
+        let skills = discover_skills(std::slice::from_ref(&skill_dir));
         assert_eq!(skills[0].name, "test");
         let expanded = expand_skill_command("/skill:test explain this", &skills);
         assert!(expanded.contains("<skill name=\"test\" location=\""));
