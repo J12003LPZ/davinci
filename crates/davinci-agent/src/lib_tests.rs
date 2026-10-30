@@ -7786,3 +7786,101 @@ mod hybrid_fold_economics {
         assert_eq!(hybrid_stats(&agent), before);
     }
 }
+
+#[test]
+fn audit_wp02_b030_history_manifest_entries_carry_role_provenance() {
+    use runtime::context_manifest::ProvenanceKind;
+    let mut agent = Agent::new("");
+    agent
+        .messages
+        .push(ChatMessage::text("user", "build the parser"));
+    agent
+        .messages
+        .push(ChatMessage::text("assistant", "I will start now"));
+    agent
+        .messages
+        .push(ChatMessage::text("toolResult", "exit code 0"));
+    let manifest = agent.prepare_context_manifest("request", RunId::new(), 1, 1);
+    let history: Vec<_> = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.category == "history")
+        .collect();
+    let kinds: Vec<_> = history.iter().map(|entry| entry.provenance_kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            ProvenanceKind::UserDecision,
+            ProvenanceKind::AgentInference,
+            ProvenanceKind::ToolEvidence
+        ]
+    );
+    // The inspector's serialized form keeps the distinction.
+    let json = serde_json::to_value(&manifest).unwrap().to_string();
+    assert!(json.contains("user_decision") && json.contains("agent_inference"));
+}
+
+#[test]
+fn audit_wp02_b029_malformed_message_fails_import_and_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut good = JsonlSession::create(dir.path(), "fixture", Some("good")).unwrap();
+    good.append_entry(SessionEntry::message(
+        "user",
+        serde_json::json!([{"type": "text", "text": "keep me"}]),
+    ))
+    .unwrap();
+    let good_id = good.header.id.clone();
+    let mut agent = Agent::new("fixture");
+    agent.load_from_session(good).unwrap();
+    let messages_before = agent.messages.clone();
+    assert_eq!(messages_before.len(), 1);
+
+    let other = tempfile::tempdir().unwrap();
+    let mut bad = JsonlSession::create(other.path(), "fixture", Some("bad")).unwrap();
+    bad.append_entry(SessionEntry::message(
+        "user",
+        serde_json::json!([{"type": "text", "text": "fine"}]),
+    ))
+    .unwrap();
+    bad.append_entry(SessionEntry::message(
+        "user",
+        serde_json::json!([{"type": "no_such_part"}]),
+    ))
+    .unwrap();
+    let broken_id = bad.entries.last().unwrap().id.clone();
+    assert!(entry_to_chat(bad.entries.last().unwrap()).is_none());
+    let error = agent.load_from_session(bad).unwrap_err();
+    assert!(error.contains(&broken_id), "{error}");
+    assert!(error.contains("malformed message"), "{error}");
+    // Current context and session are untouched.
+    assert_eq!(agent.messages, messages_before);
+    assert_eq!(agent.session.as_ref().unwrap().header.id, good_id);
+
+    // Valid message, custom and compaction entries still load.
+    let third = tempfile::tempdir().unwrap();
+    let mut valid = JsonlSession::create(third.path(), "fixture", Some("valid")).unwrap();
+    valid
+        .append_entry(SessionEntry::message(
+            "user",
+            serde_json::json!([{"type": "text", "text": "hello"}]),
+        ))
+        .unwrap();
+    let mut custom = SessionEntry::message("user", serde_json::json!(""));
+    custom.entry_type = "custom_message".into();
+    custom.message = None;
+    custom.custom_type = Some("hint".into());
+    custom.extra.insert(
+        "content".into(),
+        serde_json::json!([{"type": "text", "text": "extra context"}]),
+    );
+    valid.append_entry(custom).unwrap();
+    let mut compaction = SessionEntry::message("user", serde_json::json!(""));
+    compaction.entry_type = "compaction".into();
+    compaction.message = None;
+    compaction
+        .extra
+        .insert("summary".into(), serde_json::json!("earlier work"));
+    valid.append_entry(compaction).unwrap();
+    agent.load_from_session(valid).unwrap();
+    assert!(!agent.messages.is_empty());
+}

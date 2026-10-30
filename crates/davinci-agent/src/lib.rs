@@ -556,6 +556,9 @@ pub struct Agent {
     pub auto_retry: bool,
     pub retry_attempts: u32,
     pub retry_base_delay_ms: u64,
+    /// Where the provider call leaves the server's `Retry-After` for the
+    /// request that just failed (see [`Agent::retry_after_sink`]).
+    retry_after_sink: davinci_ai::RetryAfterSink,
     /// Maximum provider model turns in one run; `Some(0)` disables the limit.
     pub max_model_turns: Option<u32>,
     pub provider_timeout_ms: Option<u64>,
@@ -809,6 +812,7 @@ impl Agent {
             auto_retry: true,
             retry_attempts: 3,
             retry_base_delay_ms: 2_000,
+            retry_after_sink: davinci_ai::RetryAfterSink::default(),
             max_model_turns: Some(200),
             provider_timeout_ms: None,
             provider_max_retries: None,
@@ -1812,6 +1816,13 @@ impl Agent {
             self.record_successful_mutation();
         }
         running
+    }
+
+    /// Hand this to the provider call (`StreamOptions::retry_after_sink`) so
+    /// the server's `Retry-After` on a failed request reaches the retry loop
+    /// as a number, not as text inside the error message.
+    pub fn retry_after_sink(&self) -> davinci_ai::RetryAfterSink {
+        self.retry_after_sink.clone()
     }
 
     /// Compatibility path for mutation sources that cannot yet provide a path.
@@ -3700,7 +3711,7 @@ impl Agent {
                 entries.push(ContextManifestEntry::new(
                     format!("message_{i}"),
                     "history",
-                    ProvenanceKind::ToolEvidence,
+                    history_provenance(msg),
                     format!("message::{}", msg.role),
                     ContextManifestEntry::hash_content(&content_str),
                     tokens,
@@ -5502,6 +5513,9 @@ impl Agent {
     /// Activate durable task state before replacing the active session.
     /// Reloading the live source preserves its writer lease and worker handles.
     pub fn load_from_session(&mut self, mut session: JsonlSession) -> Result<(), String> {
+        // Admission comes first: a message that cannot be read must stop the
+        // load, not silently vanish from the context the model is given.
+        validate_session_messages(&session)?;
         let session_budget = self.restore_root_budget(&session)?;
         let repair_checkpoint = Self::restore_repair_checkpoint(&session)?;
         let source = std::fs::canonicalize(&session.path).map_err(|error| {
@@ -6070,6 +6084,61 @@ pub(crate) struct ProviderContextObservation {
 
 pub(crate) fn is_legacy_verification_notice(message: &ChatMessage) -> bool {
     message.extra.contains_key("davinciVerificationStatus")
+}
+
+/// Manifest provenance of one history message, from the same role and origin
+/// rules the Context VM applies to its events: a real user message is a user
+/// decision, assistant text is inference, and only tool results are tool
+/// evidence. A message with no visible content carries no authority.
+fn history_provenance(message: &ChatMessage) -> runtime::context_manifest::ProvenanceKind {
+    use runtime::context_manifest::ProvenanceKind;
+    runtime::context_vm::events_from_messages(std::slice::from_ref(message))
+        .first()
+        .map_or_else(
+            || match message.role.as_str() {
+                "toolResult" | "tool_result" => ProvenanceKind::ToolEvidence,
+                _ => ProvenanceKind::AgentInference,
+            },
+            |event| event.provenance_kind,
+        )
+}
+
+/// Every message-bearing entry on the active branch must deserialize.
+/// `entry_to_chat` drops what it cannot read, which is right for non-message
+/// entry types but would hide a damaged or hostile message from the model's
+/// context. Entry types that carry no message (custom state, labels, plans)
+/// are not checked.
+fn validate_session_messages(session: &JsonlSession) -> Result<(), String> {
+    let malformed = |entry: &SessionEntry, detail: String| {
+        format!(
+            "session entry {} (seq {}, type {}) has malformed message content: {detail}",
+            entry.id, entry.seq, entry.entry_type
+        )
+    };
+    for entry in
+        davinci_session::build_context_entries(&session.entries, session.leaf_id.as_deref())
+    {
+        match entry.entry_type.as_str() {
+            "message" => {
+                let message = entry
+                    .message
+                    .as_ref()
+                    .ok_or_else(|| malformed(entry, "no message".into()))?;
+                serde_json::from_value::<ChatMessage>(message.clone())
+                    .map_err(|error| malformed(entry, error.to_string()))?;
+            }
+            "custom_message" => match entry.extra.get("content").or(entry.message.as_ref()) {
+                None | Some(Value::String(_)) => {}
+                Some(content @ Value::Array(_)) => {
+                    serde_json::from_value::<Vec<MessageContent>>(content.clone())
+                        .map_err(|error| malformed(entry, error.to_string()))?;
+                }
+                Some(_) => return Err(malformed(entry, "content is not text or a list".into())),
+            },
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {

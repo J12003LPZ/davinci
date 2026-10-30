@@ -190,7 +190,8 @@ pub use openai_siwc::{
 };
 pub use provider_retry::{
     is_retryable_provider_error, provider_error_from_ureq, retry_delay_from_headers,
-    retry_provider_request, ProviderError, ProviderRetryOptions,
+    retry_provider_request, server_retry_delay_ms, ProviderError, ProviderRetryOptions,
+    RetryAfterSink,
 };
 pub use providers::{builtin_providers, Provider, ProviderSpec, KNOWN_APIS, PROVIDER_SPECS};
 pub use responses_ledger::{

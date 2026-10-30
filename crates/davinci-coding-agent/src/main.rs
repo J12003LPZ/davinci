@@ -1652,6 +1652,7 @@ fn complete_simple_summarization(
         install_telemetry: Some(load_settings(&default_agent_dir()).install_telemetry_enabled()),
         abort_signal: None,
         output_schema: None,
+        retry_after_sink: None,
     };
     let response = complete_simple(
         &model,
@@ -3593,6 +3594,7 @@ fn complete_prompt_with_host(
                             install_telemetry: Some(current.install_telemetry),
                             abort_signal: current.abort_signal.clone(),
                             output_schema: current.output_schema.clone(),
+                            retry_after_sink: Some(current.retry_after_sink()),
                         },
                         &mut sink,
                     );

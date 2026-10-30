@@ -759,6 +759,7 @@ fn run_in_process(config: &RunConfig, root: &Path) -> RunResult {
                 install_telemetry: Some(current.install_telemetry),
                 abort_signal: None,
                 output_schema: current.output_schema.clone(),
+                retry_after_sink: None,
             };
             let build = |options: &StreamOptions| {
                 let mut body = davinci_ai::request_body_with(

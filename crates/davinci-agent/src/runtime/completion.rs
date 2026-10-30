@@ -199,16 +199,8 @@ pub fn evaluate_task_completion_with_budget(
             break;
         }
     }
-    // If no explicit mutation tool was used, but task has result or is docs-only, check if any passed receipt exists
-    if !impl_passed {
-        for r in &receipts {
-            if r.attempt == expected_attempt && r.is_passed() {
-                impl_passed = true;
-                impl_ev = Some(r.receipt_id);
-                break;
-            }
-        }
-    }
+    // A passed read, search or shell receipt is not implementation evidence:
+    // only the mutation receipts above can satisfy this dimension.
     checks.push(DimensionCheck {
         dimension: DimensionKind::Implementation,
         requirement_id: None,
@@ -714,5 +706,81 @@ mod tests {
             .find(|d| d.dimension == DimensionKind::InstalledApp)
             .unwrap();
         assert_eq!(install_check.state, DimensionState::PassedCurrent);
+    }
+
+    fn implementation_state(receipts: &[ExecutionReceipt], task: &TaskRecord) -> DimensionState {
+        let dir = tempdir().unwrap();
+        let manifest = SourceManifestBuilder::new(dir.path()).build().unwrap();
+        evaluate_task_completion(task, None, receipts, &manifest, 0)
+            .dimensions
+            .into_iter()
+            .find(|check| check.dimension == DimensionKind::Implementation)
+            .unwrap()
+            .state
+    }
+
+    #[test]
+    fn audit_wp02_b025_read_only_success_does_not_satisfy_implementation() {
+        let task = TaskRecord::new(RunId::new(), "implement");
+        let receipt = |tool: &str, started: bool, exit: Option<i32>| ExecutionReceipt {
+            task_id: Some(task.id),
+            tool_name: tool.into(),
+            started,
+            exit_code: exit,
+            ..Default::default()
+        };
+        // Reads, searches, shell and passing tests are not implementation.
+        for tool in ["read", "grep", "bash", "cargo test"] {
+            assert_eq!(
+                implementation_state(&[receipt(tool, true, Some(0))], &task),
+                DimensionState::Failed,
+                "{tool}"
+            );
+        }
+        // Read-only success plus a passing test run still leaves it open.
+        let eval = {
+            let dir = tempdir().unwrap();
+            let manifest = SourceManifestBuilder::new(dir.path()).build().unwrap();
+            evaluate_task_completion(
+                &task,
+                None,
+                &[
+                    receipt("read", true, Some(0)),
+                    receipt("cargo test", true, Some(0)),
+                ],
+                &manifest,
+                0,
+            )
+        };
+        assert!(!eval.allowed);
+        assert!(eval
+            .remaining_gaps
+            .contains(&"Implementation not verified".to_string()));
+
+        // A genuine successful mutation receipt satisfies it.
+        for tool in ["write", "edit", "apply_patch", "implementation"] {
+            assert_eq!(
+                implementation_state(&[receipt(tool, true, Some(0))], &task),
+                DimensionState::PassedCurrent,
+                "{tool}"
+            );
+        }
+        // Failed, unstarted and denied mutations do not.
+        assert_eq!(
+            implementation_state(&[receipt("edit", true, Some(1))], &task),
+            DimensionState::Failed
+        );
+        assert_eq!(
+            implementation_state(&[receipt("write", false, None)], &task),
+            DimensionState::Failed
+        );
+        let denied = ExecutionReceipt {
+            permission_denied: true,
+            ..receipt("apply_patch", true, Some(0))
+        };
+        assert_eq!(
+            implementation_state(&[denied], &task),
+            DimensionState::Failed
+        );
     }
 }

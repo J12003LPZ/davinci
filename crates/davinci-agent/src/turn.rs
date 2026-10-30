@@ -1222,14 +1222,24 @@ Issue the call again if it is still needed.";
                         Some(HarnessVerification::Inconclusive) | None => {
                             let message = match completion_evidence {
                                 crate::CompletionEvidence::VerificationFailed => {
-                                    "A verification failure remains unresolved after your changes. Investigate the failing check or report it explicitly before finalizing."
+                                    "A verification failure remains unresolved after your changes. Investigate the failing check or report it explicitly before finalizing.".to_string()
                                 }
                                 _ => {
-                                    "You changed files but have not completed a verification command. Run the narrowest appropriate test, check, or lint command before finalizing."
+                                    let observed: Vec<_> = mutation_state
+                                        .mutation_paths
+                                        .iter()
+                                        .map(|path| {
+                                            path.strip_prefix(&self.cwd).unwrap_or(path).to_path_buf()
+                                        })
+                                        .collect();
+                                    crate::verification::workspace::unverified_change_reminder(
+                                        &observed,
+                                        mutation_state.unknown_mutation_paths,
+                                    )
                                 }
                             };
                             self.queue_capability_reminder(
-                                message,
+                                &message,
                                 "verification_required",
                                 &mut events,
                                 &mut new_messages,
@@ -1470,6 +1480,23 @@ Issue the call again if it is still needed.";
         }
     }
 
+    /// Milliseconds to wait before retry `attempt + 1`, or `None` when the
+    /// retry should not happen. Reads the server's `Retry-After` once.
+    fn retry_wait_ms(&self, attempt: u32) -> Option<u64> {
+        let remaining_ms = self.root_budget.as_ref().map(|budget| {
+            budget
+                .limits()
+                .deadline_unix_ms
+                .saturating_sub(u64::try_from(crate::command_receipt::now()).unwrap_or(0))
+        });
+        plan_retry_wait(
+            retry_delay_ms(self.retry_base_delay_ms, attempt),
+            self.retry_after_sink.take(),
+            self.provider_max_retry_delay_ms,
+            remaining_ms,
+        )
+    }
+
     #[allow(clippy::type_complexity)]
     fn complete_with_retry<F, T>(
         &mut self,
@@ -1535,6 +1562,8 @@ Issue the call again if it is still needed.";
                 self.stats.provider_retries += 1;
             }
             let provider_started = std::time::Instant::now();
+            // A delay left by an earlier request says nothing about this one.
+            self.retry_after_sink.take();
             let result = complete(self);
             crate::RunStats::add_elapsed(&mut self.stats.provider_ms, provider_started.elapsed());
             drop(permit);
@@ -1554,12 +1583,13 @@ Issue the call again if it is still needed.";
                             .record_provider_cost(usage.cost.total);
                     }
 
-                    if message.stop_reason == Some(StopReason::Error)
+                    let wait = (message.stop_reason == Some(StopReason::Error)
                         && davinci_ai::is_retryable_assistant_error(&message)
-                        && attempt + 1 < attempts
-                    {
+                        && attempt + 1 < attempts)
+                        .then(|| self.retry_wait_ms(attempt))
+                        .flatten();
+                    if let Some(delay) = wait {
                         scheduled_attempt = attempt + 1;
-                        let delay = retry_delay_ms(self.retry_base_delay_ms, attempt);
                         self.push_event(
                             events,
                             AgentEvent::AutoRetryStart {
@@ -1607,9 +1637,12 @@ Issue the call again if it is still needed.";
                 }
                 Err(err) => {
                     last_error = Some(err.clone());
-                    if attempt + 1 < attempts && davinci_ai::is_retryable_error_text(&err) {
+                    let wait = (attempt + 1 < attempts
+                        && davinci_ai::is_retryable_error_text(&err))
+                    .then(|| self.retry_wait_ms(attempt))
+                    .flatten();
+                    if let Some(delay) = wait {
                         scheduled_attempt = attempt + 1;
-                        let delay = retry_delay_ms(self.retry_base_delay_ms, attempt);
                         self.push_event(
                             events,
                             AgentEvent::AutoRetryStart {
@@ -5571,6 +5604,31 @@ fn tool_result_message(
 }
 
 /// TS `baseDelayMs * 2 ** (attempt - 1)` with attempt starting at 1.
+/// The wait before a retry. The server's `Retry-After` can only lengthen the
+/// ordinary backoff, never shorten it. It does not stretch the limits around
+/// the run: a request for more than `max_server_ms` (when that is not zero) or
+/// for more time than `remaining_ms` before the run deadline means the retry
+/// would not be allowed to start, so there is no wait and no retry. The
+/// attempt cap stays with the caller.
+pub(crate) fn plan_retry_wait(
+    exponential_ms: u64,
+    server_ms: Option<u64>,
+    max_server_ms: u64,
+    remaining_ms: Option<u64>,
+) -> Option<u64> {
+    let Some(server_ms) = server_ms else {
+        return Some(exponential_ms);
+    };
+    if max_server_ms > 0 && server_ms > max_server_ms {
+        return None;
+    }
+    let delay = exponential_ms.max(server_ms);
+    if delay > exponential_ms && remaining_ms.is_some_and(|remaining| delay >= remaining) {
+        return None;
+    }
+    Some(delay)
+}
+
 pub fn retry_delay_ms(base_delay_ms: u64, zero_based_attempt: u32) -> u64 {
     let shift = zero_based_attempt.min(20);
     base_delay_ms.saturating_mul(1_u64 << shift)
@@ -5687,6 +5745,164 @@ mod tests {
             });
             assert_eq!(calls.get(), expected_calls, "maxRetries={max_retries}");
         }
+    }
+
+    fn overloaded() -> davinci_ai::AssistantMessage {
+        davinci_ai::AssistantMessage {
+            extra: Default::default(),
+            id: "overloaded".into(),
+            role: "assistant".into(),
+            content: Vec::new(),
+            model: "fixture".into(),
+            usage: None,
+            stop_reason: Some(davinci_ai::StopReason::Error),
+            error_message: Some("overloaded_error".into()),
+        }
+    }
+
+    fn retry_delays(agent: &mut Agent, events: &[crate::AgentEvent]) -> Vec<u64> {
+        let _ = agent;
+        events
+            .iter()
+            .filter_map(|event| match event {
+                crate::AgentEvent::AutoRetryStart { delay_ms, .. } => Some(*delay_ms),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn audit_wp02_b033_plan_retry_wait_honors_server_delay_within_limits() {
+        // No server delay: the ordinary backoff, untouched.
+        assert_eq!(plan_retry_wait(2_000, None, 60_000, None), Some(2_000));
+        // The server can only lengthen it.
+        assert_eq!(
+            plan_retry_wait(2_000, Some(5_000), 60_000, None),
+            Some(5_000)
+        );
+        assert_eq!(
+            plan_retry_wait(4_000, Some(1_000), 60_000, None),
+            Some(4_000)
+        );
+        assert_eq!(plan_retry_wait(2_000, Some(0), 60_000, None), Some(2_000));
+        // Past the configured maximum it gives up instead of waiting.
+        assert_eq!(plan_retry_wait(2_000, Some(61_000), 60_000, None), None);
+        assert_eq!(plan_retry_wait(2_000, Some(61_000), 0, None), Some(61_000));
+        // It never reaches past the run deadline: the retry could not start.
+        assert_eq!(
+            plan_retry_wait(2_000, Some(5_000), 60_000, Some(5_000)),
+            None
+        );
+        assert_eq!(
+            plan_retry_wait(2_000, Some(5_000), 60_000, Some(5_001)),
+            Some(5_000)
+        );
+        assert_eq!(plan_retry_wait(2_000, Some(5_000), 60_000, Some(0)), None);
+        // The ordinary backoff is not changed by the deadline rule.
+        assert_eq!(plan_retry_wait(2_000, None, 60_000, Some(1)), Some(2_000));
+        assert_eq!(
+            plan_retry_wait(9_000, Some(1_000), 60_000, Some(1)),
+            Some(9_000)
+        );
+    }
+
+    #[test]
+    fn audit_wp02_b033_server_retry_after_extends_the_backoff_and_keeps_the_cap() {
+        use davinci_ai::AssistantMessage;
+        let mut agent = Agent::new("retry after fixture");
+        agent.auto_retry = true;
+        agent.retry_attempts = 2;
+        agent.retry_base_delay_ms = 1;
+        agent.prompt("retry after");
+        let calls = std::cell::Cell::new(0);
+        let events = agent
+            .run_loop(|agent| {
+                calls.set(calls.get() + 1);
+                // The first failure asks for 120 ms; the second says nothing.
+                if calls.get() == 1 {
+                    agent.retry_after_sink().record(120);
+                }
+                Ok::<AssistantMessage, String>(overloaded())
+            })
+            .unwrap_or_default();
+        // The attempt cap still holds: one request plus two retries.
+        assert_eq!(calls.get(), 3);
+        let delays = retry_delays(&mut agent, &events);
+        assert_eq!(delays, vec![120, 2], "{delays:?}");
+    }
+
+    #[test]
+    fn audit_wp02_b033_oversized_or_deadline_bound_delay_stops_retrying() {
+        use davinci_ai::AssistantMessage;
+        let mut agent = Agent::new("retry after cap fixture");
+        agent.auto_retry = true;
+        agent.retry_attempts = 3;
+        agent.retry_base_delay_ms = 1;
+        agent.provider_max_retry_delay_ms = 1_000;
+        agent.prompt("retry after");
+        let calls = std::cell::Cell::new(0);
+        let started = std::time::Instant::now();
+        let _ = agent.run_loop(|agent| {
+            calls.set(calls.get() + 1);
+            agent.retry_after_sink().record(600_000);
+            Err::<AssistantMessage, String>("overloaded_error".into())
+        });
+        // A ten minute request is not waited for, and not retried.
+        assert_eq!(calls.get(), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn audit_wp02_b033_cancellation_interrupts_a_server_requested_wait() {
+        use davinci_ai::AssistantMessage;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let abort = Arc::new(AtomicBool::new(false));
+        let mut agent = Agent::new("retry after cancel fixture");
+        agent.auto_retry = true;
+        agent.retry_attempts = 3;
+        agent.retry_base_delay_ms = 1;
+        agent.abort_signal = Some(abort.clone());
+        agent.prompt("retry after");
+        let calls = std::cell::Cell::new(0);
+        let canceller = {
+            let abort = abort.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                abort.store(true, Ordering::SeqCst);
+            })
+        };
+        let started = std::time::Instant::now();
+        let _ = agent.run_loop(|agent| {
+            calls.set(calls.get() + 1);
+            agent.retry_after_sink().record(30_000);
+            Err::<AssistantMessage, String>("overloaded_error".into())
+        });
+        canceller.join().unwrap();
+        // Interrupted well inside the 30 s wait, and no request started after.
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn audit_wp02_b033_a_stale_server_delay_does_not_leak_into_the_next_request() {
+        use davinci_ai::AssistantMessage;
+        let mut agent = Agent::new("stale retry after fixture");
+        agent.auto_retry = true;
+        agent.retry_attempts = 2;
+        agent.retry_base_delay_ms = 1;
+        // Left over from some earlier request.
+        agent.retry_after_sink().record(60_000);
+        agent.prompt("retry after");
+        let calls = std::cell::Cell::new(0);
+        let events = agent
+            .run_loop(|_| {
+                calls.set(calls.get() + 1);
+                Ok::<AssistantMessage, String>(overloaded())
+            })
+            .unwrap_or_default();
+        assert_eq!(calls.get(), 3);
+        assert_eq!(retry_delays(&mut agent, &events), vec![1, 2]);
     }
 
     fn model_turn_read_call(turn: usize) -> davinci_ai::AssistantMessage {

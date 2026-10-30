@@ -59,11 +59,14 @@ pub(crate) fn runner_words(words: &[String]) -> Option<&'static str> {
             Some("pytest")
         }
         [name, ..] if matches!(name.as_str(), "pytest" | "pytest.exe") => Some("pytest"),
+        // The script behind a package manager's `test` is not visible here, so
+        // only the output it produced can show which runner ran.
         [name, action, ..]
-            if matches!(name.as_str(), "go" | "npm" | "pnpm" | "yarn") && action == "test" =>
+            if matches!(name.as_str(), "npm" | "pnpm" | "yarn") && action == "test" =>
         {
-            Some("unknown")
+            Some("package-script")
         }
+        [name, action, ..] if name == "go" && action == "test" => Some("unknown"),
         _ => None,
     }
 }
@@ -154,6 +157,7 @@ pub(crate) fn counts(command: &str, stdout: &[u8], stderr: &[u8]) -> Option<Asse
             counts.total = number.parse().ok()?;
             counts.passed = counts.total.checked_sub(counts.skipped)?;
         }
+        "package-script" => return package_script_unittest(stderr),
         "pytest" => {
             // Only pytest's final terminal summary; earlier lines can be test output.
             let end = stdout.lines().map(str::trim).rfind(|s| !s.is_empty())?;
@@ -162,6 +166,46 @@ pub(crate) fn counts(command: &str, stdout: &[u8], stderr: &[u8]) -> Option<Asse
         _ => return None,
     }
     Some(counts)
+}
+
+/// A package-manager `test` script that ran Python's standard unittest runner.
+/// The runner writes its report to stderr, ending in a rule of 70 dashes, a
+/// `Ran N tests in S.SSSs` line and the `OK` verdict. All of it must close the
+/// stream, so a summary printed to stdout, or one without the rule and the
+/// runner's timing format, proves nothing. Any other runner stays unknown.
+fn package_script_unittest(stderr: &str) -> Option<AssertionCounts> {
+    static RAN: OnceLock<regex::Regex> = OnceLock::new();
+    let lines: Vec<_> = stderr
+        .lines()
+        .map(str::trim_end)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let [.., rule, summary, verdict] = lines.as_slice() else {
+        return None;
+    };
+    if *rule != "-".repeat(70) {
+        return None;
+    }
+    let skipped: u32 = if *verdict == "OK" {
+        0
+    } else {
+        verdict
+            .strip_prefix("OK (skipped=")?
+            .strip_suffix(')')?
+            .parse()
+            .ok()?
+    };
+    let pattern = RAN.get_or_init(|| {
+        regex::Regex::new(r"^Ran (\d+) tests? in \d+\.\d{3}s$")
+            .expect("static unittest summary pattern")
+    });
+    let total: u32 = pattern.captures(summary)?[1].parse().ok()?;
+    Some(AssertionCounts {
+        total,
+        passed: total.checked_sub(skipped)?,
+        failed: 0,
+        skipped,
+    })
 }
 
 fn pytest_summary(line: &str) -> Option<AssertionCounts> {
@@ -461,5 +505,48 @@ mod tests {
             0
         );
         assert!(counts("pytest", b"unknown format", b"").is_none());
+    }
+
+    fn unittest_stderr(summary: &str) -> Vec<u8> {
+        format!("...\n{}\n{summary}\n", "-".repeat(70)).into_bytes()
+    }
+
+    #[test]
+    fn audit_wp02_b032_npm_wrapper_accepts_only_real_unittest_evidence() {
+        let npm = "npm test";
+        let stdout = b"> app@1.0.0 test\n> python -m unittest\n";
+        let real = unittest_stderr("Ran 3 tests in 0.002s\n\nOK");
+        let counts = counts(npm, stdout, &real).expect("real unittest evidence");
+        assert_eq!((counts.total, counts.passed, counts.failed), (3, 3, 0));
+        assert!(crate::verification::tests_passed(&counts));
+        for wrapper in ["pnpm test", "yarn test --silent"] {
+            assert!(super::counts(wrapper, stdout, &real).is_some(), "{wrapper}");
+        }
+        let skipped = unittest_stderr("Ran 4 tests in 0.010s\n\nOK (skipped=1)");
+        let counts = super::counts(npm, stdout, &skipped).unwrap();
+        assert_eq!((counts.total, counts.passed, counts.skipped), (4, 3, 1));
+
+        // Zero tests run: counted, but never a passing check.
+        let none = unittest_stderr("Ran 0 tests in 0.000s\n\nOK");
+        let zero = super::counts(npm, stdout, &none).unwrap();
+        assert!(!crate::verification::tests_passed(&zero));
+        // A failing run carries no OK verdict.
+        let failed = unittest_stderr("Ran 3 tests in 0.002s\n\nFAILED (failures=1)");
+        assert!(super::counts(npm, stdout, &failed).is_none());
+
+        // Printed text without the runner's report: stdout, no rule, wrong timing.
+        let spoofs: [(&[u8], &[u8]); 5] = [
+            (b"Ran 3 tests in 0.002s\n\nOK\n", b""),
+            (b"", b"Ran 3 tests in 0.002s\n\nOK\n"),
+            (b"", b"----------\nRan 3 tests in 0.002s\n\nOK\n"),
+            (b"", b"----------------------------------------------------------------------\nRan 3 tests in 0.1s\n\nOK\n"),
+            (b"", b"----------------------------------------------------------------------\nRan 3 tests in 0.002s\n\nOK\nextra line\n"),
+        ];
+        for (out, err) in spoofs {
+            assert!(super::counts(npm, out, err).is_none(), "{err:?}");
+        }
+        // The wrapper does not weaken other runners or the direct command.
+        assert!(super::counts("go test ./...", stdout, &real).is_none());
+        assert!(super::counts("python -m unittest", b"", &real).is_some());
     }
 }

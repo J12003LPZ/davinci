@@ -1453,26 +1453,18 @@ workflow '{name}' ({id}) failed: {error}"
         aid: AgentId,
         phase_id: &str,
         worker: &WorkflowWorkerSpec,
+        parent_provider: &str,
     ) -> Result<TaskId, WorkflowExecutionError> {
         let now = now_ms();
+        let (provider, model_id) = worker_model_identity(worker.model.as_deref(), parent_provider);
         let record = AgentRecord {
             id: aid,
             run_id: self.runtime.run_id,
             parent: Some(self.runtime.agent_id),
             kind: AgentKind::Subagent,
             name: worker.id.clone(),
-            provider: worker
-                .model
-                .as_ref()
-                .and_then(|m| m.split('/').next())
-                .unwrap_or_default()
-                .to_string(),
-            model_id: worker
-                .model
-                .as_ref()
-                .and_then(|m| m.split('/').nth(1))
-                .unwrap_or_default()
-                .to_string(),
+            provider,
+            model_id,
             cwd: std::env::current_dir().unwrap_or_default(),
             state: AgentState::Running,
             task_id: None,
@@ -1576,13 +1568,21 @@ workflow '{name}' ({id}) failed: {error}"
 
         let mut worker_agent_ids = Vec::new();
         let mut worker_tasks = Vec::new();
+        // The provider a bare model override resolves against at launch.
+        let parent_provider = self
+            .launches
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(wf_id)
+            .and_then(|launch| launch.provider.clone())
+            .unwrap_or_default();
 
         for worker in &phase.workers {
             if already_done.contains(&worker.id) {
                 continue;
             }
             let aid = AgentId::new();
-            match self.admit_worker(aid, &phase.id, worker) {
+            match self.admit_worker(aid, &phase.id, worker, &parent_provider) {
                 Ok(tid) => {
                     worker_agent_ids.push(aid);
                     worker_tasks.push((aid, tid, worker.clone()));
@@ -1992,6 +1992,19 @@ fn resume_launch(
         launch.parent_permission_mode = Some(crate::PermissionMode::ReadOnly);
     }
     launch
+}
+
+/// Provider and model id a worker's `model` override resolves to, split the
+/// way the launcher splits it: at the first `/`, with a bare id taken from the
+/// parent's provider. No override names nothing (the worker inherits).
+fn worker_model_identity(model: Option<&str>, parent_provider: &str) -> (String, String) {
+    match model.map(str::trim).filter(|model| !model.is_empty()) {
+        Some(target) => match target.split_once('/') {
+            Some((provider, id)) => (provider.trim().to_string(), id.trim().to_string()),
+            None => (parent_provider.to_string(), target.to_string()),
+        },
+        None => (String::new(), String::new()),
+    }
 }
 
 #[cfg(test)]
@@ -2732,7 +2745,7 @@ mod tests {
             .unwrap();
         let aid = AgentId::new();
         let tid = executor
-            .admit_worker(aid, "consumer", &consumer.workers[0])
+            .admit_worker(aid, "consumer", &consumer.workers[0], "")
             .unwrap();
         let result = executor.run_workflow_worker(
             &id,
@@ -3997,11 +4010,11 @@ mod tests {
         let spec = phase_spec("all", &["a"]);
         let taken = AgentId::new();
         executor
-            .admit_worker(taken, "work", &spec.phases[0].workers[0])
+            .admit_worker(taken, "work", &spec.phases[0].workers[0], "")
             .unwrap();
         let tasks_before = executor.runtime.task_registry.list_tasks(None).len();
         let error = executor
-            .admit_worker(taken, "work", &spec.phases[0].workers[0])
+            .admit_worker(taken, "work", &spec.phases[0].workers[0], "")
             .unwrap_err();
         assert!(error.to_string().contains("could not register"), "{error}");
         assert_eq!(
@@ -4128,5 +4141,41 @@ mod tests {
             .report_completion(id, "gone", &outcome)
             .unwrap_err();
         assert!(problem.contains("not delivered to the lead"), "{problem}");
+    }
+
+    #[test]
+    fn audit_wp02_b034_bare_and_qualified_overrides_report_the_same_model() {
+        let (executor, _tmp) = setup_executor(None);
+        let mut spec = phase_spec("all", &["bare", "qualified", "nested", "inherit"]);
+        let models = [
+            Some("claude-opus-5-5"),
+            Some("anthropic/claude-opus-5-5"),
+            Some("openrouter/anthropic/claude-opus-5-5"),
+            None,
+        ];
+        for (worker, model) in spec.phases[0].workers.iter_mut().zip(models) {
+            worker.model = model.map(str::to_string);
+        }
+        let status = |worker: &WorkflowWorkerSpec| {
+            let aid = AgentId::new();
+            executor
+                .admit_worker(aid, "work", worker, "anthropic")
+                .unwrap();
+            let record = executor.runtime.registry.get(&aid).unwrap();
+            (record.provider, record.model_id)
+        };
+        let workers = &spec.phases[0].workers;
+        let expected = ("anthropic".to_string(), "claude-opus-5-5".to_string());
+        assert_eq!(status(&workers[0]), expected);
+        assert_eq!(status(&workers[1]), expected);
+        // Only the first slash separates provider from model id.
+        assert_eq!(
+            status(&workers[2]),
+            (
+                "openrouter".to_string(),
+                "anthropic/claude-opus-5-5".to_string()
+            )
+        );
+        assert_eq!(status(&workers[3]), (String::new(), String::new()));
     }
 }

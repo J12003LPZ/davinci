@@ -98,6 +98,59 @@ fn validate_server_retry_delay_ms(
     Ok(delay_ms.max(0.0) as u64)
 }
 
+/// The delay the server asked for, in milliseconds: `retry-after-ms` first,
+/// then `Retry-After` as delta-seconds or an HTTP date. An unparseable or
+/// negative header asks for nothing. A date in the past is valid and means
+/// "retry now".
+fn server_delay_ms(error: &ProviderError, now_ms: i64) -> Option<f64> {
+    if let Some(value) = error.header("retry-after-ms").and_then(retry_after_number) {
+        return Some(value);
+    }
+    let retry_after = error.header("retry-after")?;
+    match retry_after_number(retry_after) {
+        Some(seconds) => Some(seconds * 1000.0),
+        None => http_date_delay_ms(retry_after, now_ms),
+    }
+}
+
+/// The structured form of a failed request's `Retry-After` for a caller that
+/// owns its own retry loop. `None` when the server asked for nothing valid;
+/// the caller then keeps its ordinary backoff.
+pub fn server_retry_delay_ms(error: &ProviderError, now_ms: i64) -> Option<u64> {
+    server_delay_ms(error, now_ms).map(|delay_ms| delay_ms.max(0.0) as u64)
+}
+
+/// Where a provider call leaves the delay the server asked for on its final
+/// failure. The error type that call returns is a message string; this keeps
+/// the header value typed instead of making the caller parse it back out.
+#[derive(Debug, Clone, Default)]
+pub struct RetryAfterSink(std::sync::Arc<std::sync::Mutex<Option<u64>>>);
+
+impl RetryAfterSink {
+    pub fn record(&self, delay_ms: u64) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(delay_ms);
+    }
+
+    /// The recorded delay, once: reading clears it.
+    pub fn take(&self) -> Option<u64> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+/// Record the server's requested delay for `error`, if it asked for one.
+pub(crate) fn note_server_retry_delay(sink: Option<&RetryAfterSink>, error: &ProviderError) {
+    let Some(sink) = sink else {
+        return;
+    };
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if let Some(delay_ms) = server_retry_delay_ms(error, now_ms) {
+        sink.record(delay_ms);
+    }
+}
+
 /// Parse `Retry-After` / `retry-after-ms` the way undici and the TS helper do.
 pub fn retry_delay_from_headers(
     error: &ProviderError,
@@ -105,21 +158,8 @@ pub fn retry_delay_from_headers(
     max_retry_delay_ms: Option<u64>,
     now_ms: i64,
 ) -> Result<u64, ProviderError> {
-    if let Some(retry_after_ms) = error.header("retry-after-ms") {
-        if let Some(value) = retry_after_number(retry_after_ms) {
-            return validate_server_retry_delay_ms(value, max_retry_delay_ms, &error.message);
-        }
-    }
-    if let Some(retry_after) = error.header("retry-after") {
-        let delay_ms = match retry_after_number(retry_after) {
-            Some(seconds) => Some(seconds * 1000.0),
-            None => http_date_delay_ms(retry_after, now_ms),
-        };
-        // An unparseable or negative header falls through to exponential
-        // backoff. A date in the past is valid and means "retry now".
-        if let Some(delay_ms) = delay_ms {
-            return validate_server_retry_delay_ms(delay_ms, max_retry_delay_ms, &error.message);
-        }
+    if let Some(delay_ms) = server_delay_ms(error, now_ms) {
+        return validate_server_retry_delay_ms(delay_ms, max_retry_delay_ms, &error.message);
     }
     let exponential = (0.5 * 2_f64.powi(retry_index as i32)).min(8.0) * 1000.0;
     let jitter = if cfg!(test) {
@@ -660,5 +700,55 @@ mod tests {
         let error = provider_error_from_ureq(error);
         assert_eq!(error.phase, RequestPhase::Connect);
         assert!(is_retryable_provider_error(&error));
+    }
+
+    #[test]
+    fn audit_wp02_b033_server_delay_is_structured_and_bounded_to_valid_headers() {
+        let now = ymd_hms_to_unix_ms(2030, 1, 1, 0, 0, 0);
+        let delay = |header: &str, value: &str| {
+            server_retry_delay_ms(
+                &ProviderError::new(Some(429), "wait").with_header(header, value),
+                now,
+            )
+        };
+        // Delta-seconds, milliseconds and an HTTP date measured on a fake clock.
+        assert_eq!(delay("retry-after", "4"), Some(4_000));
+        assert_eq!(delay("retry-after-ms", "1500"), Some(1_500));
+        assert_eq!(
+            delay("retry-after", "Tue, 01 Jan 2030 00:00:45 GMT"),
+            Some(45_000)
+        );
+        // A date in the past means retry now; a malformed or negative header asks for nothing.
+        assert_eq!(
+            delay("retry-after", "Mon, 31 Dec 2029 23:59:00 GMT"),
+            Some(0)
+        );
+        for bad in [
+            "invalid-date",
+            "",
+            "NaN",
+            "-5",
+            "inf",
+            "Tue, 99 Foo 2030 00:00:00 GMT",
+        ] {
+            assert_eq!(delay("retry-after", bad), None, "{bad:?}");
+        }
+        assert_eq!(
+            server_retry_delay_ms(&ProviderError::new(Some(500), "boom"), now),
+            None
+        );
+        // retry-after-ms wins over retry-after, as in the provider-level loop.
+        let both = ProviderError::new(Some(429), "wait")
+            .with_header("retry-after", "9")
+            .with_header("retry-after-ms", "250");
+        assert_eq!(server_retry_delay_ms(&both, now), Some(250));
+
+        let sink = RetryAfterSink::default();
+        note_server_retry_delay(Some(&sink), &both);
+        assert_eq!(sink.take(), Some(250));
+        assert_eq!(sink.take(), None, "reading clears the sink");
+        note_server_retry_delay(Some(&sink), &ProviderError::new(Some(500), "boom"));
+        assert_eq!(sink.take(), None);
+        note_server_retry_delay(None, &both);
     }
 }

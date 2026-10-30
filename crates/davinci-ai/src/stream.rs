@@ -46,6 +46,9 @@ pub struct StreamOptions {
     /// `response_format`; other providers get no wire change and rely on the
     /// caller's validation.
     pub output_schema: Option<Value>,
+    /// Receives the `Retry-After` the server sent with the request's final
+    /// failure, as a typed delay, for a caller that runs its own retries.
+    pub retry_after_sink: Option<crate::RetryAfterSink>,
 }
 
 /// The schema name the constrained-output wire formats carry. Codex exec
@@ -844,7 +847,10 @@ pub fn live_complete_with(
         options.abort_signal.as_ref(),
         |ms| std::thread::sleep(Duration::from_millis(ms)),
     )
-    .map_err(|err| err.message)?;
+    .map_err(|err| {
+        crate::provider_retry::note_server_retry_delay(options.retry_after_sink.as_ref(), &err);
+        err.message
+    })?;
     let message = parse_provider_response(model, &text);
     observation.finish(
         if message.stop_reason == Some(StopReason::Error) {
@@ -1194,6 +1200,7 @@ fn live_complete_streaming_with_sink_envelope_inner(
     )
     .map_err(|err| {
         crate::trace::log(&format!("sse request failed: {}", err.message));
+        crate::provider_retry::note_server_retry_delay(options.retry_after_sink.as_ref(), &err);
         err.message
     })?;
     crate::trace::log(&format!("sse status {}", response.status()));

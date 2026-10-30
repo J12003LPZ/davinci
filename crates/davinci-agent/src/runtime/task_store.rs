@@ -205,11 +205,24 @@ pub(crate) struct TaskJournal {
 
 /// Lock the journal file itself, so path aliases cannot create a second writer.
 /// The OS releases the lease even when process::exit bypasses destructors.
+///
+/// The journal holds task results and the directory its quarantined tails, so
+/// both are owner-only. Before anything is read, repaired or appended, the
+/// opened handle must be a regular file named by one directory entry: a second
+/// hard link could make this write through to a file outside the session.
 fn open_exclusive(path: &Path) -> Result<File, TaskError> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        davinci_sys::fs::create_private_dir_all(parent).map_err(persistence)?;
+    }
     let mut options = OpenOptions::new();
     // Windows append-only access cannot truncate a quarantined torn tail.
     // The exclusive lease and commit mutex serialize explicit end seeks.
     options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -233,6 +246,24 @@ fn open_exclusive(path: &Path) -> Result<File, TaskError> {
             Err(error) => return Err(persistence(error)),
         }
     };
+    if !file.metadata().map_err(persistence)?.is_file() {
+        return Err(persistence("task journal is not a regular file"));
+    }
+    davinci_sys::fs::ensure_single_link(&file).map_err(|error| {
+        persistence(format!(
+            "task journal {} is not safe to write: {error}",
+            path.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Through the handle that was just validated, never through the path.
+        if file.metadata().map_err(persistence)?.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(persistence)?;
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -512,11 +543,8 @@ impl TaskJournal {
             // Preserve every torn byte before truncating. Never quarantine a
             // complete but corrupt record or an unknown schema as a mere tail.
             let tail_path = path.with_extension(format!("quarantine-{}", Uuid::new_v4()));
-            let mut quarantine = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(tail_path)
-                .map_err(persistence)?;
+            let mut quarantine =
+                davinci_sys::fs::create_new_private(&tail_path).map_err(persistence)?;
             quarantine.write_all(&tail).map_err(persistence)?;
             quarantine.sync_all().map_err(persistence)?;
             sync_parent(path)?;
@@ -1621,5 +1649,92 @@ mod tests {
             .create_task(TaskRecord::new(RunId::new(), "wrong run"))
             .is_err());
         assert!(registry.list_tasks(None).is_empty());
+    }
+
+    #[test]
+    fn audit_wp02_b027_hard_linked_journal_is_neither_initialized_nor_appended() {
+        let outside = tempfile::tempdir().unwrap();
+        let canary = outside.path().join("canary.txt");
+        std::fs::write(&canary, b"not a journal\n").unwrap();
+        let session = tempfile::tempdir().unwrap();
+        let path = session.path().join("tasks.jsonl");
+        std::fs::hard_link(&canary, &path).unwrap();
+
+        assert!(TaskRegistry::open_session_durable(&path, "source/session").is_err());
+        assert!(TaskRegistry::open_durable(&path, RunId::new()).is_err());
+        assert_eq!(std::fs::read(&canary).unwrap(), b"not a journal\n");
+
+        // An empty hard-linked file is not initialized with a header either.
+        std::fs::write(&canary, b"").unwrap();
+        assert!(TaskRegistry::open_session_durable(&path, "source/session").is_err());
+        assert_eq!(std::fs::read(&canary).unwrap(), b"");
+
+        // Recovery of a genuine single-link journal is unchanged and durable.
+        let genuine = session.path().join("genuine.jsonl");
+        let (registry, run) =
+            TaskRegistry::open_session_durable(&genuine, "source/session").unwrap();
+        let id = registry
+            .create_task(TaskRecord::new(run, "persisted"))
+            .unwrap();
+        drop(registry);
+        OpenOptions::new()
+            .append(true)
+            .open(&genuine)
+            .unwrap()
+            .write_all(b"{torn")
+            .unwrap();
+        let (registry, restored) =
+            TaskRegistry::open_session_durable(&genuine, "source/session").unwrap();
+        assert_eq!(restored, run);
+        assert!(registry.get_task(&id).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_wp02_b024_journal_quarantine_and_directory_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        // SAFETY: umask is process-wide; this test restores it before returning
+        // and no other test in this module depends on the creation mask.
+        let previous = unsafe { libc::umask(0) };
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("new").join("session");
+        let path = directory.join("tasks.jsonl");
+        let (registry, run) = TaskRegistry::open_session_durable(&path, "source/session").unwrap();
+        registry.create_task(TaskRecord::new(run, "x")).unwrap();
+        drop(registry);
+        assert_eq!(mode(&path) & 0o077, 0, "journal {:o}", mode(&path));
+        assert_eq!(mode(&directory) & 0o077, 0, "dir {:o}", mode(&directory));
+
+        // A pre-existing group/world-readable journal is tightened in place.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{torn")
+            .unwrap();
+        let (registry, _) = TaskRegistry::open_session_durable(&path, "source/session").unwrap();
+        drop(registry);
+        assert_eq!(mode(&path) & 0o077, 0);
+        let quarantines: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p != &path)
+            .collect();
+        assert_eq!(quarantines.len(), 1);
+        assert_eq!(mode(&quarantines[0]) & 0o077, 0);
+
+        // A hard link to an outside file keeps its mode and content.
+        let outside = tempfile::tempdir().unwrap();
+        let canary = outside.path().join("canary");
+        std::fs::write(&canary, b"x").unwrap();
+        std::fs::set_permissions(&canary, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let linked = directory.join("linked.jsonl");
+        std::fs::hard_link(&canary, &linked).unwrap();
+        assert!(TaskRegistry::open_session_durable(&linked, "source/session").is_err());
+        assert_eq!(mode(&canary), 0o644);
+        assert_eq!(std::fs::read(&canary).unwrap(), b"x");
+        unsafe { libc::umask(previous) };
     }
 }
