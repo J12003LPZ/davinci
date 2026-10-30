@@ -30,26 +30,38 @@ impl HistoryStore {
     /// The newest entries, newest first, without consecutive repeats. A
     /// missing or damaged file reads as less history, never an error.
     pub fn load(&self) -> Vec<String> {
-        let Ok(raw) = fs::read_to_string(&self.path) else {
+        let Ok(file) = fs::File::open(&self.path) else {
             return Vec::new();
         };
-        let mut out: Vec<String> = Vec::new();
-        for line in raw.lines().rev() {
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            let Some(text) = value.get("text").and_then(|text| text.as_str()) else {
-                continue;
-            };
-            if out.last().is_some_and(|last| last == text) {
-                continue;
-            }
-            out.push(text.to_owned());
-            if out.len() >= LOAD_LIMIT {
-                break;
+        let mut reader = std::io::BufReader::new(file);
+        let mut line = Vec::new();
+        let mut newest: std::collections::VecDeque<String> =
+            std::collections::VecDeque::with_capacity(LOAD_LIMIT);
+        loop {
+            line.clear();
+            match davinci_sys::fs::read_line_bounded(&mut reader, &mut line, MAX_ENTRY_BYTES) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&line) else {
+                        continue;
+                    };
+                    let Some(text) = value.get("text").and_then(|text| text.as_str()) else {
+                        continue;
+                    };
+                    if newest.back().is_some_and(|last| last.as_str() == text) {
+                        continue;
+                    }
+                    newest.push_back(text.to_owned());
+                    if newest.len() > LOAD_LIMIT {
+                        newest.pop_front();
+                    }
+                }
+                // An oversized convenience-history entry is skipped, never
+                // buffered whole; the reader is left at the next line.
+                Err(_) => continue,
             }
         }
-        out
+        newest.into_iter().rev().collect()
     }
 
     /// Prompts from every project, newest file first and newest entry first
@@ -246,5 +258,19 @@ mod tests {
             store.append(&format!("{i} {}", "x".repeat(4000)));
         }
         assert_eq!(mode(&store.path), 0o600);
+    }
+
+    #[test]
+    fn audit_wp07_b068_oversized_history_entries_are_skipped_with_bounded_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HistoryStore::for_cwd(dir.path(), Path::new("/work"));
+        fs::create_dir_all(store.path.parent().unwrap()).unwrap();
+        let mut body = String::new();
+        body.push_str("{\"text\":\"one\"}\n");
+        body.push_str(&format!("{{\"text\":\"{}\"}}\n", "x".repeat(20_000)));
+        body.push_str("{\"text\":\"two\"}\n");
+        body.push_str("{\"text\":\"two\"}\n");
+        fs::write(&store.path, body).unwrap();
+        assert_eq!(store.load(), vec!["two", "one"]);
     }
 }

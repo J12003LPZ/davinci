@@ -372,6 +372,7 @@ impl PersistentJsSession {
             let mut reader = BufReader::new(stdout);
             let mut line = Vec::new();
             loop {
+                line.clear();
                 match davinci_sys::fs::read_line_bounded(
                     &mut reader,
                     &mut line,
