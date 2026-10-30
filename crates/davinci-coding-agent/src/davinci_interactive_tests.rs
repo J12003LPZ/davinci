@@ -4634,3 +4634,24 @@ fn idle_esc_with_a_popup_or_overlay_in_a_worker_view_closes_it_and_arms_nothing(
     assert!(!idle_esc(&mut model, &mut last));
     assert!(!idle_esc(&mut model, &mut last));
 }
+
+#[test]
+fn audit_wp06_b062_malformed_marketplace_registry_is_visible() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(agent_dir.join("plugins")).unwrap();
+    std::fs::write(agent_dir.join("plugins/marketplaces.json"), "{broken").unwrap();
+    let rows = super::marketplace_rows(&agent_dir);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, davinci_tui::davinci::theme::State::Failed);
+    assert!(
+        rows[0].detail.contains("marketplaces.json"),
+        "{:?}",
+        rows[0].detail
+    );
+
+    std::fs::write(agent_dir.join("plugins/marketplaces.json"), "{}").unwrap();
+    assert!(super::marketplace_rows(&agent_dir)
+        .iter()
+        .all(|row| row.state != davinci_tui::davinci::theme::State::Failed));
+}

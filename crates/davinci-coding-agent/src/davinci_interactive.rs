@@ -6442,8 +6442,46 @@ fn open_extension_manager(
 /// be refreshed or removed here; Claude Code's and Codex's are read-only.
 fn marketplace_rows(agent_dir: &std::path::Path) -> Vec<ExtensionRow> {
     use davinci_coding_agent::plugins::{discover, marketplace};
-    let registry = marketplace::load_registry(agent_dir).unwrap_or_default();
-    let mut catalogs = marketplace::catalogs(agent_dir).unwrap_or_default();
+    let registry = match marketplace::load_registry(agent_dir) {
+        Ok(registry) => registry,
+        Err(err) => {
+            return vec![ExtensionRow {
+                key: "marketplace-registry-error".into(),
+                title: "Marketplaces".into(),
+                status: "registry error".into(),
+                state: State::Failed,
+                detail: err,
+                note: None,
+                group: String::new(),
+                tokens: 0,
+                can_update: false,
+                can_toggle: false,
+                can_approve: false,
+                can_revoke: false,
+                can_delete: false,
+            }]
+        }
+    };
+    let mut catalogs = match marketplace::catalogs(agent_dir) {
+        Ok(catalogs) => catalogs,
+        Err(err) => {
+            return vec![ExtensionRow {
+                key: "marketplace-catalog-error".into(),
+                title: "Marketplaces".into(),
+                status: "catalog error".into(),
+                state: State::Failed,
+                detail: err,
+                note: None,
+                group: String::new(),
+                tokens: 0,
+                can_update: false,
+                can_toggle: false,
+                can_approve: false,
+                can_revoke: false,
+                can_delete: false,
+            }]
+        }
+    };
     let builtins = discover::genuine_builtins(agent_dir);
     catalogs.sort_by_key(|catalog| !builtins.contains(&catalog.name));
     catalogs

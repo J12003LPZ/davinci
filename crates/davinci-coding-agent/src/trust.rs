@@ -157,6 +157,27 @@ fn comparable_path(path: &str) -> String {
 }
 
 /// TS `resolveProjectTrusted` without the interactive ask / extension hook.
+/// Project trust for an operation that must never inherit the
+/// "nothing to trust here" shortcut: a pristine folder that is about to gain
+/// project-controlled resources still needs an explicit decision.
+pub fn explicitly_project_trusted(
+    agent_dir: &Path,
+    cwd: &Path,
+    override_trust: Option<bool>,
+    default_project_trust: Option<&str>,
+    trusted_projects: &[String],
+) -> bool {
+    if let Some(value) = override_trust {
+        return value;
+    }
+    match ProjectTrustStore::open(agent_dir).try_get(cwd) {
+        Ok(Some(decision)) => return decision,
+        Ok(None) => {}
+        Err(_) => return false,
+    }
+    host_configured_trust(cwd, default_project_trust, trusted_projects)
+}
+
 pub fn resolve_project_trusted(
     agent_dir: &Path,
     cwd: &Path,
