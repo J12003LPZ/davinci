@@ -509,13 +509,14 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
             }
             let exclude = command.exclude_from_context.unwrap_or(false);
             let bash_command = command.command.unwrap_or_default();
-            match davinci_agent::execute_tool(
+            match davinci_agent::execute_tool_with(
                 &runtime.cwd,
                 "bash",
                 &serde_json::json!({
                     "command": bash_command,
                     "excludeFromContext": exclude
                 }),
+                &runtime.agent.tool_context,
             ) {
                 Ok(result) => {
                     let bash_result = serde_json::json!({

@@ -842,6 +842,40 @@ thread_local! {
     static WORKER_STARTUP_CONTEXT: std::cell::RefCell<Option<crate::native_extensions::graph::GraphWorkerContext>> = const { std::cell::RefCell::new(None) };
 }
 
+/// Apply the user's final tool selection after every built-in, native and
+/// extension source has merged. `--no-tools` clears the merged set, `--tools`
+/// is an allowlist over it, and `--exclude-tools` removes names from it. The
+/// same predicate is reused after reloads so latency cannot reintroduce a tool.
+fn apply_tool_admission(parsed: &Args, agent: &mut Agent) -> Result<(), String> {
+    if !parsed.tools.is_empty() {
+        let unknown: Vec<&String> = parsed
+            .tools
+            .iter()
+            .filter(|name| !agent.tool_registry.iter().any(|known| known == *name))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "Unknown tool{} requested by --tools: {}",
+                if unknown.len() == 1 { "" } else { "s" },
+                unknown
+                    .iter()
+                    .map(|name| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    if parsed.no_tools {
+        agent.tools.clear();
+    } else if !parsed.tools.is_empty() {
+        agent.tools.retain(|name| parsed.tools.contains(name));
+    }
+    agent
+        .tools
+        .retain(|name| !parsed.exclude_tools.contains(name));
+    Ok(())
+}
+
 fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, String> {
     let graph_worker = crate::native_extensions::graph_worker_context();
     if std::env::var_os("PI_GRAPH_ROLE").is_some() && graph_worker.is_none() {
@@ -1357,6 +1391,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         let _ = ext.handlers.as_slice();
     }
     agent.apply_extension_tools(&names);
+    apply_tool_admission(parsed, &mut agent)?;
     sync_visual_verification_availability(&mut agent, &host);
     if let Some(graph_worker) = &graph_worker {
         agent.tool_context.transaction_owner.graph_node = Some(graph_worker.node_id.clone());
@@ -1470,7 +1505,6 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     if let Some(key) = &parsed.api_key {
         if let Ok(mut storage) = AuthStorage::create() {
             storage.set_runtime_override(&agent.provider, key);
-            let _ = storage.login_api_key(&agent.provider, key);
         }
     }
     agent.summarizer = Some(live_compaction_summarizer(parsed, &agent));
@@ -4092,6 +4126,43 @@ fn denied_actions_summary(actions: &[serde_json::Value]) -> String {
     )
 }
 
+/// Structured denials from tool results, so a policy that refuses without an
+/// interactive challenge (read-only, for example) still counts for
+/// `--fail-on-denied` and the final summary.
+fn tool_event_denials(events: &[AgentEvent]) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                details: Some(details),
+                ..
+            } = event
+            else {
+                return None;
+            };
+            if details.get("denied").and_then(serde_json::Value::as_bool) != Some(true) {
+                return None;
+            }
+            Some(serde_json::json!({
+                "tool_call_id": tool_call_id,
+                "action": tool_name,
+                "target": details
+                    .get("target")
+                    .or_else(|| details.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(native_extensions::vector_memory::redact_secrets)
+                    .unwrap_or_default(),
+                "permission_mode": details
+                    .get("permissionMode")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("policy"),
+            }))
+        })
+        .collect()
+}
+
 /// `denials` selects `--approval-policy deny-continue`: a challenge is denied
 /// with a headless reason and the turn goes on, until one action is refused
 /// [`PRINT_DENIAL_CAP`] times. Without it the first challenge stops the run.
@@ -4368,7 +4439,7 @@ fn run_print_turns(
         }
         other => (exit_code, other),
     };
-    let denied = denials
+    let mut denied = denials
         .map(|denials| {
             std::mem::take(
                 &mut denials
@@ -4378,6 +4449,19 @@ fn run_print_turns(
             )
         })
         .unwrap_or_default();
+    for action in tool_event_denials(&all_events) {
+        let call_id = action
+            .get("tool_call_id")
+            .and_then(serde_json::Value::as_str);
+        if !denied.iter().any(|known| {
+            known
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str)
+                == call_id
+        }) {
+            denied.push(action);
+        }
+    }
     // Written before any approval_required, which stays the final line.
     if json_mode {
         let encoded = serde_json::to_string(&output::harness_stats_record(agent))
@@ -7068,10 +7152,11 @@ fn apply_session_action(
                 }
                 return Ok(true);
             }
-            match davinci_agent::execute_tool(
+            match davinci_agent::execute_tool_with(
                 &agent.cwd,
                 "bash",
                 &serde_json::json!({ "command": command }),
+                &agent.tool_context,
             ) {
                 Ok(result) => {
                     let value = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
@@ -10221,6 +10306,9 @@ fn rebind_print_extensions(parsed: &Args, agent: &mut Agent, host: &mut Extensio
         names.extend(ext.commands.iter().cloned());
     }
     agent.apply_extension_tools(&names);
+    if let Err(err) = apply_tool_admission(parsed, agent) {
+        eprintln!("Error: {err}");
+    }
     sync_visual_verification_availability(agent, host);
     attach_tool_executor(agent, host);
     host.emit(ExtensionEvent::SessionStart);

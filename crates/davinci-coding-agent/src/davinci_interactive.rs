@@ -9389,10 +9389,11 @@ fn run_user_bash(shell: &mut Shell<'_>, line: &str) -> Next {
         return Next::Go;
     }
 
-    match davinci_agent::execute_tool(
+    match davinci_agent::execute_tool_with(
         &shell.agent.cwd,
         "bash",
         &serde_json::json!({ "command": command }),
+        &shell.agent.tool_context,
     ) {
         Ok(result) => {
             let value = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);

@@ -5832,3 +5832,87 @@ fn audit_wp04_b045_cost_display_rounds_midpoints_up() {
     assert_eq!(davinci_session::format_cost_display(12.34565), "$12.3457");
     assert_eq!(davinci_session::format_cost_display(f64::NAN), "$unknown");
 }
+
+#[test]
+fn audit_wp05_b046_tools_allowlist_survives_late_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions");
+    let cwd = dir.path().join("cwd");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    let parsed = Args {
+        offline: true,
+        tools: vec!["write".into()],
+        ..Args::default()
+    };
+    let mut agent = build_agent(&parsed, &session_dir, &cwd).unwrap();
+    assert_eq!(agent.tools, vec!["write".to_string()]);
+    agent.apply_extension_tools(&["native_late".into()]);
+    apply_tool_admission(&parsed, &mut agent).unwrap();
+    assert_eq!(agent.tools, vec!["write".to_string()]);
+
+    let unknown = Args {
+        offline: true,
+        tools: vec!["not_a_tool".into()],
+        ..Args::default()
+    };
+    assert!(build_agent(&unknown, &session_dir, &cwd).is_err());
+}
+
+#[test]
+fn audit_wp05_b047_no_tools_covers_late_native_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions");
+    let cwd = dir.path().join("cwd");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    let parsed = Args {
+        offline: true,
+        no_tools: true,
+        ..Args::default()
+    };
+    let mut agent = build_agent(&parsed, &session_dir, &cwd).unwrap();
+    assert!(agent.tools.is_empty(), "{:?}", agent.tools);
+    agent.apply_extension_tools(&["native_late".into(), "js_late".into()]);
+    apply_tool_admission(&parsed, &mut agent).unwrap();
+    assert!(agent.tools.is_empty(), "{:?}", agent.tools);
+}
+
+#[test]
+fn audit_wp05_b048_excluded_native_tools_stay_uncallable() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions");
+    let cwd = dir.path().join("cwd");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    let parsed = Args {
+        offline: true,
+        exclude_tools: vec!["native_late".into()],
+        ..Args::default()
+    };
+    let mut agent = build_agent(&parsed, &session_dir, &cwd).unwrap();
+    agent.apply_extension_tools(&["native_late".into(), "other".into()]);
+    apply_tool_admission(&parsed, &mut agent).unwrap();
+    assert!(!agent.tools.iter().any(|name| name == "native_late"));
+    assert!(agent.tools.iter().any(|name| name == "other"));
+}
+
+#[test]
+fn audit_wp05_b049_structured_denials_count_for_fail_on_denied() {
+    let event = AgentEvent::ToolExecutionEnd {
+        tool_call_id: "call-1".into(),
+        tool_name: "write".into(),
+        result: serde_json::json!({"ok": false}),
+        is_error: true,
+        details: Some(serde_json::json!({
+            "denied": true,
+            "target": "outside.txt",
+            "permissionMode": "read-only"
+        })),
+    };
+    let denied = tool_event_denials(&[event]);
+    assert_eq!(denied.len(), 1);
+    assert_eq!(denied[0]["action"], "write");
+    assert_eq!(denied[0]["target"], "outside.txt");
+    assert_eq!(denied[0]["permission_mode"], "read-only");
+}
