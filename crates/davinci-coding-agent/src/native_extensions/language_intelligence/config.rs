@@ -342,7 +342,7 @@ fn validate_server(server: &Option<ServerOverride>) -> Result<(), String> {
             || server
                 .args
                 .iter()
-                .any(|arg| arg.len() > 4096 || arg.contains('\0'))
+                .any(|arg| arg.chars().count() > 4096 || arg.contains('\0'))
         {
             return Err("server.args exceed bounded argument policy".into());
         }
@@ -378,7 +378,7 @@ fn validate_rust(profile: RustConfig) -> Result<RustConfig, serde_json::Error> {
     if profile.features.len() > 128
         || profile.features.iter().any(|f| {
             f.is_empty()
-                || f.len() > 128
+                || f.chars().count() > 128
                 || !f
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
@@ -390,7 +390,7 @@ fn validate_rust(profile: RustConfig) -> Result<RustConfig, serde_json::Error> {
     }
     if profile.target.as_ref().is_some_and(|v| {
         v.is_empty()
-            || v.len() > 128
+            || v.chars().count() > 128
             || !v
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))

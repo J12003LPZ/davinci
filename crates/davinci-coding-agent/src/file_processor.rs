@@ -17,7 +17,7 @@ const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 64 * 1024 * 1024;
 const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 const NARROW_NO_BREAK_SPACE: char = '\u{202F}';
 
-pub const RPC_FILE_ARGS_ERROR: &str = "Error: @file arguments are not supported in RPC mode";
+pub const RPC_FILE_ARGS_ERROR: &str = "@file arguments are not supported in RPC mode";
 pub const IMAGE_OMITTED_CONVERT: &str =
     "[Image omitted: could not be converted to a supported inline image format.]";
 pub const IMAGE_OMITTED_RESIZE: &str =
@@ -346,10 +346,10 @@ pub fn process_file_arguments(
     for file_arg in file_args {
         let absolute = resolve_read_path(file_arg, cwd);
         if !absolute.exists() {
-            return Err(format!("Error: File not found: {}", absolute.display()));
+            return Err(format!("File not found: {}", absolute.display()));
         }
         let metadata = std::fs::metadata(&absolute)
-            .map_err(|err| format!("Error: Could not read file {}: {err}", absolute.display()))?;
+            .map_err(|err| format!("Could not read file {}: {err}", absolute.display()))?;
         if metadata.len() == 0 {
             continue;
         }
@@ -358,7 +358,7 @@ pub fn process_file_arguments(
         total_bytes = total_bytes.saturating_add(metadata.len());
         if metadata.len() > MAX_ATTACHMENT_BYTES || total_bytes > MAX_TOTAL_ATTACHMENT_BYTES {
             return Err(format!(
-                "Error: File too large to attach: {} ({} bytes; limit {} per file, {} in total)",
+                "File too large to attach: {} ({} bytes; limit {} per file, {} in total)",
                 absolute.display(),
                 metadata.len(),
                 MAX_ATTACHMENT_BYTES,
@@ -370,13 +370,11 @@ pub fn process_file_arguments(
             use std::io::Read;
             std::fs::File::open(&absolute)
                 .and_then(|file| file.take(MAX_ATTACHMENT_BYTES + 1).read_to_end(&mut bytes))
-                .map_err(|err| {
-                    format!("Error: Could not read file {}: {err}", absolute.display())
-                })?;
+                .map_err(|err| format!("Could not read file {}: {err}", absolute.display()))?;
         }
         if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
             return Err(format!(
-                "Error: File too large to attach: {} (over {} bytes)",
+                "File too large to attach: {} (over {} bytes)",
                 absolute.display(),
                 MAX_ATTACHMENT_BYTES
             ));
@@ -410,15 +408,16 @@ pub fn process_file_arguments(
         } else {
             if bytes.len() > MAX_TEXT_ATTACHMENT_BYTES {
                 return Err(format!(
-                    "Error: Text file too large for the prompt: {} ({} bytes; limit {})",
+                    "Text file too large for the prompt: {} ({} bytes; limit {})",
                     absolute.display(),
                     bytes.len(),
                     MAX_TEXT_ATTACHMENT_BYTES
                 ));
             }
-            let content = strip_bom(std::str::from_utf8(&bytes).map_err(|err| {
-                format!("Error: Could not read file {}: {err}", absolute.display())
-            })?);
+            let content = strip_bom(
+                std::str::from_utf8(&bytes)
+                    .map_err(|err| format!("Could not read file {}: {err}", absolute.display()))?,
+            );
             text.push_str(&format!(
                 "<file name=\"{}\">\n{}\n</file>\n",
                 name_attr(&absolute),
@@ -575,7 +574,7 @@ mod tests {
         let missing = dir.path().join("gone.txt");
         let err =
             process_file_arguments(&[missing.display().to_string()], dir.path(), true).unwrap_err();
-        assert_eq!(err, format!("Error: File not found: {}", missing.display()));
+        assert_eq!(err, format!("File not found: {}", missing.display()));
     }
 
     #[test]

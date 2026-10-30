@@ -18,7 +18,9 @@ pub(crate) fn final_tool_arguments(raw: &str) -> serde_json::Value {
         return serde_json::Value::Object(serde_json::Map::new());
     }
 
-    match serde_json::from_str::<serde_json::Value>(raw) {
+    // Integers written as `1.0` or `1e3` are held exactly, so the tools never
+    // see a rounded float where the model wrote an integer.
+    match davinci_protocol::json_number::parse_exact(raw) {
         Ok(value @ serde_json::Value::Object(_)) => value,
         _ => invalid_arguments(raw),
     }
@@ -190,7 +192,8 @@ pub use openai_siwc::{
 };
 pub use provider_retry::{
     is_retryable_provider_error, provider_error_from_ureq, retry_delay_from_headers,
-    retry_provider_request, ProviderError, ProviderRetryOptions,
+    retry_provider_request, server_retry_delay_ms, ProviderError, ProviderRetryOptions,
+    RetryAdvice, RetryAfterSink,
 };
 pub use providers::{builtin_providers, Provider, ProviderSpec, KNOWN_APIS, PROVIDER_SPECS};
 pub use responses_ledger::{
@@ -390,13 +393,32 @@ pub fn fuzzy_models<'a>(models: &'a [Model], query: &str) -> Vec<&'a Model> {
     models
         .iter()
         .filter(|model| {
-            model.id.to_ascii_lowercase().contains(&query)
-                || model.name.to_ascii_lowercase().contains(&query)
-                || format!("{}/{}", model.provider, model.id)
-                    .to_ascii_lowercase()
-                    .contains(&query)
+            fuzzy_subsequence(&model.id.to_ascii_lowercase(), &query)
+                || fuzzy_subsequence(&model.name.to_ascii_lowercase(), &query)
+                || fuzzy_subsequence(
+                    &format!("{}/{}", model.provider, model.id).to_ascii_lowercase(),
+                    &query,
+                )
         })
         .collect()
+}
+
+/// Case-insensitive ordered-subsequence match: `gpt6luna` matches
+/// `gpt-6-luna`, while reversed characters do not.
+fn fuzzy_subsequence(haystack: &str, needle: &str) -> bool {
+    let mut chars = needle.chars();
+    let Some(mut wanted) = chars.next() else {
+        return true;
+    };
+    for ch in haystack.chars() {
+        if ch == wanted {
+            match chars.next() {
+                Some(next) => wanted = next,
+                None => return true,
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -451,5 +473,73 @@ mod tests {
             let url = request_url(&model, &auth);
             assert!(url.starts_with("https://example.test"), "{api} -> {url}");
         }
+    }
+}
+
+#[cfg(test)]
+mod audit_wp02_b023_tests {
+    use davinci_protocol::json_number::as_u64_exact;
+
+    /// The model's tool-call text reaches the tools through
+    /// `final_tool_arguments`: exact integral decimals arrive as that integer,
+    /// and a fraction an `f64` would round onto an integer never does.
+    #[test]
+    fn audit_wp02_b023_final_tool_arguments_keep_integers_exact() {
+        let args = |raw: &str| crate::final_tool_arguments(raw);
+        let read = |raw: &str| as_u64_exact(&args(raw)["expected_revision"]);
+        assert_eq!(read(r#"{"expected_revision":1.0}"#), Some(1));
+        assert_eq!(read(r#"{"expected_revision":1e0}"#), Some(1));
+        assert_eq!(
+            read(r#"{"expected_revision":9007199254740993.0}"#),
+            Some(9_007_199_254_740_993)
+        );
+        assert_eq!(
+            read(r#"{"expected_revision":18446744073709551615.0}"#),
+            Some(u64::MAX)
+        );
+        assert_eq!(read(r#"{"expected_revision":1.0000000000000001}"#), None);
+        assert_eq!(
+            read(r#"{"expected_revision":18446744073709551616.0}"#),
+            None
+        );
+        assert_eq!(read(r#"{"expected_revision":-1.0}"#), None);
+        // Fractional parameters of other tools are untouched.
+        assert_eq!(
+            args(r#"{"temperature":0.25}"#)["temperature"].as_f64(),
+            Some(0.25)
+        );
+        // Text that is not an object is still the invalid-arguments sentinel.
+        assert!(args("[1.0]").get(crate::INVALID_ARGUMENTS_KEY).is_some());
+    }
+
+    #[test]
+    fn audit_wp19_b195_fuzzy_models_match_ordered_subsequences() {
+        use crate::{fuzzy_models, Model};
+        let model = |id: &str, name: &str| Model {
+            id: id.into(),
+            name: name.into(),
+            api: String::new(),
+            provider: "openai".into(),
+            base_url: None,
+            reasoning: false,
+            input: Vec::new(),
+            cost: crate::catalog::ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: 1,
+            max_tokens: 1,
+            compat: serde_json::Value::Null,
+            headers: Default::default(),
+            thinking_level_map: Default::default(),
+        };
+        let models = vec![model("gpt-6-luna", "GPT-6 Luna"), model("other", "Other")];
+        let hits = fuzzy_models(&models, "gpt6luna");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "gpt-6-luna");
+        assert!(fuzzy_models(&models, "anul").is_empty());
+        assert_eq!(fuzzy_models(&models, "").len(), models.len());
     }
 }

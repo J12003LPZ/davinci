@@ -6530,8 +6530,46 @@ fn open_extension_manager(
 /// be refreshed or removed here; Claude Code's and Codex's are read-only.
 fn marketplace_rows(agent_dir: &std::path::Path) -> Vec<ExtensionRow> {
     use davinci_coding_agent::plugins::{discover, marketplace};
-    let registry = marketplace::load_registry(agent_dir).unwrap_or_default();
-    let mut catalogs = marketplace::catalogs(agent_dir).unwrap_or_default();
+    let registry = match marketplace::load_registry(agent_dir) {
+        Ok(registry) => registry,
+        Err(err) => {
+            return vec![ExtensionRow {
+                key: "marketplace-registry-error".into(),
+                title: "Marketplaces".into(),
+                status: "registry error".into(),
+                state: State::Failed,
+                detail: err,
+                note: None,
+                group: String::new(),
+                tokens: 0,
+                can_update: false,
+                can_toggle: false,
+                can_approve: false,
+                can_revoke: false,
+                can_delete: false,
+            }]
+        }
+    };
+    let mut catalogs = match marketplace::catalogs(agent_dir) {
+        Ok(catalogs) => catalogs,
+        Err(err) => {
+            return vec![ExtensionRow {
+                key: "marketplace-catalog-error".into(),
+                title: "Marketplaces".into(),
+                status: "catalog error".into(),
+                state: State::Failed,
+                detail: err,
+                note: None,
+                group: String::new(),
+                tokens: 0,
+                can_update: false,
+                can_toggle: false,
+                can_approve: false,
+                can_revoke: false,
+                can_delete: false,
+            }]
+        }
+    };
     let builtins = discover::genuine_builtins(agent_dir);
     catalogs.sort_by_key(|catalog| !builtins.contains(&catalog.name));
     catalogs
@@ -7486,15 +7524,32 @@ fn open_tree_sheet(agent: &Agent, model: &mut Model) -> bool {
 /// legacy chrome has no such screen.
 fn open_diff_sheet(shell: &mut Shell<'_>) -> Next {
     let cwd = shell.cwd;
-    let changes = crate::davinci_sources::git_changes(cwd);
+    let changes = match crate::davinci_sources::git_changes(cwd) {
+        Ok(changes) => changes,
+        Err(error) => {
+            shell.note(&format!("git state unavailable: {error}"));
+            return Next::Go;
+        }
+    };
     if changes.is_empty() {
         shell.note("nothing to review — the working tree is clean");
         return Next::Go;
     }
+    // `git_changes` above already surfaced a refusal to inspect; from here a
+    // failure only leaves the counts and hunks out.
     let numstat: Vec<(String, u32, u32)> = crate::davinci_sources::host_git(cwd)
-        .args(["diff", "--numstat", "HEAD"])
-        .output()
         .ok()
+        .and_then(|mut git| {
+            git.args([
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--numstat",
+                "HEAD",
+            ])
+            .output()
+            .ok()
+        })
         .filter(|output| output.status.success())
         .map(|output| {
             String::from_utf8_lossy(&output.stdout)
@@ -7509,9 +7564,19 @@ fn open_diff_sheet(shell: &mut Shell<'_>) -> Next {
         })
         .unwrap_or_default();
     let hunk_of = |path: &str| -> (Vec<Hunk>, String, String) {
-        let output = crate::davinci_sources::host_git(cwd)
-            .args(["diff", "--unified=2", "HEAD", "--", path])
-            .output();
+        let output = crate::davinci_sources::host_git(cwd).and_then(|mut git| {
+            git.args([
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--unified=2",
+                "HEAD",
+                "--",
+                path,
+            ])
+            .output()
+            .map_err(|error| error.to_string())
+        });
         let Ok(output) = output else {
             return (Vec::new(), String::new(), String::new());
         };
@@ -7592,9 +7657,12 @@ fn open_diff_sheet(shell: &mut Shell<'_>) -> Next {
         })
         .collect();
     let behind = crate::davinci_sources::host_git(cwd)
-        .args(["rev-list", "--count", "HEAD..@{upstream}"])
-        .output()
         .ok()
+        .and_then(|mut git| {
+            git.args(["rev-list", "--count", "HEAD..@{upstream}"])
+                .output()
+                .ok()
+        })
         .filter(|output| output.status.success())
         .and_then(|output| {
             String::from_utf8_lossy(&output.stdout)
@@ -9456,10 +9524,11 @@ fn run_user_bash(shell: &mut Shell<'_>, line: &str) -> Next {
         return Next::Go;
     }
 
-    match davinci_agent::execute_tool(
+    match davinci_agent::execute_tool_with(
         &shell.agent.cwd,
         "bash",
         &serde_json::json!({ "command": command }),
+        &shell.agent.tool_context,
     ) {
         Ok(result) => {
             let value = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);

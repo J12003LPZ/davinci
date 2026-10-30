@@ -2,30 +2,32 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use davinci_sys::process::{isolated_git_command_in, GitInspectionError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::bus::RuntimeBus;
 
-/// The repository top-level containing `path`, or `None` outside a git
-/// checkout. Worktree leases must be rooted here: rooting them at a
-/// subdirectory the user launched from produced leases of the wrong tree.
-pub fn git_toplevel(path: &Path) -> Option<PathBuf> {
-    let output = Command::new("git")
-        .args(["-c", "safe.bareRepository=explicit"])
+/// The repository top-level containing `path`, `Ok(None)` outside a git
+/// checkout, or `InspectionRefused` when the repository cannot be inspected
+/// safely (old Git, unlistable filters): a refusal is not "not a repository".
+/// Worktree leases must be rooted here: rooting them at a subdirectory the user
+/// launched from produced leases of the wrong tree.
+pub fn git_toplevel(path: &Path) -> Result<Option<PathBuf>, WorktreeError> {
+    let Ok(output) = isolated_git_command_in(path)?
         .args(["rev-parse", "--show-toplevel"])
-        .current_dir(path)
         .output()
-        .ok()?;
+    else {
+        return Ok(None);
+    };
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
     let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!root.is_empty()).then(|| PathBuf::from(root))
+    Ok((!root.is_empty()).then(|| PathBuf::from(root)))
 }
 use super::events::{RuntimeEvent, RuntimeEventEnvelope};
 use super::ids::{AgentId, RunId};
@@ -71,8 +73,16 @@ pub enum WorktreeError {
     },
     #[error("git command failed: {0}")]
     GitError(String),
+    #[error("{0}")]
+    InspectionRefused(String),
     #[error("io error: {0}")]
     IoError(String),
+}
+
+impl From<GitInspectionError> for WorktreeError {
+    fn from(error: GitInspectionError) -> Self {
+        Self::InspectionRefused(error.to_string())
+    }
 }
 
 fn left_behind(path: &Option<PathBuf>, branch: &Option<String>) -> String {
@@ -138,9 +148,7 @@ fn now_ms() -> i64 {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, WorktreeError> {
-    let output = Command::new("git")
-        .current_dir(cwd)
-        .args(["-c", "safe.bareRepository=explicit"])
+    let output = isolated_git_command_in(cwd)?
         .args(args)
         .output()
         .map_err(|e| WorktreeError::GitError(format!("Failed to execute git: {e}")))?;
@@ -159,11 +167,15 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String, WorktreeError> {
 }
 
 /// Return whether `cwd` currently has tracked or untracked Git changes.
-/// Non-repositories and unavailable Git are treated as clean routing context.
-pub fn has_uncommitted_changes(cwd: &Path) -> bool {
-    run_git(cwd, &["status", "--porcelain"])
-        .map(|status| !status.is_empty())
-        .unwrap_or(false)
+/// Non-repositories and other Git failures are treated as clean routing
+/// context; a refusal to inspect the repository safely is an error, never
+/// "clean".
+pub fn has_uncommitted_changes(cwd: &Path) -> Result<bool, WorktreeError> {
+    match run_git(cwd, &["status", "--porcelain"]) {
+        Ok(status) => Ok(!status.is_empty()),
+        Err(error @ WorktreeError::InspectionRefused(_)) => Err(error),
+        Err(_) => Ok(false),
+    }
 }
 
 /// Inspect an already isolated worktree for a host-approved coding handoff.
@@ -328,9 +340,7 @@ impl WorktreeManager {
             .ok_or_else(|| WorktreeError::IoError("Worktree path is not valid unicode".into()))?;
 
         // Check if branch already exists in git
-        let branch_exists = Command::new("git")
-            .current_dir(&self.repo_root)
-            .args(["-c", "safe.bareRepository=explicit"])
+        let branch_exists = isolated_git_command_in(&self.repo_root)?
             .args(["rev-parse", "--verify", &branch])
             .output()
             .map(|o| o.status.success())
@@ -393,10 +403,8 @@ impl WorktreeManager {
         }
         let _index_file = IndexFile(index.clone());
         let git = |args: &[&str]| -> Result<String, WorktreeError> {
-            let output = Command::new("git")
-                .current_dir(&lease.path)
+            let output = isolated_git_command_in(&lease.path)?
                 .env("GIT_INDEX_FILE", &index)
-                .args(["-c", "safe.bareRepository=explicit"])
                 .args(args)
                 .output()
                 .map_err(|e| WorktreeError::GitError(e.to_string()))?;
@@ -515,9 +523,7 @@ impl WorktreeManager {
         if current_head.is_empty() || current_head == lease.base_head {
             return Ok(UnsavedWork::None);
         }
-        let integrated = Command::new("git")
-            .current_dir(&self.repo_root)
-            .args(["-c", "safe.bareRepository=explicit"])
+        let integrated = isolated_git_command_in(&self.repo_root)?
             .args(["merge-base", "--is-ancestor", &current_head, "HEAD"])
             .output()
             .map(|o| o.status.success())
@@ -784,9 +790,7 @@ impl WorktreeManager {
     /// `Ok(false)` only when git reports the ref missing (exit 1, no message).
     /// Any other failure is an error: a broken check is not an absent branch.
     fn branch_exists(&self, branch: &str) -> Result<bool, WorktreeError> {
-        let output = Command::new("git")
-            .current_dir(&self.repo_root)
-            .args(["-c", "safe.bareRepository=explicit"])
+        let output = isolated_git_command_in(&self.repo_root)?
             .args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("refs/heads/{branch}"))
             .output()
@@ -861,9 +865,7 @@ impl WorktreeManager {
 
     /// Every worktree path git lists for the repository, the main one included.
     fn registered_worktrees(&self) -> Result<Vec<PathBuf>, WorktreeError> {
-        let output = Command::new("git")
-            .current_dir(&self.repo_root)
-            .args(["-c", "safe.bareRepository=explicit"])
+        let output = isolated_git_command_in(&self.repo_root)?
             .args(["worktree", "list", "--porcelain", "-z"])
             .output()
             .map_err(|e| WorktreeError::GitError(format!("Failed to execute git: {e}")))?;
@@ -921,6 +923,7 @@ impl WorktreeLease {
 mod tests {
     use super::*;
     use crate::runtime::bus::{RuntimeDecision, RuntimeSubscriber};
+    use std::process::Command;
     use std::sync::Mutex;
     use tempfile::tempdir;
 
@@ -984,13 +987,13 @@ mod tests {
         let repo = init_temp_git_repo();
         let nested = repo.path().join("crates").join("inner");
         std::fs::create_dir_all(&nested).unwrap();
-        let root = git_toplevel(&nested).expect("inside a checkout");
+        let root = git_toplevel(&nested).unwrap().expect("inside a checkout");
         assert_eq!(
             std::fs::canonicalize(root).unwrap(),
             std::fs::canonicalize(repo.path()).unwrap()
         );
         let outside = tempdir().unwrap();
-        assert!(git_toplevel(outside.path()).is_none());
+        assert!(git_toplevel(outside.path()).unwrap().is_none());
     }
 
     fn init_temp_git_repo() -> tempfile::TempDir {
@@ -1266,7 +1269,15 @@ mod tests {
         assert!(manager.check_dirty(&lease).is_err());
         assert!(manager.is_dirty(&lease), "unreadable state is dirty");
         let err = manager.release_lease(&lease, false).unwrap_err();
-        assert!(matches!(err, WorktreeError::GitError(_)), "{err:?}");
+        // A broken git link now fails the filter listing first, which is a
+        // refusal; either way the state is an error and nothing is removed.
+        assert!(
+            matches!(
+                err,
+                WorktreeError::GitError(_) | WorktreeError::InspectionRefused(_)
+            ),
+            "{err:?}"
+        );
         assert!(precious.exists(), "nothing was deleted");
         assert!(manager.get_lease(&lease.path).is_none() || lease.path.exists());
     }
@@ -1926,5 +1937,156 @@ mod tests {
         ));
         assert!(lease.path.exists());
         manager.release_lease(&lease, true).unwrap();
+    }
+
+    /// Serializes tests that mutate the process environment.
+    static GIT_ENV: Mutex<()> = Mutex::new(());
+
+    fn slashed(path: &Path) -> String {
+        path.display().to_string().replace('\\', "/")
+    }
+
+    /// A repository whose filter driver name is not UTF-8 cannot be inspected
+    /// safely. Every consumer must report that refusal, not "not a repository"
+    /// (`git_toplevel`) and not "clean" (`has_uncommitted_changes`).
+    #[test]
+    fn audit_wp01_b003_refusal_stays_distinct_from_absent_and_clean() {
+        let repo = init_temp_git_repo();
+        let canary = repo.path().join("clean-ran");
+        let mut config = std::fs::read(repo.path().join(".git").join("config")).unwrap();
+        config.extend_from_slice(b"[filter \"bad\xffname\"]\n\tclean = echo ran >> '");
+        config.extend_from_slice(canary.to_string_lossy().replace('\\', "/").as_bytes());
+        config.extend_from_slice(b"'; cat\n");
+        std::fs::write(repo.path().join(".git").join("config"), config).unwrap();
+        std::fs::write(repo.path().join("README.md"), "dirty\n").unwrap();
+
+        let toplevel = git_toplevel(repo.path());
+        assert!(
+            matches!(toplevel, Err(WorktreeError::InspectionRefused(_))),
+            "{toplevel:?}"
+        );
+        let dirty = has_uncommitted_changes(repo.path());
+        assert!(
+            matches!(dirty, Err(WorktreeError::InspectionRefused(_))),
+            "{dirty:?}"
+        );
+        let manager = WorktreeManager::new(repo.path().to_path_buf(), repo.path().join("wt"));
+        let lease = manager.create_lease(RunId::new(), AgentId::new(), None);
+        assert!(
+            matches!(lease, Err(WorktreeError::InspectionRefused(_))),
+            "{lease:?}"
+        );
+        assert!(!canary.exists());
+    }
+
+    /// An inspection Git refuses is unknown state, not known dirty state, so
+    /// `force` cannot turn it into permission to remove anything.
+    #[test]
+    fn a_refused_inspection_keeps_the_worktree_and_lease_even_when_forced() {
+        let repo = init_temp_git_repo();
+        let trees = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo.path(), trees.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        let mut config = std::fs::read(repo.path().join(".git").join("config")).unwrap();
+        config.extend_from_slice(b"[filter \"bad\xffname\"]\n\tclean = cat\n");
+        std::fs::write(repo.path().join(".git").join("config"), config).unwrap();
+
+        for force in [false, true] {
+            let err = manager.release_lease(&lease, force).unwrap_err();
+            assert!(
+                matches!(err, WorktreeError::InspectionRefused(_)),
+                "force={force}: {err:?}"
+            );
+            assert!(lease.path.join("README.md").exists());
+            assert_eq!(manager.get_lease(&lease.path), Some(lease.clone()));
+        }
+    }
+
+    const FSMONITOR_CHILD_REPO: &str = "DAVINCI_FSMONITOR_CHILD_REPO";
+
+    /// Runs only as the child of `audit_wp01_b003_repository_fsmonitor_is_never_run`,
+    /// with the hostile `GIT_CONFIG_*` variables inherited from its parent.
+    #[test]
+    fn audit_wp01_b003_fsmonitor_child() {
+        let Some(repo) = std::env::var_os(FSMONITOR_CHILD_REPO) else {
+            return;
+        };
+        let repo = std::path::PathBuf::from(repo);
+        assert!(
+            has_uncommitted_changes(&repo).unwrap(),
+            "status must still report the real change"
+        );
+        assert!(run_git(&repo, &["status", "--porcelain"])
+            .unwrap()
+            .contains("dirty.txt"));
+        println!("fsmonitor child ran");
+    }
+
+    #[test]
+    fn audit_wp01_b003_repository_fsmonitor_is_never_run() {
+        let _env = GIT_ENV.lock().unwrap_or_else(|poison| poison.into_inner());
+        let repo = init_temp_git_repo();
+        let canary = repo.path().join("fsmonitor-ran");
+        let env_canary = repo.path().join("env-fsmonitor-ran");
+        git_in(
+            repo.path(),
+            &[
+                "config",
+                "core.fsmonitor",
+                &format!("echo ran > {} #", slashed(&canary)),
+            ],
+        );
+        std::fs::write(repo.path().join("dirty.txt"), "x").unwrap();
+
+        // Positive control: plain git does run the planted hook, so a missing
+        // canary below proves the isolation and not a broken fixture.
+        Command::new("git")
+            .current_dir(repo.path())
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        if !canary.exists() {
+            eprintln!("git here does not run core.fsmonitor shell hooks: skipping");
+            return;
+        }
+        std::fs::remove_file(&canary).unwrap();
+
+        // The hostile GIT_CONFIG_* values go to a child copy of this test binary
+        // only: setting them in this process would leak into every other test
+        // that runs git in parallel.
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::worktree::tests::audit_wp01_b003_fsmonitor_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(FSMONITOR_CHILD_REPO, repo.path())
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
+            .env(
+                "GIT_CONFIG_VALUE_0",
+                format!("echo ran > {} #", slashed(&env_canary)),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "child failed: {}{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&child.stdout).contains("fsmonitor child ran"),
+            "the child test did not execute"
+        );
+        assert!(!canary.exists(), "repository core.fsmonitor was run");
+        assert!(!env_canary.exists(), "inherited GIT_CONFIG_* was honored");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("dirty.txt")).unwrap(),
+            "x"
+        );
     }
 }

@@ -305,7 +305,7 @@ impl RepoIntelligence {
             .map(|v| v.as_str().ok_or("query_invalid"))
             .transpose()?
             .unwrap_or("");
-        if query.len() > 2048 {
+        if query.chars().count() > 2048 {
             return Err("query_invalid: query length".into());
         }
         let index = self.refresh()?;

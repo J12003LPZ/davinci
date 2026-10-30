@@ -98,7 +98,8 @@ pub struct SummarizeRequest {
 #[derive(Debug, Clone)]
 pub struct SummarizeResponse {
     pub text: String,
-    pub usage: Usage,
+    /// `None` when the provider returned no usage block: unknown, not zero.
+    pub usage: Option<Usage>,
     pub stop_reason: Option<StopReason>,
     pub error_message: Option<String>,
     pub has_tool_call: bool,
@@ -935,7 +936,8 @@ fn generate_compaction_summary(
 ) -> Result<(String, Option<Usage>), String> {
     if !turn_prefix.is_empty() {
         let mut history_text = "No prior history.".to_string();
-        let mut history_usage = None;
+        // `Some(None)` is a history summary whose provider reported no usage.
+        let mut history_usage: Option<Option<Usage>> = None;
         if !history.is_empty() {
             let result = generate_summary_with_usage(
                 history,
@@ -951,10 +953,15 @@ fn generate_compaction_summary(
             generate_turn_prefix_summary(turn_prefix, reserve_tokens, summarizer)?;
         let summary =
             format!("{history_text}\n\n---\n\n**Turn Context (split turn):**\n\n{prefix_text}");
-        let usage = Some(match history_usage {
-            Some(first) => combine_usage(&first, &prefix_usage),
+        // Two billed requests: when either one lacks usage the aggregate is
+        // unknown, never a partial sum presented as complete.
+        let usage = match history_usage {
+            Some(first) => match (first, prefix_usage) {
+                (Some(first), Some(second)) => Some(combine_usage(&first, &second)),
+                _ => None,
+            },
             None => prefix_usage,
-        });
+        };
         return Ok((summary, usage));
     }
     let (text, usage) = generate_summary_with_usage(
@@ -964,7 +971,7 @@ fn generate_compaction_summary(
         previous_summary,
         summarizer,
     )?;
-    Ok((text, Some(usage)))
+    Ok((text, usage))
 }
 
 pub fn generate_summary_with_usage(
@@ -973,7 +980,7 @@ pub fn generate_summary_with_usage(
     custom_instructions: Option<&str>,
     previous_summary: Option<&str>,
     summarizer: &Summarizer,
-) -> Result<(String, Usage), String> {
+) -> Result<(String, Option<Usage>), String> {
     let max_tokens = ((reserve_tokens as f64 * 0.8).floor() as u64).max(1);
     let prompt = admit_summary_prompt(summarizer, max_tokens, "Summarization", |cap| {
         build_history_prompt_capped(messages, previous_summary, custom_instructions, cap)
@@ -985,7 +992,7 @@ fn generate_turn_prefix_summary(
     messages: &[ChatMessage],
     reserve_tokens: u64,
     summarizer: &Summarizer,
-) -> Result<(String, Usage), String> {
+) -> Result<(String, Option<Usage>), String> {
     let max_tokens = ((reserve_tokens as f64 * 0.5).floor() as u64).max(1);
     let prompt =
         admit_summary_prompt(summarizer, max_tokens, "Turn prefix summarization", |cap| {
@@ -1066,7 +1073,7 @@ fn complete_summarization(
     max_tokens: u64,
     label: &str,
     summarizer: &Summarizer,
-) -> Result<(String, Usage), String> {
+) -> Result<(String, Option<Usage>), String> {
     let response = summarizer.summarize(&SummarizeRequest {
         system: SUMMARIZATION_SYSTEM_PROMPT.to_string(),
         prompt: prompt.to_string(),
@@ -1115,19 +1122,19 @@ pub fn get_summarization_failure(response: &SummarizeResponse, label: &str) -> O
 
 fn combine_usage(first: &Usage, second: &Usage) -> Usage {
     Usage {
-        input: first.input + second.input,
-        output: first.output + second.output,
-        cache_read: first.cache_read + second.cache_read,
-        cache_write: first.cache_write + second.cache_write,
+        input: first.input.saturating_add(second.input),
+        output: first.output.saturating_add(second.output),
+        cache_read: first.cache_read.saturating_add(second.cache_read),
+        cache_write: first.cache_write.saturating_add(second.cache_write),
         cache_write_unreported: first.cache_write_unreported || second.cache_write_unreported,
         input_unreported: first.input_unreported || second.input_unreported,
         output_unreported: first.output_unreported || second.output_unreported,
         cache_read_unreported: first.cache_read_unreported || second.cache_read_unreported,
         reasoning: match (first.reasoning, second.reasoning) {
             (None, None) => None,
-            (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+            (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
         },
-        total_tokens: first.total_tokens + second.total_tokens,
+        total_tokens: first.total_tokens.saturating_add(second.total_tokens),
         cost: davinci_protocol::UsageCost {
             input: first.cost.input + second.cost.input,
             output: first.cost.output + second.cost.output,
@@ -1173,8 +1180,7 @@ fn summarize_from_env(request: &SummarizeRequest) -> Result<SummarizeResponse, S
             .to_string();
         let usage = value
             .get("usage")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
         return Ok(SummarizeResponse {
             text: summary,
             usage,
@@ -1185,7 +1191,7 @@ fn summarize_from_env(request: &SummarizeRequest) -> Result<SummarizeResponse, S
     }
     Ok(SummarizeResponse {
         text,
-        usage: Usage::default(),
+        usage: None,
         stop_reason: Some(StopReason::Stop),
         error_message: None,
         has_tool_call: false,
@@ -1956,7 +1962,7 @@ mod tests {
         Summarizer::new(move |_| {
             Ok(SummarizeResponse {
                 text: text.into(),
-                usage: Usage::default(),
+                usage: Some(Usage::default()),
                 stop_reason: Some(StopReason::Stop),
                 error_message: None,
                 has_tool_call: false,
@@ -2425,7 +2431,7 @@ the user said hi and the assistant said hello and then the user said ok",
             seen.lock().unwrap().push(request.prompt.clone());
             Ok(SummarizeResponse {
                 text: "## Goal\nship the csv import".into(),
-                usage: Usage::default(),
+                usage: Some(Usage::default()),
                 stop_reason: Some(StopReason::Stop),
                 error_message: None,
                 has_tool_call: false,
@@ -2534,12 +2540,12 @@ ship the csv import",
             };
             Ok(SummarizeResponse {
                 text,
-                usage: Usage {
+                usage: Some(Usage {
                     input: 10,
                     output: 4,
                     total_tokens: 14,
                     ..Usage::default()
-                },
+                }),
                 stop_reason: Some(StopReason::Stop),
                 error_message: None,
                 has_tool_call: false,
@@ -2575,11 +2581,144 @@ ship the csv import",
         );
     }
 
+    /// Summarizer that answers the split-turn history request with `history`
+    /// usage and the turn-prefix request with `prefix` usage.
+    fn split_usage_summarizer(history: Option<Usage>, prefix: Option<Usage>) -> Summarizer {
+        Summarizer::new(move |request| {
+            let (text, usage) = if request.prompt.contains("PREFIX of a turn") {
+                ("prefix-checkpoint of the turn", prefix.clone())
+            } else {
+                ("## Goal\nship the rust import", history.clone())
+            };
+            Ok(SummarizeResponse {
+                text: text.into(),
+                usage,
+                stop_reason: Some(StopReason::Stop),
+                error_message: None,
+                has_tool_call: false,
+            })
+        })
+    }
+
+    fn split_compaction(summarizer: &Summarizer) -> CompactionResult {
+        // An earlier complete turn (the history request) followed by a turn
+        // cut in the middle (the prefix request).
+        let messages = vec![
+            ChatMessage::text("user", "first question ".repeat(20)),
+            ChatMessage::text("assistant", "first answer ".repeat(20)),
+            ChatMessage::text("user", "original request ".repeat(20)),
+            ChatMessage::text("assistant", "early work ".repeat(20)),
+            ChatMessage::text("assistant", "recent suffix"),
+        ];
+        let result = compact_messages_with_options(&messages, None, 2, 100, None, Some(summarizer));
+        assert!(result.compacted, "{}", result.summary);
+        assert!(
+            result.summary.contains("Turn Context (split turn)")
+                && result.summary.contains("## Goal"),
+            "the fixture must summarize history and a split turn: {}",
+            result.summary
+        );
+        result
+    }
+
+    /// B035 review finding 3: combining the two billed requests of a split turn
+    /// saturates instead of panicking (debug) or wrapping (release).
+    #[test]
+    fn audit_wp03_b035_split_summary_usage_saturates() {
+        let max = Usage {
+            input: u64::MAX,
+            output: u64::MAX,
+            cache_read: u64::MAX,
+            cache_write: u64::MAX,
+            reasoning: Some(u64::MAX),
+            total_tokens: u64::MAX,
+            ..Usage::default()
+        };
+        let one = Usage {
+            input: 1,
+            output: 1,
+            cache_read: 1,
+            cache_write: 1,
+            reasoning: Some(1),
+            total_tokens: 1,
+            ..Usage::default()
+        };
+        let result = split_compaction(&split_usage_summarizer(Some(max), Some(one)));
+        let usage = result.usage.expect("both requests reported usage");
+        assert_eq!(
+            (
+                usage.input,
+                usage.output,
+                usage.cache_read,
+                usage.cache_write
+            ),
+            (u64::MAX, u64::MAX, u64::MAX, u64::MAX)
+        );
+        assert_eq!(usage.reasoning, Some(u64::MAX));
+        assert_eq!(usage.total_tokens, u64::MAX);
+    }
+
+    /// B035 review finding 4: usage the provider did not return stays unknown.
+    #[test]
+    fn audit_wp03_b035_missing_usage_is_unknown_not_zero() {
+        let reported = Usage {
+            input: 10,
+            output: 4,
+            total_tokens: 14,
+            ..Usage::default()
+        };
+        // Ordinary two-request totals are unchanged.
+        let both = split_compaction(&split_usage_summarizer(
+            Some(reported.clone()),
+            Some(reported.clone()),
+        ));
+        let usage = both.usage.expect("both reported");
+        assert_eq!((usage.input, usage.output, usage.total_tokens), (20, 8, 28));
+        // One missing result makes the aggregate unknown, never a partial sum.
+        for (history, prefix) in [
+            (None, Some(reported.clone())),
+            (Some(reported.clone()), None),
+            (None, None),
+        ] {
+            let result = split_compaction(&split_usage_summarizer(history, prefix));
+            assert!(result.usage.is_none(), "{:?}", result.usage);
+        }
+        // A single summary without a usage block is unknown too.
+        let messages = vec![
+            ChatMessage::text("user", "aaaaaaaaaa bbbbbbbbbb ".repeat(80)),
+            ChatMessage::text("assistant", "cccccccccc ".repeat(80)),
+            ChatMessage::text("user", "recent"),
+        ];
+        let single = compact_messages_with_options(
+            &messages,
+            None,
+            1,
+            100,
+            None,
+            Some(&split_usage_summarizer(None, None)),
+        );
+        assert!(single.compacted);
+        assert!(single.usage.is_none(), "{:?}", single.usage);
+        // Explicit reported zeros are a measurement, not unknown.
+        let zeros = compact_messages_with_options(
+            &messages,
+            None,
+            1,
+            100,
+            None,
+            Some(&split_usage_summarizer(
+                Some(Usage::default()),
+                Some(Usage::default()),
+            )),
+        );
+        assert_eq!(zeros.usage, Some(Usage::default()));
+    }
+
     #[test]
     fn summarization_failure_matches_ts() {
         let error = SummarizeResponse {
             text: String::new(),
-            usage: Usage::default(),
+            usage: Some(Usage::default()),
             stop_reason: Some(StopReason::Error),
             error_message: None,
             has_tool_call: false,

@@ -187,28 +187,16 @@ pub fn evaluate_task_completion_with_budget(
     let mut impl_passed = false;
     let mut impl_ev = None;
     for r in &receipts {
-        if r.attempt == expected_attempt
-            && r.is_passed()
-            && (r.tool_name == "write"
-                || r.tool_name == "edit"
-                || r.tool_name == "apply_patch"
-                || r.tool_name == "implementation")
-        {
+        if r.attempt == expected_attempt && r.is_applied_mutation() {
             impl_passed = true;
             impl_ev = Some(r.receipt_id);
             break;
         }
     }
-    // If no explicit mutation tool was used, but task has result or is docs-only, check if any passed receipt exists
-    if !impl_passed {
-        for r in &receipts {
-            if r.attempt == expected_attempt && r.is_passed() {
-                impl_passed = true;
-                impl_ev = Some(r.receipt_id);
-                break;
-            }
-        }
-    }
+    // Neither a tool name nor a zero exit code is implementation evidence: only
+    // a receipt carrying host-observed workspace changes (built from the effect
+    // ledger by `ExecutionReceipt::from_file_effects`) satisfies this dimension.
+    // A read, a search, a shell command or a write that changed nothing does not.
     checks.push(DimensionCheck {
         dimension: DimensionKind::Implementation,
         requirement_id: None,
@@ -398,6 +386,7 @@ pub fn evaluate_task_completion_with_budget(
 
 #[cfg(test)]
 mod tests {
+    use super::super::evidence_store::applied_mutation_receipt;
     use super::super::ids::RunId;
     use super::super::source_manifest::SourceManifestBuilder;
     use super::*;
@@ -450,16 +439,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let manifest = SourceManifestBuilder::new(dir.path()).build().unwrap();
         let task = TaskRecord::new(RunId::new(), "Task with attempt 2");
-        let old_attempt_receipt = ExecutionReceipt {
-            receipt_id: EvidenceId::new(),
-            operation_id: "attempt1_receipt".into(),
-            task_id: Some(task.id),
-            attempt: 1, // Prior attempt
-            tool_name: "implementation".into(),
-            started: true,
-            exit_code: Some(0),
-            ..Default::default()
-        };
+        // A genuine mutation receipt, but of the prior attempt.
+        let old_attempt_receipt = applied_mutation_receipt(task.id, 1);
         // expected_attempt is 2, old receipt is attempt 1
         let eval = evaluate_task_completion(&task, None, &[old_attempt_receipt], &manifest, 2);
         assert!(!eval.allowed);
@@ -559,15 +540,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let manifest = SourceManifestBuilder::new(dir.path()).build().unwrap();
         let task = TaskRecord::new(RunId::new(), "Docs only task");
-        let receipt = ExecutionReceipt {
-            receipt_id: EvidenceId::new(),
-            operation_id: "doc_edit".into(),
-            task_id: Some(task.id),
-            tool_name: "edit".into(),
-            started: true,
-            exit_code: Some(0),
-            ..Default::default()
-        };
+        let receipt = applied_mutation_receipt(task.id, 0);
 
         let eval = evaluate_task_completion(&task, None, &[receipt], &manifest, 0);
         assert!(eval.allowed);
@@ -618,15 +591,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let manifest = SourceManifestBuilder::new(dir.path()).build().unwrap();
         let task = TaskRecord::new(RunId::new(), "Exhausted budget task");
-        let receipt = ExecutionReceipt {
-            receipt_id: EvidenceId::new(),
-            operation_id: "impl_1".into(),
-            task_id: Some(task.id),
-            tool_name: "implementation".into(),
-            started: true,
-            exit_code: Some(0),
-            ..Default::default()
-        };
+        let receipt = applied_mutation_receipt(task.id, 0);
 
         let eval = evaluate_task_completion_with_budget(
             &task,
@@ -664,15 +629,7 @@ mod tests {
         .unwrap();
 
         // 1. Missing install evidence -> fails
-        let impl_receipt = ExecutionReceipt {
-            receipt_id: EvidenceId::new(),
-            operation_id: "impl".into(),
-            task_id: Some(task.id),
-            tool_name: "implementation".into(),
-            started: true,
-            exit_code: Some(0),
-            ..Default::default()
-        };
+        let impl_receipt = applied_mutation_receipt(task.id, 0);
         let eval = evaluate_task_completion(
             &task,
             Some(&contract),
@@ -714,5 +671,137 @@ mod tests {
             .find(|d| d.dimension == DimensionKind::InstalledApp)
             .unwrap();
         assert_eq!(install_check.state, DimensionState::PassedCurrent);
+    }
+
+    fn implementation_state(receipts: &[ExecutionReceipt], task: &TaskRecord) -> DimensionState {
+        let dir = tempdir().unwrap();
+        let manifest = SourceManifestBuilder::new(dir.path()).build().unwrap();
+        evaluate_task_completion(task, None, receipts, &manifest, 0)
+            .dimensions
+            .into_iter()
+            .find(|check| check.dimension == DimensionKind::Implementation)
+            .unwrap()
+            .state
+    }
+
+    #[test]
+    fn audit_wp02_b025_read_only_success_does_not_satisfy_implementation() {
+        let task = TaskRecord::new(RunId::new(), "implement");
+        let receipt = |tool: &str, started: bool, exit: Option<i32>| ExecutionReceipt {
+            task_id: Some(task.id),
+            operation_id: "op".into(),
+            tool_name: tool.into(),
+            started,
+            exit_code: exit,
+            ..Default::default()
+        };
+        // Reads, searches, shell and passing tests are not implementation.
+        for tool in ["read", "grep", "bash", "cargo test"] {
+            assert_eq!(
+                implementation_state(&[receipt(tool, true, Some(0))], &task),
+                DimensionState::Failed,
+                "{tool}"
+            );
+        }
+        // Read-only success plus a passing test run still leaves it open.
+        let eval = {
+            let dir = tempdir().unwrap();
+            let manifest = SourceManifestBuilder::new(dir.path()).build().unwrap();
+            evaluate_task_completion(
+                &task,
+                None,
+                &[
+                    receipt("read", true, Some(0)),
+                    receipt("cargo test", true, Some(0)),
+                ],
+                &manifest,
+                0,
+            )
+        };
+        assert!(!eval.allowed);
+        assert!(eval
+            .remaining_gaps
+            .contains(&"Implementation not verified".to_string()));
+
+        // The evidence-free receipt of the review: the right task and attempt,
+        // a mutation tool's name, started and exit 0, in an unchanged workspace.
+        // Nothing but the name says it mutated anything, so it fails.
+        for tool in ["write", "edit", "apply_patch", "implementation"] {
+            assert_eq!(
+                implementation_state(&[receipt(tool, true, Some(0))], &task),
+                DimensionState::Failed,
+                "{tool}: a name and an exit code are not implementation evidence"
+            );
+        }
+
+        // Evidence the host built from its effect ledger satisfies it.
+        assert_eq!(
+            implementation_state(&[applied_mutation_receipt(task.id, 0)], &task),
+            DimensionState::PassedCurrent
+        );
+
+        // A write that rewrote identical bytes changed nothing: no receipt.
+        let mut same = crate::runtime::effects::OwnedFileEffect::new(
+            "same",
+            crate::runtime::ids::AgentId::new(),
+            1,
+            "a.txt",
+            crate::runtime::effects::FileEffectKind::Modified,
+            task.id,
+        );
+        same.before_blob = Some("h".into());
+        same.after_blob = Some("h".into());
+        assert!(ExecutionReceipt::from_file_effects("same", task.id, 0, &[same]).is_none());
+
+        // A hand-built `mutation` field with no changed effect is refused too.
+        let hollow = ExecutionReceipt {
+            mutation: Some(crate::runtime::evidence_store::MutationEvidence { effects: vec![] }),
+            ..receipt("write", true, Some(0))
+        };
+        assert_eq!(
+            implementation_state(&[hollow], &task),
+            DimensionState::Failed
+        );
+
+        // Failed, unstarted and denied mutations do not, whatever they carry.
+        let applied = applied_mutation_receipt(task.id, 0);
+        for broken in [
+            ExecutionReceipt {
+                exit_code: Some(1),
+                ..applied.clone()
+            },
+            ExecutionReceipt {
+                started: false,
+                exit_code: None,
+                ..applied.clone()
+            },
+            ExecutionReceipt {
+                permission_denied: true,
+                ..applied.clone()
+            },
+            ExecutionReceipt {
+                hook_vetoed: true,
+                ..applied.clone()
+            },
+            ExecutionReceipt {
+                simulated: true,
+                ..applied.clone()
+            },
+        ] {
+            assert_eq!(
+                implementation_state(&[broken], &task),
+                DimensionState::Failed
+            );
+        }
+        // Another task's, or another attempt's, receipt does not count.
+        let other = TaskRecord::new(task.run_id, "other");
+        assert_eq!(
+            implementation_state(&[applied_mutation_receipt(other.id, 0)], &task),
+            DimensionState::Failed
+        );
+        assert_eq!(
+            implementation_state(&[applied_mutation_receipt(task.id, 1)], &task),
+            DimensionState::Failed
+        );
     }
 }

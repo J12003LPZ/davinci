@@ -269,7 +269,7 @@ pub fn generate_branch_summary(
     }
     BranchSummaryResult {
         summary: Some(summary),
-        usage: Some(response.usage),
+        usage: response.usage,
         details,
         aborted: false,
         error: None,
@@ -373,12 +373,12 @@ mod tests {
             assert_eq!(request.max_tokens, 2048);
             Ok(SummarizeResponse {
                 text: "## Goal\nexplore".into(),
-                usage: Usage {
+                usage: Some(Usage {
                     input: 2,
                     output: 3,
                     total_tokens: 5,
                     ..Usage::default()
-                },
+                }),
                 stop_reason: Some(StopReason::Stop),
                 error_message: None,
                 has_tool_call: false,
@@ -409,7 +409,7 @@ mod tests {
         let tools = Summarizer::new(|_| {
             Ok(SummarizeResponse {
                 text: String::new(),
-                usage: Usage::default(),
+                usage: Some(Usage::default()),
                 stop_reason: Some(StopReason::ToolUse),
                 error_message: None,
                 has_tool_call: true,
@@ -422,7 +422,7 @@ mod tests {
         let length = Summarizer::new(|_| {
             Ok(SummarizeResponse {
                 text: "partial".into(),
-                usage: Usage::default(),
+                usage: Some(Usage::default()),
                 stop_reason: Some(StopReason::Length),
                 error_message: None,
                 has_tool_call: false,

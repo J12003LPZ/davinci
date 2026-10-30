@@ -42,7 +42,7 @@ fn unknown_effect_is_not_summarized_as_success() {
         seen.lock().unwrap().push(request.prompt.clone());
         Ok(SummarizeResponse {
             text: "The deploy command outcome is unknown.".into(),
-            usage: Default::default(),
+            usage: Some(Default::default()),
             stop_reason: Some(StopReason::Stop),
             error_message: None,
             has_tool_call: false,
@@ -109,7 +109,7 @@ fn unknown_effect_reaches_the_active_context_vm_fold_unchanged() {
         seen.lock().unwrap().push(request.prompt.clone());
         Ok(SummarizeResponse {
             text: "{}".into(),
-            usage: Default::default(),
+            usage: Some(Default::default()),
             stop_reason: Some(StopReason::Stop),
             error_message: None,
             has_tool_call: false,

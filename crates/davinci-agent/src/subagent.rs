@@ -873,25 +873,27 @@ fn run_tool_with_spawner(
         .iter()
         .any(|s| s.isolation.as_deref() == Some("worktree"));
     let wt_manager = if any_worktree {
-        let mgr = parent
-            .worktree_manager
-            .clone()
-            .or_else(|| {
-                parent
-                    .runtime
-                    .as_ref()
-                    .and_then(|rt| rt.worktree_manager.clone())
-            })
-            .unwrap_or_else(|| {
+        let existing = parent.worktree_manager.clone().or_else(|| {
+            parent
+                .runtime
+                .as_ref()
+                .and_then(|rt| rt.worktree_manager.clone())
+        });
+        let mgr = match existing {
+            Some(mgr) => mgr,
+            None => {
                 let cwd = std::env::current_dir().unwrap_or_default();
-                let repo_root = crate::runtime::worktree::git_toplevel(&cwd).unwrap_or(cwd);
+                let repo_root = crate::runtime::worktree::git_toplevel(&cwd)
+                    .map_err(|error| ToolError::Failed(error.to_string()))?
+                    .unwrap_or(cwd);
                 let wt_root = std::env::temp_dir().join("davinci").join("worktrees");
                 let mut m = WorktreeManager::new(repo_root, wt_root);
                 if let Some(rt) = &parent.runtime {
                     m = m.with_bus(rt.bus.clone());
                 }
                 m
-            });
+            }
+        };
         Some(mgr)
     } else {
         None

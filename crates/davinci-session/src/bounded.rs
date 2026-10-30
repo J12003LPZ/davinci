@@ -50,6 +50,57 @@ pub(crate) fn read_line_capped(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BoundedLine {
+    /// `buf` holds the line, without its `\n`; `terminated` says whether the
+    /// newline was present.
+    Complete {
+        terminated: bool,
+    },
+    /// The line is longer than the cap. `buf` is empty and the reader stops
+    /// inside the line; call [`skip_line`] to move past it.
+    TooLong,
+    Eof,
+}
+
+/// Like [`read_line_capped`], but also reports whether the line ended in a
+/// newline, so a streamed loader can tell a genuine final record from a torn
+/// unterminated tail.
+pub(crate) fn read_line_bounded(
+    reader: &mut impl BufRead,
+    max: usize,
+    buf: &mut Vec<u8>,
+) -> io::Result<BoundedLine> {
+    buf.clear();
+    let mut read_any = false;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        if available.is_empty() {
+            return Ok(if read_any {
+                BoundedLine::Complete { terminated: false }
+            } else {
+                BoundedLine::Eof
+            });
+        }
+        read_any = true;
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.unwrap_or(available.len());
+        if buf.len() + take > max {
+            buf.clear();
+            return Ok(BoundedLine::TooLong);
+        }
+        buf.extend_from_slice(&available[..take]);
+        reader.consume(newline.map_or(take, |index| index + 1));
+        if newline.is_some() {
+            return Ok(BoundedLine::Complete { terminated: true });
+        }
+    }
+}
+
 /// Consume the rest of the current line, through its `\n`, without keeping it.
 pub(crate) fn skip_line(reader: &mut impl BufRead) -> io::Result<()> {
     loop {

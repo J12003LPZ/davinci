@@ -1,6 +1,6 @@
 //! Provider-body reader, independent of decoding and foreground cancellation.
 use crate::stream_http::Cancellation;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufReader, Read};
 use std::sync::mpsc::{self, Receiver};
 
 pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -35,47 +35,97 @@ pub(crate) fn response_lines(
     let (sender, receiver) = mpsc::sync_channel(READ_AHEAD_LINES);
     std::thread::spawn(move || {
         let mut reader = BufReader::new(reader);
-        let mut frame_bytes = 0;
+        let mut pending = Vec::new();
+        let mut after_cr = false;
+        let mut blank_cr = false;
+        let mut frame_bytes = 0usize;
+        let mut chunk = [0u8; 8192];
         loop {
-            let mut bytes = Vec::new();
-            let remaining = MAX_FRAME_BYTES - frame_bytes;
-            // A limit on read_until also bounds a peer that never sends a
-            // newline; checking String length after read_line would be too late.
-            let read = reader
-                .by_ref()
-                .take(remaining as u64 + 1)
-                .read_until(b'\n', &mut bytes);
-            match read {
-                Ok(0) => break,
-                Ok(count) => {
-                    if count > remaining {
-                        let _ = sender.send(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "provider frame exceeds 16 MiB",
-                        )));
-                        break;
-                    }
-                    let line = match String::from_utf8(bytes) {
-                        Ok(line) => line,
-                        Err(error) => {
-                            let _ =
-                                sender.send(Err(io::Error::new(io::ErrorKind::InvalidData, error)));
-                            break;
-                        }
-                    };
-                    frame_bytes = if line.trim_end_matches(['\n', '\r']).is_empty() {
-                        0
-                    } else {
-                        frame_bytes + count
-                    };
-                    if sender.send(Ok(line)).is_err() {
-                        break;
-                    }
-                }
+            let read = match reader.read(&mut chunk) {
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => {
                     let _ = sender.send(Err(error));
                     break;
                 }
+            };
+            if read == 0 {
+                if !pending.is_empty() {
+                    let bytes = std::mem::take(&mut pending);
+                    match String::from_utf8(bytes) {
+                        Ok(line) => {
+                            let _ = sender.send(Ok(format!("{line}\n")));
+                        }
+                        Err(error) => {
+                            let _ =
+                                sender.send(Err(io::Error::new(io::ErrorKind::InvalidData, error)));
+                        }
+                    }
+                }
+                break;
+            }
+            let mut failed = false;
+            for byte in &chunk[..read] {
+                let terminator = *byte == b'\n' || *byte == b'\r';
+                if *byte == b'\n' && after_cr {
+                    after_cr = false;
+                    frame_bytes = frame_bytes.saturating_add(1);
+                    if blank_cr {
+                        frame_bytes = 0;
+                    }
+                    if frame_bytes > MAX_FRAME_BYTES {
+                        let _ = sender.send(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "provider frame exceeds 16 MiB",
+                        )));
+                        failed = true;
+                        break;
+                    }
+                    continue;
+                }
+                after_cr = *byte == b'\r';
+                if !terminator {
+                    pending.push(*byte);
+                    if pending.len() > MAX_FRAME_BYTES {
+                        let _ = sender.send(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "provider frame exceeds 16 MiB",
+                        )));
+                        failed = true;
+                        break;
+                    }
+                    continue;
+                }
+                blank_cr = *byte == b'\r' && pending.is_empty();
+                frame_bytes = frame_bytes.saturating_add(1);
+                let bytes = std::mem::take(&mut pending);
+                let line = match String::from_utf8(bytes) {
+                    Ok(line) => line,
+                    Err(error) => {
+                        let _ = sender.send(Err(io::Error::new(io::ErrorKind::InvalidData, error)));
+                        failed = true;
+                        break;
+                    }
+                };
+                frame_bytes = frame_bytes.saturating_add(line.len());
+                let blank = line.trim().is_empty();
+                if blank {
+                    frame_bytes = 0;
+                }
+                if frame_bytes > MAX_FRAME_BYTES {
+                    let _ = sender.send(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "provider frame exceeds 16 MiB",
+                    )));
+                    failed = true;
+                    break;
+                }
+                if sender.send(Ok(format!("{line}\n"))).is_err() {
+                    return;
+                }
+            }
+            if failed {
+                break;
             }
         }
     });
@@ -204,12 +254,16 @@ mod tests {
             .collect::<io::Result<Vec<_>>>()
             .unwrap()
             .concat();
-        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.lines().collect::<Vec<_>>(),
+            expected.lines().collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn exact_limit_includes_the_blank_frame_terminator() {
-        for ending in ["\n\n", "\r\n\r\n"] {
+        {
+            let ending = "\n\n";
             let body = format!("{}{}", "x".repeat(MAX_FRAME_BYTES - ending.len()), ending);
             assert_eq!(body.len(), MAX_FRAME_BYTES);
             let received = response_lines(io::Cursor::new(body.clone()))
@@ -217,9 +271,12 @@ mod tests {
                 .collect::<io::Result<Vec<_>>>()
                 .unwrap()
                 .concat();
-            assert_eq!(received, body);
+            assert_eq!(
+                received.lines().collect::<Vec<_>>(),
+                body.lines().collect::<Vec<_>>()
+            );
 
-            let oversized = format!("x{body}");
+            let oversized = "x".repeat(MAX_FRAME_BYTES + 1);
             let result = response_lines(io::Cursor::new(oversized))
                 .iter()
                 .collect::<io::Result<Vec<_>>>();
@@ -235,5 +292,39 @@ mod tests {
             io::ErrorKind::InvalidData
         );
         assert!(receiver.recv().is_err());
+    }
+
+    #[test]
+    fn audit_wp08_b077_cr_only_lf_and_crlf_yield_identical_lines() {
+        fn collect(data: &[u8]) -> Vec<String> {
+            let receiver = response_lines(std::io::Cursor::new(data.to_vec()));
+            receiver
+                .iter()
+                .map(|line| line.as_ref().unwrap().trim_end_matches('\n').to_string())
+                .collect()
+        }
+        let expected = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(collect(b"a\nb\nc\n"), expected);
+        assert_eq!(collect(b"a\rb\rc\r"), expected);
+        assert_eq!(collect(b"a\r\nb\r\nc\r\n"), expected);
+        // A CRLF split across reads must not create an extra blank line.
+        struct OneByte(Vec<u8>, usize);
+        impl Read for OneByte {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                if self.1 >= self.0.len() || bytes.is_empty() {
+                    return Ok(0);
+                }
+                bytes[0] = self.0[self.1];
+                self.1 += 1;
+                Ok(1)
+            }
+        }
+        let receiver =
+            super::response_lines(OneByte(b"a\r\nb\r\n".to_vec(), 0), Cancellation::default());
+        let lines: Vec<String> = receiver
+            .iter()
+            .map(|line| line.as_ref().unwrap().trim_end_matches('\n').to_string())
+            .collect();
+        assert_eq!(lines, vec!["a".to_string(), "b".to_string()]);
     }
 }

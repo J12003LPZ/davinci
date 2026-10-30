@@ -628,7 +628,7 @@ fn run_in_process(config: &RunConfig, root: &Path) -> RunResult {
             } else {
                 "## Goal\nContinue the fixture task.".into()
             },
-            usage: Default::default(),
+            usage: Some(Default::default()),
             stop_reason: Some(StopReason::Stop),
             error_message: None,
             has_tool_call: false,
@@ -759,6 +759,7 @@ fn run_in_process(config: &RunConfig, root: &Path) -> RunResult {
                 install_telemetry: Some(current.install_telemetry),
                 abort_signal: None,
                 output_schema: current.output_schema.clone(),
+                retry_after_sink: None,
             };
             let build = |options: &StreamOptions| {
                 let mut body = davinci_ai::request_body_with(

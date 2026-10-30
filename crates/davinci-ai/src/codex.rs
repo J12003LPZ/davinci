@@ -849,7 +849,7 @@ fn corpus_events(corpus: &str) -> Vec<Value> {
             if data.is_empty() || data == "[DONE]" {
                 continue;
             }
-            if let Ok(value) = serde_json::from_str::<Value>(&data) {
+            if let Ok(value) = davinci_protocol::json_number::parse_exact(&data) {
                 events.push(value);
             }
         }
@@ -860,7 +860,7 @@ fn corpus_events(corpus: &str) -> Vec<Value> {
         if line.is_empty() {
             continue;
         }
-        if let Ok(value) = serde_json::from_str::<Value>(line) {
+        if let Ok(value) = davinci_protocol::json_number::parse_exact(line) {
             events.push(value);
         }
     }

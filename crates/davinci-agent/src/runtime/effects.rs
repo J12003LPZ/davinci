@@ -36,6 +36,10 @@ pub struct OwnedFileEffect {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_mode: Option<u32>,
     pub task_id: TaskId,
+    /// The task's attempt when the host captured the effect. Completion evidence
+    /// is bound to it, so an earlier attempt's write never satisfies a later one.
+    #[serde(default)]
+    pub attempt: u32,
 }
 
 impl OwnedFileEffect {
@@ -58,6 +62,7 @@ impl OwnedFileEffect {
             before_mode: None,
             after_mode: None,
             task_id,
+            attempt: 0,
         }
     }
 }

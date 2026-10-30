@@ -935,7 +935,7 @@ mod tests {
         agent.summarizer = Some(crate::Summarizer::new(|_| {
             Ok(crate::SummarizeResponse {
                 text: "The task is ready for a final check.".into(),
-                usage: Default::default(),
+                usage: Some(Default::default()),
                 stop_reason: Some(davinci_ai::StopReason::Stop),
                 error_message: None,
                 has_tool_call: false,
@@ -992,7 +992,7 @@ mod tests {
         agent.summarizer = Some(crate::Summarizer::new(|_| {
             Ok(crate::SummarizeResponse {
                 text: "Lossy summary deliberately omits requirements.".into(),
-                usage: Default::default(),
+                usage: Some(Default::default()),
                 stop_reason: Some(davinci_ai::StopReason::Stop),
                 error_message: None,
                 has_tool_call: false,

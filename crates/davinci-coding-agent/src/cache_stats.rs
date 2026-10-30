@@ -323,7 +323,11 @@ pub fn format_cache_miss_notice(miss: &CacheMiss) -> Option<String> {
 }
 
 pub fn format_compaction_cost_notice(kind: &str, usage: &davinci_protocol::Usage) -> String {
-    let tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
+    let tokens = usage
+        .input
+        .saturating_add(usage.output)
+        .saturating_add(usage.cache_read)
+        .saturating_add(usage.cache_write);
     let cost = if usage.cost.total >= 0.01 {
         format!(" (~${:.2})", usage.cost.total)
     } else {
@@ -336,7 +340,7 @@ pub fn format_compaction_cost_notice(kind: &str, usage: &davinci_protocol::Usage
     };
     format!(
         "{label}: {} tokens billed{cost}",
-        format_tokens(tokens as i64)
+        format_tokens(i64::try_from(tokens).unwrap_or(i64::MAX))
     )
 }
 
@@ -536,6 +540,32 @@ mod tests {
         assert_eq!(
             format_compaction_cost_notice("compaction", &usage),
             "Compaction: 3.0k tokens billed (~$0.02)"
+        );
+    }
+
+    /// B035 review finding 3: a saturated usage renders as a huge count, not a
+    /// panic (debug), not a wrapped small number, and not a negative clamped to
+    /// zero by the `i64` cast.
+    #[test]
+    fn audit_wp03_b035_compaction_notice_saturates() {
+        let usage = davinci_protocol::Usage {
+            input: u64::MAX,
+            output: 1,
+            cache_read: u64::MAX,
+            cache_write: u64::MAX,
+            total_tokens: u64::MAX,
+            ..Default::default()
+        };
+        let notice = format_compaction_cost_notice("branch_summary", &usage);
+        assert_eq!(notice, "Branch summary: 9223372036855M tokens billed");
+        let exact = davinci_protocol::Usage {
+            input: 1_000,
+            output: 2_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_compaction_cost_notice("compaction", &exact),
+            "Compaction: 3.0k tokens billed"
         );
     }
 

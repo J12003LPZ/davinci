@@ -2192,12 +2192,12 @@ fn navigate_tree_appends_llm_branch_summary() {
         assert_eq!(request.max_tokens, 2048);
         Ok(SummarizeResponse {
             text: "## Goal\nabandoned work".into(),
-            usage: davinci_protocol::Usage {
+            usage: Some(davinci_protocol::Usage {
                 input: 1,
                 output: 2,
                 total_tokens: 3,
                 ..davinci_protocol::Usage::default()
-            },
+            }),
             stop_reason: Some(davinci_ai::StopReason::Stop),
             error_message: None,
             has_tool_call: false,
@@ -3182,7 +3182,7 @@ fn last_mutation_generation_survives() {
     agent.summarizer = Some(Summarizer::new(|_| {
         Ok(SummarizeResponse {
             text: "Lossy summary that says nothing about edits.".into(),
-            usage: Default::default(),
+            usage: Some(Default::default()),
             stop_reason: Some(davinci_ai::StopReason::Stop),
             error_message: None,
             has_tool_call: false,
@@ -6146,7 +6146,7 @@ fn wor32_abandoned_branch_summary_does_not_seed_the_active_branch() {
 checkpoint
 {echoed}"
             ),
-            usage: Default::default(),
+            usage: Some(Default::default()),
             stop_reason: Some(davinci_ai::StopReason::Stop),
             error_message: None,
             has_tool_call: false,
@@ -6854,7 +6854,7 @@ mod hybrid_fold_economics {
                 } else {
                     "## Goal\nContinue.".into()
                 },
-                usage: Default::default(),
+                usage: Some(Default::default()),
                 stop_reason: Some(davinci_ai::StopReason::Stop),
                 error_message: None,
                 has_tool_call: false,
@@ -7441,7 +7441,7 @@ mod hybrid_fold_economics {
                 } else {
                     "## Goal\nContinue.".into()
                 },
-                usage: Default::default(),
+                usage: Some(Default::default()),
                 stop_reason: Some(davinci_ai::StopReason::Stop),
                 error_message: None,
                 has_tool_call: false,
@@ -7509,6 +7509,72 @@ mod hybrid_fold_economics {
         agent.record_assistant("ok");
         agent.prompt("next");
         agent
+    }
+
+    /// B035 review finding 4: a usage whose input, output or cached-read count
+    /// the provider did not report holds a placeholder zero. It must not be
+    /// installed as a measured context size (Hybrid mode compacts from it), and
+    /// it must clear an earlier real observation rather than leave it stale.
+    #[test]
+    fn audit_wp03_b035_partial_usage_is_not_a_measured_context() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls, || {});
+        agent.prompt("hello");
+        agent.record_assistant("ok");
+        let reply = agent.messages.last().cloned().unwrap();
+
+        let reported = davinci_protocol::Usage {
+            input: 90_000,
+            output: 10,
+            ..Default::default()
+        };
+        agent.note_provider_context(Some(&reported), &reply);
+        assert_eq!(
+            agent.last_provider_context.as_ref().map(|o| o.tokens),
+            Some(90_010)
+        );
+
+        for partial in [
+            davinci_protocol::Usage {
+                output: 10,
+                input_unreported: true,
+                ..Default::default()
+            },
+            davinci_protocol::Usage {
+                input: 90_000,
+                output_unreported: true,
+                ..Default::default()
+            },
+            davinci_protocol::Usage {
+                input: 90_000,
+                output: 10,
+                cache_read_unreported: true,
+                ..Default::default()
+            },
+        ] {
+            agent.note_provider_context(Some(&reported), &reply);
+            assert!(agent.last_provider_context.is_some());
+            agent.note_provider_context(Some(&partial), &reply);
+            assert!(
+                agent.last_provider_context.is_none(),
+                "{partial:?} was installed as a measured context"
+            );
+        }
+        agent.note_provider_context(Some(&reported), &reply);
+        agent.note_provider_context(None, &reply);
+        assert!(agent.last_provider_context.is_none());
+
+        // Reported zeros are measurements: zero input with ten output tokens
+        // is a ten-token context, not an unknown one.
+        let zeros = davinci_protocol::Usage {
+            output: 10,
+            ..Default::default()
+        };
+        agent.note_provider_context(Some(&zeros), &reply);
+        assert_eq!(
+            agent.last_provider_context.as_ref().map(|o| o.tokens),
+            Some(10)
+        );
     }
 
     #[test]
@@ -8089,4 +8155,258 @@ mod hybrid_fold_economics {
         agent.set_context_vm_mode(crate::runtime::ContextVmMode::Hybrid);
         assert_eq!(hybrid_stats(&agent), before);
     }
+}
+
+#[test]
+fn audit_wp02_b030_history_manifest_entries_carry_role_provenance() {
+    use runtime::context_manifest::ProvenanceKind;
+    let mut agent = Agent::new("");
+    agent
+        .messages
+        .push(ChatMessage::text("user", "build the parser"));
+    agent
+        .messages
+        .push(ChatMessage::text("assistant", "I will start now"));
+    agent
+        .messages
+        .push(ChatMessage::text("toolResult", "exit code 0"));
+    let manifest = agent.prepare_context_manifest("request", RunId::new(), 1, 1);
+    let history: Vec<_> = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.category == "history")
+        .collect();
+    let kinds: Vec<_> = history.iter().map(|entry| entry.provenance_kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            ProvenanceKind::UserDecision,
+            ProvenanceKind::AgentInference,
+            ProvenanceKind::ToolEvidence
+        ]
+    );
+    // The inspector's serialized form keeps the distinction.
+    let json = serde_json::to_value(&manifest).unwrap().to_string();
+    assert!(json.contains("user_decision") && json.contains("agent_inference"));
+}
+
+#[test]
+fn audit_wp02_b029_malformed_message_fails_import_and_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut good = JsonlSession::create(dir.path(), "fixture", Some("good")).unwrap();
+    good.append_entry(SessionEntry::message(
+        "user",
+        serde_json::json!([{"type": "text", "text": "keep me"}]),
+    ))
+    .unwrap();
+    let good_id = good.header.id.clone();
+    let mut agent = Agent::new("fixture");
+    agent.load_from_session(good).unwrap();
+    let messages_before = agent.messages.clone();
+    assert_eq!(messages_before.len(), 1);
+
+    let other = tempfile::tempdir().unwrap();
+    let mut bad = JsonlSession::create(other.path(), "fixture", Some("bad")).unwrap();
+    bad.append_entry(SessionEntry::message(
+        "user",
+        serde_json::json!([{"type": "text", "text": "fine"}]),
+    ))
+    .unwrap();
+    bad.append_entry(SessionEntry::message(
+        "user",
+        serde_json::json!([{"type": "no_such_part"}]),
+    ))
+    .unwrap();
+    let broken_id = bad.entries.last().unwrap().id.clone();
+    assert!(entry_to_chat(bad.entries.last().unwrap()).is_none());
+    let error = agent.load_from_session(bad).unwrap_err();
+    assert!(error.contains(&broken_id), "{error}");
+    assert!(error.contains("malformed message"), "{error}");
+    // Current context and session are untouched.
+    assert_eq!(agent.messages, messages_before);
+    assert_eq!(agent.session.as_ref().unwrap().header.id, good_id);
+
+    // Valid message, custom and compaction entries still load.
+    let third = tempfile::tempdir().unwrap();
+    let mut valid = JsonlSession::create(third.path(), "fixture", Some("valid")).unwrap();
+    valid
+        .append_entry(SessionEntry::message(
+            "user",
+            serde_json::json!([{"type": "text", "text": "hello"}]),
+        ))
+        .unwrap();
+    let mut custom = SessionEntry::message("user", serde_json::json!(""));
+    custom.entry_type = "custom_message".into();
+    custom.message = None;
+    custom.custom_type = Some("hint".into());
+    custom.extra.insert(
+        "content".into(),
+        serde_json::json!([{"type": "text", "text": "extra context"}]),
+    );
+    valid.append_entry(custom).unwrap();
+    let mut compaction = SessionEntry::message("user", serde_json::json!(""));
+    compaction.entry_type = "compaction".into();
+    compaction.message = None;
+    compaction
+        .extra
+        .insert("summary".into(), serde_json::json!("earlier work"));
+    valid.append_entry(compaction).unwrap();
+    agent.load_from_session(valid).unwrap();
+    assert!(!agent.messages.is_empty());
+}
+
+fn b029_text(role: &str, text: &str) -> SessionEntry {
+    SessionEntry::message(role, serde_json::json!([{"type": "text", "text": text}]))
+}
+
+fn b029_broken() -> SessionEntry {
+    SessionEntry::message("assistant", serde_json::json!([{"type": "no_such_part"}]))
+}
+
+/// A malformed message is refused wherever it sits: on an abandoned branch,
+/// or in history a compaction hides. Neither is visible at initial load, but
+/// both come back (navigation, a later compaction rewrite).
+#[test]
+fn audit_wp02_b029_malformed_messages_off_the_active_path_fail_the_load() {
+    let good_dir = tempfile::tempdir().unwrap();
+    let mut good = JsonlSession::create(good_dir.path(), "fixture", Some("good")).unwrap();
+    good.append_entry(b029_text("user", "keep me")).unwrap();
+    let mut agent = Agent::new("fixture");
+    let good_id = good.header.id.clone();
+    agent.load_from_session(good).unwrap();
+    let messages_before = agent.messages.clone();
+
+    // 1. Malformed message on a branch that is not the selected one.
+    let dir = tempfile::tempdir().unwrap();
+    let mut branched = JsonlSession::create(dir.path(), "fixture", Some("branched")).unwrap();
+    branched.append_entry(b029_text("user", "root")).unwrap();
+    let root = branched.entries.last().unwrap().id.clone();
+    branched
+        .append_entry(b029_text("assistant", "active"))
+        .unwrap();
+    let active = branched.entries.last().unwrap().id.clone();
+    branched.set_leaf(Some(root));
+    branched.append_entry(b029_broken()).unwrap();
+    let abandoned = branched.entries.last().unwrap().id.clone();
+    branched.set_leaf(Some(active));
+    // The selected context is clean, so the old active-path check admitted it.
+    assert!(
+        !davinci_session::build_context_entries(&branched.entries, branched.leaf_id.as_deref())
+            .iter()
+            .any(|entry| entry.id == abandoned),
+        "premise: the broken message is off the active path"
+    );
+    let error = agent.load_from_session(branched).unwrap_err();
+    assert!(
+        error.contains(&abandoned) && error.contains("malformed message"),
+        "{error}"
+    );
+
+    // 2. Malformed message before a compaction: the context starts after it.
+    let dir = tempfile::tempdir().unwrap();
+    let mut compacted = JsonlSession::create(dir.path(), "fixture", Some("compacted")).unwrap();
+    compacted.append_entry(b029_broken()).unwrap();
+    let hidden = compacted.entries.last().unwrap().id.clone();
+    compacted.append_entry(b029_text("user", "kept")).unwrap();
+    let kept = compacted.entries.last().unwrap().id.clone();
+    let mut compaction = SessionEntry::message("user", serde_json::json!(""));
+    compaction.entry_type = "compaction".into();
+    compaction.message = None;
+    compaction
+        .extra
+        .insert("summary".into(), serde_json::json!("earlier work"));
+    compaction
+        .extra
+        .insert("firstKeptEntryId".into(), serde_json::json!(kept));
+    compacted.append_entry(compaction).unwrap();
+    let context: Vec<_> =
+        davinci_session::build_context_entries(&compacted.entries, compacted.leaf_id.as_deref())
+            .into_iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+    assert!(
+        !context.contains(&hidden),
+        "premise: the compaction hides it"
+    );
+    let error = agent.load_from_session(compacted).unwrap_err();
+    assert!(
+        error.contains(&hidden) && error.contains("malformed message"),
+        "{error}"
+    );
+
+    // 3. A summary entry that is not text would vanish from the context too.
+    let dir = tempfile::tempdir().unwrap();
+    let mut summarized = JsonlSession::create(dir.path(), "fixture", Some("summary")).unwrap();
+    let mut hollow = SessionEntry::message("user", serde_json::json!(""));
+    hollow.entry_type = "branch_summary".into();
+    hollow.message = None;
+    summarized.append_entry(hollow).unwrap();
+    assert!(agent
+        .load_from_session(summarized)
+        .unwrap_err()
+        .contains("summary"));
+
+    // A failed load changes nothing.
+    assert_eq!(agent.messages, messages_before);
+    assert_eq!(agent.session.as_ref().unwrap().header.id, good_id);
+}
+
+/// Navigation to a branch that would silently drop a message is refused before
+/// anything moves: not the leaf, not the persisted entries, not the messages.
+#[test]
+fn audit_wp02_b029_navigation_refuses_a_branch_with_a_malformed_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = JsonlSession::create(dir.path(), "fixture", Some("nav")).unwrap();
+    session.append_entry(b029_text("user", "root")).unwrap();
+    let root = session.entries.last().unwrap().id.clone();
+    session
+        .append_entry(b029_text("assistant", "active"))
+        .unwrap();
+    let active = session.entries.last().unwrap().id.clone();
+    let mut agent = Agent::new("fixture");
+    agent.load_from_session(session).unwrap();
+
+    // A sibling branch is added after the load (another writer, a repair
+    // tool): one valid reply and one that cannot be read.
+    let (valid, broken) = {
+        let session = agent.session.as_mut().unwrap();
+        session.set_leaf(Some(root.clone()));
+        session
+            .append_entry(b029_text("assistant", "sibling"))
+            .unwrap();
+        let valid = session.entries.last().unwrap().id.clone();
+        session.set_leaf(Some(root));
+        session.append_entry(b029_broken()).unwrap();
+        let broken = session.entries.last().unwrap().id.clone();
+        session.set_leaf(Some(active.clone()));
+        (valid, broken)
+    };
+    let entries_before = agent.session.as_ref().unwrap().entries.clone();
+    let messages_before = agent.messages.clone();
+    let id_before = agent.session.as_ref().unwrap().header.id.clone();
+
+    for summarize in [false, true] {
+        let error = agent
+            .navigate_tree_entry(&broken, summarize, None, false, 0)
+            .unwrap_err();
+        assert!(
+            error.contains(&broken) && error.contains("malformed message"),
+            "{error}"
+        );
+        let session = agent.session.as_ref().unwrap();
+        assert_eq!(session.leaf_id.as_deref(), Some(active.as_str()));
+        assert_eq!(session.entries, entries_before, "nothing was appended");
+        assert_eq!(session.header.id, id_before);
+        assert_eq!(agent.messages, messages_before);
+    }
+
+    // The readable sibling is still reachable.
+    agent
+        .navigate_tree_entry(&valid, false, None, false, 0)
+        .unwrap();
+    assert_eq!(
+        agent.session.as_ref().unwrap().leaf_id.as_deref(),
+        Some(valid.as_str())
+    );
+    assert_ne!(agent.messages, messages_before);
 }

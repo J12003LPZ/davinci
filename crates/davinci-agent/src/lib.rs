@@ -11,6 +11,8 @@ mod permission_state;
 pub mod process_manager;
 pub mod subagent_progress;
 pub mod subagent_receipt;
+#[cfg(test)]
+mod test_seam;
 pub use permission_state::PermissionState;
 mod batch;
 mod branch;
@@ -612,6 +614,22 @@ pub(crate) struct HybridCompactionStats {
     pub context_tokens_after: u64,
 }
 
+/// Stand-ins the retry tests inject: the clock the run deadline is read from
+/// and the pool a request queues in.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct TestHooks {
+    pub(crate) clock: Option<std::sync::Arc<dyn Fn() -> u64 + Send + Sync>>,
+    pub(crate) capacity: Option<std::sync::Arc<runtime::capacity::RequestCapacity>>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for TestHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestHooks")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub(crate) codemode: Option<codemode::CodeModeBinding>,
@@ -646,6 +664,12 @@ pub struct Agent {
     pub auto_retry: bool,
     pub retry_attempts: u32,
     pub retry_base_delay_ms: u64,
+    /// Where the provider call leaves the server's `Retry-After` for the
+    /// request that just failed (see [`Agent::retry_after_sink`]).
+    retry_after_sink: davinci_ai::RetryAfterSink,
+    /// Test clock and capacity pool for the retry deadline checks.
+    #[cfg(test)]
+    pub(crate) test_hooks: TestHooks,
     /// Maximum provider model turns in one run; `Some(0)` disables the limit.
     pub max_model_turns: Option<u32>,
     pub provider_timeout_ms: Option<u64>,
@@ -669,6 +693,9 @@ pub struct Agent {
     /// disk, so edits and nested files are kept current (false under
     /// `--no-context-files`, and for files a caller assigned by hand).
     pub instruction_files_enabled: bool,
+    /// Why the mandatory instruction files cannot be admitted (over a size
+    /// limit, hard-linked); the turn is refused while it is set.
+    pub(crate) instruction_error: Option<String>,
     pub(crate) context_file_stamps: std::collections::HashMap<PathBuf, context::FileStamp>,
     /// Where an `AGENTS.md` could sit from the repository root to `cwd`, set
     /// at load, so one created mid-session is noticed.
@@ -905,6 +932,9 @@ impl Agent {
             auto_retry: true,
             retry_attempts: 3,
             retry_base_delay_ms: 2_000,
+            retry_after_sink: davinci_ai::RetryAfterSink::default(),
+            #[cfg(test)]
+            test_hooks: TestHooks::default(),
             max_model_turns: Some(200),
             provider_timeout_ms: None,
             provider_max_retries: None,
@@ -923,6 +953,7 @@ impl Agent {
             templates: Vec::new(),
             context_files: Vec::new(),
             instruction_files_enabled: false,
+            instruction_error: None,
             context_file_stamps: std::collections::HashMap::new(),
             instruction_chain: Vec::new(),
             session: None,
@@ -1991,6 +2022,13 @@ impl Agent {
         running
     }
 
+    /// Hand this to the provider call (`StreamOptions::retry_after_sink`) so
+    /// the server's `Retry-After` on a failed request reaches the retry loop
+    /// as a number, not as text inside the error message.
+    pub fn retry_after_sink(&self) -> davinci_ai::RetryAfterSink {
+        self.retry_after_sink.clone()
+    }
+
     /// Compatibility path for mutation sources that cannot yet provide a path.
     #[allow(dead_code)]
     pub(crate) fn record_successful_mutation(&self) {
@@ -2639,7 +2677,8 @@ impl Agent {
             .map(|ledger| ledger.recent_tool_names(10))
             .unwrap_or_default();
 
-        let has_uncommitted_changes = runtime::has_uncommitted_changes(&self.cwd);
+        let has_uncommitted_changes =
+            runtime::has_uncommitted_changes(&self.cwd).map_err(|error| error.to_string())?;
         let router_input = prompt::CapabilityRouterInput::new(user_text)
             .with_previous_request(previous_user_request)
             .with_recent_tools(&recent_tools)
@@ -3636,13 +3675,21 @@ impl Agent {
     }
 
     /// Remember what the provider reported for the request that produced
-    /// `reply`, now at the end of `messages`. Missing usage records nothing.
+    /// `reply`, now at the end of `messages`. Missing usage, or a usage whose
+    /// input, output or cached-read count the provider did not report (a
+    /// placeholder zero, not a measurement), records nothing and clears any
+    /// earlier observation, so the full-context estimate is used instead. An
+    /// unreported cache-write count stays a plain zero: most providers never
+    /// send one, and requiring it would drop calibration for all of them.
     pub(crate) fn note_provider_context(
         &mut self,
         usage: Option<&davinci_protocol::Usage>,
         reply: &ChatMessage,
     ) {
         let tokens = usage.map_or(0, |usage| {
+            if usage.input_unreported || usage.output_unreported || usage.cache_read_unreported {
+                return 0;
+            }
             usage
                 .input
                 .saturating_add(usage.cache_read)
@@ -3889,7 +3936,7 @@ impl Agent {
                 entries.push(ContextManifestEntry::new(
                     format!("message_{i}"),
                     "history",
-                    ProvenanceKind::ToolEvidence,
+                    history_provenance(msg),
                     format!("message::{}", msg.role),
                     ContextManifestEntry::hash_content(&content_str),
                     tokens,
@@ -5706,6 +5753,9 @@ impl Agent {
     /// Activate durable task state before replacing the active session.
     /// Reloading the live source preserves its writer lease and worker handles.
     pub fn load_from_session(&mut self, mut session: JsonlSession) -> Result<(), String> {
+        // Admission comes first: a message that cannot be read must stop the
+        // load, not silently vanish from the context the model is given.
+        validate_session_messages(&session)?;
         let session_budget = self.restore_root_budget(&session)?;
         let repair_checkpoint = Self::restore_repair_checkpoint(&session)?;
         let source = std::fs::canonicalize(&session.path).map_err(|error| {
@@ -5947,6 +5997,10 @@ impl Agent {
         let (collected, _) =
             collect_entries_for_branch_summary(&session.entries, old_leaf.as_deref(), target_id);
         let (new_leaf, editor_text) = navigation_target(&target);
+        // The branch about to become active must read back whole. A message
+        // that would silently drop out of its context stops the move here,
+        // before the leaf, the summary entry or the agent's messages change.
+        validate_branch_messages(session, new_leaf.as_deref())?;
         let mut summary_text = None;
         if summarize && !collected.is_empty() {
             let provider = self.provider.clone();
@@ -6300,6 +6354,77 @@ fn compaction_entry_meta(entry: &SessionEntry) -> crate::compaction::CompactionS
             .and_then(|value| value.as_str())
             .map(str::to_string),
     }
+}
+
+/// Manifest provenance of one history message, from the same role and origin
+/// rules the Context VM applies to its events: a real user message is a user
+/// decision, assistant text is inference, and only tool results are tool
+/// evidence. A message with no visible content carries no authority.
+fn history_provenance(message: &ChatMessage) -> runtime::context_manifest::ProvenanceKind {
+    use runtime::context_manifest::ProvenanceKind;
+    runtime::context_vm::events_from_messages(std::slice::from_ref(message))
+        .first()
+        .map_or_else(
+            || match message.role.as_str() {
+                "toolResult" | "tool_result" => ProvenanceKind::ToolEvidence,
+                _ => ProvenanceKind::AgentInference,
+            },
+            |event| event.provenance_kind,
+        )
+}
+
+/// Every message-bearing entry must deserialize, on every branch and before any
+/// compaction. `entry_to_chat` drops what it cannot read, which is right for
+/// non-message entry types but would hide a damaged or hostile message from the
+/// model's context the moment its branch became active or its history became
+/// visible again. Entry types that carry no message (custom state, labels,
+/// plans) are not checked.
+fn validate_session_messages(session: &JsonlSession) -> Result<(), String> {
+    session.entries.iter().try_for_each(validate_entry_message)
+}
+
+/// The context `leaf` would give the model, if every message-bearing entry on
+/// its path is readable. Nothing is changed; callers use it to refuse a
+/// navigation before moving.
+fn validate_branch_messages(session: &JsonlSession, leaf: Option<&str>) -> Result<(), String> {
+    davinci_session::build_context_entries(&session.entries, leaf)
+        .into_iter()
+        .try_for_each(validate_entry_message)
+}
+
+fn validate_entry_message(entry: &SessionEntry) -> Result<(), String> {
+    let malformed = |detail: String| {
+        format!(
+            "session entry {} (seq {}, type {}) has malformed message content: {detail}",
+            entry.id, entry.seq, entry.entry_type
+        )
+    };
+    match entry.entry_type.as_str() {
+        "message" => {
+            let message = entry
+                .message
+                .as_ref()
+                .ok_or_else(|| malformed("no message".into()))?;
+            serde_json::from_value::<ChatMessage>(message.clone())
+                .map_err(|error| malformed(error.to_string()))?;
+        }
+        "custom_message" => match entry.extra.get("content").or(entry.message.as_ref()) {
+            None | Some(Value::String(_)) => {}
+            Some(content @ Value::Array(_)) => {
+                serde_json::from_value::<Vec<MessageContent>>(content.clone())
+                    .map_err(|error| malformed(error.to_string()))?;
+            }
+            Some(_) => return Err(malformed("content is not text or a list".into())),
+        },
+        // Summaries stand in for the history they replaced.
+        "compaction" | "branch_summary" => {
+            if entry.extra.get("summary").and_then(Value::as_str).is_none() {
+                return Err(malformed("summary is missing or not text".into()));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub(crate) fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {

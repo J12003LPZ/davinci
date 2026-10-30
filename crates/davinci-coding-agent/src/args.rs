@@ -1115,4 +1115,13 @@ mod tests {
             && d.message
                 == "Invalid prompt profile 'unknown'. Valid profiles: stable, preview, legacy-v1"));
     }
+
+    #[test]
+    fn audit_wp25_b264_b292_help_matches_loader_and_keybindings() {
+        let help = print_help();
+        assert!(!help.contains("CLAUDE.md"), "{help}");
+        assert!(help.contains("AGENTS.md repository-context"), "{help}");
+        assert!(help.contains("Ctrl+Alt+N"), "{help}");
+        assert!(!help.contains("for Ctrl+P cycling"), "{help}");
+    }
 }

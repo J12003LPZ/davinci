@@ -182,6 +182,88 @@ pub struct Theme {
     pub daltonized: bool,
 }
 
+pub fn css_color(color: Color) -> Option<String> {
+    let hexadecimal = |r: u8, g: u8, b: u8| Some(format!("#{r:02x}{g:02x}{b:02x}"));
+    match color {
+        Color::Rgb(r, g, b) => hexadecimal(r, g, b),
+        Color::Black => Some("#000000".into()),
+        Color::White => Some("#ffffff".into()),
+        Color::Red => Some("#cd3131".into()),
+        Color::Green => Some("#0dbc79".into()),
+        Color::Yellow => Some("#e5e510".into()),
+        Color::Blue => Some("#2472c8".into()),
+        Color::Magenta => Some("#bc3fbc".into()),
+        Color::Cyan => Some("#11a8cd".into()),
+        Color::Gray => Some("#808080".into()),
+        Color::DarkGray => Some("#404040".into()),
+        Color::LightRed => Some("#f14c4c".into()),
+        Color::LightGreen => Some("#23d18b".into()),
+        Color::LightYellow => Some("#f5f543".into()),
+        Color::LightBlue => Some("#3b8eea".into()),
+        Color::LightMagenta => Some("#d670d6".into()),
+        Color::LightCyan => Some("#29b8db".into()),
+        Color::Reset | Color::Indexed(_) => None,
+    }
+}
+
+/// The colour variables the exported HTML stylesheet consumes, plus a safe
+/// background value. Only validated colours are emitted; unknown terminal
+/// colours fall back to the theme's text/background family.
+pub fn export_css(theme: &Theme) -> (String, String) {
+    let background = css_color(theme.background).unwrap_or_else(|| "#1e1e1e".into());
+    let text = css_color(theme.text).unwrap_or_else(|| "#e6e6e6".into());
+    let mut css = String::from(":root{");
+    {
+        let mut add = |name: &str, color: &Color, fallback: &str| {
+            let value = css_color(*color).unwrap_or_else(|| fallback.to_string());
+            css.push_str(&format!("--{name}:{value};"));
+        };
+        add("text", &theme.text, &text);
+        add("muted", &theme.muted, &text);
+        add("dim", &theme.muted, &text);
+        add("border", &theme.border, &text);
+        add("accent", &theme.primary, &text);
+        add("success", &theme.success, &text);
+        add("warning", &theme.warning, &text);
+        add("error", &theme.error, &text);
+        add("hover", &theme.surface_alt, &background);
+        add("selectedBg", &theme.surface_alt, &background);
+        add("userMessageBg", &theme.surface, &background);
+        add("userMessageText", &theme.text, &text);
+        add("toolPendingBg", &theme.surface, &background);
+        add("toolSuccessBg", &theme.surface, &background);
+        add("toolErrorBg", &theme.surface, &background);
+        add("toolOutput", &theme.muted, &text);
+        add("toolDiffAdded", &theme.success, &text);
+        add("toolDiffRemoved", &theme.error, &text);
+        add("toolDiffContext", &theme.muted, &text);
+        add("mdCode", &theme.primary, &text);
+        add("mdCodeBlockBorder", &theme.border, &text);
+        add("mdHeading", &theme.primary, &text);
+        add("mdHr", &theme.border, &text);
+        add("mdLink", &theme.primary, &text);
+        add("mdListBullet", &theme.secondary, &text);
+        add("mdQuote", &theme.muted, &text);
+        add("mdQuoteBorder", &theme.border, &text);
+        add("customMessageBg", &theme.surface, &background);
+        add("customMessageLabel", &theme.secondary, &text);
+        add("customMessageText", &theme.text, &text);
+        add("thinkingText", &theme.muted, &text);
+        add("syntaxComment", &theme.muted, &text);
+        add("syntaxFunction", &theme.primary, &text);
+        add("syntaxKeyword", &theme.secondary, &text);
+        add("syntaxNumber", &theme.warning, &text);
+        add("syntaxOperator", &theme.text, &text);
+        add("syntaxPunctuation", &theme.muted, &text);
+        add("syntaxString", &theme.success, &text);
+        add("syntaxType", &theme.primary, &text);
+        add("syntaxVariable", &theme.text, &text);
+        add("borderAccent", &theme.primary, &text);
+    }
+    css.push('}');
+    (css, background)
+}
+
 /// The eleven tokens, before they are wrapped in a `Theme`.
 struct Ramp {
     background: Color,

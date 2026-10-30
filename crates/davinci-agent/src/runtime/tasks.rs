@@ -3935,15 +3935,7 @@ mod tests {
             .unwrap();
 
         let task = registry.get_task(&task_id).unwrap();
-        let receipt = crate::runtime::evidence_store::ExecutionReceipt {
-            receipt_id: crate::runtime::ids::EvidenceId::new(),
-            operation_id: "impl_1".into(),
-            task_id: Some(task_id),
-            tool_name: "implementation".into(),
-            started: true,
-            exit_code: Some(0),
-            ..Default::default()
-        };
+        let receipt = crate::runtime::evidence_store::applied_mutation_receipt(task_id, 0);
         let eval =
             crate::runtime::completion::evaluate_task_completion(&task, None, &[receipt], &m1, 0);
         assert!(eval.allowed);
@@ -3977,15 +3969,7 @@ mod tests {
             .build()
             .unwrap();
         let task = registry.get_task(&task_id).unwrap();
-        let receipt = crate::runtime::evidence_store::ExecutionReceipt {
-            receipt_id: crate::runtime::ids::EvidenceId::new(),
-            operation_id: "impl_revision_race".into(),
-            task_id: Some(task_id),
-            tool_name: "implementation".into(),
-            started: true,
-            exit_code: Some(0),
-            ..Default::default()
-        };
+        let receipt = crate::runtime::evidence_store::applied_mutation_receipt(task_id, 0);
         let eval = crate::runtime::completion::evaluate_task_completion(
             &task,
             None,
@@ -4037,15 +4021,7 @@ mod tests {
             .build()
             .unwrap();
         let task = registry.get_task(&task_id).unwrap();
-        let receipt = crate::runtime::evidence_store::ExecutionReceipt {
-            receipt_id: crate::runtime::ids::EvidenceId::new(),
-            operation_id: "impl_contract_mismatch".into(),
-            task_id: Some(task_id),
-            tool_name: "implementation".into(),
-            started: true,
-            exit_code: Some(0),
-            ..Default::default()
-        };
+        let receipt = crate::runtime::evidence_store::applied_mutation_receipt(task_id, 0);
         let evaluation = crate::runtime::completion::evaluate_task_completion(
             &task,
             None,

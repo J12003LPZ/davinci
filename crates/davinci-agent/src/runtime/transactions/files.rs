@@ -87,6 +87,15 @@ fn capture_file(
     alias_handle: bool,
 ) -> Result<(Image, Option<Vec<u8>>), String> {
     let before = file.metadata().map_err(|e| e.to_string())?;
+    // Every write, edit and patch captures its target here first. A file named
+    // by more than one hard link may be the same inode as one outside the
+    // workspace, so it is never modified, whatever the read policy allows. An
+    // unknown link count is refused as well.
+    if before.is_file() {
+        davinci_sys::fs::ensure_single_link(&file).map_err(|e| {
+            format!("refusing to modify a file with more than one hard link or an unknown link count: {e}")
+        })?;
+    }
     #[cfg(windows)]
     super::windows_metadata::ensure_replaceable(&file)?;
     let identity = identity(&file, &before)?;

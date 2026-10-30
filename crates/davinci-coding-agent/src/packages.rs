@@ -90,9 +90,8 @@ pub fn handle_package_command_in(
         }
         "remove" | "uninstall" => {
             let source = source.ok_or("remove <source> [-l]")?;
-            if local {
-                ensure_project_trusted_for_packages(agent_dir, cwd, &settings)?;
-            }
+            // Removal unregisters and deletes installed files without loading
+            // package code, so it must stay possible after trust is revoked.
             let normalized = match parse_package_source(&source) {
                 ParsedSource::Local(path) => normalize_local_source(&path, cwd)?,
                 _ => source.clone(),
@@ -265,7 +264,7 @@ pub fn update_extensions(
 /// own settings must not decide what runs. Same store and host settings as the
 /// startup gate.
 fn project_packages_trusted(agent_dir: &Path, cwd: &Path, user: &Settings) -> bool {
-    crate::trust::resolve_project_trusted(
+    crate::trust::explicitly_project_trusted(
         agent_dir,
         cwd,
         None,
@@ -1360,16 +1359,16 @@ mod tests {
         fs::create_dir_all(&agent).unwrap();
         let project = project_with_packages(dir.path());
         let settings = project.join(".pi").join("settings.json");
-        let before = fs::read_to_string(&settings).unwrap();
         let args = vec!["-l".to_string(), "npm:project-owned".to_string()];
 
-        // The real entry point, as `davinci remove -l <pkg>` reaches it.
-        let error = handle_package_command_in("remove", &args, &agent, &project).unwrap_err();
-        assert!(error.starts_with("UNTRUSTED_PROJECT: "), "{error}");
-        assert_eq!(
-            fs::read_to_string(&settings).unwrap(),
-            before,
-            "an untrusted project's settings were rewritten"
+        // Removal runs no package code, so an untrusted project can still be
+        // cleaned up after trust is revoked.
+        handle_package_command_in("remove", &args, &agent, &project).unwrap();
+        assert!(
+            !fs::read_to_string(&settings)
+                .unwrap()
+                .contains("project-owned"),
+            "the registration survived an untrusted removal"
         );
     }
 
@@ -1451,6 +1450,34 @@ mod tests {
             .unwrap();
         let user_scope = vec![package.display().to_string()];
         assert!(handle_package_command_in("install", &user_scope, &agent, &project).is_ok());
+    }
+
+    #[test]
+    fn audit_wp06_b054_pristine_project_install_needs_explicit_trust_and_removal_survives_revocation(
+    ) {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        fs::create_dir_all(&agent).unwrap();
+        let project = dir.path().join("pristine");
+        fs::create_dir_all(&project).unwrap();
+        let package = dir.path().join("pkg");
+        fs::create_dir_all(&package).unwrap();
+        let package_arg = package.display().to_string();
+        let args = vec!["-l".to_string(), package_arg.clone()];
+
+        let error = handle_package_command_in("install", &args, &agent, &project).unwrap_err();
+        assert!(error.starts_with("UNTRUSTED_PROJECT: "), "{error}");
+        assert!(!project.join(".davinci/settings.json").exists());
+
+        crate::trust::ProjectTrustStore::open(&agent)
+            .set(&project, Some(true))
+            .unwrap();
+        handle_package_command_in("install", &args, &agent, &project).unwrap();
+        crate::trust::ProjectTrustStore::open(&agent)
+            .set(&project, Some(false))
+            .unwrap();
+        let removed = handle_package_command_in("remove", &args, &agent, &project).unwrap();
+        assert!(removed.starts_with("Removed "), "{removed}");
     }
 
     #[test]

@@ -696,6 +696,9 @@ fn complete_server_prompt(agent: &Agent) -> Result<davinci_agent::CompleteOutput
             install_telemetry: Some(agent.install_telemetry),
             abort_signal: agent.abort_signal.clone(),
             output_schema: agent.output_schema.clone(),
+            // The agent's retry loop reads the server's Retry-After from here;
+            // without it a server-hosted session backs off on its own schedule.
+            retry_after_sink: Some(agent.retry_after_sink()),
             ..Default::default()
         },
         &mut |_| {},
@@ -1889,6 +1892,146 @@ mod tests {
             .iter()
             .any(|message| message["role"] == "user"
                 && message["content"][0]["text"] == "Say provider answer"));
+        assert!(prompted.transcript.iter().any(|item| matches!(
+            item,
+            TranscriptItem::Assistant { content, .. }
+                if content.iter().any(|part| matches!(part, AssistantContent::Text { text } if text == "provider answer"))
+        )));
+    }
+
+    /// A server-hosted session that gets a 429 with a `retry-after-ms` longer
+    /// than its ordinary backoff (2 s by default) waits the server's delay: the
+    /// provider adapter fills the agent's sink, and the agent loop reads it.
+    #[test]
+    fn audit_wp02_b033_server_session_honors_the_providers_retry_after() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PI_SERVER_PROMPT_REPLY");
+        std::env::remove_var("PI_SERVER_KEEP_TURN");
+        let dir = tempdir().unwrap();
+        struct RestoreDirs(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        impl Drop for RestoreDirs {
+            fn drop(&mut self) {
+                for (name, value) in [
+                    ("DAVINCI_CODING_AGENT_DIR", &self.0),
+                    ("PI_CODING_AGENT_DIR", &self.1),
+                ] {
+                    if let Some(value) = value {
+                        std::env::set_var(name, value);
+                    } else {
+                        std::env::remove_var(name);
+                    }
+                }
+            }
+        }
+        let _restore = RestoreDirs(
+            std::env::var_os("DAVINCI_CODING_AGENT_DIR"),
+            std::env::var_os("PI_CODING_AGENT_DIR"),
+        );
+        std::env::set_var("DAVINCI_CODING_AGENT_DIR", dir.path());
+        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let provider = std::thread::spawn(move || {
+            let mut arrivals = Vec::new();
+            let overall = std::time::Instant::now() + Duration::from_secs(20);
+            while arrivals.len() < 2 {
+                assert!(
+                    std::time::Instant::now() < overall,
+                    "provider was called {} times",
+                    arrivals.len()
+                );
+                let mut socket = match listener.accept() {
+                    Ok((socket, _)) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                arrivals.push(std::time::Instant::now());
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 8192];
+                loop {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(start) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..start]);
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        if request.len() >= start + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                if arrivals.len() == 1 {
+                    let body = r#"{"error":{"message":"rate limited"}}"#;
+                    write!(socket, "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nretry-after-ms: 2600\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                } else {
+                    let response = serde_json::json!({
+                        "id":"fixture-response","model":"fixture-model","status":"completed",
+                        "output":[{"id":"message-fixture","type":"message","role":"assistant","status":"completed",
+                            "content":[{"type":"output_text","text":"provider answer"}]}],
+                        "usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}
+                    }).to_string();
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+                }
+            }
+            arrivals
+        });
+        std::fs::write(dir.path().join("models.json"), serde_json::json!({
+            "providers":{"fixture-provider":{
+                "api":"openai-responses","baseUrl":format!("http://{address}/v1"),
+                "apiKey":"disposable-fixture",
+                "models":[{"id":"fixture-model","name":"Fixture","reasoning":true,"input":["text"],
+                    "contextWindow":16384,"maxTokens":2048,
+                    "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}]
+            }}
+        }).to_string()).unwrap();
+        let mut server = PiServer::new(dir.path().to_path_buf());
+        let created = create_session(&mut server);
+        server
+            .dispatch(Command::SetModel {
+                session_id: created.id.clone(),
+                model: ModelRef {
+                    provider: "fixture-provider".into(),
+                    id: "fixture-model".into(),
+                },
+            })
+            .unwrap();
+        let prompted = match memory_roundtrip(
+            &mut server,
+            ClientMessage::Request {
+                id: "p1".into(),
+                request: Command::Prompt {
+                    session_id: created.id.clone(),
+                    text: "Say provider answer".into(),
+                },
+            },
+        ) {
+            ServerMessage::Response {
+                result: Some(CommandResult::Prompt { session }),
+                ..
+            } => session,
+            other => panic!("expected prompt: {other:?}"),
+        };
+        let arrivals = provider.join().unwrap();
+        let gap = arrivals[1].duration_since(arrivals[0]);
+        assert!(
+            gap >= Duration::from_millis(2500),
+            "the retry came after {gap:?}, not after the 2.6 s the provider asked for"
+        );
         assert!(prompted.transcript.iter().any(|item| matches!(
             item,
             TranscriptItem::Assistant { content, .. }

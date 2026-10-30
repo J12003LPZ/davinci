@@ -62,6 +62,24 @@ fn is_valid_workflow_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// Largest saved workflow file that is read and parsed.
+const MAX_WORKFLOW_FILE_BYTES: u64 = 1024 * 1024;
+
+fn load_workflow_file(path: &Path) -> Result<WorkflowSpec, String> {
+    let bytes = davinci_sys::fs::read_path_bounded(path, MAX_WORKFLOW_FILE_BYTES).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::FileTooLarge {
+            format!(
+                "Workflow file {} exceeds the {MAX_WORKFLOW_FILE_BYTES} byte limit",
+                path.display()
+            )
+        } else {
+            format!("Failed reading workflow file {}: {e}", path.display())
+        }
+    })?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| format!("Invalid workflow spec in {}: {e}", path.display()))
+}
+
 pub fn find_saved_workflow(
     cwd: &Path,
     name: &str,
@@ -88,11 +106,7 @@ pub fn find_saved_workflow(
                     "Project workflow '{name}' requires project trust. Run /trust to approve this checkout."
                 ));
             }
-            let data = std::fs::read_to_string(path)
-                .map_err(|e| format!("Failed reading workflow file {}: {e}", path.display()))?;
-            let spec: WorkflowSpec = serde_json::from_str(&data)
-                .map_err(|e| format!("Invalid workflow spec in {}: {e}", path.display()))?;
-            return Ok(spec);
+            return load_workflow_file(path);
         }
     }
 
@@ -102,11 +116,7 @@ pub fn find_saved_workflow(
 
     for path in &global_candidates {
         if path.is_file() {
-            let data = std::fs::read_to_string(path)
-                .map_err(|e| format!("Failed reading workflow file {}: {e}", path.display()))?;
-            let spec: WorkflowSpec = serde_json::from_str(&data)
-                .map_err(|e| format!("Invalid workflow spec in {}: {e}", path.display()))?;
-            return Ok(spec);
+            return load_workflow_file(path);
         }
     }
 
@@ -525,5 +535,32 @@ mod tests {
             .active_workflow_executor()
             .and_then(|executor| executor.get_state(&wf_id.parse().unwrap()))
             .is_some());
+    }
+
+    fn write_project_workflow(cwd: &Path, name: &str, bytes: &[u8]) {
+        let dir = cwd.join(".davinci").join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{name}.json")), bytes).unwrap();
+    }
+
+    #[test]
+    fn audit_wp01_b007_saved_workflow_is_bounded_before_parsing() {
+        let cwd = tempfile::tempdir().unwrap();
+        write_project_workflow(cwd.path(), "ok", VALID_3_PHASE_WORKFLOW_JSON.as_bytes());
+        find_saved_workflow(cwd.path(), "ok", true).expect("small workflow loads");
+
+        let mut huge = b"{\"pad\":\"".to_vec();
+        huge.resize(MAX_WORKFLOW_FILE_BYTES as usize + 1, b'x');
+        write_project_workflow(cwd.path(), "huge", &huge);
+        let err = find_saved_workflow(cwd.path(), "huge", true).unwrap_err();
+        assert!(err.contains("exceeds") && err.contains("limit"), "{err}");
+
+        write_project_workflow(cwd.path(), "broken", b"{not json");
+        let err = find_saved_workflow(cwd.path(), "broken", true).unwrap_err();
+        assert!(err.contains("Invalid workflow spec"), "{err}");
+        assert!(!err.contains("not found"), "{err}");
+
+        let err = find_saved_workflow(cwd.path(), "absent-wp01-b007", true).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
     }
 }

@@ -281,12 +281,16 @@ impl ClientRequestState {
             .and_then(Value::as_array)
             .ok_or((-32602, "Invalid unregistrations"))?;
         let mut state = self.registrations.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ids = Vec::with_capacity(items.len());
         for item in items {
             let id = item
                 .get("id")
                 .and_then(Value::as_str)
                 .ok_or((-32602, "Unregistration id missing"))?;
-            state.remove(id);
+            ids.push(id.to_string());
+        }
+        for id in ids {
+            state.remove(&id);
         }
         Ok(Value::Null)
     }
@@ -302,7 +306,7 @@ fn section_value(root: &Value, section: &str) -> Option<Value> {
 
 fn compact_token(value: &Value) -> Option<String> {
     match value {
-        Value::String(value) if value.len() <= 256 => Some(value.clone()),
+        Value::String(value) if value.chars().count() <= 256 => Some(value.clone()),
         Value::Number(value) => Some(value.to_string()),
         _ => None,
     }

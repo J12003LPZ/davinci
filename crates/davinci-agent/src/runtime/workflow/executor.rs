@@ -1506,18 +1506,11 @@ workflow '{name}' ({id}) failed: {error}"
             parent: Some(self.runtime.agent_id),
             kind: AgentKind::Subagent,
             name: worker.id.clone(),
-            provider: worker
-                .model
-                .as_ref()
-                .and_then(|m| m.split('/').next())
-                .unwrap_or_default()
-                .to_string(),
-            model_id: worker
-                .model
-                .as_ref()
-                .and_then(|m| m.split('/').nth(1))
-                .unwrap_or_default()
-                .to_string(),
+            // Unknown until the worker is built: its builder resolves the
+            // override, the profile or the inherited model and publishes the
+            // result with `AgentRegistry::set_model_identity`.
+            provider: String::new(),
+            model_id: String::new(),
             cwd: std::env::current_dir().unwrap_or_default(),
             state: AgentState::Running,
             task_id: None,
@@ -1621,7 +1614,6 @@ workflow '{name}' ({id}) failed: {error}"
 
         let mut worker_agent_ids = Vec::new();
         let mut worker_tasks = Vec::new();
-
         for worker in &phase.workers {
             if already_done.contains(&worker.id) {
                 continue;
@@ -2039,6 +2031,9 @@ fn resume_launch(
     launch
 }
 
+/// Provider and model id a worker's `model` override resolves to, split the
+/// way the launcher splits it: at the first `/`, with a bare id taken from the
+/// parent's provider. No override names nothing (the worker inherits).
 #[cfg(test)]
 mod tests {
     use super::*;

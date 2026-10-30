@@ -167,7 +167,7 @@ fn positive_seconds(value: Option<&Value>) -> Option<Duration> {
     value
         .and_then(Value::as_f64)
         .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
-        .map(Duration::from_secs_f64)
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
 }
 
 pub fn start_device_authorization(provider: &str) -> Result<DeviceAuthorization, String> {
@@ -205,12 +205,20 @@ pub(crate) fn start_with(
         Some(complete) => trusted_uri(complete)?,
         None => trusted_uri(verification_uri)?,
     };
+    let interval = match body.get("interval") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(positive_seconds(body.get("interval")).ok_or_else(|| {
+            format!(
+                "{provider} device authorization returned an invalid polling interval (status {status})"
+            )
+        })?),
+    };
     Ok(DeviceAuthorization {
         provider: provider.into(),
         device_code: device_code.into(),
         user_code: user_code.into(),
         verification_uri,
-        interval: positive_seconds(body.get("interval")),
+        interval,
         expires_in: positive_seconds(body.get("expires_in")).unwrap_or(Duration::from_secs(900)),
     })
 }
@@ -300,7 +308,7 @@ pub(crate) fn poll_with(
             Some("slow_down") => {
                 slowed = true;
                 interval = positive_seconds(body.get("interval"))
-                    .unwrap_or(interval + SLOW_DOWN_INCREMENT)
+                    .unwrap_or_else(|| interval.saturating_add(SLOW_DOWN_INCREMENT))
                     .max(MINIMUM_INTERVAL);
             }
             Some("access_denied") => {
@@ -491,5 +499,17 @@ mod tests {
             .unwrap_err()
             .contains("Untrusted"));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn audit_wp08_b074_extreme_intervals_do_not_panic() {
+        assert_eq!(
+            positive_seconds(Some(&serde_json::json!(2))),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(positive_seconds(None), None);
+        assert_eq!(positive_seconds(Some(&serde_json::json!(1e308))), None);
+        assert_eq!(positive_seconds(Some(&serde_json::json!(-1))), None);
+        assert_eq!(positive_seconds(Some(&serde_json::json!(f64::NAN))), None);
     }
 }

@@ -97,13 +97,20 @@ pub fn parse_source(spec: &str, cwd: &Path) -> Result<MarketplaceSource, String>
         let path = manifest::canonical(&local).map_err(|err| err.to_string())?;
         return Ok(MarketplaceSource::Directory { path });
     }
-    if spec.starts_with("https://")
+    let git_spec = match spec.strip_prefix("git:") {
+        Some(rest) if rest.starts_with("git://") => rest,
+        _ => spec,
+    };
+    if git_spec.starts_with("git://")
+        || spec.starts_with("https://")
         || spec.starts_with("http://")
         || spec.starts_with("git@")
         || spec.starts_with("ssh://")
         || spec.ends_with(".git")
     {
-        return Ok(MarketplaceSource::Git { url: spec.into() });
+        return Ok(MarketplaceSource::Git {
+            url: git_spec.into(),
+        });
     }
     let github = spec.strip_prefix("github:").unwrap_or(spec);
     let mut parts = github.split('/');
@@ -117,11 +124,25 @@ pub fn parse_source(spec: &str, cwd: &Path) -> Result<MarketplaceSource, String>
     Err(format!("not a directory, git URL or owner/repo: {spec}"))
 }
 
-pub fn read_catalog(root: &Path) -> Option<Value> {
-    CATALOG_PATHS.iter().find_map(|rel| {
-        let body = std::fs::read_to_string(root.join(rel)).ok()?;
-        serde_json::from_str(&body).ok()
-    })
+pub fn read_catalog(root: &Path) -> Result<Option<Value>, String> {
+    for rel in CATALOG_PATHS {
+        let path = root.join(rel);
+        match std::fs::read_to_string(&path) {
+            Ok(body) => {
+                return serde_json::from_str(&body).map(Some).map_err(|err| {
+                    format!("Malformed marketplace catalog {}: {err}", path.display())
+                })
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(format!(
+                    "Unable to read marketplace catalog {}: {err}",
+                    path.display()
+                ))
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn git_program() -> PathBuf {
@@ -229,7 +250,7 @@ pub fn add(agent_dir: &Path, spec: &str, cwd: &Path) -> Result<String, String> {
             let MarketplaceSource::Directory { path } = &source else {
                 unreachable!()
             };
-            let catalog = read_catalog(path)
+            let catalog = read_catalog(path)?
                 .ok_or_else(|| format!("no marketplace.json in {}", path.display()))?;
             (catalog_name(&catalog, path)?, path.clone())
         }
@@ -237,7 +258,7 @@ pub fn add(agent_dir: &Path, spec: &str, cwd: &Path) -> Result<String, String> {
             let staging = base.join(format!(".staging-{}", uuid::Uuid::new_v4()));
             clone(&url, None, &staging)?;
             let result = (|| {
-                let catalog = read_catalog(&staging)
+                let catalog = read_catalog(&staging)?
                     .ok_or_else(|| format!("no marketplace.json in {url}"))?;
                 let name = catalog_name(&catalog, &staging)?;
                 let dest = base.join(format!("{name}-{}", uuid::Uuid::new_v4()));
@@ -250,6 +271,24 @@ pub fn add(agent_dir: &Path, spec: &str, cwd: &Path) -> Result<String, String> {
             result?
         }
     };
+    if let Some(existing) = registry.get(&name) {
+        if existing.source == source {
+            // Re-adding the same canonical source is idempotent. Remove the
+            // fresh clone we made only to read its name.
+            if location != existing.install_location {
+                let _ = std::fs::remove_dir_all(&location);
+            }
+            return Ok(name);
+        }
+        if location != existing.install_location {
+            let _ = std::fs::remove_dir_all(&location);
+        }
+        return Err(format!(
+            "marketplace {name} is already registered from {}; remove it before adding {}",
+            existing.source.describe(),
+            source.describe()
+        ));
+    }
     registry.insert(
         name.clone(),
         KnownMarketplace {
@@ -370,7 +409,7 @@ pub fn catalogs(agent_dir: &Path) -> Result<Vec<Catalog>, String> {
         if !seen.insert(name.clone()) {
             continue;
         }
-        if let Some(document) = read_catalog(&root) {
+        if let Some(document) = read_catalog(&root)? {
             out.push(Catalog {
                 name,
                 root,
@@ -765,5 +804,71 @@ mod tests {
         remove(&agent_dir, "demo-market").unwrap();
         assert!(market.exists(), "a local marketplace is never deleted");
         assert!(catalogs(&agent_dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn audit_wp06_b063_malformed_catalog_is_not_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_catalog(dir.path()).unwrap(), None);
+        let path = dir.path().join(".claude-plugin/marketplace.json");
+        write(&path, "{not json");
+        let error = read_catalog(dir.path()).unwrap_err();
+        assert!(error.contains("Malformed"), "{error}");
+        assert!(error.contains("marketplace.json"), "{error}");
+    }
+
+    #[test]
+    fn audit_wp06_b064_same_name_different_source_is_a_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        for (folder, name) in [("one", "shared"), ("two", "shared")] {
+            write(
+                &dir.path()
+                    .join(folder)
+                    .join(".claude-plugin/marketplace.json"),
+                &format!(r#"{{"name":"{name}","plugins":[]}}"#),
+            );
+        }
+        add(
+            &agent_dir,
+            dir.path().join("one").to_str().unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(registry_path(&agent_dir)).unwrap();
+        let error = add(
+            &agent_dir,
+            dir.path().join("two").to_str().unwrap(),
+            dir.path(),
+        )
+        .unwrap_err();
+        assert!(error.contains("already registered"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(registry_path(&agent_dir)).unwrap(),
+            before
+        );
+        // The identical source remains idempotent.
+        add(
+            &agent_dir,
+            dir.path().join("one").to_str().unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn audit_wp06_b065_git_urls_without_dot_git_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        for spec in ["git://host/catalog", "git://host:9418/catalog"] {
+            match parse_source(spec, dir.path()).unwrap() {
+                MarketplaceSource::Git { url } => assert_eq!(url, spec),
+                other => panic!("{spec} parsed as {other:?}"),
+            }
+        }
+        match parse_source("git:git://host/catalog", dir.path()).unwrap() {
+            MarketplaceSource::Git { url } => assert_eq!(url, "git://host/catalog"),
+            other => panic!("git: prefix parsed as {other:?}"),
+        }
+        assert!(parse_source("file:///etc/passwd", dir.path()).is_err());
     }
 }

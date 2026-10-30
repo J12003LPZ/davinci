@@ -412,6 +412,14 @@ impl CallbackServer {
                         if response.code.is_some() {
                             return Ok(response);
                         }
+                        // A valid-state provider denial is terminal: waiting
+                        // for a code the user explicitly refused only delays
+                        // the failure until the deadline.
+                        if response.status == 400 && callback_is_denial(&response.body) {
+                            return Err(
+                                "OAuth authorization was denied before a code was returned.".into(),
+                            );
+                        }
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -492,6 +500,22 @@ impl CallbackServer {
         write_http_response(&mut stream, &response)?;
         Ok(Some(response))
     }
+}
+
+fn callback_is_denial(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    let known_non_denial = [
+        ERR_STATE_MISMATCH,
+        ERR_OAUTH_STATE_MISMATCH,
+        ERR_MISSING_AUTHORIZATION_CODE,
+        ERR_CALLBACK_ROUTE_NOT_FOUND,
+        ERR_OAUTH_CALLBACK_ROUTE_NOT_FOUND,
+        ERR_CALLBACK_ALREADY_USED,
+        ERR_OPENROUTER_NO_CODE,
+    ];
+    !known_non_denial
+        .iter()
+        .any(|text| lower.contains(&text.to_ascii_lowercase()))
 }
 
 fn parse_http_target(request: &str) -> Option<(String, String)> {
@@ -804,5 +828,58 @@ mod tests {
     #[test]
     fn non_loopback_bind_is_refused() {
         assert!(CallbackServer::bind("0.0.0.0", 0, CallbackProvider::OpenAiCodex, "s").is_err());
+    }
+
+    #[test]
+    fn audit_wp08_b075_matching_state_denial_is_terminal() {
+        use std::io::{Read, Write};
+        let mut server =
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1").unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            write!(
+                stream,
+                "GET /auth/callback?error=access_denied&error_description=no&state=state-1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut sink = Vec::new();
+            let _ = stream.read_to_end(&mut sink);
+        });
+        let started = std::time::Instant::now();
+        let error = server
+            .accept_until(started + std::time::Duration::from_secs(3))
+            .unwrap_err();
+        assert!(error.contains("denied"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn audit_wp08_b075_wrong_state_denial_does_not_consume_the_callback() {
+        use std::io::{Read, Write};
+        let mut server =
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1").unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            for target in [
+                "/auth/callback?error=access_denied&state=wrong",
+                "/auth/callback?code=real&state=state-1",
+            ] {
+                let mut stream = std::net::TcpStream::connect(addr).unwrap();
+                write!(
+                    stream,
+                    "GET {target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                let mut sink = Vec::new();
+                let _ = stream.read_to_end(&mut sink);
+            }
+        });
+        let response = server
+            .accept_until(std::time::Instant::now() + std::time::Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(response.code.as_deref(), Some("real"));
+        client.join().unwrap();
     }
 }

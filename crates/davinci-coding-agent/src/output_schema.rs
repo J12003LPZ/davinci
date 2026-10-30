@@ -87,7 +87,7 @@ pub fn validate_schema(schema: &Value) -> Result<(), String> {
                     }
                 }
                 "minItems" | "maxItems" => {
-                    if value.as_u64().is_none() {
+                    if integral_u64(value).is_none() {
                         return Err(malformed());
                     }
                 }
@@ -309,6 +309,36 @@ pub fn repair_prompt(errors: &[String]) -> String {
     )
 }
 
+fn integral_u64(value: &Value) -> Option<u64> {
+    let number = value.as_number()?;
+    if let Some(value) = number.as_u64() {
+        return Some(value);
+    }
+    let value = number.as_f64()?;
+    if value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value <= u64::MAX as f64 {
+        Some(value as u64)
+    } else {
+        None
+    }
+}
+
+fn json_values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(a), Value::Number(b)) => {
+            // Keep exact integer comparisons exact so adjacent large u64
+            // values never collapse through f64.
+            if let (Some(a), Some(b)) = (a.as_u64(), b.as_u64()) {
+                return a == b;
+            }
+            if let (Some(a), Some(b)) = (a.as_i64(), b.as_i64()) {
+                return a == b;
+            }
+            matches!((a.as_f64(), b.as_f64()), (Some(a), Some(b)) if a == b)
+        }
+        _ => left == right,
+    }
+}
+
 fn validate_at(
     schema: &Value,
     value: &Value,
@@ -353,13 +383,13 @@ fn validate_at(
     }
 
     if let Some(expected) = schema.get("const") {
-        if expected != value {
+        if !json_values_equal(expected, value) {
             errors.push(format!("{path}: expected the constant {expected}"));
         }
     }
 
     if let Some(Value::Array(allowed)) = schema.get("enum") {
-        if !allowed.contains(value) {
+        if !allowed.iter().any(|item| json_values_equal(item, value)) {
             let listed: Vec<String> = allowed.iter().map(Value::to_string).collect();
             errors.push(format!(
                 "{path}: {value} is not one of {}",
@@ -412,7 +442,7 @@ fn validate_at(
     }
 
     if let Value::Array(items) = value {
-        if let Some(min) = schema.get("minItems").and_then(Value::as_u64) {
+        if let Some(min) = schema.get("minItems").and_then(integral_u64) {
             if (items.len() as u64) < min {
                 errors.push(format!(
                     "{path}: expected at least {min} items, got {}",
@@ -420,7 +450,7 @@ fn validate_at(
                 ));
             }
         }
-        if let Some(max) = schema.get("maxItems").and_then(Value::as_u64) {
+        if let Some(max) = schema.get("maxItems").and_then(integral_u64) {
             if items.len() as u64 > max {
                 errors.push(format!(
                     "{path}: expected at most {max} items, got {}",
@@ -680,5 +710,26 @@ mod tests {
         let prompt = repair_prompt(&["$: a".into(), "$.b: c".into()]);
         assert!(prompt.contains("- $: a\n- $.b: c"), "{prompt}");
         assert!(prompt.contains("only the corrected JSON"));
+    }
+
+    #[test]
+    fn audit_wp12_b108_enum_and_const_compare_json_numbers_mathematically() {
+        assert!(errors(json!({"enum": [1.0]}), json!(1)).is_empty());
+        assert!(errors(json!({"const": 1e0}), json!(1)).is_empty());
+        assert!(!errors(json!({"enum": [1.1]}), json!(1)).is_empty());
+        assert!(!errors(
+            json!({"enum": [9007199254740992u64]}),
+            json!(9007199254740993u64)
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn audit_wp12_b110_min_and_max_items_accept_integral_decimals() {
+        validate_schema(&json!({"minItems": 1.0, "maxItems": 2e0})).unwrap();
+        assert!(validate_schema(&json!({"minItems": 1.5})).is_err());
+        assert!(validate_schema(&json!({"maxItems": 1e30})).is_err());
+        assert!(errors(json!({"minItems": 1.0, "maxItems": 2e0}), json!([1, 2])).is_empty());
+        assert!(errors(json!({"minItems": 1.0}), json!([])).len() == 1);
     }
 }

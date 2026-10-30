@@ -21,6 +21,45 @@ pub fn execution_passed(
     started && exit_code == Some(0) && !timed_out && !cancelled
 }
 
+/// One file change the host observed itself, copied from the effect ledger a
+/// mutating tool writes after it succeeded. Nothing a model or a tool result
+/// says can produce it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationEffect {
+    pub path: String,
+    pub kind: super::effects::FileEffectKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_blob: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_blob: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_mode: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_mode: Option<u32>,
+}
+
+impl MutationEffect {
+    /// The workspace is different afterwards: a file created or deleted, a mode
+    /// changed, or content whose hash moved. Rewriting identical bytes is not.
+    pub fn changed_the_workspace(&self) -> bool {
+        use super::effects::FileEffectKind as Kind;
+        match self.kind {
+            Kind::Created | Kind::Deleted => true,
+            Kind::ModeChanged => self.before_mode != self.after_mode,
+            Kind::Modified => {
+                self.before_blob != self.after_blob || self.before_mode != self.after_mode
+            }
+            Kind::Unattributed => false,
+        }
+    }
+}
+
+/// Proof that an operation changed files, bound to the operation that did it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationEvidence {
+    pub effects: Vec<MutationEffect>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionReceipt {
     pub receipt_id: EvidenceId,
@@ -63,6 +102,10 @@ pub struct ExecutionReceipt {
     pub process_evidence: Option<crate::jobs::supervisor::ProcessExecutionEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assertion_counts: Option<AssertionCounts>,
+    /// Host-observed file changes. Only [`ExecutionReceipt::from_file_effects`]
+    /// fills it; the Implementation dimension accepts nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation: Option<MutationEvidence>,
     #[serde(default)]
     pub runtime_versions: HashMap<String, String>,
     pub started_at_ms: i64,
@@ -96,6 +139,7 @@ impl Default for ExecutionReceipt {
             stderr_artifact: None,
             process_evidence: None,
             assertion_counts: None,
+            mutation: None,
             runtime_versions: HashMap::new(),
             started_at_ms: 0,
             finished_at_ms: 0,
@@ -103,7 +147,82 @@ impl Default for ExecutionReceipt {
     }
 }
 
+/// A receipt for one created file, built the way the host builds it (through
+/// `from_file_effects`), for tests that need implementation evidence.
+#[cfg(test)]
+pub(crate) fn applied_mutation_receipt(task_id: TaskId, attempt: u32) -> ExecutionReceipt {
+    let mut effect = super::effects::OwnedFileEffect::new(
+        format!("write-{attempt}"),
+        super::ids::AgentId::new(),
+        1,
+        "src/lib.rs",
+        super::effects::FileEffectKind::Created,
+        task_id,
+    );
+    effect.attempt = attempt;
+    effect.after_blob = Some("after".into());
+    ExecutionReceipt::from_file_effects(&format!("write-{attempt}"), task_id, attempt, &[effect])
+        .unwrap()
+}
+
 impl ExecutionReceipt {
+    /// A receipt for the file changes one admitted operation made, built from
+    /// the effect ledger (never from a tool name or an exit code). `effects` are
+    /// the ledger entries of `operation_id` for `task_id` captured during
+    /// `attempt` (an earlier attempt's writes are not this attempt's); entries that changed
+    /// nothing are dropped, and `None` comes back when nothing is left, so an
+    /// operation that left the workspace as it was produces no receipt.
+    pub fn from_file_effects(
+        operation_id: &str,
+        task_id: TaskId,
+        attempt: u32,
+        effects: &[super::effects::OwnedFileEffect],
+    ) -> Option<Self> {
+        let changed: Vec<MutationEffect> = effects
+            .iter()
+            .filter(|effect| {
+                effect.operation_id == operation_id
+                    && effect.task_id == task_id
+                    && effect.attempt == attempt
+            })
+            .map(|effect| MutationEffect {
+                path: effect.path.clone(),
+                kind: effect.kind,
+                before_blob: effect.before_blob.clone(),
+                after_blob: effect.after_blob.clone(),
+                before_mode: effect.before_mode,
+                after_mode: effect.after_mode,
+            })
+            .filter(MutationEffect::changed_the_workspace)
+            .collect();
+        if changed.is_empty() {
+            return None;
+        }
+        Some(Self {
+            operation_id: operation_id.to_owned(),
+            task_id: Some(task_id),
+            attempt,
+            tool_name: "file_effect".into(),
+            started: true,
+            exit_code: Some(0),
+            mutation: Some(MutationEvidence { effects: changed }),
+            ..Self::default()
+        })
+    }
+
+    /// A passed receipt carrying host-observed workspace changes.
+    pub fn is_applied_mutation(&self) -> bool {
+        self.is_passed()
+            && !self.operation_id.is_empty()
+            && self.mutation.as_ref().is_some_and(|mutation| {
+                !mutation.effects.is_empty()
+                    && mutation
+                        .effects
+                        .iter()
+                        .all(MutationEffect::changed_the_workspace)
+            })
+    }
+
     /// Execution plus discovery, not proof of requirement or source coverage.
     /// Old receipts without discovery stay unverified for recognized test runners.
     pub fn is_verified_check(&self) -> bool {

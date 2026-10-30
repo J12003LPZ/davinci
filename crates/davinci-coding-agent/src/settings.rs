@@ -977,9 +977,22 @@ fn collect_manifest_resources(
     entries: &[String],
     pkg: &PackageSource,
 ) -> Vec<PathBuf> {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut out = Vec::new();
     let unfiltered = PackageSource::Spec(pkg.source().to_string());
     for entry in entries.iter().filter(|item| !is_override_pattern(item)) {
+        let literal = Path::new(entry);
+        if literal.is_absolute()
+            || literal
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            eprintln!(
+                "Ignoring package {kind} resource {entry}: it escapes {}",
+                root.display()
+            );
+            continue;
+        }
         if entry.contains('*') || entry.contains('?') {
             collect_glob_files(root, entry, &mut out);
             continue;
@@ -992,6 +1005,17 @@ fn collect_manifest_resources(
         }
     }
     out.retain(|path| {
+        let confined = path
+            .canonicalize()
+            .is_ok_and(|resolved| resolved.starts_with(&canonical_root));
+        if !confined {
+            eprintln!(
+                "Ignoring package {kind} resource {}: it resolves outside {}",
+                path.display(),
+                root.display()
+            );
+            return false;
+        }
         let relative = path
             .strip_prefix(root)
             .unwrap_or(path)
@@ -2049,6 +2073,24 @@ mod tests {
             collect_manifest_resources(root.path(), "extensions", &entries, &pkg),
             [root.path().join("extensions/two.js")]
         );
+    }
+
+    #[test]
+    fn audit_wp06_b059_manifest_resources_stay_inside_the_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("package");
+        std::fs::create_dir_all(root.join("skills")).unwrap();
+        std::fs::write(root.join("skills/ok.md"), "ok").unwrap();
+        let outside = dir.path().join("secret.md");
+        std::fs::write(&outside, "secret").unwrap();
+        let pkg: PackageSource = root.display().to_string().as_str().into();
+        let entries = vec![
+            "../secret.md".to_string(),
+            outside.display().to_string(),
+            "skills/ok.md".to_string(),
+        ];
+        let found = collect_manifest_resources(&root, "skills", &entries, &pkg);
+        assert_eq!(found, [root.join("skills/ok.md")]);
     }
 
     #[test]

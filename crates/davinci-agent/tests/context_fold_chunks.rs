@@ -31,7 +31,7 @@ fn recording(prompts: Arc<Mutex<Vec<String>>>) -> Summarizer {
         prompts.lock().unwrap().push(request.prompt.clone());
         Ok(SummarizeResponse {
             text: "{}".into(),
-            usage: Default::default(),
+            usage: Some(Default::default()),
             stop_reason: Some(StopReason::Stop),
             error_message: None,
             has_tool_call: false,

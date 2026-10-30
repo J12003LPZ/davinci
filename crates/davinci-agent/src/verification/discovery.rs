@@ -59,16 +59,31 @@ pub(crate) fn runner_words(words: &[String]) -> Option<&'static str> {
             Some("pytest")
         }
         [name, ..] if matches!(name.as_str(), "pytest" | "pytest.exe") => Some("pytest"),
+        // The script behind a package manager's `test` is not visible here, so
+        // only the output it produced can show which runner ran.
         [name, action, ..]
-            if matches!(name.as_str(), "go" | "npm" | "pnpm" | "yarn") && action == "test" =>
+            if matches!(name.as_str(), "npm" | "pnpm" | "yarn") && action == "test" =>
         {
-            Some("unknown")
+            Some("package-script")
         }
+        [name, action, ..] if name == "go" && action == "test" => Some("unknown"),
         _ => None,
     }
 }
 
 pub(crate) fn counts(command: &str, stdout: &[u8], stderr: &[u8]) -> Option<AssertionCounts> {
+    counts_in(None, command, stdout, stderr)
+}
+
+/// [`counts`] for a command whose package was bound before it started. A
+/// package-manager `test` script only has an identity in the manifest it ran, so
+/// without a [`PackageBinding`] that wrapper yields no evidence at all.
+pub(crate) fn counts_in(
+    package: Option<&PackageBinding>,
+    command: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Option<AssertionCounts> {
     if stdout.len().checked_add(stderr.len())? > 4 * 1024 * 1024 {
         return None;
     }
@@ -154,6 +169,7 @@ pub(crate) fn counts(command: &str, stdout: &[u8], stderr: &[u8]) -> Option<Asse
             counts.total = number.parse().ok()?;
             counts.passed = counts.total.checked_sub(counts.skipped)?;
         }
+        "package-script" => return package_script_unittest(package?, command, stderr),
         "pytest" => {
             // Only pytest's final terminal summary; earlier lines can be test output.
             let end = stdout.lines().map(str::trim).rfind(|s| !s.is_empty())?;
@@ -162,6 +178,195 @@ pub(crate) fn counts(command: &str, stdout: &[u8], stderr: &[u8]) -> Option<Asse
         _ => return None,
     }
     Some(counts)
+}
+
+/// What a package manager's `test` is going to run, read before the process
+/// starts: the manifest the package manager will read in the directory it runs
+/// in, its digest, and whether its `test` script is exactly the unittest runner.
+///
+/// The host binds it before dispatch. Reading the manifest after the run would
+/// let the script rewrite its own identity (`node fake.js` that stores
+/// `python -m unittest` in `scripts.test` and prints a footer).
+#[derive(Debug, Clone)]
+pub(crate) struct PackageBinding {
+    cwd: std::path::PathBuf,
+    manifest_sha256: String,
+    runs_unittest: bool,
+}
+
+impl PackageBinding {
+    /// `None` when `cwd` has no readable manifest. A manifest the package manager
+    /// would not run as written still binds, as not unittest.
+    pub(crate) fn bind(cwd: &std::path::Path) -> Option<Self> {
+        let cwd = cwd.canonicalize().ok()?;
+        let bytes = read_manifest(&cwd)?;
+        Some(Self {
+            runs_unittest: script_is_unittest(&cwd, &bytes),
+            manifest_sha256: crate::runtime::checkpoints::compute_sha256(&bytes),
+            cwd,
+        })
+    }
+
+    /// The canonical directory the manifest was read in.
+    pub(crate) fn cwd(&self) -> &std::path::Path {
+        &self.cwd
+    }
+
+    /// The manifest on disk now is byte for byte the one bound before the run.
+    fn unchanged(&self) -> bool {
+        read_manifest(&self.cwd).is_some_and(|bytes| {
+            crate::runtime::checkpoints::compute_sha256(&bytes) == self.manifest_sha256
+        })
+    }
+}
+
+/// A package-manager `test` script that ran Python's standard unittest runner.
+///
+/// Output alone cannot say which program wrote it: any script can print a
+/// unittest-shaped footer. So these independent things must hold.
+///
+/// 0. The command is exactly `<npm|pnpm|yarn> test`: no flag or argument that
+///    could redirect the package (`--prefix`, `-C`, `--workspace`), no
+///    environment assignment, no wrapper.
+/// 1. Identity, from the manifest the package manager ran, bound before the
+///    process started (see [`PackageBinding`]): its `test` script is exactly
+///    the unittest runner (no chaining, no other program), it defines no
+///    `pretest` or `posttest`, no package-manager configuration file sits
+///    beside it, and the manifest is unchanged after the run.
+/// 2. Discovery, from the runner's own progress records: a line of one
+///    character per test (`.` passed, `s` skipped) before the rule, or one
+///    `name ... ok` line per test in verbose mode. The number of records must
+///    equal the `Ran N tests` count, and the skipped records must equal the
+///    verdict's `skipped=` count. A footer without the tests it summarizes
+///    proves nothing.
+/// 3. The footer: a rule of 70 dashes, `Ran N tests in S.SSSs` and the `OK`
+///    verdict closing stderr.
+///
+/// Any other runner, or any mismatch, stays unknown. An exit status other than
+/// zero is the receipt's concern: it never reaches a passing check.
+///
+/// What this still trusts: the script that literally is `python -m unittest`
+/// resolves to the real runner, and test code that ends the process after
+/// printing a footer is indistinguishable from the runner's own. A pinned
+/// unittest adapter that reports its own results would remove both.
+fn package_script_unittest(
+    package: &PackageBinding,
+    command: &str,
+    stderr: &str,
+) -> Option<AssertionCounts> {
+    static RAN: OnceLock<regex::Regex> = OnceLock::new();
+    static RESULT: OnceLock<regex::Regex> = OnceLock::new();
+    if !bare_package_test(command) || !package.runs_unittest || !package.unchanged() {
+        return None;
+    }
+    let lines: Vec<_> = stderr
+        .lines()
+        .map(str::trim_end)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let [before @ .., rule, summary, verdict] = lines.as_slice() else {
+        return None;
+    };
+    if *rule != "-".repeat(70) {
+        return None;
+    }
+    let skipped: u32 = if *verdict == "OK" {
+        0
+    } else {
+        verdict
+            .strip_prefix("OK (skipped=")?
+            .strip_suffix(')')?
+            .parse()
+            .ok()?
+    };
+    let pattern = RAN.get_or_init(|| {
+        regex::Regex::new(r"^Ran (\d+) tests? in \d+\.\d{3}s$")
+            .expect("static unittest summary pattern")
+    });
+    let total: u32 = pattern.captures(summary)?[1].parse().ok()?;
+    let passed = total.checked_sub(skipped)?;
+
+    let (recorded, recorded_skips) = match before.last() {
+        // One character per test, written as each finished.
+        Some(progress)
+            if !progress.is_empty() && progress.bytes().all(|b| matches!(b, b'.' | b's')) =>
+        {
+            let skips = progress.bytes().filter(|b| *b == b's').count();
+            (progress.len(), skips)
+        }
+        // Verbose: one `name ... outcome` line per test.
+        _ => {
+            let result = RESULT.get_or_init(|| {
+                regex::Regex::new(r"^.+ \.\.\. (ok|skipped\b.*)$")
+                    .expect("static unittest result pattern")
+            });
+            let results: Vec<_> = before
+                .iter()
+                .filter_map(|line| result.captures(line))
+                .collect();
+            let skips = results
+                .iter()
+                .filter(|captures| captures[1].starts_with("skipped"))
+                .count();
+            (results.len(), skips)
+        }
+    };
+    if recorded != usize::try_from(total).ok()?
+        || recorded_skips != usize::try_from(skipped).ok()?
+    {
+        return None;
+    }
+    Some(AssertionCounts {
+        total,
+        passed,
+        failed: 0,
+        skipped,
+    })
+}
+
+const MAX_PACKAGE_JSON: u64 = 1024 * 1024;
+
+fn read_manifest(cwd: &std::path::Path) -> Option<Vec<u8>> {
+    davinci_sys::fs::read_path_bounded(&cwd.join("package.json"), MAX_PACKAGE_JSON).ok()
+}
+
+/// `<npm|pnpm|yarn> test` and nothing else on the line.
+fn bare_package_test(command: &str) -> bool {
+    super::literal_words(command, true)
+        .or_else(|| super::literal_words(command, false))
+        .is_some_and(|words| match words.as_slice() {
+            [name, action] => matches!(name.as_str(), "npm" | "pnpm" | "yarn") && action == "test",
+            _ => false,
+        })
+}
+
+/// The `test` script in `manifest` is the standard unittest runner and nothing
+/// else runs around it or reconfigures how scripts run.
+fn script_is_unittest(cwd: &std::path::Path, manifest: &[u8]) -> bool {
+    // These change which shell runs scripts, or which package a command means.
+    const CONFIGURATION: [&str; 4] = [".npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmrc"];
+    if CONFIGURATION
+        .iter()
+        .any(|name| cwd.join(name).symlink_metadata().is_ok())
+    {
+        return false;
+    }
+    let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(manifest) else {
+        return false;
+    };
+    if manifest.get("workspaces").is_some() {
+        return false;
+    }
+    let scripts = &manifest["scripts"];
+    if scripts.get("pretest").is_some() || scripts.get("posttest").is_some() {
+        return false;
+    }
+    let Some(script) = scripts["test"].as_str() else {
+        return false;
+    };
+    super::literal_words(script, true)
+        .and_then(|words| runner_words(&words))
+        .is_some_and(|runner| runner == "unittest")
 }
 
 fn pytest_summary(line: &str) -> Option<AssertionCounts> {
@@ -461,5 +666,325 @@ mod tests {
             0
         );
         assert!(counts("pytest", b"unknown format", b"").is_none());
+    }
+
+    fn bind(dir: &tempfile::TempDir) -> Option<PackageBinding> {
+        PackageBinding::bind(dir.path())
+    }
+
+    /// A tempdir holding a `package.json` whose `test` script is `script`.
+    fn package(script: &str, extra: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            format!(r#"{{"name":"app","scripts":{{"test":{script:?}{extra}}}}}"#),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn unittest_stderr(progress: &str, summary: &str) -> Vec<u8> {
+        format!("{progress}\n{}\n{summary}\n", "-".repeat(70)).into_bytes()
+    }
+
+    #[test]
+    fn audit_wp02_b032_npm_wrapper_accepts_only_real_unittest_evidence() {
+        let npm = "npm test";
+        let stdout = b"> app@1.0.0 test\n> python -m unittest\n";
+        let dir = package("python -m unittest", "");
+        let at = |command: &str, err: &[u8]| counts_in(bind(&dir).as_ref(), command, stdout, err);
+
+        let real = unittest_stderr("...", "Ran 3 tests in 0.002s\n\nOK");
+        let result = at(npm, &real).expect("real unittest evidence");
+        assert_eq!((result.total, result.passed, result.failed), (3, 3, 0));
+        assert!(crate::verification::tests_passed(&result));
+        for wrapper in ["pnpm test", "yarn test"] {
+            assert!(at(wrapper, &real).is_some(), "{wrapper}");
+        }
+        let skipped = unittest_stderr("..s.", "Ran 4 tests in 0.010s\n\nOK (skipped=1)");
+        let result = at(npm, &skipped).unwrap();
+        assert_eq!((result.total, result.passed, result.skipped), (4, 3, 1));
+        let verbose = unittest_stderr(
+            "test_a (t.T.test_a) ... ok\ntest_b (t.T.test_b) ... skipped 'later'",
+            "Ran 2 tests in 0.001s\n\nOK (skipped=1)",
+        );
+        let result = at(npm, &verbose).unwrap();
+        assert_eq!((result.total, result.passed, result.skipped), (2, 1, 1));
+
+        // Zero tests run: counted, but never a passing check.
+        let none = unittest_stderr("", "Ran 0 tests in 0.000s\n\nOK");
+        assert!(!crate::verification::tests_passed(&at(npm, &none).unwrap()));
+        // A failing run carries no OK verdict.
+        let failed = unittest_stderr("F..", "Ran 3 tests in 0.002s\n\nFAILED (failures=1)");
+        assert!(at(npm, &failed).is_none());
+    }
+
+    /// The review's exact bypass: a script that exits zero and prints only the
+    /// footer to stderr ran no tests and must not count as three passing ones.
+    #[test]
+    fn audit_wp02_b032_a_printed_footer_is_not_discovery() {
+        let footer = unittest_stderr_footer_only();
+        let stdout = b"";
+        // The exact three lines, with every other safeguard in place: the
+        // package really names the unittest runner.
+        let unittest_dir = package("python -m unittest", "");
+        assert!(counts_in(bind(&unittest_dir).as_ref(), "npm test", stdout, &footer).is_none());
+        // And with no package at all, or no directory.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(counts_in(bind(&empty).as_ref(), "npm test", stdout, &footer).is_none());
+        assert!(counts("npm test", stdout, &footer).is_none());
+
+        // Footer plus a plausible progress line, but the script is `echo`:
+        // identity fails.
+        let with_progress = unittest_stderr("...", "Ran 3 tests in 0.002s\n\nOK");
+        for script in [
+            "echo spoof",
+            "python -m unittest && echo ok",
+            "python -m unittest || true",
+            "node fake.js",
+            "python -m pytest",
+        ] {
+            let dir = package(script, "");
+            assert!(
+                counts_in(bind(&dir).as_ref(), "npm test", stdout, &with_progress).is_none(),
+                "{script}"
+            );
+        }
+        // Hooks that run around the script write to the same streams.
+        for hook in [r#","posttest":"echo done""#, r#","pretest":"echo start""#] {
+            let dir = package("python -m unittest", hook);
+            assert!(counts_in(bind(&dir).as_ref(), "npm test", stdout, &with_progress).is_none());
+        }
+        // The progress records must reconcile with the summary.
+        for (progress, summary) in [
+            ("..", "Ran 3 tests in 0.002s\n\nOK"),
+            ("....", "Ran 3 tests in 0.002s\n\nOK"),
+            ("..s", "Ran 3 tests in 0.002s\n\nOK"),
+            ("...", "Ran 3 tests in 0.002s\n\nOK (skipped=1)"),
+            ("", "Ran 3 tests in 0.002s\n\nOK"),
+        ] {
+            assert!(
+                counts_in(
+                    bind(&unittest_dir).as_ref(),
+                    "npm test",
+                    stdout,
+                    &unittest_stderr(progress, summary)
+                )
+                .is_none(),
+                "{progress:?} {summary:?}"
+            );
+        }
+        assert!(counts_in(
+            bind(&unittest_dir).as_ref(),
+            "npm test",
+            stdout,
+            &unittest_stderr("test_a (t.T.test_a) ... ok", "Ran 3 tests in 0.002s\n\nOK")
+        )
+        .is_none());
+        // Printed text without the runner's report: stdout, no rule, wrong timing.
+        let spoofs: [&[u8]; 4] = [
+            b"",
+            b"----------\nRan 3 tests in 0.002s\n\nOK\n",
+            b"...\n----------------------------------------------------------------------\nRan 3 tests in 0.1s\n\nOK\n",
+            b"...\n----------------------------------------------------------------------\nRan 3 tests in 0.002s\n\nOK\nextra line\n",
+        ];
+        for err in spoofs {
+            assert!(
+                counts_in(bind(&unittest_dir).as_ref(), "npm test", stdout, err).is_none(),
+                "{err:?}"
+            );
+        }
+        assert!(counts_in(
+            bind(&unittest_dir).as_ref(),
+            "npm test",
+            b"Ran 3 tests in 0.002s\n\nOK\n",
+            b""
+        )
+        .is_none());
+        // The wrapper does not weaken other runners or the direct command.
+        assert!(counts_in(
+            bind(&unittest_dir).as_ref(),
+            "go test ./...",
+            stdout,
+            &with_progress
+        )
+        .is_none());
+        assert!(counts("python -m unittest", b"", &with_progress).is_some());
+    }
+
+    fn unittest_stderr_footer_only() -> Vec<u8> {
+        format!("{}\nRan 3 tests in 0.002s\n\nOK\n", "-".repeat(70)).into_bytes()
+    }
+
+    /// A wrapper that fails cannot be verified execution, however good its
+    /// discovery output looks: the receipt gate is the exit status.
+    #[test]
+    fn audit_wp02_b032_a_nonzero_wrapper_exit_is_never_a_verified_check() {
+        let dir = package("python -m unittest", "");
+        let stderr = unittest_stderr("...", "Ran 3 tests in 0.002s\n\nOK");
+        let counts = counts_in(bind(&dir).as_ref(), "npm test", b"", &stderr).unwrap();
+        let receipt =
+            |exit: Option<i32>, started: bool| crate::runtime::evidence_store::ExecutionReceipt {
+                argv: vec!["npm test".into()],
+                started,
+                exit_code: exit,
+                assertion_counts: Some(counts.clone()),
+                ..Default::default()
+            };
+        assert!(receipt(Some(0), true).is_verified_check());
+        for broken in [
+            receipt(Some(1), true),
+            receipt(None, true),
+            receipt(Some(0), false),
+        ] {
+            assert!(!broken.is_verified_check());
+        }
+    }
+
+    /// The review's second bypass: the script is not unittest when it starts, and
+    /// rewrites `scripts.test` while it runs. Identity comes from the manifest
+    /// bound before the process, so the rewrite buys nothing; a manifest that
+    /// really was unittest and then changes is refused as well.
+    #[test]
+    fn audit_wp02_b032_a_manifest_rewritten_during_the_run_is_not_identity() {
+        let stderr = unittest_stderr(
+            "...",
+            "Ran 3 tests in 0.002s
+
+OK",
+        );
+        let manifest =
+            |script: &str| format!(r#"{{"name":"app","scripts":{{"test":{script:?}}}}}"#);
+
+        let dir = package("node fake.js", "");
+        let bound = bind(&dir);
+        std::fs::write(
+            dir.path().join("package.json"),
+            manifest("python -m unittest"),
+        )
+        .unwrap();
+        assert!(counts_in(bound.as_ref(), "npm test", b"", &stderr).is_none());
+        // Bound afterwards, the same bytes would have passed: that is the hole.
+        assert!(counts_in(bind(&dir).as_ref(), "npm test", b"", &stderr).is_some());
+
+        let dir = package("python -m unittest", "");
+        let bound = bind(&dir);
+        assert!(counts_in(bound.as_ref(), "npm test", b"", &stderr).is_some());
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"python -m unittest","posttest":"echo x"}}"#,
+        )
+        .unwrap();
+        assert!(counts_in(bound.as_ref(), "npm test", b"", &stderr).is_none());
+        std::fs::remove_file(dir.path().join("package.json")).unwrap();
+        assert!(counts_in(bound.as_ref(), "npm test", b"", &stderr).is_none());
+    }
+
+    /// Package redirection the host does not model: the manifest next to the
+    /// command is unittest, but the command or its configuration points the
+    /// package manager somewhere else.
+    #[test]
+    fn audit_wp02_b032_package_redirection_is_not_identity() {
+        let stderr = unittest_stderr(
+            "...",
+            "Ran 3 tests in 0.002s
+
+OK",
+        );
+        let dir = package("python -m unittest", "");
+        let bound = bind(&dir);
+        assert!(counts_in(bound.as_ref(), "npm test", b"", &stderr).is_some());
+        // Still a recognised wrapper (so discovery is required), never evidence.
+        for command in [
+            "npm test --prefix fake",
+            "npm test -C fake",
+            "npm test --workspace fake",
+            "npm test -- --other",
+            "yarn test --cwd fake",
+            "pnpm test --dir fake",
+            "npm_config_prefix=fake npm test",
+            "rtk proxy npm test",
+            "npm test && echo done",
+        ] {
+            assert!(
+                crate::verification::discovery::runner(command).is_some() || command.contains("&&"),
+                "{command}"
+            );
+            assert!(
+                counts_in(bound.as_ref(), command, b"", &stderr).is_none(),
+                "{command}"
+            );
+        }
+        // Configuration beside the manifest can change the shell scripts run in.
+        for name in [".npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmrc"] {
+            let configured = package("python -m unittest", "");
+            std::fs::write(configured.path().join(name), "script-shell=fake").unwrap();
+            assert!(
+                counts_in(bind(&configured).as_ref(), "npm test", b"", &stderr).is_none(),
+                "{name}"
+            );
+        }
+        let workspaces = package("python -m unittest", "");
+        std::fs::write(
+            workspaces.path().join("package.json"),
+            r#"{"workspaces":["fake"],"scripts":{"test":"python -m unittest"}}"#,
+        )
+        .unwrap();
+        assert!(counts_in(bind(&workspaces).as_ref(), "npm test", b"", &stderr).is_none());
+    }
+
+    /// Positive control from a real `npm test` that runs a real unittest suite.
+    /// Skipped, and said so, where npm or python is not installed.
+    #[test]
+    fn audit_wp02_b032_a_real_npm_run_of_unittest_is_verified() {
+        let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let present = |program: &str, flag: &str| {
+            std::process::Command::new(program)
+                .arg(flag)
+                .output()
+                .is_ok_and(|out| out.status.success())
+        };
+        if !present(npm, "--version") || !present(python, "--version") {
+            eprintln!("npm or python missing; real npm-to-unittest fixture not executed");
+            return;
+        }
+        let dir = package(&format!("{python} -m unittest"), "");
+        std::fs::write(
+            dir.path().join("test_app.py"),
+            "import unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n        self.assertTrue(True)\n    @unittest.skip('later')\n    def test_b(self):\n        pass\n    def test_c(self):\n        self.assertEqual(1, 1)\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new(npm)
+            .arg("test")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result = counts_in(
+            bind(&dir).as_ref(),
+            "npm test",
+            &output.stdout,
+            &output.stderr,
+        )
+        .expect("a real unittest run through npm");
+        assert_eq!(
+            (result.total, result.passed, result.skipped, result.failed),
+            (3, 2, 1, 0)
+        );
+        assert!(crate::verification::tests_passed(&result));
+        // The same real output, replayed where the package names another script.
+        let other = package("echo hi", "");
+        assert!(counts_in(
+            bind(&other).as_ref(),
+            "npm test",
+            &output.stdout,
+            &output.stderr
+        )
+        .is_none());
     }
 }

@@ -518,6 +518,7 @@ dependencies = [
  "davinci-session",
  "davinci-sys",
  "davinci-telemetry",
+ "globset",
  "image",
  "libc",
  "regex",

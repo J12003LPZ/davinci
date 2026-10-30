@@ -372,7 +372,7 @@ fn parse(name: &str, args: &Value) -> Result<Request, String> {
         if request.process_id == 0
             || request.port == 0
             || !matches!(request.host.as_str(), "127.0.0.1" | "::1")
-            || request.path.len() > 8192
+            || request.path.chars().count() > 8192
             || !request.path.starts_with('/')
             || request.path.starts_with("//")
             || request.path.contains('\\')
@@ -432,12 +432,12 @@ fn parse(name: &str, args: &Value) -> Result<Request, String> {
                 !selector
                     .get(*key)
                     .and_then(Value::as_str)
-                    .is_some_and(|text| !text.is_empty() && text.len() <= 1024)
+                    .is_some_and(|text| !text.is_empty() && text.chars().count() <= 1024)
             })
         {
             return Err("invalid browser selector fields".into());
         }
-        if kind == "role" && selector["role"].as_str().unwrap().len() > 64 {
+        if kind == "role" && selector["role"].as_str().unwrap().chars().count() > 64 {
             return Err("browser role exceeds limit".into());
         }
         command["selector"] = Value::Object(selector.clone());
@@ -447,7 +447,7 @@ fn parse(name: &str, args: &Value) -> Result<Request, String> {
             .get(key)
             .and_then(Value::as_str)
             .ok_or("browser text required")?;
-        if text.len() > 4096 {
+        if text.chars().count() > 4096 {
             return Err("browser text exceeds limit".into());
         }
         command[key] = json!(text);
@@ -591,11 +591,11 @@ impl BrowserController {
         context: &ToolContext,
     ) -> Result<BrowserVerificationReceipt, String> {
         if spec.dom_contains.is_empty()
-            || spec.dom_contains.len() > 4096
+            || spec.dom_contains.chars().count() > 4096
             || spec
                 .accessibility_contains
                 .as_ref()
-                .is_some_and(|value| value.is_empty() || value.len() > 4096)
+                .is_some_and(|value| value.is_empty() || value.chars().count() > 4096)
         {
             return Err("browser assertion bounds are invalid".into());
         }

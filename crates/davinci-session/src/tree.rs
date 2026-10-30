@@ -23,7 +23,56 @@ pub struct SessionUsageStats {
 
 impl SessionUsageStats {
     pub fn token_total(&self) -> u64 {
-        self.input + self.output + self.cache_read + self.cache_write
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
+    }
+}
+
+/// Present a provider cost as dollars with four decimal places, rounding
+/// halves up. Persisted costs stay unchanged; this is display only.
+pub fn format_cost_display(cost: f64) -> String {
+    if !cost.is_finite() {
+        return "$unknown".to_string();
+    }
+    let negative = cost < 0.0;
+    let text = format!("{}", cost.abs());
+    let (integer, fraction_text) = text.split_once('.').unwrap_or((&text, ""));
+    let mut padded: String = fraction_text.chars().take(5).collect();
+    while padded.len() < 5 {
+        padded.push('0');
+    }
+    let mut fraction: String = padded[..4].to_string();
+    let mut integer = integer.to_string();
+    if padded.as_bytes()[4] >= b'5' {
+        let rounded = increment_decimal(&fraction);
+        if rounded.len() > 4 {
+            fraction = rounded[rounded.len() - 4..].to_string();
+            integer = increment_decimal(&integer);
+        } else {
+            fraction = rounded;
+        }
+    }
+    let sign = if negative { "-" } else { "" };
+    format!("${sign}{integer}.{fraction}")
+}
+
+fn increment_decimal(digits: &str) -> String {
+    let mut out: Vec<u8> = digits.bytes().collect();
+    let mut index = out.len();
+    loop {
+        if index == 0 {
+            out.insert(0, b'1');
+            return String::from_utf8(out).expect("decimal digits are ASCII");
+        }
+        index -= 1;
+        if out[index] == b'9' {
+            out[index] = b'0';
+        } else {
+            out[index] += 1;
+            return String::from_utf8(out).expect("decimal digits are ASCII");
+        }
     }
 }
 
@@ -291,22 +340,23 @@ pub fn session_usage_stats(entries: &[SessionEntry]) -> SessionUsageStats {
         let Some(message) = &entry.message else {
             continue;
         };
-        stats.total_messages += 1;
+        stats.total_messages = stats.total_messages.saturating_add(1);
         match message.get("role").and_then(Value::as_str) {
-            Some("user") => stats.user_messages += 1,
+            Some("user") => stats.user_messages = stats.user_messages.saturating_add(1),
             Some("toolResult") => {
-                stats.tool_results += 1;
+                stats.tool_results = stats.tool_results.saturating_add(1);
                 add_usage(&mut stats, message.get("usage"));
             }
             Some("assistant") => {
-                stats.assistant_messages += 1;
+                stats.assistant_messages = stats.assistant_messages.saturating_add(1);
                 if let Some(content) = message.get("content").and_then(Value::as_array) {
-                    stats.tool_calls += content
+                    let calls = content
                         .iter()
                         .filter(|block| {
                             block.get("type").and_then(Value::as_str) == Some("toolCall")
                         })
                         .count() as u64;
+                    stats.tool_calls = stats.tool_calls.saturating_add(calls);
                 }
                 add_usage(&mut stats, message.get("usage"));
             }
@@ -320,18 +370,26 @@ fn add_usage(stats: &mut SessionUsageStats, usage: Option<&Value>) {
     let Some(usage) = usage else {
         return;
     };
-    stats.input += usage.get("input").and_then(Value::as_u64).unwrap_or(0);
-    stats.output += usage.get("output").and_then(Value::as_u64).unwrap_or(0);
-    stats.cache_read += usage
-        .get("cacheRead")
-        .or_else(|| usage.get("cache_read"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    stats.cache_write += usage
-        .get("cacheWrite")
-        .or_else(|| usage.get("cache_write"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    stats.input = stats
+        .input
+        .saturating_add(usage.get("input").and_then(Value::as_u64).unwrap_or(0));
+    stats.output = stats
+        .output
+        .saturating_add(usage.get("output").and_then(Value::as_u64).unwrap_or(0));
+    stats.cache_read = stats.cache_read.saturating_add(
+        usage
+            .get("cacheRead")
+            .or_else(|| usage.get("cache_read"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    );
+    stats.cache_write = stats.cache_write.saturating_add(
+        usage
+            .get("cacheWrite")
+            .or_else(|| usage.get("cache_write"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    );
     stats.cost += usage
         .get("cost")
         .and_then(|cost| {
@@ -475,5 +533,41 @@ mod tests {
         assert_eq!(path.last().unwrap().id, "19999");
         assert!(branch_entries(&entries, Some("missing")).is_empty());
         assert!(branch_entries(&entries, None).is_empty());
+    }
+
+    #[test]
+    fn audit_wp04_b039_usage_counters_saturate_instead_of_wrapping() {
+        let mut usage = SessionEntry::message("assistant", json!("hi"));
+        usage.message = Some(json!({
+            "role": "assistant",
+            "content": [],
+            "usage": {
+                "input": u64::MAX,
+                "output": 5,
+                "cacheRead": u64::MAX,
+                "cacheWrite": u64::MAX,
+            }
+        }));
+        let entries = vec![usage.clone(), usage];
+        let stats = session_usage_stats(&entries);
+        assert_eq!(stats.input, u64::MAX);
+        assert_eq!(stats.output, 10);
+        assert_eq!(stats.cache_read, u64::MAX);
+        assert_eq!(stats.cache_write, u64::MAX);
+        assert_eq!(stats.token_total(), u64::MAX);
+        assert_eq!(stats.total_messages, 2);
+    }
+
+    #[test]
+    fn audit_wp04_b045_cost_display_rounds_midpoints_up() {
+        assert_eq!(format_cost_display(0.00375), "$0.0038");
+        assert_eq!(format_cost_display(0.003749), "$0.0037");
+        assert_eq!(format_cost_display(1.005), "$1.0050");
+        assert_eq!(format_cost_display(9.99999), "$10.0000");
+        assert_eq!(format_cost_display(-0.00375), "$-0.0038");
+        assert_eq!(format_cost_display(0.0), "$0.0000");
+        assert_eq!(format_cost_display(f64::INFINITY), "$unknown");
+        assert_eq!(format_cost_display(f64::NAN), "$unknown");
+        assert_eq!(format_cost_display(1e18), "$1000000000000000000.0000");
     }
 }

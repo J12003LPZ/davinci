@@ -151,10 +151,13 @@ pub fn cycle_thinking_level(
     if levels.is_empty() {
         return None;
     }
-    let index = levels
-        .iter()
-        .position(|level| *level == current)
-        .unwrap_or(0);
+    let Some(index) = levels.iter().position(|level| *level == current) else {
+        let first = levels
+            .iter()
+            .position(|level| *level != ThinkingLevel::Off)
+            .unwrap_or(0);
+        return Some(levels[first]);
+    };
     Some(levels[(index + 1) % levels.len()])
 }
 
@@ -310,5 +313,39 @@ mod tests {
             vec![ThinkingLevel::Off]
         );
         assert_eq!(cycle_thinking_level(Some(mute), ThinkingLevel::Off), None);
+    }
+
+    #[test]
+    fn audit_wp19_b197_absent_current_level_starts_at_the_first_available() {
+        let model = Model {
+            id: "reasoning".into(),
+            name: "Reasoning".into(),
+            api: "anthropic-messages".into(),
+            provider: "anthropic".into(),
+            base_url: None,
+            reasoning: true,
+            input: vec!["text".into()],
+            cost: crate::catalog::ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: 1,
+            max_tokens: 1,
+            compat: serde_json::Value::Null,
+            headers: Default::default(),
+            thinking_level_map: Default::default(),
+        };
+        let levels = get_supported_thinking_levels(&model);
+        let first = levels
+            .iter()
+            .copied()
+            .find(|level| *level != ThinkingLevel::Off)
+            .unwrap_or(levels[0]);
+        assert_eq!(
+            cycle_thinking_level(Some(&model), ThinkingLevel::Off),
+            Some(first)
+        );
     }
 }

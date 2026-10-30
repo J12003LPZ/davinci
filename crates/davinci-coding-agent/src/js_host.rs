@@ -367,14 +367,20 @@ impl PersistentJsSession {
             });
         }
         let module_name = module.display().to_string();
-        let (tx, lines) = std::sync::mpsc::channel();
+        let (tx, lines) = std::sync::mpsc::sync_channel(MAX_PERSISTENT_QUEUED_MESSAGES);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
+            let mut line = Vec::new();
             loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line) {
+                line.clear();
+                match davinci_sys::fs::read_line_bounded(
+                    &mut reader,
+                    &mut line,
+                    MAX_PERSISTENT_LINE_BYTES,
+                ) {
                     Ok(0) => break,
                     Ok(_) => {
+                        let line = String::from_utf8_lossy(&line).into_owned();
                         if !line.trim_start().starts_with('{') {
                             if davinci_ai::trace::enabled() {
                                 davinci_ai::trace::log(&format!(
@@ -384,12 +390,14 @@ impl PersistentJsSession {
                             }
                             continue;
                         }
-                        if tx.send(Ok(line)).is_err() {
-                            break;
+                        match tx.try_send(Ok(line)) {
+                            Ok(()) => {}
+                            Err(std::sync::mpsc::TrySendError::Full(_)) => break,
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
                         }
                     }
                     Err(err) => {
-                        let _ = tx.send(Err(err));
+                        let _ = tx.try_send(Err(err));
                         break;
                     }
                 }
@@ -521,6 +529,10 @@ pub fn stop_persistent_js_extension() {
 /// already speaks line-delimited `{op, payload}` in persistent mode, and the
 /// TS reference keeps extensions loaded for the whole session anyway.
 const MAX_PERSISTENT_JS_SESSIONS: usize = 8;
+/// One persistent protocol line and the pending-reply queue are bounded so a
+/// runaway extension cannot grow memory without limit.
+const MAX_PERSISTENT_LINE_BYTES: usize = 1024 * 1024;
+const MAX_PERSISTENT_QUEUED_MESSAGES: usize = 64;
 
 #[derive(Default)]
 struct PersistentJsPool {
