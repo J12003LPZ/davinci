@@ -152,8 +152,11 @@ def grade(tid, workdir, timeout=120, *, phase="grader", evidence=None):
         return checked["pass"], int(checked["pass"]), int(not checked["pass"]), detail[-1] if detail else str(checked["exit"])
     copy_tree(hidden, workdir)
     files = []
-    for base, _, names in os.walk(hidden):
-        files += [os.path.relpath(os.path.join(base, n), hidden) for n in names]
+    for base, directories, names in os.walk(hidden):
+        directories[:] = [name for name in directories
+                          if name not in ("__pycache__", ".pytest_cache", "node_modules")]
+        files += [os.path.relpath(os.path.join(base, n), hidden) for n in names
+                  if not n.endswith((".pyc", ".pyo"))]
     checked = run_grading_check(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *files],
         workdir,
