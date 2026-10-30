@@ -166,17 +166,26 @@ pub fn isolated_git_command() -> Command {
 }
 
 /// [`isolated_git_command`] for a command that will run in `dir`, with the
-/// repository's own filter and diff drivers neutralized.
+/// repository's own filter drivers neutralized.
 ///
 /// A clean/smudge/process filter is a program the repository's config names
 /// and its attributes select; `status` and `diff` run it while comparing
 /// content. Git has no switch for "no filters", so the filters present are
 /// listed (`git config` runs none of them, and `--includes` follows config
 /// includes; system and global config are the null file) and each is overridden
-/// on the command line with an empty command, which Git treats as "no filter",
-/// plus `required=false` so a skipped filter is not an error. The list is read
-/// once, when the command is built: a config edited between that and the run is
-/// not covered, which is the limit of this approach.
+/// with an empty command, which Git treats as "no filter", plus
+/// `required=false` so a skipped filter is not an error. The overrides travel
+/// as `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` on the
+/// child, key and value separate: a `-c name=value` argument is split at the
+/// first `=`, so a driver named `x=y` would override the wrong key and the real
+/// driver would still run. The list is read once, when the command is built: a
+/// config edited between that and the run is not covered, which is the limit of
+/// this approach.
+///
+/// Fails closed: when the filters cannot be listed or a listed key cannot be
+/// taken apart, the returned command is poisoned. Spawning it still succeeds
+/// but git exits 128 on an invalid config key whose text names the reason, so
+/// the caller sees an ordinary git failure instead of an unneutralized run.
 ///
 /// Diff drivers (`diff.<name>.textconv` and `.command`) cannot be neutralized
 /// this way: Git tries to spawn an empty driver command and the diff dies
@@ -186,52 +195,89 @@ pub fn isolated_git_command() -> Command {
 pub fn isolated_git_command_in(dir: &Path) -> Command {
     let mut command = isolated_git_command();
     command.current_dir(dir);
-    for setting in driver_overrides(dir) {
-        command.arg("-c").arg(setting);
+    match driver_overrides(dir) {
+        Ok(settings) => {
+            command.env("GIT_CONFIG_COUNT", settings.len().to_string());
+            for (index, (key, value)) in settings.iter().enumerate() {
+                command.env(format!("GIT_CONFIG_KEY_{index}"), key);
+                command.env(format!("GIT_CONFIG_VALUE_{index}"), value);
+            }
+        }
+        Err(reason) => {
+            // A key with a space in its section name is never valid, whatever
+            // the reason text holds.
+            let reason: String = reason.chars().filter(|c| !c.is_control()).collect();
+            command
+                .env("GIT_CONFIG_COUNT", "1")
+                .env(
+                    "GIT_CONFIG_KEY_0",
+                    format!("davinci inspection refused: {reason}"),
+                )
+                .env("GIT_CONFIG_VALUE_0", "1");
+        }
     }
     command
 }
 
-/// `-c` settings that disable every repository-defined filter found in the
-/// configuration visible from `dir`.
-fn driver_overrides(dir: &Path) -> Vec<String> {
+/// `(key, value)` settings that disable every repository-defined filter found
+/// in the configuration visible from `dir`.
+fn driver_overrides(dir: &Path) -> Result<Vec<(String, String)>, String> {
     let output = isolated_git_command()
         .current_dir(dir)
         .args([
             "config",
             "--includes",
             "--name-only",
+            "-z",
             "--get-regexp",
-            "^(filter|diff)\\.",
+            "^filter\\.",
         ])
         .stdin(Stdio::null())
-        .output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    // Exit 1 is "no matching key"; anything else (not a repository, unreadable
-    // config) leaves nothing to neutralize or fails the real command anyway.
-    if !output.status.success() {
-        return Vec::new();
+        .output()
+        .map_err(|error| format!("cannot list filter drivers: {error}"))?;
+    // Exit 1 is "no matching key"; any other failure means the filters are
+    // unknown, which is not the same as there being none.
+    match output.status.code() {
+        Some(0) => filter_overrides(&output.stdout),
+        Some(1) => Ok(Vec::new()),
+        _ => Err(format!(
+            "cannot list filter drivers: git config exited with {}",
+            output.status
+        )),
     }
-    let mut settings = std::collections::BTreeSet::new();
-    for key in String::from_utf8_lossy(&output.stdout).lines() {
+}
+
+/// Parse the NUL-separated key list `git config -z --name-only` prints into
+/// override settings for every `filter.<name>.*` driver.
+fn filter_overrides(stdout: &[u8]) -> Result<Vec<(String, String)>, String> {
+    let text =
+        std::str::from_utf8(stdout).map_err(|_| "a config key is not valid UTF-8".to_string())?;
+    let mut names = std::collections::BTreeSet::new();
+    for key in text.split('\0').filter(|key| !key.is_empty()) {
         // section.subsection.variable; the subsection may itself contain dots.
         let (Some(first), Some(last)) = (key.find('.'), key.rfind('.')) else {
-            continue;
+            return Err(format!("config key {key:?} has no section"));
         };
         if first == last {
+            // section.variable: no subsection, so no driver name.
             continue;
         }
-        let (section, name) = (&key[..first], &key[first + 1..last]);
-        if section == "filter" {
-            for driver in ["clean", "smudge", "process"] {
-                settings.insert(format!("filter.{name}.{driver}="));
-            }
-            settings.insert(format!("filter.{name}.required=false"));
+        let name = &key[first + 1..last];
+        if name.contains(['\n', '\0']) {
+            return Err(format!(
+                "filter driver name {name:?} has a control character"
+            ));
         }
+        names.insert(name.to_string());
     }
-    settings.into_iter().collect()
+    let mut settings = Vec::with_capacity(names.len() * 4);
+    for name in names {
+        for driver in ["clean", "smudge", "process"] {
+            settings.push((format!("filter.{name}.{driver}"), String::new()));
+        }
+        settings.push((format!("filter.{name}.required"), "false".to_string()));
+    }
+    Ok(settings)
 }
 
 /// Kill `pid` and its descendants. On Unix, `pid` must be the leader of its
@@ -1111,5 +1157,155 @@ mod tests {
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&out.stdout).contains("g.txt"));
+    }
+
+    fn plain_git(args: &[&str]) -> Command {
+        let mut command = Command::new("git");
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .args(args);
+        command
+    }
+
+    /// B003: a filter driver whose name contains `=` made the old
+    /// `-c filter.<name>.clean=` override set the wrong key (Git splits at the
+    /// first `=`), so the real driver still ran. The overrides now travel as
+    /// separate `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` entries.
+    #[test]
+    fn audit_wp01_b003_filter_named_with_equals_is_neutralized() {
+        let _guard = GIT_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        git_in(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            dir.join(".gitattributes"),
+            "f.txt filter=x=y\nh.txt filter=p=q\n",
+        )
+        .unwrap();
+        for name in ["f.txt", "h.txt"] {
+            std::fs::write(dir.join(name), "one\n").unwrap();
+        }
+        git_in(dir, &["add", "."]);
+        git_in(dir, &["commit", "-q", "-m", "c"]);
+
+        let slash = |name: &str| dir.join(name).to_string_lossy().replace('\\', "/");
+        let marks = ["clean-ran", "process-ran", "spaced-ran"];
+        git_in(
+            dir,
+            &[
+                "config",
+                "filter.x=y.clean",
+                &format!("echo ran >> '{}'; cat", slash(marks[0])),
+            ],
+        );
+        git_in(
+            dir,
+            &[
+                "config",
+                "filter.p=q.process",
+                &format!("echo ran >> '{}'", slash(marks[1])),
+            ],
+        );
+        // Attributes cannot select a name with spaces, but it must still be
+        // listed and overridden without breaking the command.
+        git_in(
+            dir,
+            &[
+                "config",
+                "filter.with space.clean",
+                &format!("echo ran >> '{}'; cat", slash(marks[2])),
+            ],
+        );
+
+        let make_stale = || {
+            for name in ["f.txt", "h.txt"] {
+                std::fs::write(dir.join(name), "one\n").unwrap();
+                let file = std::fs::File::options()
+                    .write(true)
+                    .open(dir.join(name))
+                    .unwrap();
+                file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+            std::fs::write(dir.join("f.txt"), "two\n").unwrap();
+        };
+        let run = |mut command: Command| {
+            let out = command.current_dir(dir).output().unwrap();
+            assert!(out.status.success(), "{out:?}");
+        };
+        let ran = || marks.iter().filter(|n| dir.join(n).exists()).count();
+
+        // Control: plain git runs the driver named with `=`.
+        make_stale();
+        run(plain_git(&["status", "--porcelain"]));
+        run(plain_git(&["diff"]));
+        assert!(
+            dir.join(marks[0]).exists(),
+            "control: the clean filter named x=y must run under plain git"
+        );
+        for mark in marks {
+            let _ = std::fs::remove_file(dir.join(mark));
+        }
+
+        // Isolated: none of them.
+        make_stale();
+        let mut status = isolated_git_command_in(dir);
+        status.args(["status", "--porcelain"]);
+        run(status);
+        let mut diff = isolated_git_command_in(dir);
+        diff.args(["diff", "--no-ext-diff", "--no-textconv"]);
+        run(diff);
+        assert_eq!(ran(), 0, "a filter named with `=` ran under isolation");
+    }
+
+    /// B003: when the filters cannot be listed the command must not run.
+    #[test]
+    fn audit_wp01_b003_unlistable_filters_fail_closed() {
+        let _guard = GIT_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        git_in(dir, &["init", "-q", "-b", "main"]);
+        let canary = dir.join("clean-ran");
+        std::fs::write(dir.join(".gitattributes"), "f.txt filter=canary\n").unwrap();
+        std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+        // A driver name that is not UTF-8 cannot be carried in an override
+        // key, so the listing is unusable although git reads it fine.
+        let mut config = std::fs::read(dir.join(".git").join("config")).unwrap();
+        config.extend_from_slice(b"[filter \"bad\xffname\"]\n\tclean = echo ran >> '");
+        config.extend_from_slice(canary.to_string_lossy().replace('\\', "/").as_bytes());
+        config.extend_from_slice(b"'; cat\n");
+        std::fs::write(dir.join(".git").join("config"), config).unwrap();
+        std::fs::write(dir.join(".gitattributes"), b"f.txt filter=bad\xffname\n").unwrap();
+        let out = isolated_git_command_in(dir)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("inspection refused"), "{stderr}");
+        assert!(
+            !stderr.contains("not a git repository"),
+            "must not look like a clean non-repository: {stderr}"
+        );
+        assert!(!canary.exists(), "the filter ran although listing failed");
+    }
+
+    /// B003: key parsing keeps key and value separate and rejects what it
+    /// cannot take apart.
+    #[test]
+    fn audit_wp01_b003_filter_overrides_parse() {
+        let settings =
+            filter_overrides(b"filter.x=y.clean\0filter.a.b.smudge\0filter.plain\0").unwrap();
+        assert!(settings.contains(&("filter.x=y.clean".to_string(), String::new())));
+        assert!(settings.contains(&("filter.x=y.required".to_string(), "false".to_string())));
+        assert!(settings.contains(&("filter.a.b.process".to_string(), String::new())));
+        assert_eq!(settings.len(), 8, "two drivers, four settings each");
+        assert!(filter_overrides(b"nodots\0").is_err());
+        assert!(filter_overrides(b"filter.a\nb.clean\0").is_err());
+        assert!(filter_overrides(b"filter.\xff.clean\0").is_err());
     }
 }
