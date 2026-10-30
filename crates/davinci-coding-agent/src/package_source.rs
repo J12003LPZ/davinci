@@ -42,7 +42,10 @@ pub fn parse_package_source(source: &str) -> ParsedSource {
 }
 
 pub fn parse_git_source(source: &str) -> (String, Option<String>) {
-    let raw = source.strip_prefix("git:").unwrap_or(source);
+    let raw = match source.strip_prefix("git:") {
+        Some(rest) if rest.starts_with("git://") => rest,
+        _ => source,
+    };
     if raw.starts_with("git@") {
         if let Some(idx) = raw.rfind('@') {
             if idx > 3 {
@@ -237,6 +240,22 @@ mod tests {
         assert_eq!(
             installed_root(&dir.path().display().to_string(), dir.path(), dir.path()),
             Some(dir.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn audit_wp18_b175_git_urls_keep_their_scheme_and_port() {
+        assert_eq!(
+            parse_git_source("git://host/repo"),
+            ("git://host/repo".to_string(), None)
+        );
+        assert_eq!(
+            parse_git_source("git://host:9418/repo"),
+            ("git://host:9418/repo".to_string(), None)
+        );
+        assert_eq!(
+            parse_git_source("git:git://host/repo"),
+            ("git://host/repo".to_string(), None)
         );
     }
 }

@@ -302,6 +302,14 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 .as_deref()
                 .map(davinci_agent::parse_rpc_images)
                 .unwrap_or_default();
+            if command
+                .message
+                .as_deref()
+                .is_none_or(|text| text.trim().is_empty())
+                && images.is_empty()
+            {
+                return fail(id, &kind, "prompt text is required".into());
+            }
             if runtime.agent.is_compacting {
                 return fail(id, &kind, COMPACTION_PROMPT_ERROR.to_string());
             }
@@ -347,6 +355,14 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 .as_deref()
                 .map(davinci_agent::parse_rpc_images)
                 .unwrap_or_default();
+            if command
+                .message
+                .as_deref()
+                .is_none_or(|text| text.trim().is_empty())
+                && images.is_empty()
+            {
+                return fail(id, &kind, "steer text is required".into());
+            }
             if let Some(message) = &command.message {
                 let text = davinci_agent::expand_user_text(
                     message,
@@ -364,6 +380,14 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 .as_deref()
                 .map(davinci_agent::parse_rpc_images)
                 .unwrap_or_default();
+            if command
+                .message
+                .as_deref()
+                .is_none_or(|text| text.trim().is_empty())
+                && images.is_empty()
+            {
+                return fail(id, &kind, "follow-up text is required".into());
+            }
             if let Some(message) = &command.message {
                 let text = davinci_agent::expand_user_text(
                     message,
