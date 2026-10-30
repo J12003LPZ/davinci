@@ -1,8 +1,11 @@
 use super::symbols::digest;
 use super::{Edge, Import, LanguageAdapter, RepoFile, SourceRange, Symbol};
 use std::collections::BTreeMap;
-use tree_sitter::Node;
+use std::ops::ControlFlow;
+use std::time::{Duration, Instant};
+use tree_sitter::{Node, ParseOptions, ParseState};
 
+const PARSE_BUDGET: Duration = Duration::from_micros(250_000);
 const MAX_SOURCE_BYTES: usize = 1_000_000;
 const MAX_RECORDS: usize = 20_000;
 
@@ -39,7 +42,6 @@ pub fn parse_source(path: &str, source: &str) -> Result<RepoFile, String> {
     parser
         .set_language(&language.grammar(path))
         .map_err(|e| e.to_string())?;
-    parser.set_timeout_micros(250_000);
     let mut file = RepoFile {
         path: path.into(),
         language,
@@ -54,7 +56,20 @@ pub fn parse_source(path: &str, source: &str) -> Result<RepoFile, String> {
         parse_status: "ok".into(),
         unresolved: Vec::new(),
     };
-    let Some(tree) = parser.parse(source, None) else {
+    let deadline = Instant::now() + PARSE_BUDGET;
+    let mut over_budget = |_: &ParseState| {
+        if Instant::now() >= deadline {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    };
+    let options = ParseOptions::new().progress_callback(&mut over_budget);
+    let Some(tree) = parser.parse_with_options(
+        &mut |offset, _| &source.as_bytes()[offset..],
+        None,
+        Some(options),
+    ) else {
         file.parse_status = "parse_failed: parser budget exhausted".into();
         return Ok(file);
     };
