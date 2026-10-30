@@ -2483,18 +2483,28 @@ mod tests {
         let spec: WorkflowSpec = serde_json::from_str(VALID_3_PHASE_WORKFLOW_JSON).unwrap();
 
         let wf_id = executor.execute_background(spec).unwrap();
-        // Give background thread a moment to finish execution
-        let mut completed = false;
-        for _ in 0..500 {
-            if let Some(st) = executor.get_state(&wf_id) {
-                if st.status == WorkflowStatus::Completed {
-                    completed = true;
-                    break;
-                }
+        // The background thread's progress is only observable through the
+        // state. Wait on a wall-clock bound sized for a loaded Windows runner,
+        // and stop at the first terminal status that is not Completed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let last = loop {
+            let status = executor.get_state(&wf_id).map(|state| state.status);
+            if matches!(
+                status,
+                Some(
+                    WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled
+                )
+            ) || std::time::Instant::now() >= deadline
+            {
+                break status;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(completed, "background workflow should complete");
+        };
+        assert_eq!(
+            last,
+            Some(WorkflowStatus::Completed),
+            "background workflow should complete"
+        );
 
         let list = executor.list_workflows();
         assert_eq!(list.len(), 1);
