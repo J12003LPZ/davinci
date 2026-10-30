@@ -208,7 +208,9 @@ fn rebuild_reference_shell_uses_claude_120x40_geometry() {
         .skip(1)
         .take(PET_W)
         .all(|c| "▀▄█ ".contains(c))));
-    assert!(rows[35].to_string().contains("● high · /effort"));
+    // The effort is named in the masthead, not above the composer.
+    assert!(rows[3].to_string().contains("with high effort"));
+    assert!(rows[35].to_string().trim().is_empty());
     assert_eq!(rows[36].to_string(), "─".repeat(120));
     assert!(rows[37].to_string().starts_with("❯"));
     assert_eq!(rows[38].to_string(), "─".repeat(120));

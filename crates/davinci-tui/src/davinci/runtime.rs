@@ -1574,7 +1574,8 @@ impl WheelBurst {
 
 /// A left click on a drawn target: jump back to the newest output, or take
 /// the completion under the pointer. `DAVINCI_DISABLE_MOUSE_CLICKS` leaves
-/// only the wheel.
+/// only the wheel. `false` leaves the press to text selection, which a press
+/// on the composer also gets after it places the caret.
 pub(crate) fn route_click_target(model: &mut Model, mouse: event::MouseEvent) -> bool {
     use event::{MouseButton::Left, MouseEventKind};
     if mouse.kind != MouseEventKind::Down(Left)
@@ -1596,8 +1597,10 @@ pub(crate) fn route_click_target(model: &mut Model, mouse: event::MouseEvent) ->
             model.transcript_scroll.take();
         }
         app::Target::ComposerRow(row) => {
-            // The text starts after the two-cell prompt.
+            // The text starts after the two-cell prompt. The press also
+            // starts a selection, so dragging over the draft copies it.
             model.place_caret(row, usize::from(mouse.column).saturating_sub(2));
+            return false;
         }
         app::Target::Prompt(entry) => {
             app::scroll_transcript_to_entry(model, entry);
