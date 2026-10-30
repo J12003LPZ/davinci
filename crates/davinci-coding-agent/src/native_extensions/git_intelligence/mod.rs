@@ -100,6 +100,14 @@ impl GitIntelligence {
     ) -> Result<ToolResult, ToolError> {
         let parsed: tools::GitSymbolHistoryArgs = serde_json::from_value(args.clone())
             .map_err(|e| ToolError::Failed(format!("git_symbol_history: invalid args: {e}")))?;
+        if parsed
+            .max_commits
+            .is_some_and(|value| !(1..=50).contains(&value))
+        {
+            return Err(ToolError::Failed(
+                "git_symbol_history: maxCommits must be 1..50".into(),
+            ));
+        }
 
         let cache_key = self.compute_cache_key("git_symbol_history", args);
         if let Some(key) = &cache_key {
@@ -148,6 +156,11 @@ impl GitIntelligence {
     ) -> Result<ToolResult, ToolError> {
         let parsed: tools::GitRelatedCommitsArgs = serde_json::from_value(args.clone())
             .map_err(|e| ToolError::Failed(format!("git_related_commits: invalid args: {e}")))?;
+        if parsed.limit.is_some_and(|value| !(1..=50).contains(&value)) {
+            return Err(ToolError::Failed(
+                "git_related_commits: limit must be 1..50".into(),
+            ));
+        }
 
         let cache_key = self.compute_cache_key("git_related_commits", args);
         if let Some(key) = &cache_key {
@@ -253,6 +266,14 @@ impl GitIntelligence {
     ) -> Result<ToolResult, ToolError> {
         let parsed: tools::GitBranchDiffArgs = serde_json::from_value(args.clone())
             .map_err(|e| ToolError::Failed(format!("git_branch_diff: invalid args: {e}")))?;
+        if parsed
+            .max_files
+            .is_some_and(|value| !(1..=100).contains(&value))
+        {
+            return Err(ToolError::Failed(
+                "git_branch_diff: maxFiles must be 1..100".into(),
+            ));
+        }
 
         match resolver.branch_diff(
             parsed.base.as_deref(),

@@ -100,7 +100,7 @@ pub(super) fn validate(name: &str, args: &Value) -> Result<(), String> {
         let valid = match schema["type"].as_str() {
             Some("string") => value.as_str().is_some_and(|s| {
                 !s.trim().is_empty()
-                    && s.len() <= schema["maxLength"].as_u64().unwrap_or(4096) as usize
+                    && s.chars().count() <= schema["maxLength"].as_u64().unwrap_or(4096) as usize
             }),
             Some("integer") => value.as_u64().is_some_and(|v| {
                 v >= schema["minimum"].as_u64().unwrap_or(0)

@@ -408,12 +408,21 @@ impl GitResolver {
         ];
 
         let grep_arg: String;
+        let pickaxe_arg: String;
         if let Some(q) = query {
+            if q.trim().is_empty() {
+                return Err("query filter cannot be empty".into());
+            }
             grep_arg = format!("--grep={q}");
             args.push(&grep_arg);
-        } else if let Some(sym) = symbol {
-            grep_arg = format!("--grep={sym}");
-            args.push(&grep_arg);
+        }
+        if let Some(sym) = symbol {
+            if sym.trim().is_empty() {
+                return Err("symbol filter cannot be empty".into());
+            }
+            pickaxe_arg = format!("-S{sym}");
+            args.push("--pickaxe-all");
+            args.push(&pickaxe_arg);
         }
 
         let validated_path: PathBuf;

@@ -81,8 +81,8 @@ pub fn execute(snapshot: &Snapshot, name: &str, args: Value) -> Result<Value, St
         "sec_source_search" => {
             let input: SearchInput =
                 serde_json::from_value(args).map_err(|_| "invalid source search input")?;
-            if input.query.is_empty() || input.query.len() > 256 {
-                return Err("search query requires 1..256 bytes".into());
+            if input.query.is_empty() || input.query.chars().count() > 256 {
+                return Err("search query requires 1..256 characters".into());
             }
             let mut matches = Vec::new();
             let mut encountered = 0usize;
