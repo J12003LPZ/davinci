@@ -210,7 +210,10 @@ impl Usage {
             output_unreported: false,
             cache_read_unreported: false,
             reasoning: None,
-            total_tokens: input + output + cache_read + cache_write,
+            total_tokens: input
+                .saturating_add(output)
+                .saturating_add(cache_read)
+                .saturating_add(cache_write),
             cost,
         };
         usage.cost.total =
@@ -512,5 +515,28 @@ pub fn default_model_ref() -> ModelRef {
     ModelRef {
         provider: "google".to_string(),
         id: "gemini-3-flash".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_wp03_b035_usage_totals_saturate() {
+        let cost = ModelCost {
+            input: 1.0,
+            output: 1.0,
+            cache_read: 1.0,
+            cache_write: 1.0,
+        };
+        let max = Usage::from_tokens(u64::MAX, u64::MAX, u64::MAX, u64::MAX, &cost);
+        assert_eq!(max.total_tokens, u64::MAX);
+        let edge = Usage::from_tokens(u64::MAX, 1, 0, 1, &cost);
+        assert_eq!(edge.total_tokens, u64::MAX);
+        let late = Usage::from_tokens(0, 0, u64::MAX, 5, &cost);
+        assert_eq!(late.total_tokens, u64::MAX);
+        let ordinary = Usage::from_tokens(1, 2, 3, 4, &cost);
+        assert_eq!(ordinary.total_tokens, 10);
     }
 }
