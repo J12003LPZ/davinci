@@ -564,16 +564,9 @@ fn read_provider_stream(
     if read_error.is_some() && frames > 0 && (framer.saw_done() || decoder.is_done()) {
         read_error = None;
     }
-    if !aborted && read_error.is_none() && !decoder.is_done() {
-        if let Some(frame) = framer.flush() {
-            frames += 1;
-            raw.clear();
-            if keep_raw_events {
-                raw_events.push(frame.data.clone());
-            }
-            feed(&frame.data, decoder, &mut events, on_event);
-        }
-    }
+    // EOF does not dispatch an unfinished event: only a real blank line ends
+    // an SSE event. A stream cut before its terminator is handled below as a
+    // missing terminal response.
 
     if !aborted {
         // A frame that failed to parse may have carried content or tool-call

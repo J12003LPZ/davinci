@@ -115,6 +115,8 @@ pub struct SseFramer {
     data: String,
     has_data: bool,
     saw_done: bool,
+    /// Whether the stream-leading BOM has been considered.
+    started: bool,
     /// The first `data:` payload that was not valid JSON, so a reader can
     /// fail the turn instead of reporting a stream with a hole as complete.
     malformed: Option<String>,
@@ -131,6 +133,12 @@ impl SseFramer {
     /// Feed one line (without its line terminator). Returns the frame that the
     /// line completed, if any.
     pub fn feed_line(&mut self, line: &str) -> Option<SseFrame> {
+        let line = if self.started {
+            line
+        } else {
+            self.started = true;
+            line.strip_prefix('\u{feff}').unwrap_or(line)
+        };
         let line = line.strip_suffix('\r').unwrap_or(line);
         if line.is_empty() {
             return self.flush();
@@ -209,9 +217,6 @@ pub fn frames_of(corpus: &str) -> Vec<SseFrame> {
         if let Some(frame) = framer.feed_line(line) {
             frames.push(frame);
         }
-    }
-    if let Some(frame) = framer.flush() {
-        frames.push(frame);
     }
     frames
 }
@@ -2448,5 +2453,21 @@ data: {"type":"response.completed","response":{"status":"completed"}}
         assert_eq!(decoder.last_response_id(), Some("resp_123"));
         assert_eq!(decoder.raw_items().len(), 1);
         assert_eq!(decoder.raw_items()[0]["name"], "read");
+    }
+
+    #[test]
+    fn audit_wp08_b076_eof_does_not_dispatch_an_unterminated_event() {
+        assert!(frames_of("data: {\"a\":1}").is_empty());
+        let frames = frames_of("data: {\"a\":1}\n\n");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data["a"], 1);
+    }
+
+    #[test]
+    fn audit_wp08_b078_only_the_stream_leading_bom_is_stripped() {
+        let frames = frames_of("\u{feff}data: {\"a\":1}\n\ndata: {\"b\":\"\u{feff}\"}\n\n");
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].data["a"], 1);
+        assert_eq!(frames[1].data["b"], "\u{feff}");
     }
 }
