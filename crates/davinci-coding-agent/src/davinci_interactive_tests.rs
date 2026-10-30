@@ -2359,7 +2359,7 @@ fn verification_notice_is_displayed_separately_from_assistant_prose() {
         &mut m,
         &mut turn,
         &AgentEvent::VerificationNotice {
-            status: davinci_agent::CompletionEvidence::Unverified,
+            status: davinci_agent::CompletionStatus::Unverified,
             generation: 1,
             text: "Verification is incomplete".into(),
         },

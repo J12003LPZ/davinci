@@ -2861,13 +2861,31 @@ fn run_nested_subagent(
 ) -> Result<String, String> {
     let (mut child, profile_allows_codemode) = build_worker(parsed, cwd, mcp, req)?;
     let teammate = req.mode == davinci_agent::AgentSpawnMode::Teammate;
+    let workspace = req
+        .worktree_path
+        .clone()
+        .unwrap_or_else(|| cwd.to_path_buf());
+    let receipt_slot = req.receipt_slot.clone();
     // Shared-workspace write ownership is taken per mutating call by the
     // turn's dispatch (`turn.rs`), the same path as the lead's own calls.
     let mut turn = |prompt: &str| {
         if teammate {
             refresh_worker_settings(&mut child, profile_allows_codemode);
         }
-        run_worker_turn(parsed, &mut child, prompt)
+        let before = davinci_agent::WorkspaceSnapshot::capture(&workspace).ok();
+        let result = run_worker_turn(parsed, &mut child, prompt);
+        let after = davinci_agent::WorkspaceSnapshot::capture(&workspace).ok();
+        if let Some(slot) = &receipt_slot {
+            let receipt = davinci_agent::VerificationReceipt::from_worker(
+                child.completion_status(),
+                &child.mutation_verification_state(),
+                before.as_ref(),
+                after.as_ref(),
+                Some(&workspace),
+            );
+            davinci_agent::publish_subagent_receipt(slot, receipt);
+        }
+        result
     };
     if teammate {
         let runtime = req

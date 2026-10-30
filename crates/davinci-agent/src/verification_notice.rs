@@ -1,14 +1,16 @@
 //! Completion evidence belongs to host display events, not model-authored chat.
 
-use crate::{Agent, AgentEvent, CompletionEvidence};
+use crate::{Agent, AgentEvent, CompletionStatus};
 
 impl Agent {
     pub(crate) fn emit_verification_notice(&mut self, events: &mut Vec<AgentEvent>) {
-        let status = self.completion_evidence();
+        self.record_terminal_completion_status();
+        let status = self.completion_status();
         let text = match status {
-            CompletionEvidence::Partial => "Verification is partial: passing checks cover some changes; other changed paths remain unchecked.",
-            CompletionEvidence::Unverified => "Verification is incomplete: no applicable completed check confirms the latest changes.",
-            CompletionEvidence::VerificationFailed => "Verification failed after the latest changes; the failure remains unresolved.",
+            CompletionStatus::Partial => "Verification is partial: passing checks cover some changes; other changed paths remain unchecked.",
+            CompletionStatus::Unverified => "Verification is incomplete: no applicable completed check confirms the latest changes.",
+            CompletionStatus::VerificationFailed => "Verification failed after the latest changes; the failure remains unresolved.",
+            CompletionStatus::VerificationUnavailable => "Verification was not observed: changes were made but no verification command ran.",
             _ => { self.last_verification_notice = None; return; }
         };
         let generation = self.mutation_verification_state().mutation_generation;
@@ -56,7 +58,7 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::VerificationNotice {
-                status: CompletionEvidence::Unverified,
+                status: CompletionStatus::VerificationUnavailable,
                 ..
             }
         )));
@@ -174,7 +176,7 @@ mod tests {
         assert!(matches!(
             events.last(),
             Some(AgentEvent::VerificationNotice {
-                status: CompletionEvidence::VerificationFailed,
+                status: CompletionStatus::VerificationFailed,
                 ..
             })
         ));

@@ -4822,7 +4822,7 @@ fn switching_sessions_replaces_the_plugin_context_with_the_new_sessions() {
 #[test]
 fn print_verification_notice_is_a_separate_event_and_not_a_provider_error() {
     let notice = AgentEvent::VerificationNotice {
-        status: davinci_agent::CompletionEvidence::Unverified,
+        status: davinci_agent::CompletionStatus::Unverified,
         generation: 1,
         text: "Verification is incomplete".into(),
     };
