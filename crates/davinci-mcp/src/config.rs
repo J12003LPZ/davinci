@@ -266,8 +266,8 @@ mod tests {
 
     #[test]
     fn remote_tool_timeout_defaults_to_one_minute_and_rejects_out_of_range_values() {
-        let default = parse(r#"{"mcpServers":{"remote":{"url":"https://example.com/mcp"}}}"#)
-            .unwrap();
+        let default =
+            parse(r#"{"mcpServers":{"remote":{"url":"https://example.com/mcp"}}}"#).unwrap();
         assert_eq!(
             default.mcp_servers["remote"].call_timeout().unwrap(),
             std::time::Duration::from_secs(60)

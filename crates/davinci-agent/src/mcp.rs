@@ -1025,12 +1025,10 @@ mod tests {
         let registry = McpRegistry::connect(&config, dir.path());
         assert!(registry.tool_names().is_empty());
         assert_eq!(registry.rows()[0].status, "error");
-        assert!(
-            registry.rows()[0]
-                .error
-                .as_deref()
-                .is_some_and(|message| message.contains("callTimeoutSeconds"))
-        );
+        assert!(registry.rows()[0]
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("callTimeoutSeconds")));
     }
 
     #[test]
