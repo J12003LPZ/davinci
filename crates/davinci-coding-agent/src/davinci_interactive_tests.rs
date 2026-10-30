@@ -250,13 +250,13 @@ fn a_second_interrupt_while_one_is_pending_asks_for_the_way_out() {
     let abort = Arc::new(AtomicBool::new(false));
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     // The first esc requests the abort and is not a force-quit.
-    assert!(!mid_turn_key(&mut m, esc, &abort));
+    assert!(!mid_turn_key(&mut m, esc, &abort, &Mutex::new(None)));
     assert!(abort.load(Ordering::Relaxed));
     // The second, with the flag already up, is: the worker is not
     // answering, and the only way left restores the terminal first.
-    assert!(mid_turn_key(&mut m, esc, &abort));
+    assert!(mid_turn_key(&mut m, esc, &abort, &Mutex::new(None)));
     let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-    assert!(mid_turn_key(&mut m, ctrl_c, &abort));
+    assert!(mid_turn_key(&mut m, ctrl_c, &abort, &Mutex::new(None)));
 }
 
 #[test]
@@ -438,6 +438,85 @@ fn model() -> Model {
         40,
         true,
     )
+}
+
+#[test]
+fn mid_turn_shift_tab_updates_the_footer_at_once_and_cycles_from_the_displayed_mode() {
+    let mut agent = Agent::new("base prompt");
+    let mut m = model();
+    m.screen = davinci_tui::davinci::model::Screen::Agent;
+    m.running = true;
+    change_permission_mode(&mut agent, &mut m, PermissionMode::Ask);
+    let pending = agent.pending_permission_mode.clone();
+    let abort = Arc::new(AtomicBool::new(false));
+    let shift_tab = || {
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::BackTab,
+            crossterm::event::KeyModifiers::SHIFT,
+        )
+    };
+
+    assert!(!mid_turn_key(&mut m, shift_tab(), &abort, &pending));
+    assert_eq!(m.permission_mode, "edits", "footer changes immediately");
+    assert_eq!(*pending.lock().unwrap(), Some(PermissionMode::Edits));
+    assert_eq!(agent.permission_mode(), PermissionMode::Ask, "agent waits");
+
+    // The second press starts from the displayed mode, not the agent's.
+    assert!(!mid_turn_key(&mut m, shift_tab(), &abort, &pending));
+    assert_eq!(m.permission_mode, "read-only");
+    assert_eq!(*pending.lock().unwrap(), Some(PermissionMode::ReadOnly));
+    assert!(!abort.load(Ordering::Relaxed));
+
+    // The worker's apply point reaches the agent through set_permission_mode.
+    assert_eq!(
+        agent.apply_pending_permission_mode(),
+        Some(PermissionMode::ReadOnly)
+    );
+    assert_eq!(agent.permission_mode(), PermissionMode::ReadOnly);
+    assert!(agent.is_plan_mode());
+    assert!(pending.lock().unwrap().is_none());
+}
+
+#[test]
+fn mid_turn_cycle_pressed_after_the_last_batch_lands_at_turn_end() {
+    let mut agent = Agent::new("base prompt");
+    let mut m = model();
+    m.screen = davinci_tui::davinci::model::Screen::Agent;
+    m.running = true;
+    change_permission_mode(&mut agent, &mut m, PermissionMode::Ask);
+    let pending = agent.pending_permission_mode.clone();
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::BackTab,
+        crossterm::event::KeyModifiers::SHIFT,
+    );
+    let _ = mid_turn_key(&mut m, key, &Arc::new(AtomicBool::new(false)), &pending);
+
+    // run_turn's tail: apply what is left, then show what the agent holds.
+    agent.apply_pending_permission_mode();
+    sync_permission_state(&agent, &mut m);
+    assert_eq!(agent.permission_mode(), PermissionMode::Edits);
+    assert_eq!(m.permission_mode, "edits");
+}
+
+#[test]
+fn mid_turn_shift_tab_is_left_alone_while_a_modal_is_open_or_off_the_agent_screen() {
+    let mut m = model();
+    m.running = true;
+    m.permission_mode = "ask".into();
+    let pending = Mutex::new(None);
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::BackTab,
+        crossterm::event::KeyModifiers::SHIFT,
+    );
+    m.screen = davinci_tui::davinci::model::Screen::Agent;
+    m.overlay = Some(davinci_tui::davinci::model::Overlay::Ask);
+    let _ = mid_turn_key(&mut m, key, &Arc::new(AtomicBool::new(false)), &pending);
+    assert_eq!(m.permission_mode, "ask");
+    m.overlay = None;
+    m.screen = davinci_tui::davinci::model::Screen::Plan;
+    let _ = mid_turn_key(&mut m, key, &Arc::new(AtomicBool::new(false)), &pending);
+    assert_eq!(m.permission_mode, "ask");
+    assert!(pending.lock().unwrap().is_none());
 }
 
 #[test]
@@ -1915,9 +1994,34 @@ fn a_waiting_call_says_so_on_its_ledger_row_and_is_quiet_again_once_answered() {
 }
 
 #[test]
+fn a_shell_call_is_drawn_under_the_name_of_the_shell_that_ran_it() {
+    use davinci_tui::davinci::theme::{ColorDepth, Theme};
+    let theme = Theme::da_vinci(ColorDepth::TrueColor, false);
+    let header = |tool: &str| {
+        let args = serde_json::json!({ "command": "ls -la" });
+        davinci_tui::davinci::ui::tool_line(
+            80,
+            &theme,
+            davinci_tui::davinci::theme::State::Done,
+            instrument_of(tool),
+            &target_of(tool, &args),
+            Some("0.10s"),
+            0,
+            false,
+        )
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
+    };
+    assert_eq!(header("bash"), "● Bash(ls -la)");
+    assert_eq!(header("powershell"), "● PowerShell(ls -la)");
+}
+
+#[test]
 fn shell_is_manus_and_everything_else_is_instrumenta() {
     assert_eq!(instrument_of("bash"), "manus");
-    assert_eq!(instrument_of("powershell"), "manus");
+    assert_eq!(instrument_of("powershell"), "manus-powershell");
     assert_eq!(instrument_of("read"), "instrumenta");
     assert_eq!(instrument_of("grep"), "instrumenta");
     assert_eq!(instrument_of("memory_search"), "memoria");
@@ -3086,15 +3190,18 @@ fn an_edit_draws_its_delta_from_the_details_the_tool_returned() {
             })),
         },
     );
+    // The card hangs straight from the call's line: no estimate row, no tool
+    // text, no blank between.
     assert!(matches!(
         &m.transcript[0],
         Entry::Tool {
             state: State::Delta,
+            summary: None,
+            output,
             ..
-        }
+        } if output.is_empty()
     ));
-    assert!(matches!(m.transcript[1], Entry::Gap));
-    match &m.transcript[2] {
+    match &m.transcript[1] {
         Entry::Delta {
             path,
             adds,
@@ -3298,6 +3405,147 @@ fn hunks_from_diff_strips_the_number_column_and_counts() {
     assert_eq!(hunks[2].kind, HunkKind::Context);
     assert_eq!(hunks[2].text, "kept");
     assert_eq!(hunks[3].text, "…");
+}
+
+#[test]
+fn a_model_switch_is_confirmed_as_the_elbow_row_under_its_command() {
+    let mut m = model();
+    m.model_title = "Opus 5.5".into();
+    assert_eq!(
+        model_set(&m, Some(Ok(()))),
+        Done::Set {
+            text: "Set model to Opus 5.5 and saved as your default for new sessions".into(),
+            accent: Some("Opus 5.5".into()),
+        }
+    );
+    let Done::Set { text, .. } = model_set(&m, None) else {
+        panic!("a session-only switch is still a confirmation");
+    };
+    assert_eq!(text, "Set model to Opus 5.5 for this session only");
+    let Done::Set { text, .. } = model_set(&m, Some(Err("read-only".into()))) else {
+        panic!("a switch that could not be saved is still a confirmation");
+    };
+    assert_eq!(text, "Set model to Opus 5.5 for this run only (read-only)");
+}
+
+#[test]
+fn an_effort_change_is_confirmed_without_an_accent() {
+    assert_eq!(
+        effort_set("high", Ok(())),
+        Done::Set {
+            text: "Set effort to high and saved as your default for new sessions".into(),
+            accent: None,
+        }
+    );
+    let Done::Set { text, .. } = effort_set("low", Err("disk full".into())) else {
+        panic!("an unsaved change is still a confirmation");
+    };
+    assert_eq!(text, "Set effort to low for this run only (disk full)");
+}
+
+#[test]
+fn a_confirmed_change_lands_under_the_slash_command_that_asked_for_it() {
+    let mut m = model();
+    m.model_title = "Opus 5.5".into();
+    m.composer.push_str("/model opus-5-5");
+    m.submit();
+    let Done::Set { text, accent } = model_set(&m, Some(Ok(()))) else {
+        panic!("a confirmation");
+    };
+    m.confirm(&text, accent.as_deref());
+    let rows: Vec<String> = davinci_tui::davinci::views::transcript::lines(&m, &m.transcript, 100)
+        .iter()
+        .map(|row| row.to_string().replace('\u{a0}', " "))
+        .collect();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows[0].starts_with("❯ /model opus-5-5"), "{rows:?}");
+    assert_eq!(
+        rows[1],
+        "  ⎿  Set model to Opus 5.5 and saved as your default for new sessions"
+    );
+}
+
+#[test]
+fn an_edit_card_has_no_blank_row_or_estimate_between_it_and_its_call() {
+    let mut m = model();
+    let mut turn = Turn::default();
+    apply(
+        &mut m,
+        &mut turn,
+        &AgentEvent::ToolExecutionStart {
+            tool_call_id: "1".into(),
+            tool_name: "edit".into(),
+            args: json!({"path": "src/lib.rs", "edits": [{"oldText": "a", "newText": "b\nc"}]}),
+        },
+    );
+    apply(
+        &mut m,
+        &mut turn,
+        &AgentEvent::ToolExecutionEnd {
+            tool_call_id: "1".into(),
+            tool_name: "edit".into(),
+            result: json!("Successfully replaced text in src/lib.rs."),
+            is_error: false,
+            details: Some(json!({
+                "path": "src/lib.rs",
+                "diff": " 9 fn x() {\n-10 a\n+10 b\n+11 c\n 11 }"
+            })),
+        },
+    );
+    let rows: Vec<String> = davinci_tui::davinci::views::transcript::lines(&m, &m.transcript, 100)
+        .iter()
+        .take(7)
+        .map(|row| {
+            row.to_string()
+                .replace('\u{a0}', " ")
+                .trim_end()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "● Update(src/lib.rs)",
+            "  ⎿  Added 2 lines, removed 1 line",
+            "       9  fn x() {",
+            "      10 -a",
+            "      10 +b",
+            "      11 +c",
+            "      12  }",
+        ]
+    );
+}
+
+#[test]
+fn hunks_from_diff_numbers_context_rows_in_the_new_file() {
+    // The tool numbers a context row in the old file, an added row in the new
+    // one. After two additions the context below sits two lines further down;
+    // after a removal, one less.
+    let (_, _, hunks) = hunks_from_diff(
+        " 3 a
++4 x
++5 y
+ 4 b
+-5 c
+ 6 d",
+    );
+    let numbers: Vec<Option<u32>> = hunks.iter().map(|hunk| hunk.line).collect();
+    assert_eq!(
+        numbers,
+        [Some(3), Some(4), Some(5), Some(6), Some(5), Some(7)]
+    );
+    let kinds: Vec<HunkKind> = hunks.iter().map(|hunk| hunk.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            HunkKind::Context,
+            HunkKind::Add,
+            HunkKind::Add,
+            HunkKind::Context,
+            HunkKind::Del,
+            HunkKind::Context
+        ]
+    );
 }
 
 #[test]
@@ -4238,7 +4486,7 @@ fn a_finished_compaction_keeps_the_chat_and_opens_no_sheet() {
         tokens_after: 0,
         usage: None,
     };
-    let done = after_compaction(ExtensionHost::default(), &agent, &mut m, result, 5);
+    let done = after_compaction(ExtensionHost::default(), &agent, &mut m, result, 5, 24_600);
     assert!(matches!(done, Done::Opened));
     assert!(!m.running);
     assert!(m.compaction.is_none() && m.overlay.is_none());
@@ -4268,9 +4516,88 @@ fn a_failed_compaction_says_why() {
         tokens_after: 0,
         usage: None,
     };
-    let done = after_compaction(ExtensionHost::default(), &agent, &mut m, result, 0);
+    let done = after_compaction(ExtensionHost::default(), &agent, &mut m, result, 0, 0);
     assert!(matches!(done, Done::Note(text) if text == "nothing to compact"));
     assert!(m.transcript.is_empty());
+}
+
+/// Run `after_compaction` the way `/compact` does: the whole-context estimate
+/// is taken before the agent's messages are replaced by the summary, while the
+/// result carries the messages-only count the compactor reports. Returns the
+/// row text with the two whole-context numbers it must show.
+fn compaction_row_for(agent: &mut Agent) -> (String, u64, u64) {
+    let context_before = agent.estimated_context_tokens();
+    let messages_before = agent.messages.len();
+    let messages_only = davinci_agent::estimate_context_tokens(&agent.messages);
+    assert!(
+        messages_only < context_before,
+        "the fixture needs system and tool overhead outside the messages"
+    );
+    let summary = davinci_agent::compaction_context_message("short summary");
+    agent.messages = vec![summary];
+    let result = davinci_agent::CompactionResult {
+        summary: "short summary".into(),
+        messages: agent.messages.clone(),
+        compacted: true,
+        details: Default::default(),
+        first_kept_entry_id: String::new(),
+        tokens_before: messages_only,
+        tokens_after: 0,
+        usage: None,
+    };
+    let after = agent.estimated_context_tokens();
+    let mut m = model();
+    let done = after_compaction(
+        ExtensionHost::default(),
+        agent,
+        &mut m,
+        result,
+        messages_before,
+        context_before,
+    );
+    assert!(matches!(done, Done::Opened));
+    (format!("{:?}", m.transcript), context_before, after)
+}
+
+fn agent_with_overhead() -> Agent {
+    let mut agent = Agent::new("system prompt line. ".repeat(2_000));
+    agent.messages = (0..6)
+        .map(|i| davinci_ai::ChatMessage::text("user", format!("message {i} {}", "x".repeat(400))))
+        .collect();
+    agent
+}
+
+#[test]
+fn the_compact_row_compares_whole_context_on_both_sides_of_the_arrow() {
+    let format = davinci_tui::davinci::views::context_usage::format_tokens;
+    let mut agent = agent_with_overhead();
+    let (shown, before, after) = compaction_row_for(&mut agent);
+    assert!(before >= after, "compaction must not read as growth");
+    assert!(
+        shown.contains(&format!(
+            "context compacted · {} → {} tokens",
+            format(before),
+            format(after)
+        )),
+        "{shown}"
+    );
+}
+
+#[test]
+fn the_compact_row_compares_whole_context_in_context_vm_active_mode() {
+    let format = davinci_tui::davinci::views::context_usage::format_tokens;
+    let mut agent = agent_with_overhead();
+    agent.set_context_vm_mode(davinci_agent::runtime::ContextVmMode::Active);
+    let (shown, before, after) = compaction_row_for(&mut agent);
+    assert!(before >= after, "compaction must not read as growth");
+    assert!(
+        shown.contains(&format!(
+            "context compacted · {} → {} tokens",
+            format(before),
+            format(after)
+        )),
+        "{shown}"
+    );
 }
 
 #[test]
@@ -4476,7 +4803,7 @@ fn esc_in_a_worker_view_returns_to_main_and_never_interrupts_or_drops_the_queue(
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
 
     // In the worker's view Esc only goes back.
-    assert!(!mid_turn_key(&mut model, esc, &abort));
+    assert!(!mid_turn_key(&mut model, esc, &abort, &Mutex::new(None)));
     assert!(
         !abort.load(Ordering::Relaxed),
         "Esc in a worker view interrupted the turn"
@@ -4485,7 +4812,7 @@ fn esc_in_a_worker_view_returns_to_main_and_never_interrupts_or_drops_the_queue(
     assert_eq!(model.queued, vec!["after this".to_string()]);
 
     // On main it keeps interrupting, and the queued follow-up survives.
-    assert!(!mid_turn_key(&mut model, esc, &abort));
+    assert!(!mid_turn_key(&mut model, esc, &abort, &Mutex::new(None)));
     assert!(abort.load(Ordering::Relaxed));
     assert_eq!(model.queued, vec!["after this".to_string()]);
 }
@@ -4555,7 +4882,7 @@ fn mid_turn_esc_in_a_worker_view_with_a_popup_only_closes_the_popup() {
     assert!(model.suggestions.is_some(), "the popup must be open");
     let abort = Arc::new(AtomicBool::new(false));
 
-    assert!(!mid_turn_key(&mut model, esc(), &abort));
+    assert!(!mid_turn_key(&mut model, esc(), &abort, &Mutex::new(None)));
     assert!(!abort.load(Ordering::Relaxed), "Esc interrupted main");
     assert!(model.suggestions.is_none());
     assert_eq!(
@@ -4566,7 +4893,7 @@ fn mid_turn_esc_in_a_worker_view_with_a_popup_only_closes_the_popup() {
     assert_eq!(model.queued, vec!["later".to_string()]);
 
     // Next Esc goes back to main, still without touching the turn.
-    assert!(!mid_turn_key(&mut model, esc(), &abort));
+    assert!(!mid_turn_key(&mut model, esc(), &abort, &Mutex::new(None)));
     assert!(!abort.load(Ordering::Relaxed));
     assert_eq!(model.viewing_worker(), None);
 }
@@ -4578,7 +4905,7 @@ fn mid_turn_esc_in_a_worker_view_with_an_overlay_only_closes_the_overlay() {
     assert!(model.overlay.is_some());
     let abort = Arc::new(AtomicBool::new(false));
 
-    assert!(!mid_turn_key(&mut model, esc(), &abort));
+    assert!(!mid_turn_key(&mut model, esc(), &abort, &Mutex::new(None)));
     assert!(!abort.load(Ordering::Relaxed), "Esc interrupted main");
     assert!(model.overlay.is_none());
     assert_eq!(model.viewing_worker(), Some("w1"));
@@ -4592,7 +4919,7 @@ fn mid_turn_ctrl_c_in_a_worker_view_still_interrupts_main_and_says_so() {
         crossterm::event::KeyCode::Char('c'),
         crossterm::event::KeyModifiers::CONTROL,
     );
-    assert!(!mid_turn_key(&mut model, ctrl_c, &abort));
+    assert!(!mid_turn_key(&mut model, ctrl_c, &abort, &Mutex::new(None)));
     assert!(abort.load(Ordering::Relaxed));
     assert!(model
         .toast

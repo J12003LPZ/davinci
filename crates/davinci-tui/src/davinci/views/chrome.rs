@@ -285,7 +285,7 @@ fn context_fold(model: &Model, left_width: usize) -> Vec<Span<'static>> {
     .unwrap_or_default()
 }
 
-fn key_label(model: &Model, action: &str) -> Option<String> {
+pub(super) fn key_label(model: &Model, action: &str) -> Option<String> {
     model
         .keybindings
         .keys_for(action)

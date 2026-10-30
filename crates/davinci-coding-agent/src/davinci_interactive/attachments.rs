@@ -25,6 +25,15 @@ pub(super) fn retained(text: &str, images: &[MessageContent]) -> Vec<MessageCont
         .collect()
 }
 
+/// The chips of the pasted images that go with `text`, in paste order: what
+/// the transcript lists under the prompt as `⎿ [Image #1]`.
+pub(super) fn chips_in(text: &str, images: &[MessageContent]) -> Vec<String> {
+    (1..=images.len())
+        .map(chip)
+        .filter(|chip| text.contains(chip))
+        .collect()
+}
+
 /// Whether `text` still shows a chip of one of `images`.
 pub(super) fn any_chip(text: &str, images: &[MessageContent]) -> bool {
     !retained(text, images).is_empty()
@@ -64,6 +73,19 @@ mod tests {
         assert!(retained("", &images).is_empty());
         // A partly deleted chip no longer counts.
         assert!(retained("[Image #2", &images).is_empty());
+    }
+
+    #[test]
+    fn the_transcript_lists_one_chip_per_image_still_in_the_text() {
+        let images = [image("a"), image("b"), image("c")];
+        assert_eq!(
+            chips_in("compare [Image #1] with [Image #3]", &images),
+            ["[Image #1]", "[Image #3]"]
+        );
+        assert!(chips_in("no chips here", &images).is_empty());
+        assert!(chips_in("[Image #1]", &[]).is_empty());
+        // `#1` is not `#10`.
+        assert_eq!(chips_in("[Image #10]", &images), Vec::<String>::new());
     }
 
     #[test]

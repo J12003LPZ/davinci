@@ -612,6 +612,10 @@ pub struct Agent {
     pub agent_profile_models: Option<AgentProfileModels>,
     /// Typed trusted-host responder; takes precedence over the legacy approver.
     pub approval_responder: Option<approval::ApprovalResponder>,
+    /// A mode the host asked for while a turn owns the agent. The host holds a
+    /// clone of this slot; the turn loop applies it through
+    /// `set_permission_mode` before dispatching the next batch of tool calls.
+    pub pending_permission_mode: Arc<Mutex<Option<PermissionMode>>>,
     /// The responder is an unattended policy, not a person. A denial it
     /// returns tells the model the run cannot ask, not that a user declined.
     pub headless_approval: bool,
@@ -848,6 +852,7 @@ impl Agent {
             permissions: Arc::new(PermissionState::new(PermissionPolicy::default())),
             approver: None,
             approval_responder: None,
+            pending_permission_mode: Arc::new(Mutex::new(None)),
             headless_approval: false,
             output_schema: None,
             approval_registry: Arc::new(approval::ApprovalRegistry::default()),
@@ -2274,6 +2279,18 @@ impl Agent {
             policy.mode = mode;
         }
         self.reset_system_prompt_to_base();
+    }
+
+    /// Apply the mode a host queued while a turn was running, through the same
+    /// entry point as an idle change. Returns the mode applied, if any.
+    pub fn apply_pending_permission_mode(&mut self) -> Option<PermissionMode> {
+        let mode = self
+            .pending_permission_mode
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take()?;
+        self.set_permission_mode(mode);
+        Some(mode)
     }
 
     pub fn cycle_permission_mode(&mut self) -> PermissionMode {

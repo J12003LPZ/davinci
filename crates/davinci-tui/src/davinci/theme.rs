@@ -517,9 +517,9 @@ const CC_DARK: Cc = Cc {
     accept_edits: rgb(0xAF87FF),
     diff_text: rgb(0xF8F8F2),
     diff_add: rgb(0x50C850),
-    diff_add_bg: rgb(0x022800),
+    diff_add_bg: rgb(0x225C2B),
     diff_del: rgb(0xDC5A5A),
-    diff_del_bg: rgb(0x3D0100),
+    diff_del_bg: rgb(0x7A2936),
     code_keyword: Color::Blue,
     code_string: Color::Red,
     code_macro: Color::Cyan,
@@ -555,7 +555,7 @@ const CC_DARK_256: Cc = Cc {
     diff_add: Color::Indexed(77),
     diff_add_bg: Color::Indexed(22),
     diff_del: Color::Indexed(167),
-    diff_del_bg: Color::Indexed(52),
+    diff_del_bg: Color::Indexed(89),
     code_keyword: Color::Blue,
     code_string: Color::Red,
     code_macro: Color::Cyan,
@@ -1117,6 +1117,25 @@ mod tests {
         assert_eq!(auto_variant_name(Some("15;0")), "dark");
         assert_eq!(auto_variant_name(Some("default;default")), "dark");
         assert_eq!(auto_variant_name(None), "dark");
+    }
+
+    #[test]
+    fn diff_rows_use_the_reference_backgrounds_at_every_depth() {
+        let cc = Theme::da_vinci(ColorDepth::TrueColor, false).cc();
+        assert_eq!(cc.diff_add_bg, Color::Rgb(0x22, 0x5C, 0x2B));
+        assert_eq!(cc.diff_del_bg, Color::Rgb(0x7A, 0x29, 0x36));
+        // The nearest cells of the 256-color cube: (0,95,0) and (135,0,95).
+        let cc = Theme::da_vinci(ColorDepth::Ansi256, false).cc();
+        assert_eq!(cc.diff_add_bg, Color::Indexed(22));
+        assert_eq!(cc.diff_del_bg, Color::Indexed(89));
+        // Basic and no-color terminals carry the change by sign and ink only.
+        for theme in [
+            Theme::da_vinci(ColorDepth::Basic, false),
+            Theme::da_vinci(ColorDepth::TrueColor, true),
+        ] {
+            assert_eq!(theme.cc().diff_add_bg, Color::Reset);
+            assert_eq!(theme.cc().diff_del_bg, Color::Reset);
+        }
     }
 
     #[test]

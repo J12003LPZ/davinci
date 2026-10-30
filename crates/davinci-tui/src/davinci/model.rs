@@ -619,6 +619,16 @@ impl Hunk {
 /// `instrumenta`, which is also the fallback instrument of real tool calls.
 pub const NOTICE_INSTRUMENT: &str = "notice";
 
+/// The shell instrument for a POSIX shell: its calls read `Bash(...)`.
+pub const SHELL_INSTRUMENT: &str = "manus";
+/// The shell instrument for a command that ran in PowerShell: `PowerShell(...)`.
+pub const POWERSHELL_INSTRUMENT: &str = "manus-powershell";
+
+/// Whether `instrument` is one of the two shells.
+pub fn is_shell_instrument(instrument: &str) -> bool {
+    instrument == SHELL_INSTRUMENT || instrument == POWERSHELL_INSTRUMENT
+}
+
 /// A block in the transcript. Blocks are separated by one blank row; nothing
 /// inside a block is (design.md §3).
 #[derive(Debug, Clone)]
@@ -649,6 +659,14 @@ pub enum Entry {
         output: Vec<String>,
     },
     Detail(String),
+    /// A line hung from the prompt above it by the elbow: a command's outcome
+    /// (`Set model to Opus 5.5 and saved as your default for new sessions`) or
+    /// an attached image (`[Image #1]`). `accent` is a piece of `text` drawn
+    /// in the accent ink, the model's name in the first case.
+    Result {
+        text: String,
+        accent: Option<String>,
+    },
     /// A failure detail: what went wrong, then the subject — `1 failed
     /// store::roundtrip_windows_paths` (`1g`).
     Failure {
@@ -676,6 +694,11 @@ pub enum Entry {
     Done {
         verb: String,
         seconds: u64,
+        /// The local time the turn ended, as `10:03 PM`; `None` when the
+        /// clock is unavailable.
+        at: Option<String>,
+        /// Background shells still running when the turn ended.
+        shells: usize,
         /// The tick the turn settled on; the marker cools from the accent
         /// to the quiet ink over the next couple of seconds.
         landed: u64,
@@ -745,6 +768,13 @@ impl Entry {
 
     pub fn detail(text: &str) -> Self {
         Entry::Detail(super::sanitize::terminal_safe(text).into_owned())
+    }
+
+    pub fn result(text: &str, accent: Option<&str>) -> Self {
+        Entry::Result {
+            text: super::sanitize::terminal_safe(text).into_owned(),
+            accent: accent.map(|accent| super::sanitize::terminal_safe(accent).into_owned()),
+        }
     }
 
     pub fn failure(what: &str, subject: &str) -> Self {
@@ -4566,6 +4596,52 @@ impl Model {
         self.running = true;
     }
 
+    /// Hang a command's outcome from the prompt that asked for it:
+    /// `❯ /model` then `⎿ Set model to …`, flush, with no blank row and no
+    /// idle agent anchor between. A change with no command above it (a
+    /// shortcut, a picker opened by key) gets a row of its own.
+    pub fn confirm(&mut self, text: &str, accent: Option<&str>) {
+        self.running = false;
+        let command = self
+            .transcript
+            .iter()
+            .rposition(|entry| matches!(entry, Entry::User(prompt) if prompt.trim_start().starts_with('/')))
+            .filter(|&index| {
+                self.transcript[index + 1..]
+                    .iter()
+                    .all(|entry| matches!(entry, Entry::Gap | Entry::Agent(_)))
+            });
+        match command {
+            Some(index) => self.transcript.truncate(index + 1),
+            None if !matches!(self.transcript.last(), None | Some(Entry::Gap)) => {
+                self.transcript.push(Entry::Gap);
+            }
+            None => {}
+        }
+        self.transcript.push(Entry::result(text, accent));
+    }
+
+    /// One `⎿ [Image #N]` row per image sent with the prompt just submitted,
+    /// directly under it. Does nothing when the newest entry that is a prompt
+    /// is not the one the chips came from.
+    pub fn attach_chips(&mut self, prompt: &str, chips: &[String]) {
+        let prompt = super::sanitize::terminal_safe(prompt);
+        let Some(index) = self
+            .transcript
+            .iter()
+            .rposition(|entry| matches!(entry, Entry::User(_)))
+            .filter(|&index| {
+                matches!(&self.transcript[index], Entry::User(text) if text.as_str() == prompt.as_ref())
+            })
+        else {
+            return;
+        };
+        for (at, chip) in chips.iter().enumerate() {
+            self.transcript
+                .insert(index + 1 + at, Entry::result(chip, None));
+        }
+    }
+
     /// Set the composer aside to be sent when the running turn is over.
     /// Returns whether anything was queued. Queued lines join the history
     /// too: they were typed and sent, only later.
@@ -4742,6 +4818,99 @@ mod tests {
             44,
             true,
         )
+    }
+
+    fn rows_of(m: &Model) -> Vec<String> {
+        m.transcript
+            .iter()
+            .map(|entry| match entry {
+                Entry::Gap => "·gap".to_string(),
+                Entry::User(text) => format!("user {text}"),
+                Entry::Agent(_) => "agent".to_string(),
+                Entry::Result { text, .. } => format!("result {text}"),
+                Entry::Prose(text) => format!("prose {text}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_confirmation_replaces_the_idle_tail_of_the_command_that_asked() {
+        let mut m = model(100);
+        m.transcript.push(Entry::prose("earlier reply"));
+        m.composer.push_str("/model");
+        m.submit();
+        assert!(m.running);
+        m.confirm("Set model to Opus 5.5", Some("Opus 5.5"));
+        assert!(!m.running);
+        assert_eq!(
+            rows_of(&m),
+            [
+                "prose earlier reply",
+                "·gap",
+                "user /model",
+                "result Set model to Opus 5.5"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_confirmation_with_no_command_above_it_gets_a_row_of_its_own() {
+        let mut m = model(100);
+        m.transcript.push(Entry::user("fix the bug"));
+        m.transcript.push(Entry::Gap);
+        m.transcript.push(Entry::prose("done"));
+        m.confirm("Set model to Opus 5.5", None);
+        assert_eq!(
+            rows_of(&m),
+            [
+                "user fix the bug",
+                "·gap",
+                "prose done",
+                "·gap",
+                "result Set model to Opus 5.5"
+            ]
+        );
+        // A command that has other output after it is not hung from either.
+        let mut m = model(100);
+        m.transcript.push(Entry::user("/model"));
+        m.transcript.push(Entry::prose("a reply"));
+        m.confirm("Set model to X", None);
+        assert_eq!(
+            rows_of(&m),
+            [
+                "user /model",
+                "prose a reply",
+                "·gap",
+                "result Set model to X"
+            ]
+        );
+        // Nothing yet in the log: no leading blank row.
+        let mut m = model(100);
+        m.confirm("Set model to X", None);
+        assert_eq!(rows_of(&m), ["result Set model to X"]);
+    }
+
+    #[test]
+    fn image_chips_go_under_the_prompt_they_came_from_and_only_that_one() {
+        let mut m = model(100);
+        m.composer.push_str("[Image #1] what is this");
+        m.submit();
+        m.attach_chips("[Image #1] what is this", &["[Image #1]".into()]);
+        assert_eq!(
+            rows_of(&m),
+            [
+                "user [Image #1] what is this",
+                "result [Image #1]",
+                "·gap",
+                "agent"
+            ]
+        );
+        // A prompt that is not the newest one (an extension's) gets nothing.
+        let mut m = model(100);
+        m.transcript.push(Entry::user("older"));
+        m.attach_chips("something else", &["[Image #1]".into()]);
+        assert_eq!(rows_of(&m), ["user older"]);
     }
 
     #[test]

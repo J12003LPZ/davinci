@@ -48,6 +48,7 @@ fn main() {
             50,
             false,
         ),
+        ("cc", "Claude Code parity rows", 120, 40, false),
         ("1c", "Plan", 100, 30, false),
         ("1d", "Command palette", 100, 30, false),
         ("1e", "Code and changes split", 160, 40, false),

@@ -223,7 +223,8 @@ fn wait_native_decision(
 /// Manus; everything else the agent reaches for is Instrumenta.
 pub fn instrument_of(tool_name: &str) -> &'static str {
     match tool_name {
-        "bash" | "powershell" | "job_output" | "job_kill" => "manus",
+        "powershell" => davinci_tui::davinci::model::POWERSHELL_INSTRUMENT,
+        "bash" | "job_output" | "job_kill" => davinci_tui::davinci::model::SHELL_INSTRUMENT,
         name if name.starts_with("memory") => "memoria",
         name if name.starts_with("graph") => "grafo",
         name if name.starts_with("agent_") || name.starts_with("task_") => "societas",
@@ -785,9 +786,12 @@ impl Turn {
                     })
                     .unwrap_or_default();
                 let (adds, dels, hunks) = hunks_from_diff(diff);
-                model.transcript.insert(index + 1, Entry::Gap);
+                // The card hangs straight from the call's line, as
+                // `Update(path)` / `⎿ Added 27 lines` / numbered rows. Its
+                // own summary and rows stand in for the estimate counted
+                // from the request and for the tool's text.
                 model.transcript.insert(
-                    index + 2,
+                    index + 1,
                     Entry::Delta {
                         path,
                         adds,
@@ -795,11 +799,13 @@ impl Turn {
                         hunks,
                     },
                 );
-                self.shift(index, 2);
-                if let Some(Entry::Tool { summary, .. }) = model.transcript.get_mut(index) {
-                    if summary.is_none() {
-                        *summary = Some(format!("+{adds} -{dels}"));
-                    }
+                self.shift(index, 1);
+                if let Some(Entry::Tool {
+                    summary, output, ..
+                }) = model.transcript.get_mut(index)
+                {
+                    *summary = None;
+                    output.clear();
                 }
             }
         }
@@ -1250,8 +1256,11 @@ fn todo_state(status: davinci_agent::TodoStatus) -> State {
 }
 
 /// The Δ block of an edit's diff, as the tool returns it (`+12 text`,
-/// `-12 text`, ` 12 text`, `    ...`): the numbers come off, additions and
-/// deletions are counted, `...` becomes a context row of its own.
+/// `-12 text`, ` 12 text`, `    ...`): additions and deletions are counted,
+/// `...` becomes a context row of its own. The tool numbers an added row in
+/// the new file but a removed or context row in the old one; a context row
+/// is renumbered into the new file (shifted by what was added or removed
+/// above it) so the gutter reads downward the way the file does.
 pub fn hunks_from_diff(diff: &str) -> (u32, u32, Vec<Hunk>) {
     let mut adds = 0u32;
     let mut dels = 0u32;
@@ -1291,6 +1300,12 @@ pub fn hunks_from_diff(diff: &str) -> (u32, u32, Vec<Hunk>) {
         if kind == HunkKind::Context && text.trim() == "..." {
             hunks.push(Hunk::new(HunkKind::Context, "…"));
         } else if let Some(line_number) = line_number {
+            let line_number = if kind == HunkKind::Context {
+                let shifted = i64::from(line_number) + i64::from(adds) - i64::from(dels);
+                u32::try_from(shifted.max(1)).unwrap_or(line_number)
+            } else {
+                line_number
+            };
             hunks.push(Hunk::at(kind, line_number, text));
         } else {
             hunks.push(Hunk::new(kind, text));
@@ -1530,10 +1545,25 @@ fn double_escape(
     doubled
 }
 
+/// Cycle the permission mode while a turn owns the agent. The next mode comes
+/// from what the footer shows (a queued one, else the model's), the footer
+/// changes at once, and the worker applies the queued mode before its next
+/// batch of tool calls.
+fn cycle_permission_mode_mid_turn(model: &mut Model, pending: &Mutex<Option<PermissionMode>>) {
+    let mut slot = pending.lock().unwrap_or_else(|err| err.into_inner());
+    let shown = (*slot)
+        .or_else(|| PermissionMode::parse(&model.permission_mode))
+        .unwrap_or_default();
+    let next = shown.next();
+    *slot = Some(next);
+    model.permission_mode = next.as_str().to_string();
+}
+
 fn mid_turn_key(
     model: &mut Model,
     key: crossterm::event::KeyEvent,
     abort: &Arc<AtomicBool>,
+    pending_mode: &Mutex<Option<PermissionMode>>,
 ) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
     // The roster and a worker's view own their keys first: Esc in a worker's
@@ -1545,6 +1575,12 @@ fn mid_turn_key(
     if let Some(data) = davinci_tui::key_event_bytes(&key) {
         if model.keybindings.matches(&data, "davinci.tools.expand") {
             model.show_tool_output = !model.show_tool_output;
+            return false;
+        }
+        if model.overlay.is_none()
+            && davinci_tui::davinci::app::permission_cycle_chord(model, key, &data)
+        {
+            cycle_permission_mode_mid_turn(model, pending_mode);
             return false;
         }
         if key.code != KeyCode::Esc
@@ -1607,7 +1643,19 @@ fn compacting_key(model: &mut Model, key: crossterm::event::KeyEvent) {
         return;
     }
     // The flag is never read: the keys that would raise it are gone above.
-    let _ = mid_turn_key(model, key, &Arc::new(AtomicBool::new(false)));
+    // Compaction holds the agent with no turn loop to apply a queued mode, so
+    // the chord is left alone rather than changing only the footer.
+    if davinci_tui::key_event_bytes(&key)
+        .is_some_and(|data| davinci_tui::davinci::app::permission_cycle_chord(model, key, &data))
+    {
+        return;
+    }
+    let _ = mid_turn_key(
+        model,
+        key,
+        &Arc::new(AtomicBool::new(false)),
+        &Mutex::new(None),
+    );
 }
 
 /// A turn and everything queued behind it, in the order it was typed.
@@ -1654,6 +1702,10 @@ fn run_turn(
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>();
     let abort = Arc::new(AtomicBool::new(false));
     agent.abort_signal = Some(abort.clone());
+    // The slot the worker drains before each batch of tool calls. Anything
+    // left from an earlier turn was already applied at that turn's end.
+    let pending_mode = agent.pending_permission_mode.clone();
+    *pending_mode.lock().unwrap_or_else(|err| err.into_inner()) = None;
     agent.event_sink = Some(EventSink(Arc::new(move |event: &AgentEvent| {
         let _ = event_tx.send(event.clone());
     })));
@@ -1899,7 +1951,7 @@ fn run_turn(
                     crossterm::event::Event::Key(key)
                         if key.kind != crossterm::event::KeyEventKind::Release =>
                     {
-                        let hung = mid_turn_key(model, key, &abort);
+                        let hung = mid_turn_key(model, key, &abort, &pending_mode);
                         if let Some(runtime) = &roster_runtime {
                             roster_host.pump(runtime, model);
                         }
@@ -1999,6 +2051,13 @@ fn run_turn(
             model.transcript.push(Entry::Done {
                 verb: working.past_verb().to_string(),
                 seconds: started.elapsed().as_secs(),
+                at: davinci_sys::clock::local_clock_label(),
+                shells: agent
+                    .tool_context
+                    .jobs
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .running(),
                 landed: model.tick,
             });
         }
@@ -2047,6 +2106,10 @@ fn run_turn(
     }
 
     agent.abort_signal = None;
+    // A cycle pressed after the last tool batch has not reached the agent yet.
+    // Apply it, then show what the agent holds so the two never disagree.
+    agent.apply_pending_permission_mode();
+    sync_permission_state(agent, model);
     agent.event_sink = None;
     agent.approver = None;
     agent.approval_responder = None;
@@ -2986,6 +3049,13 @@ pub fn drain_ui_calls(model: &mut Model, host: &Arc<Mutex<ExtensionHost>>) -> Op
 pub enum Done {
     /// Prose in the transcript.
     Said(String),
+    /// A change made, confirmed on the elbow row under the command that asked
+    /// for it (`⎿ Set model to Opus 5.5 and saved as your default for new
+    /// sessions`). `accent` is the part of `text` drawn in the accent ink.
+    Set {
+        text: String,
+        accent: Option<String>,
+    },
     /// A line that carries the attention glyph: a refusal, a usage error, a
     /// cancellation (design.md §4 — the glyph, not the colour, says so).
     Note(String),
@@ -3950,6 +4020,7 @@ fn after_compaction(
     model: &mut Model,
     result: davinci_agent::CompactionResult,
     messages_before: usize,
+    context_before: u64,
 ) -> Done {
     use crate::extension_host::ExtensionEvent;
     if !result.compacted {
@@ -3959,13 +4030,14 @@ fn after_compaction(
         return Done::Note(result.summary);
     }
     host.emit(ExtensionEvent::SessionCompact);
-    // Measured the way `tokens_before` was, so the drop is the real one.
+    // Both ends are the whole context, the number `/context` reports.
+    // `result.tokens_before` counts messages only, so it is not the "before".
     let after = agent.estimated_context_tokens();
     let folded = messages_before.saturating_sub(agent.messages.len());
     let format = davinci_tui::davinci::views::context_usage::format_tokens;
     let mut row = format!(
         "{COMPACTED} · {} → {} tokens",
-        format(result.tokens_before),
+        format(context_before),
         format(after),
     );
     // A Context VM fold checkpoints without dropping messages.
@@ -4030,6 +4102,7 @@ pub fn perform(
                 return Ok(Done::Note("compaction cancelled".into()));
             };
             let messages_before = agent.messages.len();
+            let context_before = agent.estimated_context_tokens();
             let result = agent.compact(instructions.as_deref());
             Ok(after_compaction(
                 host,
@@ -4037,6 +4110,7 @@ pub fn perform(
                 model,
                 result,
                 messages_before,
+                context_before,
             ))
         }
         SlashAction::Export(path) => {
@@ -4209,14 +4283,7 @@ pub fn perform(
                 model: agent.model_id.clone(),
             });
             adopt_model(parsed, agent, model);
-            let remembered = persist_model_choice(agent);
-            Ok(Done::Said(match remembered {
-                Ok(()) => format!("model {} / {}", agent.provider, agent.model_id),
-                Err(err) => format!(
-                    "model {} / {} · this run only ({err})",
-                    agent.provider, agent.model_id
-                ),
-            }))
+            Ok(model_set(model, Some(persist_model_choice(agent))))
         }
         // Bare `/effort`: the model picker opens on the current model, whose
         // effort row adjusts with ←/→.
@@ -4239,13 +4306,7 @@ pub fn perform(
                 &agent.model_id,
                 agent.thinking_level.as_str(),
             );
-            Ok(Done::Said(match remembered {
-                Ok(()) => format!("thinking level {}", agent.thinking_level.as_str()),
-                Err(err) => format!(
-                    "thinking level {} · this run only ({err})",
-                    agent.thinking_level.as_str()
-                ),
-            }))
+            Ok(effort_set(agent.thinking_level.as_str(), remembered))
         }
         SlashAction::Tree => {
             let mut host = crate::loaded_extension_host(parsed);
@@ -4744,6 +4805,33 @@ fn supported_thinking_choice(
         .find(|level| rank(*level) <= rank(preferred))
         .or_else(|| supported.first().copied())
         .unwrap_or(davinci_protocol::ThinkingLevel::Off)
+}
+
+/// The elbow row under `/model` once the switch is made: the model's name in
+/// the accent ink, and where the choice was kept. `saved` is `None` for a
+/// switch that was only for this session.
+fn model_set(model: &Model, saved: Option<Result<(), String>>) -> Done {
+    let title = model.model_title.clone();
+    let text = match saved {
+        Some(Ok(())) => format!("Set model to {title} and saved as your default for new sessions"),
+        Some(Err(err)) => format!("Set model to {title} for this run only ({err})"),
+        None => format!("Set model to {title} for this session only"),
+    };
+    Done::Set {
+        text,
+        accent: Some(title),
+    }
+}
+
+/// The elbow row under `/effort` once the level is set.
+fn effort_set(level: &str, saved: Result<(), String>) -> Done {
+    Done::Set {
+        text: match saved {
+            Ok(()) => format!("Set effort to {level} and saved as your default for new sessions"),
+            Err(err) => format!("Set effort to {level} for this run only ({err})"),
+        },
+        accent: None,
+    }
 }
 
 fn adopt_model(parsed: &crate::args::Args, agent: &mut Agent, model: &mut Model) {
@@ -9120,6 +9208,7 @@ impl Shell<'_> {
             return Next::Go;
         };
         let messages_before = self.agent.messages.len();
+        let context_before = self.agent.estimated_context_tokens();
         // Enter on `/compact` went through `Model::submit`, which marks a turn
         // running; this is not one, and nothing here can interrupt it.
         self.model.running = false;
@@ -9186,7 +9275,14 @@ impl Shell<'_> {
             let _ = self.terminal.set_progress(false);
         }
         let done = match outcome {
-            Ok(result) => after_compaction(host, self.agent, self.model, result, messages_before),
+            Ok(result) => after_compaction(
+                host,
+                self.agent,
+                self.model,
+                result,
+                messages_before,
+                context_before,
+            ),
             Err(_) => {
                 // The panic skipped the agent's own cleanup, and its message
                 // went to the screen behind the renderer.
@@ -9203,6 +9299,7 @@ impl Shell<'_> {
     fn finish(&mut self, done: Done) -> Next {
         match done {
             Done::Said(text) => self.say(&text),
+            Done::Set { text, accent } => self.model.confirm(&text, accent.as_deref()),
             Done::Note(text) => self.note(&text),
             Done::Opened => self.model.running = false,
             Done::Ask(question) => {
@@ -9504,6 +9601,8 @@ fn submit_prompt(shell: &mut Shell<'_>, text: &str, images: &[davinci_ai::Messag
     // `[Image #N]` chip is still in the text.
     let mut images = images.to_vec();
     images.extend(attachments::retained(text, shell.images));
+    let chips = attachments::chips_in(text, shell.images);
+    shell.model.attach_chips(text, &chips);
     // A prompt that is not the draft (an extension's, `/init`) leaves the
     // images the draft still shows, and their status line, for the draft's
     // own send.
@@ -9604,14 +9703,8 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
                 },
             );
             adopt_model(shell.parsed, shell.agent, shell.model);
-            match persist_model_choice(shell.agent) {
-                Ok(()) => shell.say(&format!("model {} / {}", item.provider, item.id)),
-                Err(err) => shell.say(&format!(
-                    "model {} / {} · this run only ({err})",
-                    item.provider, item.id
-                )),
-            }
-            Next::Go
+            let saved = persist_model_choice(shell.agent);
+            shell.finish(model_set(shell.model, Some(saved)))
         }
         Choice::Ask(index) => {
             let Some(question) = shell.pending.take() else {
@@ -9684,20 +9777,8 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
                 );
                 sync_thinking_state(shell.agent, shell.model);
             }
-            if session_only {
-                shell.say(&format!(
-                    "model {} / {} · this session only",
-                    row.provider, row.id
-                ));
-            } else {
-                match persist_model_choice(shell.agent) {
-                    Ok(()) => shell.say(&format!("model {} / {}", row.provider, row.id)),
-                    Err(err) => shell.say(&format!(
-                        "model {} / {} · this run only ({err})",
-                        row.provider, row.id
-                    )),
-                }
-            }
+            let saved = (!session_only).then(|| persist_model_choice(shell.agent));
+            shell.finish(model_set(shell.model, saved));
             refresh_thinking_sheet(shell.agent, shell.model);
             Next::Go
         }
@@ -9716,9 +9797,9 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
             shell.model.thinking_index = index;
             let action = crate::slash::SlashAction::SetThinking(level);
             match perform(shell.parsed, shell.agent, shell.model, action) {
-                Ok(Done::Said(text)) => {
+                Ok(done @ (Done::Said(_) | Done::Set { .. })) => {
                     shell.model.close();
-                    shell.say(&text);
+                    shell.finish(done);
                 }
                 Ok(Done::Note(text)) | Err(text) => shell.note(&text),
                 Ok(_) => {}

@@ -15,6 +15,40 @@ const EXTENSION_CONFLICT: &str =
 const POSITIONAL_CONFLICT: &str =
     "positional update targets cannot be combined with --self, --extensions, or --all";
 
+/// `--help` text for a package subcommand, or `None` when `command` is not one.
+pub fn package_command_help(command: &str) -> Option<&'static str> {
+    match command {
+        "install" => Some(
+            "Usage: davinci install <source> [-l|--local]\n\
+             Install a package from a local path, npm:<name>[@version], or a Git URL.\n\
+             -l, --local  install into the project instead of user settings (project must be trusted)",
+        ),
+        "remove" | "uninstall" => Some(
+            "Usage: davinci remove <source> [-l|--local]\n       davinci uninstall <source> [-l|--local]\n\
+             Remove an installed package.\n\
+             -l, --local  remove from the project instead of user settings (project must be trusted)",
+        ),
+        "update" => Some(
+            "Usage: davinci update [source] [--extensions|--extension <name>|--models|--all|--self] [--force]\n\
+             Update installed extensions (the default), or the surface you pick.\n\
+             [source], --extension <name>  update one extension\n\
+             --extensions                  update all extensions\n\
+             --models                      refresh model catalogs\n\
+             --all                         update extensions and refresh model catalogs\n\
+             --self                        not supported: prints how to reinstall davinci manually\n\
+             --force                       accepted, currently has no effect\n\
+             Conflicting selector combinations are rejected.",
+        ),
+        "list" => Some("Usage: davinci list\nList installed extensions."),
+        "config" => Some(
+            "Usage: davinci config [-l|--local]\n\
+             Show the package resource configuration panel.\n\
+             -l, --local  use the project scope instead of user settings",
+        ),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct UpdateFlags {
     self_flag: bool,
@@ -1092,6 +1126,52 @@ pub fn ensure_agent_dir(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn package_command_help_is_specific_per_command() {
+        let install = package_command_help("install").unwrap();
+        assert!(install.starts_with("Usage: davinci install <source>"));
+        let list = package_command_help("list").unwrap();
+        assert!(list.starts_with("Usage: davinci list"));
+        assert!(package_command_help("config")
+            .unwrap()
+            .starts_with("Usage: davinci config"));
+        assert_ne!(install, list);
+        assert_eq!(
+            package_command_help("remove"),
+            package_command_help("uninstall")
+        );
+        assert!(package_command_help("remove")
+            .unwrap()
+            .contains("davinci uninstall <source>"));
+        assert_eq!(package_command_help("bogus"), None);
+        assert_eq!(package_command_help("--help"), None);
+    }
+
+    #[test]
+    fn update_help_names_every_flag_the_parser_accepts() {
+        let help = package_command_help("update").unwrap();
+        for flag in [
+            "--self",
+            "--extensions",
+            "--models",
+            "--all",
+            "--force",
+            "--extension",
+        ] {
+            assert!(help.contains(flag), "update help is missing {flag}");
+            // The parser must accept it too, so the list cannot drift to flags that do nothing.
+            let args: Vec<String> = if flag == "--extension" {
+                vec![flag.into(), "x".into()]
+            } else {
+                vec![flag.into()]
+            };
+            assert!(
+                parse_update_flags(&args).is_ok(),
+                "{flag} rejected by parser"
+            );
+        }
+    }
 
     #[test]
     fn local_sources_are_stored_absolute() {
