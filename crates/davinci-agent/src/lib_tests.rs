@@ -2151,12 +2151,12 @@ fn navigate_tree_appends_llm_branch_summary() {
         assert_eq!(request.max_tokens, 2048);
         Ok(SummarizeResponse {
             text: "## Goal\nabandoned work".into(),
-            usage: davinci_protocol::Usage {
+            usage: Some(davinci_protocol::Usage {
                 input: 1,
                 output: 2,
                 total_tokens: 3,
                 ..davinci_protocol::Usage::default()
-            },
+            }),
             stop_reason: Some(davinci_ai::StopReason::Stop),
             error_message: None,
             has_tool_call: false,
@@ -3141,7 +3141,7 @@ fn last_mutation_generation_survives() {
     agent.summarizer = Some(Summarizer::new(|_| {
         Ok(SummarizeResponse {
             text: "Lossy summary that says nothing about edits.".into(),
-            usage: Default::default(),
+            usage: Some(Default::default()),
             stop_reason: Some(davinci_ai::StopReason::Stop),
             error_message: None,
             has_tool_call: false,
@@ -5999,7 +5999,7 @@ fn wor32_abandoned_branch_summary_does_not_seed_the_active_branch() {
 checkpoint
 {echoed}"
             ),
-            usage: Default::default(),
+            usage: Some(Default::default()),
             stop_reason: Some(davinci_ai::StopReason::Stop),
             error_message: None,
             has_tool_call: false,
@@ -6550,7 +6550,7 @@ mod hybrid_fold_economics {
                 } else {
                     "## Goal\nContinue.".into()
                 },
-                usage: Default::default(),
+                usage: Some(Default::default()),
                 stop_reason: Some(davinci_ai::StopReason::Stop),
                 error_message: None,
                 has_tool_call: false,
@@ -7137,7 +7137,7 @@ mod hybrid_fold_economics {
                 } else {
                     "## Goal\nContinue.".into()
                 },
-                usage: Default::default(),
+                usage: Some(Default::default()),
                 stop_reason: Some(davinci_ai::StopReason::Stop),
                 error_message: None,
                 has_tool_call: false,
@@ -7205,6 +7205,72 @@ mod hybrid_fold_economics {
         agent.record_assistant("ok");
         agent.prompt("next");
         agent
+    }
+
+    /// B035 review finding 4: a usage whose input, output or cached-read count
+    /// the provider did not report holds a placeholder zero. It must not be
+    /// installed as a measured context size (Hybrid mode compacts from it), and
+    /// it must clear an earlier real observation rather than leave it stale.
+    #[test]
+    fn audit_wp03_b035_partial_usage_is_not_a_measured_context() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = agent(calls, || {});
+        agent.prompt("hello");
+        agent.record_assistant("ok");
+        let reply = agent.messages.last().cloned().unwrap();
+
+        let reported = davinci_protocol::Usage {
+            input: 90_000,
+            output: 10,
+            ..Default::default()
+        };
+        agent.note_provider_context(Some(&reported), &reply);
+        assert_eq!(
+            agent.last_provider_context.as_ref().map(|o| o.tokens),
+            Some(90_010)
+        );
+
+        for partial in [
+            davinci_protocol::Usage {
+                output: 10,
+                input_unreported: true,
+                ..Default::default()
+            },
+            davinci_protocol::Usage {
+                input: 90_000,
+                output_unreported: true,
+                ..Default::default()
+            },
+            davinci_protocol::Usage {
+                input: 90_000,
+                output: 10,
+                cache_read_unreported: true,
+                ..Default::default()
+            },
+        ] {
+            agent.note_provider_context(Some(&reported), &reply);
+            assert!(agent.last_provider_context.is_some());
+            agent.note_provider_context(Some(&partial), &reply);
+            assert!(
+                agent.last_provider_context.is_none(),
+                "{partial:?} was installed as a measured context"
+            );
+        }
+        agent.note_provider_context(Some(&reported), &reply);
+        agent.note_provider_context(None, &reply);
+        assert!(agent.last_provider_context.is_none());
+
+        // Reported zeros are measurements: zero input with ten output tokens
+        // is a ten-token context, not an unknown one.
+        let zeros = davinci_protocol::Usage {
+            output: 10,
+            ..Default::default()
+        };
+        agent.note_provider_context(Some(&zeros), &reply);
+        assert_eq!(
+            agent.last_provider_context.as_ref().map(|o| o.tokens),
+            Some(10)
+        );
     }
 
     #[test]

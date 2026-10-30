@@ -396,7 +396,7 @@ fn compacted_history_retains_matching_ids() {
     agent.summarizer = Some(Summarizer::new(|_| {
         Ok(SummarizeResponse {
             text: "Summary of earlier work.".into(),
-            usage: Default::default(),
+            usage: Some(Default::default()),
             stop_reason: Some(StopReason::Stop),
             error_message: None,
             has_tool_call: false,
@@ -460,7 +460,7 @@ fn failed_or_empty_fold_leaves_active_state_unchanged() {
         Err("summarizer unavailable".to_string()),
         Ok(SummarizeResponse {
             text: String::new(),
-            usage: Default::default(),
+            usage: Some(Default::default()),
             stop_reason: Some(StopReason::Stop),
             error_message: None,
             has_tool_call: false,

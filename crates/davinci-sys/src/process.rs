@@ -141,6 +141,10 @@ pub fn isolated_git_command() -> Command {
         }
     }
     for name in [
+        // Read by `git config` only, never by status or diff: left in place it
+        // makes the filter listing and the command it protects see different
+        // configuration.
+        "GIT_CONFIG",
         "GIT_CONFIG_COUNT",
         "GIT_CONFIG_PARAMETERS",
         "GIT_CONFIG_SYSTEM",
@@ -182,41 +186,108 @@ pub fn isolated_git_command() -> Command {
 /// config edited between that and the run is not covered, which is the limit of
 /// this approach.
 ///
-/// Fails closed: when the filters cannot be listed or a listed key cannot be
-/// taken apart, the returned command is poisoned. Spawning it still succeeds
-/// but git exits 128 on an invalid config key whose text names the reason, so
-/// the caller sees an ordinary git failure instead of an unneutralized run.
+/// Fails closed with a Rust error, never with a poisoned environment: the
+/// overrides are Git's `GIT_CONFIG_COUNT` mechanism, which Git before 2.31
+/// silently ignores, so inspection is refused up front on an older or unprobeable
+/// Git ([`GitInspectionError::UnsupportedGit`]), and when the filters cannot be
+/// listed or a listed key cannot be taken apart
+/// ([`GitInspectionError::FilterListing`]). No command is returned, so nothing
+/// can run an unneutralized filter, and callers can tell a refusal from "not a
+/// repository" and from "clean".
 ///
 /// Diff drivers (`diff.<name>.textconv` and `.command`) cannot be neutralized
 /// this way: Git tries to spawn an empty driver command and the diff dies
 /// ("cannot spawn"). The supported switches are `--no-ext-diff` and
 /// `--no-textconv`, and every `diff`/`log -p`/`show` run through this command
 /// must pass both.
-pub fn isolated_git_command_in(dir: &Path) -> Command {
+pub fn isolated_git_command_in(dir: &Path) -> Result<Command, GitInspectionError> {
+    isolated_git_command_in_with(dir, git_version())
+}
+
+fn isolated_git_command_in_with(
+    dir: &Path,
+    version: Result<(u32, u32), GitInspectionError>,
+) -> Result<Command, GitInspectionError> {
+    let (major, minor) = version?;
+    if (major, minor) < MIN_GIT_VERSION {
+        return Err(GitInspectionError::UnsupportedGit { major, minor });
+    }
+    let settings = driver_overrides(dir).map_err(GitInspectionError::FilterListing)?;
     let mut command = isolated_git_command();
     command.current_dir(dir);
-    match driver_overrides(dir) {
-        Ok(settings) => {
-            command.env("GIT_CONFIG_COUNT", settings.len().to_string());
-            for (index, (key, value)) in settings.iter().enumerate() {
-                command.env(format!("GIT_CONFIG_KEY_{index}"), key);
-                command.env(format!("GIT_CONFIG_VALUE_{index}"), value);
+    command.env("GIT_CONFIG_COUNT", settings.len().to_string());
+    for (index, (key, value)) in settings.iter().enumerate() {
+        command.env(format!("GIT_CONFIG_KEY_{index}"), key);
+        command.env(format!("GIT_CONFIG_VALUE_{index}"), value);
+    }
+    Ok(command)
+}
+
+/// First Git with `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`.
+const MIN_GIT_VERSION: (u32, u32) = (2, 31);
+
+/// Why a repository could not be inspected safely. Distinct from the answer
+/// "this is not a repository" and from an empty result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitInspectionError {
+    /// `git --version` could not be run or read.
+    GitUnavailable(String),
+    /// Git is older than the version the filter overrides need.
+    UnsupportedGit { major: u32, minor: u32 },
+    /// The repository's filter drivers could not be listed or carried.
+    FilterListing(String),
+}
+
+impl std::fmt::Display for GitInspectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GitUnavailable(reason) => {
+                write!(f, "repository inspection refused: git is unavailable: {reason}")
+            }
+            Self::UnsupportedGit { major, minor } => write!(
+                f,
+                "repository inspection refused: git {major}.{minor} is older than {}.{},                  which repository filters cannot be neutralized without",
+                MIN_GIT_VERSION.0, MIN_GIT_VERSION.1
+            ),
+            Self::FilterListing(reason) => {
+                write!(f, "repository inspection refused: {reason}")
             }
         }
-        Err(reason) => {
-            // A key with a space in its section name is never valid, whatever
-            // the reason text holds.
-            let reason: String = reason.chars().filter(|c| !c.is_control()).collect();
-            command
-                .env("GIT_CONFIG_COUNT", "1")
-                .env(
-                    "GIT_CONFIG_KEY_0",
-                    format!("davinci inspection refused: {reason}"),
-                )
-                .env("GIT_CONFIG_VALUE_0", "1");
-        }
     }
-    command
+}
+
+impl std::error::Error for GitInspectionError {}
+
+/// `(major, minor)` of the `git` on PATH, probed once per process. A failed
+/// probe is not cached, so a Git installed later is picked up.
+fn git_version() -> Result<(u32, u32), GitInspectionError> {
+    static VERSION: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    if let Some(version) = VERSION.get() {
+        return Ok(*version);
+    }
+    let output = Command::new("git")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| GitInspectionError::GitUnavailable(error.to_string()))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let version = output
+        .status
+        .success()
+        .then(|| parse_git_version(&text))
+        .flatten()
+        .ok_or_else(|| {
+            GitInspectionError::GitUnavailable(format!("unreadable version {:?}", text.trim()))
+        })?;
+    Ok(*VERSION.get_or_init(|| version))
+}
+
+/// `git version 2.43.0.windows.1` -> `(2, 43)`.
+fn parse_git_version(text: &str) -> Option<(u32, u32)> {
+    let mut parts = text.trim().strip_prefix("git version ")?.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
 }
 
 /// `(key, value)` settings that disable every repository-defined filter found
@@ -1143,16 +1214,17 @@ mod tests {
 
         // Isolated: none of them.
         make_stale();
-        let mut status = isolated_git_command_in(dir);
+        let mut status = isolated_git_command_in(dir).unwrap();
         status.args(["status", "--porcelain"]);
         run(status);
-        let mut diff = isolated_git_command_in(dir);
+        let mut diff = isolated_git_command_in(dir).unwrap();
         diff.args(["diff", "--no-ext-diff", "--no-textconv"]);
         run(diff);
         assert_eq!(ran(&marks), 0, "a repository filter or diff driver ran");
 
         // The real answer is still reported.
         let out = isolated_git_command_in(dir)
+            .unwrap()
             .args(["status", "--porcelain"])
             .output()
             .unwrap();
@@ -1237,32 +1309,163 @@ mod tests {
             let out = command.current_dir(dir).output().unwrap();
             assert!(out.status.success(), "{out:?}");
         };
-        let ran = || marks.iter().filter(|n| dir.join(n).exists()).count();
+        let clear = || {
+            for mark in marks {
+                let _ = std::fs::remove_file(dir.join(mark));
+            }
+        };
+        let ran = || marks[..2].iter().filter(|n| dir.join(n).exists()).count();
 
-        // Control: plain git runs the driver named with `=`.
-        make_stale();
-        run(plain_git(&["status", "--porcelain"]));
-        run(plain_git(&["diff"]));
-        assert!(
-            dir.join(marks[0]).exists(),
-            "control: the clean filter named x=y must run under plain git"
-        );
-        for mark in marks {
-            let _ = std::fs::remove_file(dir.join(mark));
+        // Controls, one per command: plain git runs both the clean filter and
+        // the process filter named with `=`, so absence below means something.
+        for (label, args) in [
+            ("status", &["status", "--porcelain"][..]),
+            ("diff", &["diff"][..]),
+        ] {
+            clear();
+            make_stale();
+            run(plain_git(args));
+            assert!(
+                dir.join(marks[0]).exists(),
+                "control: plain git {label} must run the clean filter x=y"
+            );
+            assert!(
+                dir.join(marks[1]).exists(),
+                "control: plain git {label} must run the process filter p=q"
+            );
         }
 
-        // Isolated: none of them.
-        make_stale();
-        let mut status = isolated_git_command_in(dir);
-        status.args(["status", "--porcelain"]);
-        run(status);
-        let mut diff = isolated_git_command_in(dir);
-        diff.args(["diff", "--no-ext-diff", "--no-textconv"]);
-        run(diff);
-        assert_eq!(ran(), 0, "a filter named with `=` ran under isolation");
+        // Isolated, same fixture state per command: none of them.
+        for (label, args) in [
+            ("status", &["status", "--porcelain"][..]),
+            ("diff", &["diff", "--no-ext-diff", "--no-textconv"][..]),
+        ] {
+            clear();
+            make_stale();
+            let mut command = isolated_git_command_in(dir).unwrap();
+            command.args(args);
+            run(command);
+            assert_eq!(ran(), 0, "isolated {label}: a filter named with `=` ran");
+        }
+        // The space-named driver cannot be selected by an attribute, so this
+        // case only establishes that listing and overriding it succeeds.
+        assert!(!dir.join(marks[2]).exists());
     }
 
-    /// B003: when the filters cannot be listed the command must not run.
+    /// Fixture for the `GIT_CONFIG` and refusal tests: a tracked file selected
+    /// by a clean filter and another by a process filter, both writing a canary.
+    fn canary_repo(dir: &std::path::Path) -> [std::path::PathBuf; 2] {
+        git_in(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            dir.join(".gitattributes"),
+            "f.txt filter=canary\nh.txt filter=lazy\n",
+        )
+        .unwrap();
+        for name in ["f.txt", "h.txt"] {
+            std::fs::write(dir.join(name), "one\n").unwrap();
+        }
+        git_in(dir, &["add", "."]);
+        git_in(dir, &["commit", "-q", "-m", "c"]);
+        let marks = [dir.join("clean-ran"), dir.join("process-ran")];
+        let slash = |p: &std::path::Path| p.to_string_lossy().replace('\\', "/");
+        git_in(
+            dir,
+            &[
+                "config",
+                "filter.canary.clean",
+                &format!("echo ran >> '{}'; cat", slash(&marks[0])),
+            ],
+        );
+        git_in(
+            dir,
+            &[
+                "config",
+                "filter.lazy.process",
+                &format!("echo ran >> '{}'", slash(&marks[1])),
+            ],
+        );
+        marks
+    }
+
+    /// Same length, newer mtime on both files: status and diff must compare
+    /// content, which runs the filters.
+    fn make_canary_stale(dir: &std::path::Path) {
+        for name in ["f.txt", "h.txt"] {
+            std::fs::write(dir.join(name), "one\n").unwrap();
+            let file = std::fs::File::options()
+                .write(true)
+                .open(dir.join(name))
+                .unwrap();
+            file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+    }
+
+    /// B003 review finding 1: an inherited `GIT_CONFIG` is read by `git config`
+    /// only. Left in place it made the filter listing (the null file: nothing)
+    /// differ from the repository config that `status` and `diff` then read, so
+    /// the canary filters ran.
+    #[test]
+    fn audit_wp01_b003_inherited_git_config_does_not_hide_filters() {
+        let _guard = GIT_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        let marks = canary_repo(dir);
+        let clear = || {
+            for mark in &marks {
+                let _ = std::fs::remove_file(mark);
+            }
+        };
+        let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        let previous = std::env::var_os("GIT_CONFIG");
+        std::env::set_var("GIT_CONFIG", null);
+
+        // Controls: with the hostile variable inherited, plain git still runs
+        // both filters for each command, and `git config` alone sees none.
+        for args in [&["status", "--porcelain"][..], &["diff"][..]] {
+            clear();
+            make_canary_stale(dir);
+            let out = plain_git(args).current_dir(dir).output().unwrap();
+            assert!(out.status.success(), "{out:?}");
+            assert!(marks[0].exists(), "control: clean filter, {args:?}");
+            assert!(marks[1].exists(), "control: process filter, {args:?}");
+        }
+        let listing = plain_git(&["config", "--name-only", "--get-regexp", "^filter\\."])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert_eq!(
+            listing.status.code(),
+            Some(1),
+            "control: the inherited GIT_CONFIG must blind a plain git config"
+        );
+
+        let mut results = Vec::new();
+        for args in [
+            &["status", "--porcelain"][..],
+            &["diff", "--no-ext-diff", "--no-textconv"][..],
+        ] {
+            clear();
+            make_canary_stale(dir);
+            let mut command = isolated_git_command_in(dir).unwrap();
+            command.args(args);
+            results.push((args[0], command.output().unwrap()));
+            assert!(!marks[0].exists(), "isolated {args:?} ran the clean filter");
+            assert!(
+                !marks[1].exists(),
+                "isolated {args:?} ran the process filter"
+            );
+        }
+        match previous {
+            Some(value) => std::env::set_var("GIT_CONFIG", value),
+            None => std::env::remove_var("GIT_CONFIG"),
+        }
+        for (label, out) in results {
+            assert!(out.status.success(), "{label}: {out:?}");
+        }
+    }
+
+    /// B003: when the filters cannot be listed no command is returned at all.
     #[test]
     fn audit_wp01_b003_unlistable_filters_fail_closed() {
         let _guard = GIT_ENV.lock().unwrap_or_else(|e| e.into_inner());
@@ -1270,7 +1473,6 @@ mod tests {
         let dir = repo.path();
         git_in(dir, &["init", "-q", "-b", "main"]);
         let canary = dir.join("clean-ran");
-        std::fs::write(dir.join(".gitattributes"), "f.txt filter=canary\n").unwrap();
         std::fs::write(dir.join("f.txt"), "one\n").unwrap();
         // A driver name that is not UTF-8 cannot be carried in an override
         // key, so the listing is unusable although git reads it fine.
@@ -1280,18 +1482,48 @@ mod tests {
         config.extend_from_slice(b"'; cat\n");
         std::fs::write(dir.join(".git").join("config"), config).unwrap();
         std::fs::write(dir.join(".gitattributes"), b"f.txt filter=bad\xffname\n").unwrap();
-        let out = isolated_git_command_in(dir)
-            .args(["status", "--porcelain"])
-            .output()
-            .unwrap();
-        assert!(!out.status.success(), "{out:?}");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("inspection refused"), "{stderr}");
+        let error = isolated_git_command_in(dir).expect_err("must refuse");
         assert!(
-            !stderr.contains("not a git repository"),
-            "must not look like a clean non-repository: {stderr}"
+            matches!(error, GitInspectionError::FilterListing(_)),
+            "{error:?}"
         );
+        assert!(error.to_string().contains("inspection refused"), "{error}");
         assert!(!canary.exists(), "the filter ran although listing failed");
+    }
+
+    /// B003 review finding 2: Git before 2.31 ignores the environment-pair
+    /// overrides, so a repository filter would run un-neutralized. Inspection
+    /// is refused before any listing or command exists, and so before any
+    /// canary can run. The version is injected because this host's Git is newer.
+    #[test]
+    fn audit_wp01_b003_old_or_unprobeable_git_is_refused() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        let marks = canary_repo(dir);
+        make_canary_stale(dir);
+        for (major, minor) in [(2, 30), (1, 99), (0, 0)] {
+            assert_eq!(
+                isolated_git_command_in_with(dir, Ok((major, minor))).unwrap_err(),
+                GitInspectionError::UnsupportedGit { major, minor }
+            );
+        }
+        assert!(isolated_git_command_in_with(dir, Ok((2, 31))).is_ok());
+        assert!(isolated_git_command_in_with(dir, Ok((3, 0))).is_ok());
+        let unavailable = GitInspectionError::GitUnavailable("no git".into());
+        assert_eq!(
+            isolated_git_command_in_with(dir, Err(unavailable.clone())).unwrap_err(),
+            unavailable
+        );
+        assert!(!marks[0].exists() && !marks[1].exists());
+        assert_eq!(
+            parse_git_version("git version 2.43.0.windows.1\n"),
+            Some((2, 43))
+        );
+        assert_eq!(parse_git_version("git version 2.30.2"), Some((2, 30)));
+        assert_eq!(parse_git_version("not git"), None);
+        assert_eq!(parse_git_version("git version x.y"), None);
+        // The probe on this host reads a real version at or above the gate.
+        assert!(git_version().unwrap() >= MIN_GIT_VERSION);
     }
 
     /// B003: key parsing keeps key and value separate and rejects what it

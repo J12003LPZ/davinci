@@ -7409,16 +7409,21 @@ fn open_diff_sheet(shell: &mut Shell<'_>) -> Next {
         shell.note("nothing to review — the working tree is clean");
         return Next::Go;
     }
+    // `git_changes` above already surfaced a refusal to inspect; from here a
+    // failure only leaves the counts and hunks out.
     let numstat: Vec<(String, u32, u32)> = crate::davinci_sources::host_git(cwd)
-        .args([
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--numstat",
-            "HEAD",
-        ])
-        .output()
         .ok()
+        .and_then(|mut git| {
+            git.args([
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--numstat",
+                "HEAD",
+            ])
+            .output()
+            .ok()
+        })
         .filter(|output| output.status.success())
         .map(|output| {
             String::from_utf8_lossy(&output.stdout)
@@ -7433,8 +7438,8 @@ fn open_diff_sheet(shell: &mut Shell<'_>) -> Next {
         })
         .unwrap_or_default();
     let hunk_of = |path: &str| -> (Vec<Hunk>, String, String) {
-        let output = crate::davinci_sources::host_git(cwd)
-            .args([
+        let output = crate::davinci_sources::host_git(cwd).and_then(|mut git| {
+            git.args([
                 "diff",
                 "--no-ext-diff",
                 "--no-textconv",
@@ -7443,7 +7448,9 @@ fn open_diff_sheet(shell: &mut Shell<'_>) -> Next {
                 "--",
                 path,
             ])
-            .output();
+            .output()
+            .map_err(|error| error.to_string())
+        });
         let Ok(output) = output else {
             return (Vec::new(), String::new(), String::new());
         };
@@ -7524,9 +7531,12 @@ fn open_diff_sheet(shell: &mut Shell<'_>) -> Next {
         })
         .collect();
     let behind = crate::davinci_sources::host_git(cwd)
-        .args(["rev-list", "--count", "HEAD..@{upstream}"])
-        .output()
         .ok()
+        .and_then(|mut git| {
+            git.args(["rev-list", "--count", "HEAD..@{upstream}"])
+                .output()
+                .ok()
+        })
         .filter(|output| output.status.success())
         .and_then(|output| {
             String::from_utf8_lossy(&output.stdout)

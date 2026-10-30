@@ -5,25 +5,29 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use davinci_sys::process::isolated_git_command_in;
+use davinci_sys::process::{isolated_git_command_in, GitInspectionError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::bus::RuntimeBus;
 
-/// The repository top-level containing `path`, or `None` outside a git
-/// checkout. Worktree leases must be rooted here: rooting them at a
-/// subdirectory the user launched from produced leases of the wrong tree.
-pub fn git_toplevel(path: &Path) -> Option<PathBuf> {
-    let output = isolated_git_command_in(path)
+/// The repository top-level containing `path`, `Ok(None)` outside a git
+/// checkout, or `InspectionRefused` when the repository cannot be inspected
+/// safely (old Git, unlistable filters): a refusal is not "not a repository".
+/// Worktree leases must be rooted here: rooting them at a subdirectory the user
+/// launched from produced leases of the wrong tree.
+pub fn git_toplevel(path: &Path) -> Result<Option<PathBuf>, WorktreeError> {
+    let Ok(output) = isolated_git_command_in(path)?
         .args(["rev-parse", "--show-toplevel"])
         .output()
-        .ok()?;
+    else {
+        return Ok(None);
+    };
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
     let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!root.is_empty()).then(|| PathBuf::from(root))
+    Ok((!root.is_empty()).then(|| PathBuf::from(root)))
 }
 use super::events::{RuntimeEvent, RuntimeEventEnvelope};
 use super::ids::{AgentId, RunId};
@@ -61,8 +65,16 @@ pub enum WorktreeError {
     DirtyWorktreePreserved { path: PathBuf },
     #[error("git command failed: {0}")]
     GitError(String),
+    #[error("{0}")]
+    InspectionRefused(String),
     #[error("io error: {0}")]
     IoError(String),
+}
+
+impl From<GitInspectionError> for WorktreeError {
+    fn from(error: GitInspectionError) -> Self {
+        Self::InspectionRefused(error.to_string())
+    }
 }
 
 fn now_ms() -> i64 {
@@ -73,7 +85,7 @@ fn now_ms() -> i64 {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, WorktreeError> {
-    let output = isolated_git_command_in(cwd)
+    let output = isolated_git_command_in(cwd)?
         .args(args)
         .output()
         .map_err(|e| WorktreeError::GitError(format!("Failed to execute git: {e}")))?;
@@ -92,11 +104,15 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String, WorktreeError> {
 }
 
 /// Return whether `cwd` currently has tracked or untracked Git changes.
-/// Non-repositories and unavailable Git are treated as clean routing context.
-pub fn has_uncommitted_changes(cwd: &Path) -> bool {
-    run_git(cwd, &["status", "--porcelain"])
-        .map(|status| !status.is_empty())
-        .unwrap_or(false)
+/// Non-repositories and other Git failures are treated as clean routing
+/// context; a refusal to inspect the repository safely is an error, never
+/// "clean".
+pub fn has_uncommitted_changes(cwd: &Path) -> Result<bool, WorktreeError> {
+    match run_git(cwd, &["status", "--porcelain"]) {
+        Ok(status) => Ok(!status.is_empty()),
+        Err(error @ WorktreeError::InspectionRefused(_)) => Err(error),
+        Err(_) => Ok(false),
+    }
 }
 
 /// Inspect an already isolated worktree for a host-approved coding handoff.
@@ -237,7 +253,7 @@ impl WorktreeManager {
             .ok_or_else(|| WorktreeError::IoError("Worktree path is not valid unicode".into()))?;
 
         // Check if branch already exists in git
-        let branch_exists = isolated_git_command_in(&self.repo_root)
+        let branch_exists = isolated_git_command_in(&self.repo_root)?
             .args(["rev-parse", "--verify", &branch])
             .output()
             .map(|o| o.status.success())
@@ -300,7 +316,7 @@ impl WorktreeManager {
         }
         let _index_file = IndexFile(index.clone());
         let git = |args: &[&str]| -> Result<String, WorktreeError> {
-            let output = isolated_git_command_in(&lease.path)
+            let output = isolated_git_command_in(&lease.path)?
                 .env("GIT_INDEX_FILE", &index)
                 .args(args)
                 .output()
@@ -415,7 +431,7 @@ impl WorktreeManager {
         if current_head.is_empty() || current_head == lease.base_head {
             return Ok(false);
         }
-        let integrated = isolated_git_command_in(&self.repo_root)
+        let integrated = isolated_git_command_in(&self.repo_root)?
             .args(["merge-base", "--is-ancestor", &current_head, "HEAD"])
             .output()
             .map(|o| o.status.success())
@@ -618,13 +634,13 @@ mod tests {
         let repo = init_temp_git_repo();
         let nested = repo.path().join("crates").join("inner");
         std::fs::create_dir_all(&nested).unwrap();
-        let root = git_toplevel(&nested).expect("inside a checkout");
+        let root = git_toplevel(&nested).unwrap().expect("inside a checkout");
         assert_eq!(
             std::fs::canonicalize(root).unwrap(),
             std::fs::canonicalize(repo.path()).unwrap()
         );
         let outside = tempdir().unwrap();
-        assert!(git_toplevel(outside.path()).is_none());
+        assert!(git_toplevel(outside.path()).unwrap().is_none());
     }
 
     fn init_temp_git_repo() -> tempfile::TempDir {
@@ -888,7 +904,15 @@ mod tests {
         assert!(manager.check_dirty(&lease).is_err());
         assert!(manager.is_dirty(&lease), "unreadable state is dirty");
         let err = manager.release_lease(&lease, false).unwrap_err();
-        assert!(matches!(err, WorktreeError::GitError(_)), "{err:?}");
+        // A broken git link now fails the filter listing first, which is a
+        // refusal; either way the state is an error and nothing is removed.
+        assert!(
+            matches!(
+                err,
+                WorktreeError::GitError(_) | WorktreeError::InspectionRefused(_)
+            ),
+            "{err:?}"
+        );
         assert!(precious.exists(), "nothing was deleted");
         assert!(manager.get_lease(&lease.path).is_none() || lease.path.exists());
     }
@@ -949,6 +973,39 @@ mod tests {
         path.display().to_string().replace('\\', "/")
     }
 
+    /// A repository whose filter driver name is not UTF-8 cannot be inspected
+    /// safely. Every consumer must report that refusal, not "not a repository"
+    /// (`git_toplevel`) and not "clean" (`has_uncommitted_changes`).
+    #[test]
+    fn audit_wp01_b003_refusal_stays_distinct_from_absent_and_clean() {
+        let repo = init_temp_git_repo();
+        let canary = repo.path().join("clean-ran");
+        let mut config = std::fs::read(repo.path().join(".git").join("config")).unwrap();
+        config.extend_from_slice(b"[filter \"bad\xffname\"]\n\tclean = echo ran >> '");
+        config.extend_from_slice(canary.to_string_lossy().replace('\\', "/").as_bytes());
+        config.extend_from_slice(b"'; cat\n");
+        std::fs::write(repo.path().join(".git").join("config"), config).unwrap();
+        std::fs::write(repo.path().join("README.md"), "dirty\n").unwrap();
+
+        let toplevel = git_toplevel(repo.path());
+        assert!(
+            matches!(toplevel, Err(WorktreeError::InspectionRefused(_))),
+            "{toplevel:?}"
+        );
+        let dirty = has_uncommitted_changes(repo.path());
+        assert!(
+            matches!(dirty, Err(WorktreeError::InspectionRefused(_))),
+            "{dirty:?}"
+        );
+        let manager = WorktreeManager::new(repo.path().to_path_buf(), repo.path().join("wt"));
+        let lease = manager.create_lease(RunId::new(), AgentId::new(), None);
+        assert!(
+            matches!(lease, Err(WorktreeError::InspectionRefused(_))),
+            "{lease:?}"
+        );
+        assert!(!canary.exists());
+    }
+
     const FSMONITOR_CHILD_REPO: &str = "DAVINCI_FSMONITOR_CHILD_REPO";
 
     /// Runs only as the child of `audit_wp01_b003_repository_fsmonitor_is_never_run`,
@@ -960,7 +1017,7 @@ mod tests {
         };
         let repo = std::path::PathBuf::from(repo);
         assert!(
-            has_uncommitted_changes(&repo),
+            has_uncommitted_changes(&repo).unwrap(),
             "status must still report the real change"
         );
         assert!(run_git(&repo, &["status", "--porcelain"])

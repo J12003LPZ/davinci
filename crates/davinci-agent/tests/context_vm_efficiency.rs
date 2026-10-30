@@ -112,7 +112,7 @@ fn run(mode: ContextVmMode, summarizer: bool, turns: usize) -> serde_json::Value
             };
             Ok(SummarizeResponse {
                 text,
-                usage: Default::default(),
+                usage: Some(Default::default()),
                 stop_reason: Some(StopReason::Stop),
                 error_message: None,
                 has_tool_call: false,

@@ -628,7 +628,7 @@ fn run_in_process(config: &RunConfig, root: &Path) -> RunResult {
             } else {
                 "## Goal\nContinue the fixture task.".into()
             },
-            usage: Default::default(),
+            usage: Some(Default::default()),
             stop_reason: Some(StopReason::Stop),
             error_message: None,
             has_tool_call: false,

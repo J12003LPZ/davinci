@@ -28,10 +28,14 @@ pub struct GitChange {
 /// repositories found normally, neutralizes the repository's filter drivers,
 /// and drops user config and inherited `GIT_*` overrides. Callers that diff
 /// must pass `--no-ext-diff --no-textconv` (diff drivers have no safe override).
-pub(crate) fn host_git(cwd: &Path) -> Command {
-    let mut command = davinci_sys::process::isolated_git_command_in(cwd);
+///
+/// Fails with the inspection refusal (old Git, unlistable filters) instead of
+/// returning a command, so a refusal is never read as "clean" or "no data".
+pub(crate) fn host_git(cwd: &Path) -> Result<Command, String> {
+    let mut command =
+        davinci_sys::process::isolated_git_command_in(cwd).map_err(|error| error.to_string())?;
     command.arg("-C").arg(cwd);
-    command
+    Ok(command)
 }
 
 /// A git failure as text: stderr when git said something, the exit status
@@ -57,7 +61,7 @@ fn git_failure(what: &str, output: &std::process::Output) -> String {
 /// error, so the caller can say the state is unavailable instead of showing a
 /// clean tree.
 pub fn git_changes(cwd: &Path) -> Result<Vec<GitChange>, String> {
-    let output = host_git(cwd)
+    let output = host_git(cwd)?
         .args(["status", "--porcelain"])
         .output()
         .map_err(|error| format!("git status could not start: {error}"))?;
@@ -96,7 +100,7 @@ pub fn parse_porcelain(text: &str) -> Vec<GitChange> {
 /// `Δn +a -d` for the status bar, from `git diff --numstat` plus the count of
 /// changed files. Untracked files count as changed but contribute no lines.
 pub fn git_delta(cwd: &Path, changes: &[GitChange]) -> Result<(u32, u32, u32), String> {
-    let output = host_git(cwd)
+    let output = host_git(cwd)?
         .args([
             "diff",
             "--no-ext-diff",
@@ -137,16 +141,21 @@ pub fn parse_numstat(text: &str) -> (u32, u32) {
 
 /// The changes popover (`1e`), with per-file line counts where git has them.
 pub fn change_rows(cwd: &Path, changes: &[GitChange]) -> Vec<ChangeRow> {
+    // Line counts are decoration: `git_changes` already surfaced a refusal to
+    // inspect, so a missing count here only leaves the row without numbers.
     let counts = host_git(cwd)
-        .args([
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--numstat",
-            "HEAD",
-        ])
-        .output()
         .ok()
+        .and_then(|mut git| {
+            git.args([
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--numstat",
+                "HEAD",
+            ])
+            .output()
+            .ok()
+        })
         .filter(|output| output.status.success())
         .map(|output| {
             String::from_utf8_lossy(&output.stdout)
@@ -483,10 +492,14 @@ fn pull_request_for(
     last.asked = Some((std::time::Instant::now(), branch.to_owned()));
     if let (Err(error), false) = (&output, last.hinted) {
         let origin = host_git(cwd)
-            .args(["remote", "get-url", "origin"])
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
+            .ok()
+            .and_then(|mut git| {
+                git.args(["remote", "get-url", "origin"])
+                    .stdin(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .ok()
+            })
             .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
             .unwrap_or_default();
         last.hint = missing_gh_hint(error, &origin);
@@ -754,7 +767,8 @@ mod tests {
 
     #[test]
     fn host_git_never_discovers_a_bare_repository_implicitly() {
-        let command = host_git(Path::new("work"));
+        let repo = tempfile::tempdir().unwrap();
+        let command = host_git(repo.path()).unwrap();
         let args: Vec<_> = command.get_args().collect();
         let has = |setting: &str| {
             args.windows(2)
@@ -762,7 +776,7 @@ mod tests {
         };
         assert!(has("safe.bareRepository=explicit"));
         assert!(has("core.fsmonitor=false"));
-        assert!(args.ends_with(&["-C", "work"].map(std::ffi::OsStr::new)));
+        assert!(args.ends_with(&[std::ffi::OsStr::new("-C"), repo.path().as_os_str()]));
     }
 
     #[test]
@@ -792,6 +806,40 @@ mod tests {
         change_rows(root, &changes);
         assert!(changes.is_empty());
         assert!(!marker.exists(), "host git ran the planted core.fsmonitor");
+    }
+
+    /// A refusal to inspect (a filter name that cannot be carried as an
+    /// override) is an error from every status path, never an empty "clean"
+    /// list and never the "not a repository" empty answer.
+    #[test]
+    fn audit_wp01_b003_git_changes_reports_a_refusal_not_a_clean_tree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            eprintln!("git is unavailable: skipping");
+            return;
+        }
+        let canary = root.join("clean-ran");
+        let mut config = std::fs::read(root.join(".git").join("config")).unwrap();
+        config.extend_from_slice(b"[filter \"bad\xffname\"]\n\tclean = echo ran >> '");
+        config.extend_from_slice(canary.display().to_string().replace('\\', "/").as_bytes());
+        config.extend_from_slice(b"'; cat\n");
+        std::fs::write(root.join(".git").join("config"), config).unwrap();
+        std::fs::write(root.join("new.txt"), "x").unwrap();
+
+        let error = git_changes(root).expect_err("must not look clean");
+        assert!(error.contains("inspection refused"), "{error}");
+        assert!(git_delta(root, &[]).is_err());
+        assert!(host_git(root).is_err());
+        assert!(!canary.exists());
     }
 
     #[test]

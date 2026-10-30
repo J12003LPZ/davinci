@@ -1671,7 +1671,7 @@ fn complete_simple_summarization(
             })
             .collect::<Vec<_>>()
             .join(""),
-        usage: response.usage.unwrap_or_default(),
+        usage: response.usage,
         stop_reason: response.stop_reason,
         error_message: response.error_message,
         has_tool_call: response
@@ -3218,8 +3218,32 @@ fn complete_prompt_with_host(
     .with_cache(agent.tool_context.cache.clone());
     // Leases belong to the repository, not to the directory davinci was
     // launched from (a subdirectory would lease the wrong tree).
-    let lease_root = davinci_agent::runtime::worktree::git_toplevel(&agent.cwd)
-        .unwrap_or_else(|| agent.cwd.clone());
+    let lease_root = match davinci_agent::runtime::worktree::git_toplevel(&agent.cwd) {
+        Ok(root) => root.unwrap_or_else(|| agent.cwd.clone()),
+        Err(error) => {
+            // A refusal to inspect the repository is not "not a repository":
+            // say so instead of leasing worktrees from the wrong root.
+            let reply = format!("Repository unavailable: {error}");
+            let end = AgentEvent::AgentEnd {
+                messages: vec![davinci_ai::ChatMessage::text("assistant", &reply)],
+                will_retry: false,
+            };
+            if stream_json {
+                if let Ok(value) = to_json_print_event(&end) {
+                    if let Ok(encoded) = serde_json::to_string(&value) {
+                        let _ = output::write_raw_stdout_line(&encoded);
+                    }
+                }
+            } else {
+                agent.emit_live(end.clone());
+            }
+            let mut host = host.lock().unwrap_or_else(|error| error.into_inner());
+            host.emit(ExtensionEvent::TurnEnd);
+            host.emit(ExtensionEvent::AgentEnd);
+            host.emit(ExtensionEvent::AgentSettled);
+            return (reply, vec![end]);
+        }
+    };
     let wt_mgr =
         davinci_agent::WorktreeManager::new(lease_root, default_agent_dir().join("worktrees"))
             .with_bus(runtime_bus.clone());

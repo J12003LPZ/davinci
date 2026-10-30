@@ -196,8 +196,12 @@ fn configure_workflow_runtime(
         let cwd = session
             .map(|s| std::path::PathBuf::from(&s.header.cwd))
             .or_else(|| std::env::current_dir().ok());
-        if let Some(root) = cwd.and_then(|cwd| davinci_agent::runtime::worktree::git_toplevel(&cwd))
-        {
+        let root = match cwd {
+            Some(cwd) => davinci_agent::runtime::worktree::git_toplevel(&cwd)
+                .map_err(|error| error.to_string())?,
+            None => None,
+        };
+        if let Some(root) = root {
             let manager = davinci_agent::runtime::WorktreeManager::new(
                 root,
                 std::env::temp_dir().join("davinci").join("worktrees"),

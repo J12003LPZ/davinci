@@ -176,7 +176,7 @@ fn manual_fold_invokes_structured_summarizer_and_applies_a_user_correction() {
                 "previous":"use old API","evidence":{"value":"use new API",
                 "source_refs":[new_ref],"provenance_kind":"user_decision"},
                 "replacement":{"value":"use new API","source_refs":[new_ref],"provenance_kind":"user_decision"}}]}).to_string(),
-            usage: Default::default(), stop_reason: None, error_message: None, has_tool_call: false,
+            usage: Some(Default::default()), stop_reason: None, error_message: None, has_tool_call: false,
         })
     }));
     agent
@@ -575,7 +575,7 @@ fn a_full_active_window_folds_from_the_run_loop() {
         seen.fetch_add(1, Ordering::SeqCst);
         Ok(davinci_agent::SummarizeResponse {
             text: serde_json::json!({"transitions": []}).to_string(),
-            usage: Default::default(),
+            usage: Some(Default::default()),
             stop_reason: None,
             error_message: None,
             has_tool_call: false,

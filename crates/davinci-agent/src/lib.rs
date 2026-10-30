@@ -2484,7 +2484,8 @@ impl Agent {
             .map(|ledger| ledger.recent_tool_names(10))
             .unwrap_or_default();
 
-        let has_uncommitted_changes = runtime::has_uncommitted_changes(&self.cwd);
+        let has_uncommitted_changes =
+            runtime::has_uncommitted_changes(&self.cwd).map_err(|error| error.to_string())?;
         let router_input = prompt::CapabilityRouterInput::new(user_text)
             .with_previous_request(previous_user_request)
             .with_recent_tools(&recent_tools)
@@ -3481,13 +3482,21 @@ impl Agent {
     }
 
     /// Remember what the provider reported for the request that produced
-    /// `reply`, now at the end of `messages`. Missing usage records nothing.
+    /// `reply`, now at the end of `messages`. Missing usage, or a usage whose
+    /// input, output or cached-read count the provider did not report (a
+    /// placeholder zero, not a measurement), records nothing and clears any
+    /// earlier observation, so the full-context estimate is used instead. An
+    /// unreported cache-write count stays a plain zero: most providers never
+    /// send one, and requiring it would drop calibration for all of them.
     pub(crate) fn note_provider_context(
         &mut self,
         usage: Option<&davinci_protocol::Usage>,
         reply: &ChatMessage,
     ) {
         let tokens = usage.map_or(0, |usage| {
+            if usage.input_unreported || usage.output_unreported || usage.cache_read_unreported {
+                return 0;
+            }
             usage
                 .input
                 .saturating_add(usage.cache_read)
