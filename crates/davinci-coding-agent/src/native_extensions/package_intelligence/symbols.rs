@@ -1,5 +1,6 @@
 use super::model::PackageSymbolResult;
 use std::fs;
+use std::io::Read as _;
 use std::path::Path;
 
 pub fn find_symbol_in_types(
@@ -12,12 +13,26 @@ pub fn find_symbol_in_types(
     let mut warnings = Vec::new();
 
     let meta = fs::metadata(types_path).map_err(|e| format!("cannot read types file: {e}"))?;
-    if meta.len() > 512 * 1024 {
+    let truncated = meta.len() > 512 * 1024;
+    if truncated {
         warnings.push("types file exceeds 512 KiB limit; truncated scan".to_string());
     }
 
-    let content =
-        fs::read_to_string(types_path).map_err(|e| format!("failed to read types file: {e}"))?;
+    let mut file =
+        fs::File::open(types_path).map_err(|e| format!("failed to read types file: {e}"))?;
+    let mut bytes = Vec::new();
+    std::io::Read::take(&mut file, 512 * 1024)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("failed to read types file: {e}"))?;
+    let content = match String::from_utf8(bytes) {
+        Ok(content) => content,
+        Err(error) if truncated => {
+            let valid = error.utf8_error().valid_up_to();
+            String::from_utf8(error.into_bytes()[..valid].to_vec())
+                .map_err(|_| "types file is not valid UTF-8".to_string())?
+        }
+        Err(_) => return Err("types file is not valid UTF-8".into()),
+    };
     let lines: Vec<&str> = content.lines().collect();
 
     // Check for qualified symbol e.g. "z.object" -> ["z", "object"]
@@ -148,25 +163,51 @@ pub fn find_symbol_in_types(
 }
 
 fn matches_symbol_declaration(line: &str, name: &str) -> bool {
-    let patterns = [
-        format!("function {name}("),
-        format!("function {name}<"),
-        format!("const {name}:"),
-        format!("const {name} ="),
-        format!("let {name}:"),
-        format!("var {name}:"),
-        format!("interface {name}"),
-        format!("type {name} ="),
-        format!("type {name}<"),
-        format!("class {name}"),
-        format!("namespace {name}"),
-        format!("enum {name}"),
-        format!("{name}("),
-        format!("{name}<"),
-        format!("{name}:"),
-    ];
-
-    patterns.iter().any(|pat| line.contains(pat))
+    let mut found = false;
+    let mut offset = 0;
+    while let Some(index) = line[offset..].find(name) {
+        let start = offset + index;
+        let end = start + name.len();
+        let before_ok = line[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !(ch.is_alphanumeric() || ch == '_' || ch == '$'));
+        let after_ok = line[end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !(ch.is_alphanumeric() || ch == '_' || ch == '$'));
+        if before_ok && after_ok {
+            found = true;
+            break;
+        }
+        offset = end;
+    }
+    if !found {
+        return false;
+    }
+    let declaration = [
+        "function",
+        "class",
+        "interface",
+        "type",
+        "const",
+        "let",
+        "var",
+        "namespace",
+        "enum",
+    ]
+    .iter()
+    .any(|keyword| line.split_whitespace().any(|token| token == *keyword));
+    if declaration {
+        return true;
+    }
+    // Object/array shorthand or a property declaration: `name(` or
+    // `name:` without a keyword.
+    let trimmed = line.trim_start();
+    trimmed.starts_with(&format!("{name}("))
+        || trimmed.starts_with(&format!("{name}<"))
+        || trimmed.starts_with(&format!("{name}:"))
+        || trimmed.starts_with(&format!("{name} ="))
 }
 
 fn infer_kind(line: &str, name: &str) -> String {
