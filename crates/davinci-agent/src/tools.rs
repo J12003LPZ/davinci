@@ -361,8 +361,40 @@ pub enum ToolError {
     Unknown(String),
     #[error("{0}")]
     Failed(String),
+    /// The tool may have run before the failure, so its effect cannot be
+    /// ruled out. This is reported to the model as an unknown outcome, never
+    /// as a definite failure.
+    #[error("{0}")]
+    MayHaveRun(String),
     #[error("{0}")]
     Durability(String),
+}
+
+impl ToolError {
+    /// The model-visible result for this error. Only an error that may have
+    /// reached the tool carries the unknown-outcome marker that also keeps the
+    /// tool ledger from recording a confirmed failure.
+    pub fn into_tool_result(self, tool: &str) -> ToolResult {
+        match self {
+            ToolError::MayHaveRun(message) => ToolResult {
+                content: format!(
+                    "{message}\n\nOutcome unknown: `{tool}` may already have run before the \
+connection was lost, so its effect may exist. It was not retried. Check the server or target \
+state before calling it again."
+                ),
+                is_error: true,
+                details: Some(serde_json::json!({
+                    "outcome_unknown": true,
+                    "tool": tool,
+                })),
+            },
+            other => ToolResult {
+                content: other.to_string(),
+                is_error: true,
+                details: None,
+            },
+        }
+    }
 }
 
 pub fn tool_specs() -> Vec<AgentTool> {
@@ -1403,7 +1435,14 @@ fn mcp_call_tool(
     input: &serde_json::Value,
     context: &ToolContext,
 ) -> Result<ToolResult, ToolError> {
-    context.mcp.call_exposed(name, input)
+    // The id is how a server tells a repeat from a new call, so a call that
+    // has none is refused before anything is sent.
+    let Some(invocation_id) = context.tool_call_id.as_deref() else {
+        return Err(ToolError::Failed(format!(
+            "MCP tool `{name}` needs a tool-call id and none was provided; nothing was sent"
+        )));
+    };
+    context.mcp.call_exposed(name, input, invocation_id)
 }
 
 fn update_plan_parameters() -> Value {
@@ -4597,6 +4636,29 @@ fn code_rename_preview_tool(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_error_that_may_have_reached_the_tool_is_reported_as_unknown() {
+        let result = super::ToolError::MayHaveRun("mcp transport failed".into())
+            .into_tool_result("mcp__lost__effect");
+        assert!(result.is_error);
+        assert!(result.content.contains("mcp transport failed"));
+        assert!(
+            result.content.contains("Outcome unknown"),
+            "{}",
+            result.content
+        );
+        assert!(result.content.contains("not retried"), "{}", result.content);
+        let details = result.details.expect("details");
+        assert_eq!(details["outcome_unknown"], true);
+        assert_eq!(details["tool"], "mcp__lost__effect");
+
+        // A definite failure stays a plain failure: no unknown-outcome text.
+        let failed = super::ToolError::Failed("permission denied".into()).into_tool_result("read");
+        assert!(failed.is_error);
+        assert_eq!(failed.content, "permission denied");
+        assert!(failed.details.is_none());
+    }
+
     #[test]
     fn exit_status_line_names_every_failed_exit_and_leaves_success_alone() {
         assert_eq!(super::exit_status_line(Some(0), false), None);

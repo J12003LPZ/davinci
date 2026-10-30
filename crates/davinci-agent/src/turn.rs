@@ -30,6 +30,52 @@ pub(crate) enum Preparation {
     Ready { lane: crate::scheduler::ToolLane },
 }
 
+// Test seam: runs right after an allow decision, outside the policy lock, so
+// a test can move the policy where a late revision read would miss it.
+#[cfg(test)]
+thread_local! {
+    static AFTER_PERMISSION_DECISION: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_permission_decision_hook() {
+    AFTER_PERMISSION_DECISION.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook();
+        }
+    });
+}
+
+// Test seam: runs in the journal dispatch callback after every validation and
+// right before the final cancellation and policy gate.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_JOURNAL_GATE: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn before_journal_gate_hook() {
+    BEFORE_JOURNAL_GATE.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook();
+        }
+    });
+}
+
+fn unprepared_dispatch_refusal() -> crate::ToolResult {
+    crate::ToolResult {
+        content: "Internal error: the tool call was not prepared before dispatch, so its authorization is unknown; no adapter was run.".into(),
+        is_error: true,
+        details: Some(serde_json::json!({
+            "denied": true,
+            "internal_error": true,
+            "unprepared_dispatch": true
+        })),
+    }
+}
+
 struct PendingToolOperationGuard {
     pending: Option<crate::PendingToolOperation>,
 }
@@ -2113,25 +2159,57 @@ Issue the call again if it is still needed.";
             .unwrap_or_else(|| crate::tool_ledger::classify_side_effect(name))
     }
 
+    /// Registered extension/MCP capabilities use the same journal facade as
+    /// built-ins.  The planner applies conservative external-mutation effects
+    /// for non-built-in sources; unknown tools still use the legacy
+    /// compatibility ledger and cannot silently become journal operations.
+    fn journal_eligible_capability(&self, name: &str) -> bool {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.capability_registry.get(name))
+            .is_some_and(|capability| {
+                matches!(
+                    capability.source,
+                    crate::runtime::CapabilitySource::Builtin
+                        | crate::runtime::CapabilitySource::JsExtension
+                        | crate::runtime::CapabilitySource::NativeExtension
+                        | crate::runtime::CapabilitySource::Mcp
+                )
+            })
+    }
+
     fn operation_runtime_for_tool(
         &self,
         name: &str,
     ) -> Option<crate::runtime::operations::ToolOperationRuntime> {
         let runtime = self.runtime.as_ref()?;
-        let capability = runtime.capability_registry.get(name)?;
-        // Registered extension/MCP capabilities use the same journal facade as
-        // built-ins.  The planner applies conservative external-mutation
-        // effects for non-built-in sources; unknown tools still use the legacy
-        // compatibility ledger and cannot silently become journal operations.
-        runtime.operations.clone().filter(|_| {
-            matches!(
-                capability.source,
-                crate::runtime::CapabilitySource::Builtin
-                    | crate::runtime::CapabilitySource::JsExtension
-                    | crate::runtime::CapabilitySource::NativeExtension
-                    | crate::runtime::CapabilitySource::Mcp
-            )
-        })
+        runtime
+            .operations
+            .clone()
+            .filter(|_| self.journal_eligible_capability(name))
+    }
+
+    /// Which authority owns this call: eligibility comes from the tool's own
+    /// capability, configuration from the runtime's journal.
+    fn tool_execution_authority(
+        &self,
+        id: &str,
+        name: &str,
+    ) -> crate::tool_ledger::ToolCallExecutionAuthority {
+        let journal_configured = self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.operations.is_some());
+        self.tool_ledger
+            .lock()
+            .map(|ledger| {
+                ledger.execution_authority(
+                    id,
+                    self.journal_eligible_capability(name),
+                    journal_configured,
+                )
+            })
+            .unwrap_or(crate::tool_ledger::ToolCallExecutionAuthority::CompatibilityLedger)
     }
 
     fn current_operation_plan(
@@ -2219,7 +2297,18 @@ Issue the call again if it is still needed.";
             .map_err(|error| format!("operation intent could not be rebuilt: {error}"))
     }
 
+    /// Drops the revision a compatibility-route call was prepared under.
+    fn forget_prepared_revision(&self, call_id: &str) -> Option<u64> {
+        self.prepared_permission_revisions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(call_id)
+    }
+
+    /// Releases everything a prepared call holds when it will not run: the
+    /// journal admission and the compatibility route's authorized revision.
     pub(crate) fn cancel_pending_tool_operation(&self, call_id: &str) {
+        self.forget_prepared_revision(call_id);
         let pending = self
             .pending_tool_operations
             .lock()
@@ -2320,12 +2409,7 @@ Issue the call again if it is still needed.";
             }
         }
         let operation_runtime = self.operation_runtime_for_tool(name);
-        let journal_configured = operation_runtime.is_some();
-        let route = self
-            .tool_ledger
-            .lock()
-            .map(|ledger| ledger.execution_authority(id, journal_configured, journal_configured))
-            .unwrap_or(crate::tool_ledger::ToolCallExecutionAuthority::CompatibilityLedger);
+        let route = self.tool_execution_authority(id, name);
         if route == crate::tool_ledger::ToolCallExecutionAuthority::LegacyObservationBlocked {
             return immediate(
                 "Legacy tool-ledger record was migrated as an observation; operation recovery must reconcile it before dispatch.".into(),
@@ -2566,29 +2650,30 @@ Issue the call again if it is still needed.";
             }
             return immediate(reason, true);
         }
-        let journal_permission_revision =
+        // Both routes authorize under a revision; the journal commits it with
+        // the admission, the compatibility route re-checks it before the adapter.
+        let authorized =
             if route == crate::tool_ledger::ToolCallExecutionAuthority::OperationJournal {
-                match self.stable_permission_revision(cwd, id, name, args) {
-                    Ok(revision) => Some(revision),
-                    Err(reason) => {
-                        // `denied` marks a call that never ran, for the hosts'
-                        // rows and post-tool hooks, without sniffing the text.
-                        cancel_persisted_intent(journal_pending.as_ref(), &reason);
-                        if let Ok(mut ledger) = self.tool_ledger.lock() {
-                            ledger.record_blocked(id, &reason);
-                        }
-                        return immediate(reason, true);
-                    }
-                }
+                self.stable_permission_revision(cwd, id, name, args)
             } else {
-                if let Some(reason) = self.permission_denial(cwd, id, name, args) {
-                    if let Ok(mut ledger) = self.tool_ledger.lock() {
-                        ledger.record_blocked(id, &reason);
-                    }
-                    return immediate(reason, true);
-                }
-                None
+                // One evaluation, as before: the first one writes session state
+                // and moves the revision, and a retry would ask the user twice.
+                // The decision hands back the revision it was made under, so no
+                // later read can stand in for it.
+                self.permission_authorization(cwd, id, name, args)
             };
+        let authorized_revision = match authorized {
+            Ok(revision) => revision,
+            Err(reason) => {
+                // `denied` marks a call that never ran, for the hosts'
+                // rows and post-tool hooks, without sniffing the text.
+                cancel_persisted_intent(journal_pending.as_ref(), &reason);
+                if let Ok(mut ledger) = self.tool_ledger.lock() {
+                    ledger.record_blocked(id, &reason);
+                }
+                return immediate(reason, true);
+            }
+        };
         let class = self
             .permissions
             .lock()
@@ -2605,21 +2690,10 @@ Issue the call again if it is still needed.";
                     true,
                 );
             };
-            let Some(permission_revision) = journal_permission_revision else {
-                cancel_persisted_intent(
-                    Some(&pending),
-                    "permission policy revision is unavailable",
-                );
-                self.approval_registry.take_dispatch(id);
-                return immediate(
-                    "Operation denied: permission policy revision is unavailable.".into(),
-                    true,
-                );
-            };
             pending.admitted = match pending
                 .runtime
                 .dispatcher()
-                .authorize_and_queue(&pending.admitted, permission_revision)
+                .authorize_and_queue(&pending.admitted, authorized_revision)
             {
                 Ok(admitted) => admitted,
                 Err(error) => {
@@ -2649,8 +2723,95 @@ Issue the call again if it is still needed.";
                 }
             };
             pending_calls.insert(id.to_owned(), pending);
+        } else {
+            self.prepared_permission_revisions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(id.to_owned(), authorized_revision);
         }
         Preparation::Ready { lane }
+    }
+
+    /// Last check before a compatibility-route adapter runs: the run was not
+    /// cancelled and the permission policy is the one the call was authorized
+    /// under. The journal route has the same checks in its dispatch callback.
+    ///
+    /// Order matters: take the permission lock, then read cancellation, then
+    /// compare the revision, then release. A cancel that lands while the lock
+    /// is contended is seen, and nothing blocking sits between this return and
+    /// the adapter. A policy change landing after the adapter started applies
+    /// from the next call, the same as the journal route's callback.
+    fn pre_dispatch_gate(&self, authorized_revision: u64) -> Result<(), crate::ToolResult> {
+        let refuse = |content: &str, marker: &str| crate::ToolResult {
+            content: content.into(),
+            is_error: true,
+            details: Some(serde_json::json!({ "denied": true, marker: true })),
+        };
+        let (cancelled, current) = match self.permissions.lock() {
+            Ok(permissions) => (
+                self.abort_requested()
+                    || self
+                        .runtime
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.is_cancelled()),
+                permissions.revision(),
+            ),
+            Err(_) => (false, None),
+        };
+        if cancelled {
+            return Err(refuse(
+                "Tool call was cancelled before dispatch; no adapter was run.",
+                "cancelled",
+            ));
+        }
+        if current != Some(authorized_revision) {
+            return Err(refuse(
+                "Permission policy changed before dispatch; no adapter was run. Retry the call to authorize it again.",
+                "permission_policy_changed",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The journal route's cancellation and policy check, run by its dispatch
+    /// callback just before the adapter. Same order as
+    /// [`Self::pre_dispatch_gate`]: take the permission lock first, then read
+    /// cancellation, then the revision, so a cancel that lands while the lock
+    /// is contended is seen.
+    fn journal_dispatch_gate(&self, authorized_revision: Option<u64>) -> Result<(), String> {
+        let permissions = self.permissions.lock();
+        let cancelled = self.abort_requested()
+            || self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.is_cancelled());
+        let latest_revision = permissions
+            .ok()
+            .and_then(|permissions| permissions.revision());
+        if cancelled {
+            return Err("operation was cancelled before dispatch".into());
+        }
+        if latest_revision != authorized_revision {
+            return Err("permission policy changed at dispatch".into());
+        }
+        Ok(())
+    }
+
+    /// Both stages, the way the turn loop drives them.
+    #[cfg(test)]
+    pub(crate) fn prepare_and_run_call(
+        &self,
+        cwd: &Path,
+        id: &str,
+        name: &str,
+        args: &Value,
+        depth: usize,
+    ) -> crate::ToolResult {
+        match self.prepare_tool_call(cwd, id, name, args, depth) {
+            Preparation::Immediate(result) => result,
+            Preparation::Wait { call_id, .. } => self.wait_for_tool_call(&call_id),
+            Preparation::Ready { .. } => self.run_prepared_call(cwd, id, name, args, depth),
+        }
     }
 
     /// Stage two: the call itself. Takes `&self` only, so it may run on a
@@ -2683,17 +2844,13 @@ Issue the call again if it is still needed.";
             .remove(id);
         let mut pending_operation = PendingToolOperationGuard::new(pending);
         let journal_authoritative = pending_operation.as_ref().is_some();
+        // Single use, bound to this call id. Always consumed, so a journal
+        // call cannot leave a stale entry behind either.
+        let prepared_revision = self.forget_prepared_revision(id);
 
         if !journal_authoritative
-            && self.operation_runtime_for_tool(name).is_some()
-            && self
-                .tool_ledger
-                .lock()
-                .map(|ledger| {
-                    ledger.execution_authority(id, true, true)
-                        == crate::tool_ledger::ToolCallExecutionAuthority::OperationJournal
-                })
-                .unwrap_or(false)
+            && self.tool_execution_authority(id, name)
+                == crate::tool_ledger::ToolCallExecutionAuthority::OperationJournal
         {
             return crate::ToolResult {
                 content: "Operation was not admitted before dispatch; no adapter was run.".into(),
@@ -2701,6 +2858,16 @@ Issue the call again if it is still needed.";
                 details: Some(serde_json::json!({ "operation_dispatch": true, "denied": true })),
             };
         }
+        // Authority is never reconstructed: a compatibility call that was not
+        // prepared has no revision to be held to, so it does not run.
+        let authorized_revision = match prepared_revision {
+            Some(revision) => Some(revision),
+            None if journal_authoritative => None,
+            None => {
+                self.approval_registry.take_dispatch(id);
+                return unprepared_dispatch_refusal();
+            }
+        };
         if let Err(error) = self.ensure_session_persistence() {
             return crate::ToolResult {
                 content: error,
@@ -3102,7 +3269,7 @@ Issue the call again if it is still needed.";
                 } else if structured.is_some() && name.starts_with("mcp__") {
                     match context.mcp.resolve_tool(name) {
                         Some((server, tool)) => {
-                            context.mcp.call_full(&server, &tool, args).map(|full| {
+                            context.mcp.call_full(&server, &tool, args, id).map(|full| {
                                 let unsupported = full.content.iter().any(|block| {
                                     block.kind != "text"
                                         && !(block.kind == "resource" && block.resource.as_ref()
@@ -3189,11 +3356,7 @@ Issue the call again if it is still needed.";
                     Err(crate::tools::ToolError::Durability(error)) => {
                         self.tool_durability_failure(error)
                     }
-                    Err(err) => crate::ToolResult {
-                        content: err.to_string(),
-                        is_error: true,
-                        details: None,
-                    },
+                    Err(err) => err.into_tool_result(name),
                 };
 
                 if let Some(receipt) = context
@@ -3395,22 +3558,6 @@ Issue the call again if it is still needed.";
                         );
                     }
                     latest_runtime.validate_workspace(cwd)?;
-                    if self.abort_requested()
-                        || self
-                            .runtime
-                            .as_ref()
-                            .is_some_and(|runtime| runtime.is_cancelled())
-                    {
-                        return Err("operation was cancelled before dispatch".into());
-                    }
-                    let latest_revision = self
-                        .permissions
-                        .lock()
-                        .ok()
-                        .and_then(|permissions| permissions.revision());
-                    if latest_revision != permission_revision {
-                        return Err("permission policy changed at dispatch".into());
-                    }
                     self.check_contract_gate(cwd, id, name, args)
                         .map_err(|error| error.to_string())?;
                     self.check_contract_dispatch_boundary(cwd, name, args)
@@ -3426,6 +3573,11 @@ Issue the call again if it is still needed.";
                     if latest_digest != current_digest {
                         return Err("tool payload or task contract changed at dispatch".into());
                     }
+                    // Last: a cancel or policy change during any check above
+                    // is seen here. Only the durable effect latch follows.
+                    #[cfg(test)]
+                    before_journal_gate_hook();
+                    self.journal_dispatch_gate(permission_revision)?;
                     Ok(())
                 },
                 execute,
@@ -3470,13 +3622,28 @@ Issue the call again if it is still needed.";
             }
             result
         } else {
-            execute()
+            match authorized_revision {
+                Some(revision) => self
+                    .pre_dispatch_gate(revision)
+                    .map_or_else(|refused| refused, |()| execute()),
+                None => unprepared_dispatch_refusal(),
+            }
         };
         pending_operation.disarm();
         if !journal_authoritative {
             if let Ok(mut ledger) = self.tool_ledger.lock() {
                 if outcome.is_error {
-                    ledger.record_failure(id, &outcome.content);
+                    let unknown = outcome
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("outcome_unknown"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if unknown {
+                        ledger.record_unknown_outcome(id, &outcome.content);
+                    } else {
+                        ledger.record_failure(id, &outcome.content);
+                    }
                 } else {
                     ledger.record_completion(id, &outcome.content, false);
                 }
@@ -4344,7 +4511,20 @@ Issue the call again if it is still needed.";
     /// block there wins) and after the unknown-tool check (nobody is asked
     /// about a tool that does not exist).
     fn permission_denial(&self, cwd: &Path, id: &str, name: &str, args: &Value) -> Option<String> {
-        self.permission_denial_inner(cwd, id, name, args, false)
+        self.permission_authorization(cwd, id, name, args).err()
+    }
+
+    /// The decision and the policy revision it was made under. The revision is
+    /// read inside the same lock hold as the policy the decision evaluated, or,
+    /// after an approval, inside the hold that applied it, never afterwards.
+    fn permission_authorization(
+        &self,
+        cwd: &Path,
+        id: &str,
+        name: &str,
+        args: &Value,
+    ) -> Result<u64, String> {
+        self.permission_authorization_inner(cwd, id, name, args, false)
     }
 
     pub(crate) fn host_permission_denial(
@@ -4354,24 +4534,31 @@ Issue the call again if it is still needed.";
         name: &str,
         args: &Value,
     ) -> Option<String> {
-        self.permission_denial_inner(cwd, id, name, args, true)
+        self.permission_authorization_inner(cwd, id, name, args, true)
+            .err()
     }
 
-    fn permission_denial_inner(
+    fn permission_authorization_inner(
         &self,
         cwd: &Path,
         id: &str,
         name: &str,
         args: &Value,
         retain_host_consent: bool,
-    ) -> Option<String> {
+    ) -> Result<u64, String> {
+        const EXHAUSTED: &str = "Permission denied: policy revision is exhausted.";
         // A new preparation supersedes any abandoned consent for this call ID.
         self.approval_registry.take_dispatch(id);
         // Asking for user intent is a host interaction, not a repository or
         // global-permission grant. The operations selected later still pass
         // the normal permission and task-contract gates.
         if name == "ask_user_question" {
-            return None;
+            return self
+                .permissions
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .revision()
+                .ok_or_else(|| EXHAUSTED.to_owned());
         }
         use crate::PermissionVerdict;
         // Read outside the lock: profile discovery touches the disk.
@@ -4409,7 +4596,11 @@ Issue the call again if it is still needed.";
         };
         let verdict = issued_policy.decide(id, name, args, cwd);
         let request = match verdict {
-            PermissionVerdict::Allow => return None,
+            PermissionVerdict::Allow => {
+                #[cfg(test)]
+                after_permission_decision_hook();
+                return issued_revision.ok_or_else(|| EXHAUSTED.to_owned());
+            }
             PermissionVerdict::Deny { reason } => {
                 crate::stats::SharedCounters::add(&self.counters.permission_denials, 1);
                 if let Some(runtime) = &self.runtime {
@@ -4418,7 +4609,7 @@ Issue the call again if it is still needed.";
                         reason: reason.clone(),
                     });
                 }
-                return Some(reason);
+                return Err(reason);
             }
             PermissionVerdict::Ask(request) => {
                 crate::stats::SharedCounters::add(&self.counters.permission_prompts, 1);
@@ -4433,7 +4624,7 @@ Issue the call again if it is still needed.";
                             call_id: id.to_string(),
                             reason: reason.clone(),
                         });
-                        return Some(reason);
+                        return Err(reason);
                     }
                 }
                 request
@@ -4459,7 +4650,7 @@ Issue the call again if it is still needed.";
                     reason: reason.clone(),
                 });
             }
-            return Some(reason);
+            return Err(reason);
         }
         let denied = |reason: String| {
             crate::stats::SharedCounters::add(&self.counters.permission_denials, 1);
@@ -4469,10 +4660,10 @@ Issue the call again if it is still needed.";
                     reason: reason.clone(),
                 });
             }
-            Some(reason)
+            Err(reason)
         };
         let Some(revision) = issued_revision else {
-            return denied("Permission denied: policy revision is exhausted.".into());
+            return denied(EXHAUSTED.into());
         };
         let digest = self
             .approval_registry
@@ -4510,12 +4701,12 @@ Issue the call again if it is still needed.";
         {
             return denied("Permission denied: approval was cancelled.".into());
         }
-        let stale_reason = {
+        let (stale_reason, applied_revision) = {
             let mut policy = self
                 .permissions
                 .lock()
                 .unwrap_or_else(|err| err.into_inner());
-            if issued_revision.is_none()
+            let reason: Option<String> = if issued_revision.is_none()
                 || policy.revision() != issued_revision
                 || *policy != issued_policy
             {
@@ -4559,12 +4750,16 @@ Issue the call again if it is still needed.";
                     PermissionVerdict::Deny { reason } => Some(reason),
                     _ => Some("Permission denied: action changed while approval was pending; request approval again.".into()),
                 }
-            }
+            };
+            // A session grant above moved the revision; the call is authorized
+            // under the one it left behind, read in this same hold.
+            (reason, policy.revision())
         };
         // Observers may read policy themselves, so emit after releasing it.
-        match stale_reason {
-            Some(reason) => denied(reason),
-            None => None,
+        match (stale_reason, applied_revision) {
+            (Some(reason), _) => denied(reason),
+            (None, Some(revision)) => Ok(revision),
+            (None, None) => denied(EXHAUSTED.into()),
         }
     }
 
@@ -6969,6 +7164,247 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    /// Agent with `design_read` (read class, so the parallel lane, unknown to
+    /// the built-in dispatcher) and `fixture` (class other, so a serial
+    /// barrier) both routed to `executor`.
+    fn pairing_agent(
+        mode: crate::PermissionMode,
+        executor: impl Fn(&str, &Value) -> crate::ToolResult + Send + Sync + 'static,
+    ) -> Agent {
+        let mut agent = Agent::new("pairing fixture");
+        agent.tools = vec!["design_read".into(), "fixture".into(), "write".into()];
+        agent.permissions = Arc::new(crate::PermissionState::new(crate::PermissionPolicy::new(
+            mode,
+        )));
+        agent.custom_tool_executor = Some(crate::CustomToolExecutor::new(move |_, name, args| {
+            Ok(executor(name, args))
+        }));
+        agent
+    }
+
+    fn ok_result(content: impl Into<String>) -> crate::ToolResult {
+        crate::ToolResult {
+            content: content.into(),
+            is_error: false,
+            details: None,
+        }
+    }
+
+    /// (call id, is_error, text) of every tool result message, in order.
+    fn paired(messages: &[ChatMessage]) -> Vec<(String, bool, String)> {
+        messages
+            .iter()
+            .map(|m| {
+                (
+                    m.tool_call_id.clone().expect("tool result without call id"),
+                    m.is_error == Some(true),
+                    content_text(&m.content),
+                )
+            })
+            .collect()
+    }
+
+    fn end_count(events: &[AgentEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
+            .count()
+    }
+
+    #[test]
+    fn b2_reverse_completion_pairs_each_result_to_its_call_id_in_call_order() {
+        let root = tempdir().unwrap();
+        let finished = Arc::new(Mutex::new(Vec::new()));
+        let record = finished.clone();
+        let mut agent = pairing_agent(crate::PermissionMode::AlwaysApprove, move |_, args| {
+            let tag = args["tag"].as_str().unwrap().to_owned();
+            if tag == "slow" {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            record.lock().unwrap().push(tag.clone());
+            ok_result(format!("result-of-{tag}"))
+        });
+        let calls = vec![
+            (
+                "c-slow".into(),
+                "design_read".into(),
+                json!({"tag": "slow"}),
+            ),
+            (
+                "c-fast".into(),
+                "design_read".into(),
+                json!({"tag": "fast"}),
+            ),
+        ];
+        let mut events = Vec::new();
+        let messages = agent.execute_tool_batch(root.path(), calls, &mut events);
+
+        assert_eq!(
+            *finished.lock().unwrap(),
+            ["fast", "slow"],
+            "the fixture must complete in reverse call order"
+        );
+        assert_eq!(
+            paired(&messages),
+            [
+                ("c-slow".into(), false, "result-of-slow".into()),
+                ("c-fast".into(), false, "result-of-fast".into()),
+            ]
+        );
+        assert_eq!(end_count(&events), 2);
+    }
+
+    #[test]
+    fn b2_a_denied_call_does_not_stop_its_sibling_and_pairing_holds() {
+        // Policy: a per-call permission denial is that call's error result only.
+        // Siblings in the same message still run; only a cancelling denial
+        // (the approver aborting the turn) stops the rest.
+        let root = tempdir().unwrap();
+        let mut agent = pairing_agent(crate::PermissionMode::ReadOnly, |_, _| ok_result("ran"));
+        let calls = vec![
+            (
+                "c-write".into(),
+                "write".into(),
+                json!({"path": "denied.txt", "content": "x"}),
+            ),
+            ("c-read".into(), "design_read".into(), json!({})),
+        ];
+        let mut events = Vec::new();
+        let messages = agent.execute_tool_batch(root.path(), calls, &mut events);
+
+        let got = paired(&messages);
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].0.as_str(), got[0].1), ("c-write", true));
+        assert_eq!(got[1], ("c-read".into(), false, "ran".into()));
+        assert!(!root.path().join("denied.txt").exists());
+        assert_eq!(end_count(&events), 2);
+    }
+
+    #[test]
+    fn b2_an_invalid_call_next_to_a_valid_one_errors_alone() {
+        let root = tempdir().unwrap();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counter = ran.clone();
+        let mut agent = pairing_agent(crate::PermissionMode::AlwaysApprove, move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            ok_result("valid ran")
+        });
+        let calls = vec![
+            (
+                "c-bad".into(),
+                "design_read".into(),
+                json!({"__davinci_invalid_arguments": r#"{"path":"#}),
+            ),
+            ("c-good".into(), "design_read".into(), json!({})),
+        ];
+        let mut events = Vec::new();
+        let messages = agent.execute_tool_batch(root.path(), calls, &mut events);
+
+        let got = paired(&messages);
+        assert_eq!((got[0].0.as_str(), got[0].1), ("c-bad", true));
+        assert!(got[0].2.contains("not valid JSON"), "{}", got[0].2);
+        assert_eq!(got[1], ("c-good".into(), false, "valid ran".into()));
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "only the valid call runs");
+        assert_eq!(end_count(&events), 2);
+    }
+
+    #[test]
+    fn b2_cancel_mid_batch_gives_every_call_exactly_one_result() {
+        let root = tempdir().unwrap();
+        let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trigger = abort.clone();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counter = ran.clone();
+        let mut agent = pairing_agent(crate::PermissionMode::AlwaysApprove, move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            trigger.store(true, Ordering::SeqCst);
+            ok_result("first finished")
+        });
+        agent.abort_signal = Some(abort);
+        let calls = ["c1", "c2", "c3"]
+            .map(|id| (id.to_owned(), "fixture".to_owned(), json!({"id": id})))
+            .to_vec();
+        let mut events = Vec::new();
+        let messages = agent.execute_tool_batch(root.path(), calls, &mut events);
+
+        let got = paired(&messages);
+        assert_eq!(
+            got.iter().map(|g| g.0.as_str()).collect::<Vec<_>>(),
+            ["c1", "c2", "c3"],
+            "no orphan tool_use and no duplicate result"
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "later calls never dispatch");
+        assert!(!got[0].1);
+        assert!(got[1].1 && got[2].1, "skipped calls are error results");
+        assert_eq!(end_count(&events), 3);
+    }
+
+    #[test]
+    fn b2_mutating_calls_run_one_at_a_time_in_call_order() {
+        // Policy (scheduler.rs): anything that is not read-class is a barrier
+        // that runs alone, after earlier calls and before later ones.
+        let root = tempdir().unwrap();
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (l, p, o) = (live.clone(), peak.clone(), order.clone());
+        let mut agent = pairing_agent(crate::PermissionMode::AlwaysApprove, move |_, args| {
+            let now = l.fetch_add(1, Ordering::SeqCst) + 1;
+            p.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            o.lock()
+                .unwrap()
+                .push(args["id"].as_str().unwrap().to_owned());
+            l.fetch_sub(1, Ordering::SeqCst);
+            ok_result("done")
+        });
+        let calls = ["m1", "m2", "m3"]
+            .map(|id| (id.to_owned(), "fixture".to_owned(), json!({"id": id})))
+            .to_vec();
+        let mut events = Vec::new();
+        let messages = agent.execute_tool_batch(root.path(), calls, &mut events);
+
+        assert_eq!(peak.load(Ordering::SeqCst), 1, "mutating calls overlapped");
+        assert_eq!(*order.lock().unwrap(), ["m1", "m2", "m3"]);
+        assert_eq!(paired(&messages).len(), 3);
+    }
+
+    #[test]
+    fn b2_an_oversize_result_is_truncated_and_stays_paired_to_its_call() {
+        let root = tempdir().unwrap();
+        let huge: String = (0..20_000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(root.path().join("huge.txt"), &huge).unwrap();
+        std::fs::write(root.path().join("small.txt"), "tiny\n").unwrap();
+        let mut agent = Agent::new("output cap fixture");
+        agent.tools = vec!["read".into()];
+        agent.permissions = Arc::new(crate::PermissionState::new(crate::PermissionPolicy::new(
+            crate::PermissionMode::AlwaysApprove,
+        )));
+        let calls = vec![
+            ("c-huge".into(), "read".into(), json!({"path": "huge.txt"})),
+            (
+                "c-small".into(),
+                "read".into(),
+                json!({"path": "small.txt"}),
+            ),
+        ];
+        let mut events = Vec::new();
+        let messages = agent.execute_tool_batch(root.path(), calls, &mut events);
+
+        let got = paired(&messages);
+        assert_eq!(got[0].0, "c-huge");
+        assert!(!got[0].1);
+        assert!(
+            got[0].2.len() < huge.len() / 2,
+            "huge result was not capped: {} of {} bytes",
+            got[0].2.len(),
+            huge.len()
+        );
+        assert!(!got[0].2.contains("line 19999"), "tail leaked past the cap");
+        assert_eq!(got[1].0, "c-small");
+        assert!(got[1].2.contains("tiny"), "{}", got[1].2);
+    }
+
     #[test]
     fn existing_serialized_agent_event_json_is_unchanged() {
         let event = AgentEvent::ToolExecutionStart {
@@ -7367,7 +7803,7 @@ mod tests {
         agent.set_active_contract(contract);
         let args = serde_json::json!({"path": "src/ok.rs", "content": "allowed"});
 
-        let result = agent.run_prepared_call(temp.path(), "native_write", "write", &args, 0);
+        let result = agent.prepare_and_run_call(temp.path(), "native_write", "write", &args, 0);
         assert!(!result.is_error, "{}", result.content);
         assert_eq!(
             std::fs::read_to_string(temp.path().join("src/ok.rs")).unwrap(),
@@ -7399,7 +7835,7 @@ mod tests {
         agent.set_active_contract(contract);
         let args = serde_json::json!({"path": "docs/x.md", "content": "out of scope"});
 
-        let result = agent.run_prepared_call(temp.path(), "native_write", "write", &args, 0);
+        let result = agent.prepare_and_run_call(temp.path(), "native_write", "write", &args, 0);
         assert!(result.is_error);
         assert!(result.content.contains("scope"), "{}", result.content);
         assert!(!temp.path().join("docs/x.md").exists());
@@ -7799,7 +8235,7 @@ mod tests {
             "path": "test.txt",
             "content": "first line\n"
         });
-        let res = agent.run_prepared_call(dir.path(), "call-1", "write", &args, 0);
+        let res = agent.prepare_and_run_call(dir.path(), "call-1", "write", &args, 0);
         assert!(!res.is_error);
 
         let effects = runtime.effect_ledger.read().unwrap().clone();
@@ -7818,7 +8254,7 @@ mod tests {
             "path": "test.txt",
             "content": "first line\nsecond line\n"
         });
-        let res2 = agent.run_prepared_call(dir.path(), "call-2", "write", &args2, 0);
+        let res2 = agent.prepare_and_run_call(dir.path(), "call-2", "write", &args2, 0);
         assert!(!res2.is_error);
 
         let effects2 = runtime.effect_ledger.read().unwrap().clone();
@@ -7880,7 +8316,7 @@ mod tests {
             _ => panic!("review-only capability must deny nonlocal shell commands"),
         }
 
-        let dispatch = agent.run_prepared_call(
+        let dispatch = agent.prepare_and_run_call(
             dir.path(),
             "review-dispatch-write",
             "write",
@@ -7994,7 +8430,7 @@ mod tests {
             agent.finalize_tool_call(root.path(), "check", "exec_command", &command, checked);
             agent.post_tool = None;
             agent.permissions.lock().unwrap().deny.clear();
-            let status = agent.run_prepared_call(
+            let status = agent.prepare_and_run_call(
                 root.path(),
                 "status",
                 "patch_status",
@@ -8337,7 +8773,8 @@ mod tests {
                 _ => panic!("unexpected Git observation preparation: {case}"),
             }
             let plain = json!({"id":id, "paths":["a.txt"]});
-            let result = agent.run_prepared_call(root.path(), "plain", "patch_status", &plain, 0);
+            let result =
+                agent.prepare_and_run_call(root.path(), "plain", "patch_status", &plain, 0);
             assert!(!result.is_error, "{}", result.content);
             assert_eq!(
                 result.details.unwrap()["transaction"]["state"],
@@ -8769,6 +9206,333 @@ mod operation_dispatch_tests {
         );
     }
 
+    /// An agent with one MCP server, `rec`, whose `effect` tool is served by
+    /// `transport`.
+    fn mcp_agent(
+        transport: impl davinci_mcp::RpcTransport + 'static,
+    ) -> (Agent, tempfile::TempDir, Arc<OperationJournal>) {
+        let (mut agent, workspace, journal) = configured_agent();
+        agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+        agent.attach_mcp(crate::mcp::McpRegistry::with_test_transport(
+            "rec",
+            Box::new(transport),
+        ));
+        (agent, workspace, journal)
+    }
+
+    fn recorded_ids(calls: &Arc<std::sync::Mutex<Vec<serde_json::Value>>>) -> Vec<String> {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|params| {
+                params["_meta"][davinci_mcp::INVOCATION_ID_META_KEY]
+                    .as_str()
+                    .unwrap_or("<none>")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn g12_a_direct_mcp_call_carries_its_tool_call_id_to_the_server() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (agent, workspace, _journal) =
+            mcp_agent(crate::mcp::test_support::RecordingTransport {
+                calls: calls.clone(),
+                lose_reply: false,
+            });
+        let args = json!({});
+        assert!(matches!(
+            agent.prepare_tool_call(
+                workspace.path(),
+                "direct-mcp-1",
+                "mcp__rec__effect",
+                &args,
+                0
+            ),
+            Preparation::Ready { .. }
+        ));
+        let result = agent.run_prepared_call(
+            workspace.path(),
+            "direct-mcp-1",
+            "mcp__rec__effect",
+            &args,
+            0,
+        );
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(recorded_ids(&calls), ["direct-mcp-1"]);
+    }
+
+    #[test]
+    fn g12_a_batched_mcp_call_carries_its_own_child_call_id_to_the_server() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (agent, workspace, journal) = mcp_agent(crate::mcp::test_support::RecordingTransport {
+            calls: calls.clone(),
+            lose_reply: false,
+        });
+        let args = json!({"operations": [{"tool": "mcp__rec__effect", "args": {}}]});
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), "batch-mcp-1", "batch", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        let result = agent.run_prepared_call(workspace.path(), "batch-mcp-1", "batch", &args, 0);
+        assert!(!result.is_error, "{}", result.content);
+        // The id the server sees is the one the batch gave that child: the
+        // parent's tool-call id and the child's position.
+        assert_eq!(recorded_ids(&calls), ["batch-mcp-1#1"]);
+        assert_eq!(journal.snapshot().unwrap().operations.len(), 2);
+    }
+
+    /// Commits the effect, then cancels the agent's run the way a user does
+    /// mid-call, and never produces a reply: the connection reports that no
+    /// reply arrived. Every `tools/call` is counted, resends included.
+    struct CommitThenCancel {
+        token: crate::runtime::CancellationToken,
+        calls: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl davinci_mcp::RpcTransport for CommitThenCancel {
+        fn call(
+            &mut self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> davinci_mcp::Result<serde_json::Value> {
+            match method {
+                "initialize" => Ok(json!({
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {"tools": {}}
+                })),
+                "tools/list" => Ok(json!({
+                    "tools": [{"name": "effect", "inputSchema": {"type": "object"}}]
+                })),
+                "tools/call" => {
+                    self.calls.lock().unwrap().push(params);
+                    self.token.cancel();
+                    Err(davinci_mcp::Error::Transport(
+                        "no reply before the call was cancelled".into(),
+                    ))
+                }
+                other => Err(davinci_mcp::Error::Protocol(format!("unexpected {other}"))),
+            }
+        }
+
+        fn notify(&mut self, _: &str, _: serde_json::Value) -> davinci_mcp::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn g14_a_cancel_after_the_effect_committed_reaches_the_model_as_unknown_and_is_not_resent() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut configured, workspace, journal) = configured_agent();
+        let token = configured
+            .runtime
+            .as_ref()
+            .unwrap()
+            .cancellation_token
+            .clone();
+        configured.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+        configured.attach_mcp(crate::mcp::McpRegistry::with_test_transport(
+            "rec",
+            Box::new(CommitThenCancel {
+                token: token.clone(),
+                calls: calls.clone(),
+            }),
+        ));
+        let agent = configured;
+        let args = json!({});
+        let id = "g14-agent";
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), id, "mcp__rec__effect", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        let result = agent.run_prepared_call(workspace.path(), id, "mcp__rec__effect", &args, 0);
+
+        assert!(token.is_cancelled(), "the run was cancelled mid-call");
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("Outcome unknown"),
+            "{}",
+            result.content
+        );
+        assert!(result.content.contains("not retried"), "{}", result.content);
+        assert_eq!(
+            result
+                .details
+                .as_ref()
+                .and_then(|d| d.get("outcome_unknown")),
+            Some(&json!(true)),
+            "the model-visible result is the unknown outcome, not a failure"
+        );
+        assert_eq!(recorded_ids(&calls), [id], "exactly one tools/call");
+
+        // The journal keeps the attempt open with a possible effect, so the
+        // call is not a confirmed failure that something may retry.
+        let snapshot = journal.snapshot().unwrap();
+        let attempt = &snapshot.attempts[0];
+        assert_ne!(attempt.state(), OperationState::Succeeded);
+        assert!(
+            matches!(
+                attempt.effect_status(),
+                crate::runtime::operations::EffectStatus::Possible
+                    | crate::runtime::operations::EffectStatus::Unknown
+                    | crate::runtime::operations::EffectStatus::EffectsObserved
+            ),
+            "{:?}",
+            attempt.effect_status()
+        );
+        // Delivering the same call id again does not send it again.
+        let again = agent.run_prepared_call(workspace.path(), id, "mcp__rec__effect", &args, 0);
+        assert!(again.is_error);
+        assert_eq!(recorded_ids(&calls), [id], "still exactly one tools/call");
+    }
+
+    #[test]
+    fn g14_a_cancel_before_dispatch_sends_nothing() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (agent, workspace, _journal) =
+            mcp_agent(crate::mcp::test_support::RecordingTransport {
+                calls: calls.clone(),
+                lose_reply: false,
+            });
+        let args = json!({});
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), "g14-early", "mcp__rec__effect", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        agent.runtime.as_ref().unwrap().cancel();
+        let result =
+            agent.run_prepared_call(workspace.path(), "g14-early", "mcp__rec__effect", &args, 0);
+        assert!(result.is_error);
+        assert!(
+            !result.content.contains("Outcome unknown"),
+            "{}",
+            result.content
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "nothing reached the server"
+        );
+    }
+
+    #[test]
+    fn execution_authority_follows_each_tools_own_capability_and_the_journal() {
+        use crate::tool_ledger::ToolCallExecutionAuthority::{
+            CompatibilityLedger, LegacyObservationBlocked, OperationJournal,
+        };
+        let register = |agent: &Agent, name: &str, source| {
+            agent
+                .runtime
+                .as_ref()
+                .unwrap()
+                .capability_registry
+                .register(crate::RuntimeCapability::new(
+                    name,
+                    source,
+                    crate::ToolClass::Other,
+                    false,
+                    &json!({"type": "object"}),
+                    None,
+                ));
+        };
+        let sources = [
+            ("builtin_tool", crate::CapabilitySource::Builtin),
+            ("js_tool", crate::CapabilitySource::JsExtension),
+            ("native_tool", crate::CapabilitySource::NativeExtension),
+            ("mcp__srv__tool", crate::CapabilitySource::Mcp),
+        ];
+
+        let (journaled, _workspace, _journal) = configured_agent();
+        for (name, source) in sources {
+            register(&journaled, name, source);
+            assert!(journaled.journal_eligible_capability(name), "{name}");
+            assert_eq!(
+                journaled.tool_execution_authority("fresh", name),
+                OperationJournal,
+                "{name} with a journal"
+            );
+        }
+        assert!(!journaled.journal_eligible_capability("unregistered_tool"));
+        assert_eq!(
+            journaled.tool_execution_authority("fresh", "unregistered_tool"),
+            CompatibilityLedger
+        );
+        // A legacy record blocks an eligible tool and cannot capture an
+        // ineligible one.
+        for name in ["mcp__srv__tool", "unregistered_tool"] {
+            journaled
+                .tool_ledger
+                .lock()
+                .unwrap()
+                .record_start("legacy", name, &json!({}));
+        }
+        assert_eq!(
+            journaled.tool_execution_authority("legacy", "mcp__srv__tool"),
+            LegacyObservationBlocked
+        );
+        assert_eq!(
+            journaled.tool_execution_authority("legacy", "unregistered_tool"),
+            CompatibilityLedger
+        );
+
+        // Same capabilities, no journal configured: compatibility ledger.
+        let mut plain = Agent::new("");
+        plain.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+        for (name, source) in sources {
+            register(&plain, name, source);
+            assert!(plain.journal_eligible_capability(name), "{name}");
+            assert_eq!(
+                plain.tool_execution_authority("fresh", name),
+                CompatibilityLedger,
+                "{name} without a journal"
+            );
+        }
+    }
+
+    /// The journal only dedupes ids it admitted. A mutating id the compatibility
+    /// ledger pruned is new to it, so the ledger has to refuse it first.
+    #[test]
+    fn a_pruned_mutating_id_is_not_run_again_on_a_journal_configured_agent() {
+        let (mut agent, workspace, journal) = configured_agent();
+        agent.tools.push("write".into());
+        let args = json!({"path": "out.txt", "content": "x"});
+        let policy = crate::runtime::ReplayPolicy::NeverAutoReplay;
+        {
+            let mut ledger = agent.tool_ledger.lock().unwrap();
+            for n in 0..300 {
+                let id = format!("old-{n}");
+                ledger
+                    .reserve_call_with_policy(&id, "write", &args, policy)
+                    .unwrap();
+                ledger.begin_execution_with_policy(&id, "write", &args, policy);
+                ledger.record_completion(&id, "ok", false);
+            }
+            assert!(!ledger.records().contains_key("old-0"), "pruned");
+        }
+
+        let Preparation::Immediate(result) =
+            agent.prepare_tool_call(workspace.path(), "old-0", "write", &args, 0)
+        else {
+            panic!("a pruned mutating id must not be prepared for dispatch");
+        };
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("previously completed"),
+            "{}",
+            result.content
+        );
+        assert!(
+            journal.snapshot().unwrap().operations.is_empty(),
+            "no operation was admitted for it"
+        );
+        assert_eq!(adapter_runs(&agent), 0);
+    }
+
     #[test]
     fn permission_revision_change_after_admission_stops_before_dispatch() {
         let (agent, workspace, journal) = configured_agent();
@@ -8793,6 +9557,390 @@ mod operation_dispatch_tests {
             attempt.effect_status(),
             crate::runtime::operations::EffectStatus::NotStarted
         );
+    }
+
+    /// A runtime without a journal: every call takes the compatibility route.
+    fn compat_agent() -> (Agent, tempfile::TempDir) {
+        let workspace = tempfile::tempdir().unwrap();
+        for name in ["input.txt", "second.txt"] {
+            std::fs::write(workspace.path().join(name), "dispatch fixture").unwrap();
+        }
+        let mut agent = Agent::new("");
+        agent.tools = vec!["read".into(), "batch".into()];
+        agent.tool_execution_mode = ToolExecutionMode::Sequential;
+        agent.cwd = workspace.path().to_path_buf();
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+        (agent, workspace)
+    }
+
+    fn adapter_runs(agent: &Agent) -> u64 {
+        agent
+            .counters
+            .executed_leaf_operations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn assert_policy_stop(result: &crate::ToolResult) {
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("Permission policy changed"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn compat_route_stops_when_permission_revision_changes_after_preparation() {
+        let (agent, workspace) = compat_agent();
+        let args = json!({"path": "input.txt"});
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), "compat-policy", "read", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        agent.permissions.lock().unwrap().mode = crate::PermissionMode::Ask;
+
+        let result = agent.run_prepared_call(workspace.path(), "compat-policy", "read", &args, 0);
+        assert_policy_stop(&result);
+        assert_eq!(adapter_runs(&agent), 0, "the adapter must not run");
+        let ledger = agent.tool_ledger.lock().unwrap();
+        assert!(
+            !ledger.is_already_executed("compat-policy"),
+            "no successful execution is recorded"
+        );
+    }
+
+    #[test]
+    fn compat_route_stops_when_cancelled_after_preparation() {
+        let (agent, workspace) = compat_agent();
+        let args = json!({"path": "input.txt"});
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), "compat-cancel", "read", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        agent.runtime.as_ref().unwrap().cancel();
+
+        let result = agent.run_prepared_call(workspace.path(), "compat-cancel", "read", &args, 0);
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("cancelled before dispatch"),
+            "{}",
+            result.content
+        );
+        assert_eq!(adapter_runs(&agent), 0, "the adapter must not run");
+        assert!(!agent
+            .tool_ledger
+            .lock()
+            .unwrap()
+            .is_already_executed("compat-cancel"));
+    }
+
+    #[test]
+    fn batch_child_stops_when_permission_revision_changes_before_it_runs() {
+        let (mut agent, workspace) = compat_agent();
+        // The batch prepares every child before running any, so the hook on
+        // the second child moves the policy after the first was authorized.
+        let permissions = agent.permissions.clone();
+        agent.pre_tool = Some(crate::PreToolHook(Arc::new(move |_, args| {
+            if args["path"] == "second.txt" {
+                permissions.lock().unwrap().mode = crate::PermissionMode::Ask;
+            }
+            None
+        })));
+        let result = agent.run_batch(
+            workspace.path(),
+            "batch-policy",
+            &json!({"operations": [
+                {"tool": "read", "args": {"path": "input.txt"}},
+                {"tool": "read", "args": {"path": "second.txt"}},
+            ]}),
+        );
+        // Child 1 was authorized before the change and is refused; child 2 was
+        // authorized under the new policy and runs.
+        assert_eq!(adapter_runs(&agent), 1, "{}", result.content);
+        let rows = &result.details.as_ref().unwrap()["operations"];
+        assert_eq!(rows[0]["status"], "error", "{}", result.content);
+        assert_eq!(rows[1]["status"], "ok", "{}", result.content);
+        assert!(
+            result.content.contains("Permission policy changed"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn plan_batch_call_stops_when_permission_revision_changes_before_commit() {
+        let (mut agent, workspace) = compat_agent();
+        // `ToolExecutionStart` fires after preparation and before the run.
+        let permissions = agent.permissions.clone();
+        agent.event_sink = Some(crate::EventSink(Arc::new(move |event| {
+            if matches!(event, crate::AgentEvent::ToolExecutionStart { .. }) {
+                permissions.lock().unwrap().mode = crate::PermissionMode::Ask;
+            }
+        })));
+        let mut events = Vec::new();
+        let messages = agent.execute_plan_batch(
+            workspace.path(),
+            vec![(
+                "plan-policy".into(),
+                "read".into(),
+                json!({"path": "input.txt"}),
+            )],
+            &mut events,
+        );
+        assert_eq!(adapter_runs(&agent), 0);
+        let rendered = format!("{:?}", messages[0].content);
+        assert!(rendered.contains("Permission policy changed"), "{rendered}");
+    }
+
+    #[test]
+    fn codemode_child_stops_when_permission_revision_changes_before_it_runs() {
+        let (agent, workspace) = compat_agent();
+        let args = json!({"path": "input.txt"});
+        // Same two steps `dispatch_script_child` performs for a child.
+        assert!(matches!(
+            agent.prepare_tool_call_with_origin(
+                workspace.path(),
+                "script-policy",
+                "read",
+                &args,
+                1,
+                crate::ToolOperationOrigin::ProviderCall,
+            ),
+            Preparation::Ready { .. }
+        ));
+        agent.permissions.lock().unwrap().mode = crate::PermissionMode::Ask;
+        let mut structured = None;
+        let result = agent.run_prepared_call_with_structured(
+            workspace.path(),
+            "script-policy",
+            "read",
+            &args,
+            1,
+            Some(&mut structured),
+        );
+        assert_policy_stop(&result);
+        assert_eq!(adapter_runs(&agent), 0);
+
+        // A child nobody changed still runs through `dispatch_script_child`.
+        let (ok, _, _) =
+            agent.dispatch_script_child(workspace.path(), "script-ok", "read", &args, None, 0);
+        assert!(!ok.is_error, "{}", ok.content);
+        assert_eq!(adapter_runs(&agent), 1);
+    }
+
+    /// Runs `hook` once, right after the next allow decision on this thread.
+    struct DecisionHook;
+
+    impl DecisionHook {
+        fn install(hook: impl Fn() + 'static) -> Self {
+            super::AFTER_PERMISSION_DECISION.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+            Self
+        }
+    }
+
+    impl Drop for DecisionHook {
+        fn drop(&mut self) {
+            super::AFTER_PERMISSION_DECISION.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    fn move_policy_after_decision(agent: &Agent) -> DecisionHook {
+        let permissions = agent.permissions.clone();
+        let fired = std::cell::Cell::new(false);
+        DecisionHook::install(move || {
+            if !fired.replace(true) {
+                permissions.lock().unwrap().mode = crate::PermissionMode::Ask;
+            }
+        })
+    }
+
+    #[test]
+    fn policy_change_between_decision_and_revision_capture_is_not_authorized() {
+        let (agent, workspace) = compat_agent();
+        let args = json!({"path": "input.txt"});
+        let _hook = move_policy_after_decision(&agent);
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), "late-capture", "read", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        let result = agent.run_prepared_call(workspace.path(), "late-capture", "read", &args, 0);
+        assert_policy_stop(&result);
+        assert_eq!(adapter_runs(&agent), 0, "the adapter must not run");
+    }
+
+    #[test]
+    fn script_child_is_refused_when_policy_moves_after_its_decision() {
+        let (agent, workspace) = compat_agent();
+        let args = json!({"path": "input.txt"});
+        let _hook = move_policy_after_decision(&agent);
+        let (result, _, _) =
+            agent.dispatch_script_child(workspace.path(), "script-late", "read", &args, None, 0);
+        assert_policy_stop(&result);
+        assert_eq!(adapter_runs(&agent), 0, "the adapter must not run");
+    }
+
+    #[test]
+    fn cancel_while_gate_waits_for_the_permission_lock_is_denied() {
+        let (agent, _workspace) = compat_agent();
+        let revision = agent.permissions.lock().unwrap().revision().unwrap();
+        let refused = std::thread::scope(|scope| {
+            let held = agent.permissions.lock().unwrap();
+            let gate = scope.spawn(|| agent.pre_dispatch_gate(revision));
+            // Let the gate reach the lock, cancel while it waits, then release.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            agent.runtime.as_ref().unwrap().cancel();
+            drop(held);
+            gate.join().unwrap()
+        });
+        let refused = refused.expect_err("a cancel during the wait must be seen");
+        assert!(
+            refused.content.contains("cancelled before dispatch"),
+            "{}",
+            refused.content
+        );
+    }
+
+    #[test]
+    fn cancel_while_the_journal_gate_waits_for_the_permission_lock_is_denied() {
+        let (agent, _workspace, _journal) = configured_agent();
+        let revision = agent.permissions.lock().unwrap().revision();
+        let refused = std::thread::scope(|scope| {
+            let held = agent.permissions.lock().unwrap();
+            let gate = scope.spawn(|| agent.journal_dispatch_gate(revision));
+            // Let the gate reach the lock, cancel while it waits, then release.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            agent.runtime.as_ref().unwrap().cancel();
+            drop(held);
+            gate.join().unwrap()
+        });
+        let refused = refused.expect_err("a cancel during the wait must be seen");
+        assert!(refused.contains("cancelled before dispatch"), "{refused}");
+    }
+
+    /// A policy change that lands during the contract and capability checks
+    /// must still stop the call: the gate is the last step before the latch.
+    #[test]
+    fn journal_route_policy_change_during_validation_is_denied_before_the_adapter() {
+        let (agent, workspace, journal) = configured_agent();
+        let args = json!({"path": "input.txt"});
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), "late-validation", "read", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        let operation_id = journal.snapshot().unwrap().operations[0].operation_id();
+        let permissions = agent.permissions.clone();
+        super::BEFORE_JOURNAL_GATE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                permissions.lock().unwrap().mode = crate::PermissionMode::Ask;
+            }));
+        });
+        let result = agent.run_prepared_call(workspace.path(), "late-validation", "read", &args, 0);
+        super::BEFORE_JOURNAL_GATE.with(|slot| *slot.borrow_mut() = None);
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result
+                .content
+                .contains("permission policy changed at dispatch"),
+            "{}",
+            result.content
+        );
+        assert_eq!(adapter_runs(&agent), 0, "the adapter must not run");
+        let snapshot = journal.snapshot().unwrap();
+        let attempt = snapshot
+            .attempts
+            .iter()
+            .find(|attempt| attempt.operation_id() == operation_id)
+            .unwrap();
+        assert_eq!(attempt.state(), OperationState::Cancelled);
+    }
+
+    /// A call a cancelled turn never starts must not leave its prepared
+    /// revision behind for a later call that reuses the id.
+    #[test]
+    fn a_sibling_skipped_by_a_cancelled_batch_leaves_no_prepared_revision() {
+        let (mut agent, workspace) = compat_agent();
+        let runtime = agent.runtime.clone().unwrap();
+        agent.event_sink = Some(crate::EventSink(Arc::new(move |event| {
+            if matches!(event, crate::AgentEvent::ToolExecutionStart { .. }) {
+                runtime.cancel();
+            }
+        })));
+        let calls = ["first", "second"]
+            .map(|id| {
+                (
+                    id.to_string(),
+                    "read".to_string(),
+                    json!({"path": "input.txt"}),
+                )
+            })
+            .to_vec();
+        let mut events = Vec::new();
+        let messages = agent.execute_tool_batch(workspace.path(), calls, &mut events);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(adapter_runs(&agent), 0, "cancelled before any adapter ran");
+        assert!(
+            agent
+                .prepared_permission_revisions
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "skipped sibling must release its prepared revision"
+        );
+    }
+
+    #[test]
+    fn compat_call_without_preparation_is_refused() {
+        let (agent, workspace) = compat_agent();
+        let args = json!({"path": "input.txt"});
+        let result = agent.run_prepared_call(workspace.path(), "never-prepared", "read", &args, 0);
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("was not prepared"),
+            "{}",
+            result.content
+        );
+        assert_eq!(adapter_runs(&agent), 0, "the adapter must not run");
+    }
+
+    #[test]
+    fn abandoned_preparation_leaves_no_revision_for_a_reused_id() {
+        let (agent, workspace) = compat_agent();
+        let args = json!({"path": "input.txt"});
+        let recorded = |id: &str| {
+            agent
+                .prepared_permission_revisions
+                .lock()
+                .unwrap()
+                .contains_key(id)
+        };
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), "reused", "read", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        assert!(recorded("reused"));
+        // A skipped sibling or a cancelled turn abandons the call.
+        agent.cancel_pending_tool_operation("reused");
+        assert!(!recorded("reused"), "abandoned entry must be gone");
+        // The reused id does not inherit the old revision.
+        let result = agent.run_prepared_call(workspace.path(), "reused", "read", &args, 0);
+        assert!(result.is_error, "{}", result.content);
+        assert_eq!(adapter_runs(&agent), 0);
+
+        // Consuming the record is single use.
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), "once", "read", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        assert!(
+            !agent
+                .run_prepared_call(workspace.path(), "once", "read", &args, 0)
+                .is_error
+        );
+        assert!(!recorded("once"));
     }
 
     #[test]

@@ -623,7 +623,7 @@ fn requirement_clause_count(request: &str) -> usize {
         .count()
 }
 
-fn parse_git_status(bytes: &[u8]) -> Option<BTreeMap<PathBuf, [u8; 2]>> {
+pub(crate) fn parse_git_status(bytes: &[u8]) -> Option<BTreeMap<PathBuf, [u8; 2]>> {
     let mut fields = bytes.split(|byte| *byte == 0);
     let mut paths = BTreeMap::new();
     while let Some(field) = fields.next() {

@@ -2,6 +2,7 @@
 
 pub mod executor;
 pub mod limits;
+mod source_fingerprint;
 pub mod spec;
 pub mod state;
 pub mod tools;

@@ -5,7 +5,6 @@ mod unix;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -1033,14 +1032,34 @@ pub fn encode_auth_preamble(token: &str) -> Vec<u8> {
     format!("AUTH {token}\n").into_bytes()
 }
 
+/// A server never listens without a nonempty auth token; there is no
+/// unauthenticated fallback.
+pub fn require_auth_token(token: Option<&str>) -> Result<&str, ServerError> {
+    token.filter(|token| !token.is_empty()).ok_or_else(|| {
+        ServerError::Protocol("server requires a nonempty auth token (--auth-token)".into())
+    })
+}
+
+/// Constant time in the token contents. The only early exit is the length
+/// comparison, which leaks the length alone. After it, every byte pair is
+/// XORed and OR-folded into one accumulator with no data-dependent branch, so
+/// the work done is the same wherever (or whether) the inputs differ. A plain
+/// `==` on slices stops at the first mismatching byte.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+            == 0
+}
+
 pub fn authorize_transport(expected: Option<&str>, preamble: &[u8]) -> Result<(), ServerError> {
-    let Some(expected) = expected.filter(|token| !token.is_empty()) else {
-        return Ok(());
-    };
+    let expected = require_auth_token(expected)?;
     let text = std::str::from_utf8(preamble).unwrap_or("");
     let line = text.lines().next().unwrap_or("").trim();
-    let got = line.strip_prefix("AUTH ").map(str::trim);
-    if got == Some(expected) {
+    let got = line.strip_prefix("AUTH ").map(str::trim).unwrap_or("");
+    if constant_time_eq(got.as_bytes(), expected.as_bytes()) {
         Ok(())
     } else {
         Err(ServerError::Protocol("Unauthorized".into()))
@@ -1065,23 +1084,34 @@ fn read_auth_line<R: Read>(stream: &mut R) -> Result<Vec<u8>, ServerError> {
     Ok(buf)
 }
 
-pub fn bind_tcp(addr: &str) -> Result<TcpListener, ServerError> {
-    TcpListener::bind(addr).map_err(|err| ServerError::Io(err.to_string()))
-}
-
+/// The only way to serve a connection from outside this crate: it reads the
+/// auth preamble and refuses a missing or empty token before any protocol byte
+/// is decoded. The unauthenticated `serve_stream` is crate-private.
+///
+/// ```
+/// use davinci_server::{serve_stream_with_auth, PiServer};
+/// let mut server = PiServer::new(std::env::temp_dir());
+/// let stream = std::io::Cursor::new(Vec::<u8>::new());
+/// assert!(serve_stream_with_auth(&mut server, stream, None).is_err());
+/// ```
+///
+/// ```compile_fail
+/// use davinci_server::{serve_stream, PiServer};
+/// let mut server = PiServer::new(std::env::temp_dir());
+/// let _ = serve_stream(&mut server, std::io::Cursor::new(Vec::<u8>::new()));
+/// ```
 pub fn serve_stream_with_auth<S: Read + Write>(
     server: &mut PiServer,
     mut stream: S,
     expected_token: Option<&str>,
 ) -> Result<(), ServerError> {
-    if expected_token.is_some() {
-        let preamble = read_auth_line(&mut stream)?;
-        authorize_transport(expected_token, &preamble)?;
-    }
+    require_auth_token(expected_token)?;
+    let preamble = read_auth_line(&mut stream)?;
+    authorize_transport(expected_token, &preamble)?;
     serve_stream(server, stream)
 }
 
-pub fn serve_stream<S: Read + Write>(
+pub(crate) fn serve_stream<S: Read + Write>(
     server: &mut PiServer,
     mut stream: S,
 ) -> Result<(), ServerError> {
@@ -1868,7 +1898,6 @@ mod tests {
 
     #[test]
     fn authorize_transport_requires_auth_preamble() {
-        assert!(authorize_transport(None, b"").is_ok());
         assert!(authorize_transport(Some("secret"), &encode_auth_preamble("secret")).is_ok());
         assert_eq!(
             authorize_transport(Some("secret"), b"AUTH wrong\n")
@@ -1876,6 +1905,43 @@ mod tests {
                 .to_string(),
             "Unauthorized"
         );
+    }
+
+    #[test]
+    fn authorize_transport_refuses_when_no_token_is_configured() {
+        for expected in [None, Some("")] {
+            for preamble in [&b""[..], b"AUTH \n", b"AUTH anything\n"] {
+                assert!(
+                    authorize_transport(expected, preamble).is_err(),
+                    "{expected:?} {preamble:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn authorize_transport_denies_a_token_differing_only_in_the_last_byte() {
+        assert!(authorize_transport(Some("secret-a"), b"AUTH secret-b\n").is_err());
+        assert!(authorize_transport(Some("secret-a"), b"AUTH secret-\n").is_err());
+        assert!(authorize_transport(Some("secret-a"), b"AUTH secret-ab\n").is_err());
+    }
+
+    #[test]
+    fn serve_stream_with_auth_refuses_without_a_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = PiServer::new(dir.path().to_path_buf());
+        let mut stream = std::io::Cursor::new(Vec::<u8>::new());
+        assert!(serve_stream_with_auth(&mut server, &mut stream, None).is_err());
+        assert!(serve_stream_with_auth(&mut server, &mut stream, Some("")).is_err());
+    }
+
+    #[test]
+    fn require_auth_token_rejects_missing_and_empty_tokens() {
+        assert_eq!(require_auth_token(Some("secret")).unwrap(), "secret");
+        for token in [None, Some("")] {
+            let error = require_auth_token(token).unwrap_err().to_string();
+            assert!(error.contains("auth token"), "{error}");
+        }
     }
 
     #[cfg(unix)]

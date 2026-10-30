@@ -489,7 +489,8 @@ fn a_chat_entry_keeps_the_message_extras() {
 fn queues_and_compaction_match_ts_modes() {
     let mut agent = Agent::new(default_system_prompt());
     agent.prompt(&"aaaaaaaaaa bbbbbbbbbb ".repeat(80));
-    agent.record_assistant(&"cccccccccc ".repeat(80));
+    agent.record_assistant(&"cccccccccc ".repeat(400));
+    agent.prompt("go on");
     agent.queues.enqueue_steer("steer me");
     agent.queues.enqueue_follow_up("follow");
     assert_eq!(agent.queues.steer.len(), 1);
@@ -854,6 +855,33 @@ fn root_context_report_includes_provider_system_suffix() {
     assert!(!suffix.stable);
     assert_eq!(suffix.priority, ContextPriority::Mandatory);
     assert!(suffix.selected);
+}
+
+#[test]
+fn root_context_report_sizes_skills_from_metadata_without_reading_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("SKILL.md");
+    // Not UTF-8: reading the body fails and would answer with the tiny inline
+    // text, so only the file's size can explain the estimate.
+    std::fs::write(&path, vec![0xff_u8; 4_000]).unwrap();
+    let mut agent = Agent::new("base");
+    agent.skills.push(crate::Skill {
+        name: "big".into(),
+        path,
+        description: String::new(),
+        body: "tiny".into(),
+        base_dir: dir.path().to_path_buf(),
+        namespace: None,
+    });
+
+    let report = agent.root_context_budget_report(u64::MAX);
+    let skill = report
+        .contributions
+        .iter()
+        .find(|entry| entry.source == "skill::big")
+        .unwrap();
+    assert_eq!(skill.estimated_tokens, 1_000);
+    assert_eq!(skill.priority, ContextPriority::Deferred);
 }
 
 #[test]
@@ -3730,7 +3758,7 @@ fn concurrent_identical_calls_followers_receive_terminal_result() {
         let a = Arc::clone(&agent);
         handles.push(std::thread::spawn(move || {
             let cwd = std::path::PathBuf::from(".");
-            a.run_prepared_call(
+            a.prepare_and_run_call(
                 &cwd,
                 "concurrent_call_id",
                 "custom_slow",
@@ -5932,6 +5960,112 @@ fn wor21_repeated_compaction_reloads_the_same_branch_history() {
     assert_eq!(chat_texts(&messages_from_session(&reopened)), live);
 }
 
+/// An agent whose only compaction entry predates the carried-requirements
+/// metadata: its summary text is the sole record of what the user restricted.
+fn agent_with_legacy_compaction(dir: &std::path::Path, restriction: &str) -> Agent {
+    let mut agent = legacy_compaction_agent(dir);
+    agent.summarizer = Some(Summarizer::new(|_| {
+        Ok(crate::compaction::SummarizeResponse {
+            text: "## Goal\nship the import".into(),
+            usage: Default::default(),
+            stop_reason: Some(davinci_ai::StopReason::Stop),
+            error_message: None,
+            has_tool_call: false,
+        })
+    }));
+    agent.prompt(&format!("{restriction} {}", "x".repeat(400)));
+    agent.record_assistant(&format!("answer {}", "y".repeat(400)));
+    for turn in 0..3 {
+        agent.prompt(&format!("question {turn} {}", "x".repeat(400)));
+        agent.record_assistant(&format!("answer {turn} {}", "y".repeat(400)));
+    }
+    let first = agent.compact(None);
+    assert!(first.compacted, "{}", first.summary);
+    let session = agent.session.as_mut().unwrap();
+    let entry = session
+        .entries
+        .iter_mut()
+        .find(|entry| entry.entry_type == "compaction")
+        .unwrap();
+    entry.extra.remove("carriedUserRequirements");
+    agent.messages = messages_from_session(agent.session.as_ref().unwrap());
+    for turn in 0..3 {
+        agent.prompt(&format!("later question {turn} {}", "x".repeat(400)));
+        agent.record_assistant(&format!("later answer {turn} {}", "y".repeat(400)));
+    }
+    agent
+}
+
+#[test]
+fn a_restriction_recorded_only_in_a_legacy_compaction_summary_survives_the_next_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = agent_with_legacy_compaction(dir.path(), "Never delete vendor/");
+    let second = agent.compact(None);
+    assert!(second.compacted, "{}", second.summary);
+    let meta =
+        crate::compaction_summary_meta(&agent.messages[0]).expect("generated summary metadata");
+    // Model-written legacy text is carried verbatim, but never as a user requirement.
+    assert!(
+        !meta
+            .carried_user_requirements
+            .iter()
+            .any(|entry| entry.contains("Never delete vendor/")),
+        "{:?}",
+        meta.carried_user_requirements
+    );
+    assert!(
+        meta.carried_legacy_summary
+            .as_deref()
+            .is_some_and(|text| text.contains("Never delete vendor/")),
+        "{meta:?}"
+    );
+    // And it keeps surviving: the entry is now ordinary carried metadata.
+    let path = agent.session.as_ref().unwrap().path.clone();
+    let reopened = JsonlSession::open(&path).unwrap();
+    let reloaded = messages_from_session(&reopened)
+        .iter()
+        .find_map(crate::compaction_summary_meta)
+        .unwrap();
+    assert_eq!(reloaded, meta);
+}
+
+#[test]
+fn compaction_metadata_survives_a_session_reopen_and_legacy_entries_load_without_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = legacy_compaction_agent(dir.path());
+    for turn in 0..4 {
+        agent.prompt(&format!("question {turn} {}", "x".repeat(400)));
+        agent.record_assistant(&format!("answer {turn} {}", "y".repeat(400)));
+    }
+    let result = agent.compact(None);
+    assert!(result.compacted, "{}", result.summary);
+    let live = crate::compaction_summary_meta(&agent.messages[0]).expect("live metadata");
+    assert!(!live.carried_user_requirements.is_empty());
+
+    let path = agent.session.as_ref().unwrap().path.clone();
+    let reopened = JsonlSession::open(&path).unwrap();
+    let messages = messages_from_session(&reopened);
+    let reloaded = messages
+        .iter()
+        .find_map(crate::compaction_summary_meta)
+        .expect("reloaded metadata");
+    assert_eq!(reloaded, live);
+
+    // An entry written before the metadata existed still loads, carrying none.
+    let mut entry = reopened
+        .entries
+        .iter()
+        .find(|entry| entry.entry_type == "compaction")
+        .unwrap()
+        .clone();
+    entry.extra.remove("carriedUserRequirements");
+    let legacy = crate::entry_to_chat(&entry).expect("legacy entry loads");
+    assert!(crate::compaction_summary_meta(&legacy)
+        .unwrap()
+        .carried_user_requirements
+        .is_empty());
+}
+
 #[test]
 fn wor20_failed_compaction_checkpoint_keeps_live_history() {
     let dir = tempfile::tempdir().unwrap();
@@ -6162,7 +6296,7 @@ fn a_full_context_with_failed_auto_compaction_blocks_the_request() {
     agent.compaction.keep_recent_tokens = 1;
     agent.summarizer = Some(Summarizer::new(|_| Err("provider timed out".into())));
     for i in 0..6 {
-        agent.prompt(&format!("request {i}: {}", "background ".repeat(400)));
+        agent.prompt(&format!("request {i}: {}", "background ".repeat(250)));
         agent.record_assistant(&format!("reply {i}: {}", "detail ".repeat(400)));
     }
     let before = agent.messages.len();
@@ -6318,6 +6452,163 @@ fn tool_result_entry(id: &str) -> SessionEntry {
     let mut entry = SessionEntry::message("toolResult", serde_json::json!([]));
     entry.message.as_mut().unwrap()["toolCallId"] = id.into();
     entry
+}
+
+fn results_for<'a>(agent: &'a Agent, id: &str) -> Vec<&'a ChatMessage> {
+    agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "toolResult" && m.tool_call_id.as_deref() == Some(id))
+        .collect()
+}
+
+#[test]
+fn b3_an_unresolved_call_is_closed_before_the_next_request_and_never_rerun() {
+    // (ledger saw the call start, expected recovery outcome, expected text)
+    for (started, outcome, text) in [
+        (true, "unknown", "Outcome unknown"),
+        (false, "not_executed", "Not executed"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seeded_session(
+            dir.path(),
+            vec![
+                SessionEntry::message("user", serde_json::json!("write it")),
+                tool_call_entry("c1", "write"),
+            ],
+        );
+        let args = serde_json::json!({"path": "x.txt", "content": "y"});
+        let mut agent = resume(&path);
+        agent.cwd = dir.path().to_path_buf();
+        agent.set_permission_mode(PermissionMode::AlwaysApprove);
+        if started {
+            agent
+                .tool_ledger
+                .lock()
+                .unwrap()
+                .record_start("c1", "write", &args);
+        }
+
+        agent.prompt("continue");
+
+        let closed = results_for(&agent, "c1");
+        assert_eq!(closed.len(), 1, "started={started}: exactly one result");
+        assert_eq!(closed[0].is_error, Some(true));
+        assert!(
+            davinci_ai::content_text(&closed[0].content).contains(text),
+            "started={started}"
+        );
+        assert_eq!(
+            closed[0].extra["details"]["toolRecovery"]["outcome"], outcome,
+            "started={started}"
+        );
+        // The call and its closing result stay adjacent, and the result is
+        // durable in the session file, not only in memory.
+        let call_at = agent
+            .messages
+            .iter()
+            .position(|m| m.role == "assistant")
+            .unwrap();
+        assert_eq!(agent.messages[call_at + 1].role, "toolResult");
+        let reopened = JsonlSession::open(&path).unwrap();
+        assert!(reopened
+            .entries
+            .iter()
+            .any(|e| e.message.as_ref().is_some_and(|m| m["toolCallId"] == "c1")));
+
+        if started {
+            // A possibly-committed call is not run again under its old id: the
+            // ledger still holds it as in flight, so a re-issue is no leader.
+            let again = agent
+                .tool_ledger
+                .lock()
+                .unwrap()
+                .reserve_call("c1", "write", &args)
+                .unwrap();
+            assert!(
+                !matches!(again, crate::tool_ledger::ReservationOutcome::Reserved),
+                "a possibly-committed call could be executed again"
+            );
+            assert!(!dir.path().join("x.txt").exists());
+        }
+    }
+}
+
+#[test]
+fn b3_an_orphan_tool_result_is_refused_before_any_provider_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_session(
+        dir.path(),
+        vec![
+            SessionEntry::message("user", serde_json::json!("hello")),
+            tool_result_entry("ghost"),
+        ],
+    );
+    let mut agent = resume(&path);
+    agent.prompt("next");
+    let requests = std::cell::Cell::new(0);
+    let mut model = scripted_tool_calls(vec![]);
+    let error = agent
+        .run_loop(|current| {
+            requests.set(requests.get() + 1);
+            model(current)
+        })
+        .unwrap_err();
+    assert!(
+        error.contains("ghost") && error.contains("no matching tool call"),
+        "{error}"
+    );
+    assert_eq!(
+        requests.get(),
+        0,
+        "the unpaired history reached the provider"
+    );
+}
+
+#[test]
+fn b3_a_fork_does_not_inherit_the_parents_ledger_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_session(
+        dir.path(),
+        vec![
+            SessionEntry::message("user", serde_json::json!("go")),
+            tool_call_entry("live", "write"),
+            tool_result_entry("done"),
+        ],
+    );
+    let args = serde_json::json!({"path": "x.txt", "content": "y"});
+    let parent = resume(&path);
+    {
+        let mut ledger = parent.tool_ledger.lock().unwrap();
+        ledger.reserve_call("live", "write", &args).unwrap();
+        ledger.record_start("live", "write", &args);
+        ledger.reserve_call("done", "write", &args).unwrap();
+        ledger.record_start("done", "write", &args);
+        ledger.record_completion("done", "ok", false);
+        assert!(ledger.get_completed_result("done").is_some());
+    }
+
+    let source = JsonlSession::open(&path).unwrap();
+    let leaf = source.leaf_id.clone().unwrap();
+    let fork = source.fork(&leaf, &dir.path().join("forks")).unwrap();
+    assert_ne!(fork.header.id, source.header.id);
+    assert_eq!(
+        fork.header.parent_session_id.as_deref(),
+        Some(source.header.id.as_str())
+    );
+    assert_ne!(
+        fork.path.with_extension("tool-ledger.json"),
+        path.with_extension("tool-ledger.json"),
+        "a fork must not share the parent's ledger file"
+    );
+    let child = resume(&fork.path.clone());
+
+    let ledger = child.tool_ledger.lock().unwrap();
+    assert!(
+        ledger.records().is_empty(),
+        "the fork inherited ledger records"
+    );
+    assert!(ledger.get_completed_result("done").is_none());
 }
 
 /// Evidence that classifies as `Verified`, not merely a recorded generation.

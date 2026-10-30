@@ -568,7 +568,9 @@ impl Drop for LaunchRollback<'_> {
         }
         for (manager, lease) in &self.leases {
             // These workers never ran, so their worktrees contain no worker output.
-            let _ = manager.release_lease(lease, false);
+            if let Err(error) = manager.release_lease(lease, false) {
+                eprintln!("warning: {error}");
+            }
         }
     }
 }
@@ -1163,8 +1165,12 @@ fn run_tool_with_spawner(
                                 lease.path.display(),
                                 lease.branch
                             ));
-                        } else {
-                            let _ = mgr.release_lease(&lease, false);
+                        } else if let Err(error) = mgr.release_lease(&lease, false) {
+                            preserved = Some(format!(
+                                "worktree kept: {} (branch {}): {error}",
+                                lease.path.display(),
+                                lease.branch
+                            ));
                         }
                     }
                     let reported = if let Some(worker) = &req_clone.runtime {
@@ -1205,15 +1211,18 @@ fn run_tool_with_spawner(
                 if let Some(runtime) = &parent.runtime {
                     let _ = runtime.registry.transition(cid, AgentState::Failed);
                 }
+                let mut reason = String::from("background agent thread exited before launch");
                 if let (Some(manager), Some(lease)) = (&cleanup_manager, &cleanup_lease) {
-                    let _ = manager.release_lease(lease, false);
+                    if let Err(error) = manager.release_lease(lease, false) {
+                        reason.push_str(&format!("; {error}"));
+                    }
                 }
                 drop(rollback);
                 return Ok(partial_launch_receipt(
                     &requests,
                     &launched_ids,
                     parent,
-                    "background agent thread exited before launch".into(),
+                    reason,
                 ));
             }
             if let Some(progress) = &req.progress {
@@ -1282,7 +1291,14 @@ fn run_tool_with_spawner(
         let mut worktree_note = None;
         if let (Some(mgr), Some(lease)) = (&wt_manager, &leases[0]) {
             if outcome.is_ok() && !mgr.is_dirty(lease) {
-                let _ = mgr.release_lease(lease, false);
+                if let Err(error) = mgr.release_lease(lease, false) {
+                    worktree_note = Some(serde_json::json!({
+                        "path": lease.path.display().to_string(),
+                        "branch": lease.branch,
+                        "preserved": true,
+                        "cleanup_error": error.to_string(),
+                    }));
+                }
             } else {
                 worktree_note = Some(serde_json::json!({
                     "path": lease.path.display().to_string(),

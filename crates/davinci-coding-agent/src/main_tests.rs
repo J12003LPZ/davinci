@@ -1,4 +1,46 @@
 #[test]
+fn shutdown_steps_end_owned_children_before_user_code_runs() {
+    let names: Vec<_> = super::session_cleanup_steps(super::Args::default(), None)
+        .iter()
+        .map(|step| step.name)
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "background jobs",
+            "MCP servers",
+            "JS pool",
+            "session_shutdown event",
+            "stop hooks"
+        ]
+    );
+}
+
+#[test]
+fn signal_path_gets_the_startup_context_captured_at_install_time() {
+    let context = crate::native_extensions::graph::GraphWorkerContext::from_parts(
+        Some("writer"),
+        Some("patch-report"),
+        Some("artifact.json"),
+        None,
+    )
+    .expect("context");
+    super::WORKER_STARTUP_CONTEXT.with(|slot| *slot.borrow_mut() = Some(context.clone()));
+    let read_later = super::capture_startup_context();
+    super::WORKER_STARTUP_CONTEXT.with(|slot| *slot.borrow_mut() = None);
+
+    // The watcher thread has its own empty thread-local; the capture must
+    // still hand it the context the agent was built with.
+    let seen = std::thread::spawn(move || {
+        assert!(super::current_startup_context().is_none());
+        read_later()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(seen, Some(context));
+}
+
+#[test]
 fn contextual_dispatch_attachments_require_context_and_live_cancellation() {
     for shared in [false, true] {
         let mut agent = davinci_agent::Agent::new_builtin(davinci_agent::PromptProfile::Stable);

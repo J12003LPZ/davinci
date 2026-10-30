@@ -38,6 +38,7 @@ mod experimental {
         Pi {
             options: Args,
             listen: Vec<UnixAddress>,
+            auth: Option<ExperimentalAuth>,
         },
         Server {
             listen: Vec<UnixAddress>,
@@ -69,7 +70,7 @@ mod experimental {
     ) -> Result<Option<String>, String> {
         Ok(None)
     }
-    pub fn bind_listen_addresses(_: &[UnixAddress]) -> Result<String, String> {
+    pub fn bind_listen_addresses(_: &[UnixAddress], _: Option<&str>) -> Result<String, String> {
         Ok(String::new())
     }
     pub fn run_server(_: ServerCommand) -> Result<String, String> {
@@ -91,6 +92,7 @@ mod experimental {
             _ => Ok(ExperimentalCli::Pi {
                 options: parse_args(raw),
                 listen: vec![],
+                auth: None,
             }),
         }
     }
@@ -524,10 +526,13 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
                 return Ok(0);
             }
             experimental::ExperimentalCli::Pi {
-                listen, options, ..
+                listen,
+                auth,
+                options,
             } => {
                 if !listen.is_empty() {
-                    let _ = experimental::bind_listen_addresses(&listen)?;
+                    let token = experimental::resolve_experimental_auth(auth)?;
+                    let _ = experimental::bind_listen_addresses(&listen, token.as_deref())?;
                 }
                 options
             }
@@ -3249,7 +3254,8 @@ fn complete_prompt_with_host(
     let wf_store = davinci_agent::WorkflowStateStore::with_options(
         davinci_agent::runtime::workflow::state::DEFAULT_MAX_INLINE_ARTIFACT_BYTES,
         default_agent_dir().join("workflow_artifacts"),
-    );
+    )
+    .with_source_root(agent.cwd.clone());
     runtime_handle = match runtime_host::configure_session_workflow_with_journal(
         runtime_handle,
         &agent.cwd,
@@ -3799,7 +3805,11 @@ fn complete_prompt_with_host(
         for skill in &agent.skills {
             let tag = format!("<skill name=\"{}\"", skill.name);
             if latest_user_text.contains(&tag) {
-                host.native_record_skill_outcome_for_skill(&skill.name, &skill.body, skill_outcome);
+                host.native_record_skill_outcome_for_skill(
+                    &skill.name,
+                    &skill.read_body(),
+                    skill_outcome,
+                );
             }
         }
 
@@ -5697,17 +5707,58 @@ fn run_stop_hooks_for(parsed: &Args, cwd: &Path) {
     davinci_coding_agent::plugins::run_session_end(&default_agent_dir(), cwd);
 }
 
+/// The exit cleanup, once per process and bounded by
+/// `shutdown::CLEANUP_DEADLINE`, whether the normal exit or a signal gets here
+/// first. A step that hangs is abandoned at the deadline, not waited for.
 fn emit_session_shutdown(parsed: &Args) {
-    loaded_extension_host(parsed).emit(ExtensionEvent::SessionShutdown {
-        reason: "quit".into(),
-    });
-    crate::js_host::shutdown_js_pool();
-    // `process::exit` follows: nothing below runs a destructor, so the
-    // children are reaped here.
-    davinci_agent::jobs::kill_every_job();
-    davinci_agent::McpRegistry::shutdown_all();
-    let cwd = std::env::current_dir().unwrap_or_default();
-    run_stop_hooks_for(parsed, &cwd);
+    emit_session_shutdown_with(parsed, current_startup_context());
+}
+
+/// The graph worker context the session was built with. It is a thread-local
+/// of the thread that built the agent, so a trigger on another thread (the
+/// signal watcher) must be handed it rather than read it.
+fn current_startup_context() -> Option<crate::native_extensions::graph::GraphWorkerContext> {
+    WORKER_STARTUP_CONTEXT.with(|context| context.borrow().clone())
+}
+
+fn emit_session_shutdown_with(
+    parsed: &Args,
+    startup: Option<crate::native_extensions::graph::GraphWorkerContext>,
+) {
+    let cleanup = shutdown::session_cleanup();
+    let finished = cleanup.run_steps(
+        shutdown::CLEANUP_DEADLINE,
+        session_cleanup_steps(parsed.clone(), startup),
+    );
+    if let Some(warning) = cleanup.report(finished) {
+        shutdown::warn_best_effort(warning);
+    }
+}
+
+/// Independent steps, ordered so the children we own are terminated first and
+/// the steps that run user or extension code, which may hang, come last.
+/// `process::exit` follows: nothing runs a destructor, so children are reaped
+/// here.
+fn session_cleanup_steps(
+    parsed: Args,
+    startup: Option<crate::native_extensions::graph::GraphWorkerContext>,
+) -> Vec<shutdown::Step> {
+    let event_args = parsed.clone();
+    vec![
+        shutdown::Step::new("background jobs", davinci_agent::jobs::kill_every_job),
+        shutdown::Step::new("MCP servers", davinci_agent::McpRegistry::shutdown_all),
+        shutdown::Step::new("JS pool", crate::js_host::shutdown_js_pool),
+        shutdown::Step::new("session_shutdown event", move || {
+            WORKER_STARTUP_CONTEXT.with(|context| *context.borrow_mut() = startup);
+            loaded_extension_host(&event_args).emit(ExtensionEvent::SessionShutdown {
+                reason: "quit".into(),
+            });
+        }),
+        shutdown::Step::new("stop hooks", move || {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            run_stop_hooks_for(&parsed, &cwd);
+        }),
+    ]
 }
 
 fn immediate_shutdown_if_fixture(parsed: &Args) -> Option<i32> {
@@ -5718,9 +5769,19 @@ fn immediate_shutdown_if_fixture(parsed: &Args) -> Option<i32> {
 
 fn install_mode_shutdown_watchers(parsed: &Args) {
     let parsed = parsed.clone();
+    let startup = capture_startup_context();
     shutdown::install_shutdown_watchers(move |_| {
-        emit_session_shutdown(&parsed);
+        emit_session_shutdown_with(&parsed, startup());
     });
+}
+
+/// Reads the startup context now, on the thread that built the agent, and
+/// returns a reader any thread may call later. The signal watcher thread has
+/// its own empty thread-local, so reading it there would lose the context.
+fn capture_startup_context(
+) -> impl Fn() -> Option<crate::native_extensions::graph::GraphWorkerContext> + Send + Sync {
+    let startup = std::sync::Mutex::new(current_startup_context());
+    move || startup.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// UI brand: the identity mark follows the installed binary name, so a copy

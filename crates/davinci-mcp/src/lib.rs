@@ -51,6 +51,22 @@ pub enum Error {
     /// status. The server is unusable afterwards.
     #[error("{0}")]
     Transport(String),
+    /// The request may have reached the server, but its answer never came
+    /// back. The effect may or may not exist, so callers must not report a
+    /// definite failure or retry automatically.
+    ///
+    /// `cause` keeps the original failure (HTTP status, timeout, closed pipe)
+    /// when it is known, so a caller can still tell a rejected request from a
+    /// dropped connection without parsing the message.
+    #[error("{message}")]
+    Ambiguous {
+        message: String,
+        cause: Option<Box<Error>>,
+    },
+    /// The request provably never left the client: it was refused before it
+    /// could be written to the server.
+    #[error("{0}")]
+    NotDelivered(String),
     /// A JSON-RPC error reply. The server is fine; this one call was not.
     #[error("mcp {code}: {message}")]
     Rpc { code: i64, message: String },
@@ -65,6 +81,46 @@ impl Error {
     /// Whether the registry should forget the server after this error.
     pub fn drops_server(&self) -> bool {
         !self.is_rpc()
+    }
+
+    /// True when a `tools/call` returned this error and the call may already
+    /// have run. Only errors produced by [`Client::call_tool`] are classified;
+    /// an error straight from a transport has not been attributed to a call.
+    pub fn may_have_run(&self) -> bool {
+        matches!(self, Error::Ambiguous { .. })
+    }
+
+    /// An ambiguous outcome whose cause is not known.
+    pub fn ambiguous(message: impl Into<String>) -> Self {
+        Error::Ambiguous {
+            message: message.into(),
+            cause: None,
+        }
+    }
+
+    /// An ambiguous outcome that keeps `cause`, so its class survives.
+    pub fn ambiguous_from(cause: Error) -> Self {
+        Error::Ambiguous {
+            message: cause.to_string(),
+            cause: Some(Box::new(cause)),
+        }
+    }
+
+    /// The failure behind an ambiguous outcome, or `self` for any other error.
+    /// Classify with this, never with the message text.
+    pub fn underlying(&self) -> &Error {
+        match self {
+            Error::Ambiguous {
+                cause: Some(cause), ..
+            } => cause.underlying(),
+            other => other,
+        }
+    }
+
+    /// True when the request was refused before it could reach the server, so
+    /// its effect is provably absent.
+    pub fn definitely_not_delivered(&self) -> bool {
+        matches!(self, Error::NotDelivered(_))
     }
 }
 
@@ -226,11 +282,38 @@ impl Client {
     }
 
     pub fn call_tool(&mut self, name: &str, arguments: Value) -> Result<CallToolResult> {
-        let result = self.transport.rpc().call(
-            "tools/call",
-            json!({ "name": name, "arguments": arguments }),
-        )?;
-        serde_json::from_value(result).map_err(|err| Error::Protocol(format!("tools/call: {err}")))
+        self.call_tool_with_invocation(name, arguments, None)
+    }
+
+    /// `call_tool` that stamps the request with the caller's stable id for
+    /// this logical call, as MCP `_meta` under [`INVOCATION_ID_META_KEY`], so
+    /// a server can recognise a repeat of a call it may already have run. The
+    /// id is never part of the arguments or of any text the model sees.
+    pub fn call_tool_with_invocation(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        invocation_id: Option<&str>,
+    ) -> Result<CallToolResult> {
+        let mut params = json!({ "name": name, "arguments": arguments });
+        if let Some(id) = invocation_id {
+            params["_meta"] = json!({ INVOCATION_ID_META_KEY: id });
+        }
+        let outcome = self.transport.rpc().call("tools/call", params);
+        let result = match outcome {
+            Ok(result) => result,
+            // The server answered this call, so its outcome is known, and a
+            // refused write provably never reached it. Every other failure
+            // happened after the request was handed to the transport, so the
+            // effect cannot be ruled out.
+            Err(error) if error.is_rpc() || error.definitely_not_delivered() => {
+                return Err(error);
+            }
+            Err(error) => return Err(Error::ambiguous_from(error)),
+        };
+        // The reply arrived but could not be decoded: the server may already
+        // have applied the call.
+        serde_json::from_value(result).map_err(|err| Error::ambiguous(format!("tools/call: {err}")))
     }
 
     pub fn read_resource(&mut self, uri: &str) -> Result<String> {
@@ -340,6 +423,11 @@ fn declares(capabilities: &Value, name: &str) -> bool {
 fn named(method: &str, err: Error) -> Error {
     match err {
         Error::Transport(text) => Error::Transport(format!("{method}: {text}")),
+        Error::Ambiguous { message, cause } => Error::Ambiguous {
+            message: format!("{method}: {message}"),
+            cause,
+        },
+        Error::NotDelivered(text) => Error::NotDelivered(format!("{method}: {text}")),
         other => Error::Protocol(format!("{method}: {other}")),
     }
 }
@@ -499,6 +587,9 @@ pub fn agent_tool_name(server: &str, tool: &str) -> String {
 
 pub const CALL_TIMEOUT_SECS: u64 = CALL_TIMEOUT.as_secs();
 
+/// `_meta` key carrying the stable id of one logical `tools/call`.
+pub const INVOCATION_ID_META_KEY: &str = "davinci/invocationId";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,6 +695,51 @@ mod tests {
         assert_eq!(client.tools.len(), 1);
         assert_eq!(client.tools[0].name, "echo");
         assert_eq!(client.call_tool("echo", json!({})).unwrap().text(), "ok");
+    }
+
+    /// Records the params of every `tools/call` it receives.
+    struct CapturingRpc {
+        seen: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl RpcTransport for CapturingRpc {
+        fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+            match method {
+                "initialize" => Ok(json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {"tools": {}}
+                })),
+                "tools/list" => Ok(json!({
+                    "tools":[{"name":"echo","inputSchema":{"type":"object"}}]
+                })),
+                "tools/call" => {
+                    self.seen.lock().unwrap().push(params);
+                    Ok(json!({"content":[{"type":"text","text":"ok"}]}))
+                }
+                other => Err(Error::Protocol(format!("unexpected {other}"))),
+            }
+        }
+
+        fn notify(&mut self, _: &str, _: Value) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn g12_the_invocation_id_travels_in_meta_and_never_in_the_arguments() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let transport = CapturingRpc { seen: seen.clone() };
+        let mut client = Client::connect_transport("capture", Box::new(transport)).unwrap();
+        client
+            .call_tool_with_invocation("echo", json!({"text": "hi"}), Some("call-7"))
+            .unwrap();
+        client.call_tool("echo", json!({"text": "hi"})).unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0]["_meta"][INVOCATION_ID_META_KEY], "call-7");
+        assert_eq!(seen[0]["arguments"], json!({"text": "hi"}));
+        // No id given: the request carries no `_meta` at all.
+        assert!(seen[1].get("_meta").is_none(), "{}", seen[1]);
     }
 
     #[test]
@@ -732,10 +868,13 @@ mod tests {
     }
 
     #[test]
-    fn malformed_correlated_reply_is_a_protocol_error() {
+    fn malformed_correlated_reply_is_an_ambiguous_outcome() {
         let mut client = fixture_client(&["--malformed-reply"]);
         let error = client.call_tool("echo", json!({"text": "x"})).unwrap_err();
-        assert!(matches!(error, Error::Protocol(_)), "{error}");
+        // The server answered, but undecodably, so the call may have run.
+        assert!(matches!(error, Error::Ambiguous { .. }), "{error}");
+        assert!(error.may_have_run(), "{error}");
+        assert!(error.drops_server(), "{error}");
     }
 
     #[test]
@@ -783,6 +922,121 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("fatal: boom"), "{text}");
+    }
+
+    #[test]
+    fn a_lost_tool_reply_is_ambiguous_and_a_refused_call_is_not() {
+        // The request reached the server; the reply never came back.
+        let mut hung = Client::connect_with_timeout(
+            "memory",
+            stdio_config(&["--hang"]),
+            Path::new("."),
+            Duration::from_millis(600),
+        )
+        .expect("fixture");
+        let error = hung.call_tool("echo", json!({"text": "x"})).unwrap_err();
+        assert!(error.may_have_run(), "{error}");
+        assert!(!error.definitely_not_delivered(), "{error}");
+
+        // The server exited after the request was written.
+        let mut dying = fixture_client(&["--die"]);
+        let error = dying.call_tool("echo", json!({"text": "x"})).unwrap_err();
+        assert!(error.may_have_run(), "{error}");
+
+        // The server answered with a JSON-RPC error: it handled the call and
+        // said it failed, so the outcome is known.
+        let mut refusing = fixture_client(&["--rpc-error"]);
+        let error = refusing.call_tool("echo", json!({})).unwrap_err();
+        assert!(error.is_rpc(), "{error}");
+        assert!(!error.may_have_run(), "{error}");
+    }
+
+    #[test]
+    fn g14_a_call_cancelled_after_the_effect_committed_is_unknown_and_never_resent() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("effects.log");
+        let log_arg = log.to_string_lossy().into_owned();
+        let mut client = Client::connect_with_timeout(
+            "memory",
+            stdio_config(&["--commit-then-hang", &log_arg]),
+            Path::new("."),
+            Duration::from_millis(600),
+        )
+        .expect("fixture");
+
+        // The server commits the effect, then never answers: the client times
+        // out and sends `notifications/cancelled`.
+        let error = client
+            .call_tool_with_invocation("echo", json!({"text": "x"}), Some("call-9"))
+            .unwrap_err();
+        assert!(error.may_have_run(), "{error}");
+        assert!(!error.definitely_not_delivered(), "{error}");
+
+        // Cancellation is best effort and does not prove the effect absent:
+        // wait for the server to see it, then count what it logged.
+        let started = std::time::Instant::now();
+        let entries = loop {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text.contains("cancelled") || started.elapsed() > Duration::from_secs(5) {
+                break text.lines().map(str::to_owned).collect::<Vec<_>>();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let with_prefix = |prefix: &str| -> Vec<&String> {
+            entries
+                .iter()
+                .filter(|line| line.starts_with(prefix) && line.ends_with("call-9"))
+                .collect()
+        };
+        assert_eq!(
+            with_prefix("call ").len(),
+            1,
+            "exactly one tools/call for the invocation: {entries:?}"
+        );
+        assert_eq!(
+            with_prefix("effect ").len(),
+            1,
+            "exactly one effect for the invocation: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|l| l.starts_with("cancelled")),
+            "the client must tell the server it gave up: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn g14_the_commit_then_hang_fixture_counts_a_resend_while_it_hangs() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("effects.log");
+        let mut child = std::process::Command::new(fixture_exe())
+            .arg("--commit-then-hang")
+            .arg(&log)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let call = |id: u32| {
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                "params":{"name":"echo","_meta":{INVOCATION_ID_META_KEY:"call-1"}}})
+        };
+        // The same invocation arrives twice before the server is cancelled.
+        writeln!(stdin, "{}", call(1)).unwrap();
+        writeln!(stdin, "{}", call(2)).unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}})
+        )
+        .unwrap();
+        drop(stdin);
+        child.wait().unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        let count = |prefix: &str| text.lines().filter(|l| l.starts_with(prefix)).count();
+        assert_eq!(count("call "), 2, "{text}");
+        assert_eq!(count("effect "), 2, "{text}");
+        assert_eq!(count("cancelled"), 1, "{text}");
     }
 
     #[test]

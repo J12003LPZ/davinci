@@ -1,6 +1,6 @@
 //! Git worktree manager isolating mutation agents in dedicated working trees.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,10 +61,73 @@ pub enum WorktreeError {
     StaleLease(PathBuf),
     #[error("worktree has uncommitted or unmerged changes: {path}")]
     DirtyWorktreePreserved { path: PathBuf },
+    #[error("worktree cleanup incomplete ({detail}); left behind: {}", left_behind(.path, .branch))]
+    CleanupIncomplete {
+        /// The worktree directory or its git registration, if still present.
+        path: Option<PathBuf>,
+        /// The agent branch, if it still exists.
+        branch: Option<String>,
+        detail: String,
+    },
     #[error("git command failed: {0}")]
     GitError(String),
     #[error("io error: {0}")]
     IoError(String),
+}
+
+fn left_behind(path: &Option<PathBuf>, branch: &Option<String>) -> String {
+    let mut parts = Vec::new();
+    if let Some(path) = path {
+        parts.push(format!("path {}", path.display()));
+    }
+    if let Some(branch) = branch {
+        parts.push(format!("branch {branch}"));
+    }
+    parts.join(", ")
+}
+
+/// Something under the managed prefix that no live lease owns. Reported only:
+/// it may hold someone's unmerged work, so nothing deletes it automatically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeOrphan {
+    Directory(PathBuf),
+    Branch(String),
+    /// Git still lists a worktree here, whether or not its directory exists.
+    Registration(PathBuf),
+}
+
+/// Comparable form of a path that may not exist: git prints forward slashes
+/// and no `\\?\` prefix, while `canonicalize` on Windows adds one.
+fn path_key(path: &Path) -> String {
+    let resolved = path.canonicalize().unwrap_or_else(|_| {
+        match (
+            path.parent().and_then(|p| p.canonicalize().ok()),
+            path.file_name(),
+        ) {
+            (Some(parent), Some(name)) => parent.join(name),
+            _ => path.to_path_buf(),
+        }
+    });
+    let text = resolved.to_string_lossy().replace('\\', "/");
+    let text = text.strip_prefix("//?/").unwrap_or(&text).to_string();
+    if cfg!(windows) {
+        text.to_lowercase()
+    } else {
+        text
+    }
+}
+
+/// Git prints raw bytes; Windows paths from git are UTF-8.
+fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
 }
 
 fn now_ms() -> i64 {
@@ -141,6 +204,16 @@ pub fn handoff_snapshot(cwd: &Path, paths: &[String]) -> Result<String, Worktree
     ))
 }
 
+/// Work a worktree holds that removing it would lose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsavedWork {
+    None,
+    /// Modified, staged or untracked files.
+    Uncommitted,
+    /// Commits that are neither reachable from HEAD nor an exact-tree match.
+    Unmerged,
+}
+
 /// Thread-safe manager for ephemeral git worktrees.
 #[derive(Clone)]
 pub struct WorktreeManager {
@@ -150,7 +223,14 @@ pub struct WorktreeManager {
     bus: Option<RuntimeBus>,
     seq: Arc<AtomicU64>,
     generations: Arc<AtomicU64>,
+    /// Runs between the cleanliness check and the removal, to prove git
+    /// decides cleanliness atomically at removal time.
+    #[cfg(test)]
+    before_remove_hook: Arc<std::sync::Mutex<Option<BeforeRemoveHook>>>,
 }
+
+#[cfg(test)]
+type BeforeRemoveHook = Box<dyn Fn() + Send + Sync>;
 
 impl std::fmt::Debug for WorktreeManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -170,7 +250,14 @@ impl WorktreeManager {
             bus: None,
             seq: Arc::new(AtomicU64::new(0)),
             generations: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            before_remove_hook: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    #[cfg(test)]
+    fn set_before_remove_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.before_remove_hook.lock().unwrap() = Some(Box::new(hook));
     }
 
     pub fn with_bus(mut self, bus: RuntimeBus) -> Self {
@@ -411,15 +498,22 @@ impl WorktreeManager {
     /// `git cherry` ignores whitespace and merge-only edits. A worker that
     /// still points to its original `base_head` has no new committed work.
     pub fn check_dirty(&self, lease: &WorktreeLease) -> Result<bool, WorktreeError> {
+        Ok(self.unsaved_work(lease)? != UnsavedWork::None)
+    }
+
+    /// What removing the worktree would lose. Uncommitted files are never
+    /// discarded by a release, forced or not; only committed work that is not
+    /// integrated may be, and only when the caller forces.
+    fn unsaved_work(&self, lease: &WorktreeLease) -> Result<UnsavedWork, WorktreeError> {
         if !lease.path.exists() {
-            return Ok(false);
+            return Ok(UnsavedWork::None);
         }
         if !run_git(&lease.path, &["status", "--porcelain"])?.is_empty() {
-            return Ok(true);
+            return Ok(UnsavedWork::Uncommitted);
         }
         let current_head = run_git(&lease.path, &["rev-parse", "HEAD"])?;
         if current_head.is_empty() || current_head == lease.base_head {
-            return Ok(false);
+            return Ok(UnsavedWork::None);
         }
         let integrated = Command::new("git")
             .current_dir(&self.repo_root)
@@ -429,7 +523,7 @@ impl WorktreeManager {
             .map(|o| o.status.success())
             .unwrap_or(false);
         if integrated {
-            return Ok(false);
+            return Ok(UnsavedWork::None);
         }
         // Patch IDs used by `git cherry` ignore whitespace and merge-only
         // changes. Instead, compute the exact result of merging the worker
@@ -447,14 +541,22 @@ impl WorktreeManager {
             ],
         ) {
             Ok(tree) => tree,
-            Err(_) => return Ok(true),
+            Err(_) => return Ok(UnsavedWork::Unmerged),
         };
         let main_tree = run_git(&self.repo_root, &["rev-parse", "HEAD^{tree}"])?;
-        Ok(merged_tree != main_tree)
+        Ok(if merged_tree == main_tree {
+            UnsavedWork::None
+        } else {
+            UnsavedWork::Unmerged
+        })
     }
 
     /// Release an existing worktree lease.
-    /// If dirty and `force` is false, preserves the worktree directory and returns `DirtyWorktreePreserved`.
+    /// A dirty worktree is preserved and returns `DirtyWorktreePreserved`;
+    /// state that cannot be read is an error, never "clean". `force` overrides
+    /// only known unmerged commits, and only when the caller asks for it:
+    /// uncommitted files are never deleted, and an inspection that failed or
+    /// was refused keeps the worktree and the lease whatever `force` says.
     pub fn release_lease(&self, lease: &WorktreeLease, force: bool) -> Result<(), WorktreeError> {
         let mut leases = self.leases.write().map_err(|_| {
             WorktreeError::GitError("Failed to acquire write lock on leases".into())
@@ -462,21 +564,36 @@ impl WorktreeManager {
         // The manager's record is the authority, not the caller's struct: a
         // newer lease on the same path must survive a stale holder's release,
         // even a forced one.
-        match leases.get(&lease.path) {
-            Some(recorded) if recorded == lease => {}
-            Some(_) => return Err(WorktreeError::StaleLease(lease.path.clone())),
-            None => return Err(WorktreeError::LeaseNotFound(lease.path.clone())),
+        if leases
+            .get(&lease.path)
+            .is_some_and(|recorded| recorded != lease)
+        {
+            return Err(WorktreeError::StaleLease(lease.path.clone()));
         }
-        // Unreadable state preserves the worktree unless the caller forces.
-        let dirty = match self.check_dirty(lease) {
-            Ok(dirty) => dirty,
-            Err(error) if !force => return Err(error),
-            Err(_) => true,
-        };
-        if dirty && !force {
-            return Err(WorktreeError::DirtyWorktreePreserved {
-                path: lease.path.clone(),
-            });
+        // Nothing recorded for this path: the manager owns nothing here, so
+        // whatever exists at the path or branch belongs to someone else (a
+        // replacement created after this lease was released). Succeed only
+        // when there is nothing left to clean; never touch what is there.
+        if !leases.contains_key(&lease.path) {
+            let leftover = lease.path.exists()
+                || self.is_registered(&lease.path)?
+                || (lease.branch.starts_with("davinci/agent/")
+                    && self.branch_exists(&lease.branch)?);
+            return if leftover {
+                Err(WorktreeError::LeaseNotFound(lease.path.clone()))
+            } else {
+                Ok(())
+            };
+        }
+        // Unreadable state preserves the worktree too, forced or not.
+        match self.unsaved_work(lease)? {
+            UnsavedWork::None => {}
+            UnsavedWork::Unmerged if force => {}
+            UnsavedWork::Uncommitted | UnsavedWork::Unmerged => {
+                return Err(WorktreeError::DirtyWorktreePreserved {
+                    path: lease.path.clone(),
+                });
+            }
         }
 
         // Remove worktree via git
@@ -485,34 +602,103 @@ impl WorktreeManager {
             .to_str()
             .ok_or_else(|| WorktreeError::IoError("Worktree path is not valid unicode".into()))?;
 
-        if lease.path.exists() {
-            // Do not bypass Git's worktree locks or erase a directory that Git
-            // refused to remove. Keep the lease on any failed cleanup so it
-            // can be inspected and retried safely.
-            run_git(
-                &self.repo_root,
-                &["worktree", "remove", "--force", wt_path_str],
-            )?;
-            if lease.path.exists() {
-                return Err(WorktreeError::GitError(format!(
-                    "git removed the worktree registration but {} still exists",
-                    lease.path.display()
-                )));
+        // Anything that survives teardown is reported and the lease is kept, so
+        // the caller can retry and nothing is forgotten while still on disk.
+        let mut left_path = None;
+        let mut left_branch = None;
+        let mut details = Vec::new();
+
+        #[cfg(test)]
+        if let Some(hook) = self.before_remove_hook.lock().unwrap().as_ref() {
+            hook();
+        }
+        // Not forced: git refuses modified or untracked files and locked
+        // worktrees, deciding at removal time. The check above would race with
+        // work created since.
+        let removal = lease
+            .path
+            .exists()
+            .then(|| run_git(&self.repo_root, &["worktree", "remove", wt_path_str]));
+        // Git can delete the files and still fail on its metadata; with the
+        // directory gone that is the registration case below.
+        if let Some(Err(error)) = removal.as_ref().filter(|_| lease.path.exists()) {
+            details.push(error.to_string());
+        } else {
+            // Registration is checked whatever happened to the directory: git
+            // can delete the files and still fail to delete its own metadata.
+            // A failed check is not proof of absence, so it keeps the lease
+            // like a leftover.
+            match self.is_registered(&lease.path) {
+                Ok(false) => {
+                    // Only an empty leftover directory goes; anything with
+                    // content is reported, never deleted recursively.
+                    if lease.path.exists() {
+                        if let Err(error) = std::fs::remove_dir(&lease.path) {
+                            details.push(format!("cannot delete directory: {error}"));
+                        }
+                    }
+                }
+                Ok(true) if lease.path.exists() => {
+                    details.push("git still lists the worktree".into());
+                }
+                Ok(true) => {
+                    if let Err(error) = self.remove_registration(&lease.path, wt_path_str) {
+                        details.push(error);
+                    }
+                    match self.is_registered(&lease.path) {
+                        Ok(false) => {}
+                        Ok(true) => left_path = Some(lease.path.clone()),
+                        Err(error) => {
+                            details.push(error.to_string());
+                            left_path = Some(lease.path.clone());
+                        }
+                    }
+                }
+                Err(error) => {
+                    details.push(error.to_string());
+                    left_path = Some(lease.path.clone());
+                }
             }
+        }
+        if lease.path.exists() {
+            left_path = Some(lease.path.clone());
         }
 
         // A failed branch removal is not a successful release: keep the
         // record so the owner can reconcile the incomplete cleanup.
         if lease.branch.starts_with("davinci/agent/") {
-            run_git(&self.repo_root, &["branch", "-D", &lease.branch])?;
+            match self.branch_exists(&lease.branch) {
+                Ok(false) => {}
+                Ok(true) if left_path.is_some() => left_branch = Some(lease.branch.clone()),
+                Ok(true) => {
+                    if let Err(error) = run_git(&self.repo_root, &["branch", "-D", &lease.branch]) {
+                        details.push(error.to_string());
+                        left_branch = Some(lease.branch.clone());
+                    }
+                }
+                Err(error) => {
+                    details.push(error.to_string());
+                    left_branch = Some(lease.branch.clone());
+                }
+            }
         }
 
-        // Remove from leases, then unlock before invoking subscribers.
-        leases.remove(&lease.path);
+        if left_path.is_some() || left_branch.is_some() || !details.is_empty() {
+            return Err(WorktreeError::CleanupIncomplete {
+                path: left_path,
+                branch: left_branch,
+                detail: details.join("; "),
+            });
+        }
+
+        // Remove from leases, then unlock before invoking subscribers. A
+        // repeated release of a cleaned lease finds nothing recorded and
+        // stays quiet.
+        let was_recorded = leases.remove(&lease.path).is_some();
         drop(leases);
 
         // Emit WorktreeRemoved event
-        if let Some(bus) = &self.bus {
+        if let Some(bus) = self.bus.as_ref().filter(|_| was_recorded) {
             let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
             let envelope = RuntimeEventEnvelope::new(
                 seq,
@@ -541,6 +727,159 @@ impl WorktreeManager {
             return Vec::new();
         };
         leases.values().cloned().collect()
+    }
+
+    /// Managed `wt-*` directories and `davinci/agent/*` branches that no live
+    /// lease owns, for example after a crash. Report only: it never deletes,
+    /// since an orphan may hold unmerged work.
+    pub fn scan_orphans(&self) -> Result<Vec<WorktreeOrphan>, WorktreeError> {
+        // Creation holds the write lock while it adds the worktree, so a scan
+        // never sees a half-created lease as an orphan.
+        let leases = self
+            .leases
+            .read()
+            .map_err(|_| WorktreeError::GitError("Failed to acquire read lock on leases".into()))?;
+        let mut orphans = Vec::new();
+        match std::fs::read_dir(&self.worktree_root) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.map_err(|e| WorktreeError::IoError(e.to_string()))?;
+                    let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+                    let managed = entry.file_name().to_string_lossy().starts_with("wt-");
+                    if is_dir && managed && !leases.contains_key(&entry.path()) {
+                        orphans.push(WorktreeOrphan::Directory(entry.path()));
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(WorktreeError::IoError(error.to_string())),
+        }
+        let refs = run_git(
+            &self.repo_root,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/heads/davinci/agent/",
+            ],
+        )?;
+        for branch in refs.lines().filter_map(|r| r.strip_prefix("refs/heads/")) {
+            if !leases.values().any(|lease| lease.branch == branch) {
+                orphans.push(WorktreeOrphan::Branch(branch.to_string()));
+            }
+        }
+        // Git's own registrations under the managed prefix, which outlive a
+        // deleted directory and keep its branch checked out.
+        let root = format!("{}/", path_key(&self.worktree_root));
+        let leased: HashSet<String> = leases.keys().map(|path| path_key(path)).collect();
+        for listed in self.registered_worktrees()? {
+            let key = path_key(&listed);
+            if key.starts_with(&root) && !leased.contains(&key) {
+                orphans.push(WorktreeOrphan::Registration(listed));
+            }
+        }
+        orphans.sort_by_key(|orphan| format!("{orphan:?}"));
+        Ok(orphans)
+    }
+
+    /// `Ok(false)` only when git reports the ref missing (exit 1, no message).
+    /// Any other failure is an error: a broken check is not an absent branch.
+    fn branch_exists(&self, branch: &str) -> Result<bool, WorktreeError> {
+        let output = Command::new("git")
+            .current_dir(&self.repo_root)
+            .args(["-c", "safe.bareRepository=explicit"])
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{branch}"))
+            .output()
+            .map_err(|e| WorktreeError::GitError(format!("Failed to execute git: {e}")))?;
+        if output.status.success() {
+            return Ok(true);
+        }
+        if output.status.code() == Some(1) && output.stderr.iter().all(u8::is_ascii_whitespace) {
+            return Ok(false);
+        }
+        Err(WorktreeError::GitError(format!(
+            "cannot check branch {branch} (status {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+
+    /// Drop the registration of one worktree whose directory is gone. Never
+    /// `git worktree prune`: it deletes every stale registration in the
+    /// repository, including a worktree whose directory is only temporarily
+    /// missing. Asks git first; failing that, deletes the one admin directory
+    /// whose `gitdir` file points at `path`, unless it is locked.
+    fn remove_registration(&self, path: &Path, path_str: &str) -> Result<(), String> {
+        let refused = match run_git(
+            &self.repo_root,
+            &["worktree", "remove", "--force", path_str],
+        ) {
+            Ok(_) => return Ok(()),
+            Err(error) => error.to_string(),
+        };
+        let common = run_git(&self.repo_root, &["rev-parse", "--git-common-dir"])
+            .map_err(|error| format!("{refused}; {error}"))?;
+        let admin_root = self.repo_root.join(common).join("worktrees");
+        let wanted = path_key(path);
+        let entries = std::fs::read_dir(&admin_root)
+            .map_err(|error| format!("{refused}; cannot read {}: {error}", admin_root.display()))?;
+        for admin in entries.flatten().map(|entry| entry.path()) {
+            let Ok(gitdir) = std::fs::read(admin.join("gitdir")) else {
+                continue;
+            };
+            // A relative `gitdir` is relative to the admin directory that
+            // holds it; `path_key` would resolve it against the process cwd.
+            let gitdir = path_from_git_bytes(gitdir.trim_ascii_end());
+            let gitdir = if gitdir.is_relative() {
+                admin.join(gitdir)
+            } else {
+                gitdir
+            };
+            let points_here = gitdir.parent().is_some_and(|dir| path_key(dir) == wanted);
+            if !points_here {
+                continue;
+            }
+            if admin.join("locked").exists() {
+                return Err(format!("{refused}; the registration is locked"));
+            }
+            return std::fs::remove_dir_all(&admin)
+                .map_err(|error| format!("{refused}; cannot delete {}: {error}", admin.display()));
+        }
+        Err(format!("{refused}; no registration points at the lease"))
+    }
+
+    /// Whether git still lists `path` as a worktree of the repository.
+    /// Reads the NUL-separated listing: plain `--porcelain` quotes unusual
+    /// path characters, which would never compare equal to the real path.
+    fn is_registered(&self, path: &Path) -> Result<bool, WorktreeError> {
+        let wanted = path_key(path);
+        Ok(self
+            .registered_worktrees()?
+            .iter()
+            .any(|listed| path_key(listed) == wanted))
+    }
+
+    /// Every worktree path git lists for the repository, the main one included.
+    fn registered_worktrees(&self) -> Result<Vec<PathBuf>, WorktreeError> {
+        let output = Command::new("git")
+            .current_dir(&self.repo_root)
+            .args(["-c", "safe.bareRepository=explicit"])
+            .args(["worktree", "list", "--porcelain", "-z"])
+            .output()
+            .map_err(|e| WorktreeError::GitError(format!("Failed to execute git: {e}")))?;
+        if !output.status.success() {
+            return Err(WorktreeError::GitError(format!(
+                "cannot list worktrees (status {:?}): {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter_map(|field| field.strip_prefix(b"worktree "))
+            .map(path_from_git_bytes)
+            .collect())
     }
 
     pub fn repo_root(&self) -> &Path {
@@ -638,8 +977,6 @@ mod tests {
             [0, 255, 10, 13]
         );
         assert!(!target.path.join("README.md").exists());
-        manager.release_lease(&source, true).unwrap();
-        manager.release_lease(&target, true).unwrap();
     }
 
     #[test]
@@ -657,7 +994,10 @@ mod tests {
     }
 
     fn init_temp_git_repo() -> tempfile::TempDir {
-        let dir = tempdir().unwrap();
+        init_git_repo_in(tempdir().unwrap())
+    }
+
+    fn init_git_repo_in(dir: tempfile::TempDir) -> tempfile::TempDir {
         let path = dir.path();
 
         Command::new("git")
@@ -883,7 +1223,16 @@ mod tests {
         assert!(lease.path.exists());
         assert!(dirty_file.exists());
 
-        // Now release with force: true
+        // `force` never overrides uncommitted work either.
+        let err = manager.release_lease(&lease, true).unwrap_err();
+        assert!(
+            matches!(err, WorktreeError::DirtyWorktreePreserved { .. }),
+            "{err:?}"
+        );
+        assert!(dirty_file.exists());
+
+        // Once the work is gone the same lease releases, forced or not.
+        std::fs::remove_file(&dirty_file).unwrap();
         manager.release_lease(&lease, true).unwrap();
         assert!(!lease.path.exists());
     }
@@ -920,6 +1269,500 @@ mod tests {
         assert!(matches!(err, WorktreeError::GitError(_)), "{err:?}");
         assert!(precious.exists(), "nothing was deleted");
         assert!(manager.get_lease(&lease.path).is_none() || lease.path.exists());
+    }
+
+    fn branch_exists(repo: &Path, branch: &str) -> bool {
+        Command::new("git")
+            .current_dir(repo)
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{branch}"))
+            .output()
+            .unwrap()
+            .status
+            .success()
+    }
+
+    /// G-03: git refusing to remove a worktree is not a successful teardown.
+    #[test]
+    fn a_failing_worktree_removal_keeps_the_lease_and_names_what_is_left() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        // A locked worktree makes `git worktree remove` fail even when forced once.
+        git_in(
+            repo_dir.path(),
+            &["worktree", "lock", lease.path.to_str().unwrap()],
+        );
+
+        let err = manager.release_lease(&lease, true).unwrap_err();
+        match &err {
+            WorktreeError::CleanupIncomplete { path, branch, .. } => {
+                assert_eq!(path.as_deref(), Some(lease.path.as_path()));
+                assert_eq!(branch.as_deref(), Some(lease.branch.as_str()));
+            }
+            other => panic!("expected CleanupIncomplete, got {other:?}"),
+        }
+        assert!(err.to_string().contains(&lease.branch), "{err}");
+        assert!(lease.path.exists(), "a refused removal deletes nothing");
+        assert_eq!(manager.get_lease(&lease.path).as_ref(), Some(&lease));
+
+        // Once the obstacle is gone the same lease can be released.
+        git_in(
+            repo_dir.path(),
+            &["worktree", "unlock", lease.path.to_str().unwrap()],
+        );
+        manager.release_lease(&lease, true).unwrap();
+        assert!(!lease.path.exists());
+        assert!(!branch_exists(repo_dir.path(), &lease.branch));
+        assert!(manager.get_lease(&lease.path).is_none());
+    }
+
+    /// Git prints unusual path characters quoted in plain `--porcelain`; a
+    /// locked worktree under such a path must still be recognised as owned.
+    #[test]
+    fn a_locked_worktree_under_a_path_git_quotes_is_still_recognised() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        // A user-level `core.quotePath=false` would hide the quoting.
+        git_in(repo_dir.path(), &["config", "core.quotePath", "true"]);
+        // A TAB is the character most likely to be quoted in plain
+        // `--porcelain` on unix. Windows filenames cannot hold one.
+        let name = if cfg!(unix) {
+            "sp ace\tq \u{e9}\u{4e16}"
+        } else {
+            "sp ace \u{e9}\u{4e16}"
+        };
+        let root = wt_dir.path().join(name);
+        let manager = WorktreeManager::new(repo_dir.path(), &root);
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        // Whether plain `--porcelain` quotes the path depends on the git
+        // version; the `-z` listing is parsed independent of that policy.
+        assert!(manager.is_registered(&lease.path).unwrap());
+        git_in(
+            repo_dir.path(),
+            &["worktree", "lock", lease.path.to_str().unwrap()],
+        );
+
+        let err = manager.release_lease(&lease, true).unwrap_err();
+        assert!(
+            matches!(err, WorktreeError::CleanupIncomplete { .. }),
+            "{err:?}"
+        );
+        assert!(lease.path.join("README.md").exists(), "locked files stay");
+        assert_eq!(manager.get_lease(&lease.path).as_ref(), Some(&lease));
+
+        git_in(
+            repo_dir.path(),
+            &["worktree", "unlock", lease.path.to_str().unwrap()],
+        );
+        manager.release_lease(&lease, true).unwrap();
+        assert!(!lease.path.exists());
+    }
+
+    /// Keeps git from deleting the metadata of the one registered worktree:
+    /// open handles on Windows, a read-only directory on unix. Returns `None`
+    /// where the block cannot work (unix as root).
+    fn block_admin_deletion(repo: &Path) -> Option<Box<dyn std::any::Any>> {
+        let admin = std::fs::read_dir(repo.join(".git").join("worktrees"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_SHARE_READ without FILE_SHARE_DELETE: git's unlink fails.
+            let held: Vec<_> = std::fs::read_dir(&admin)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.is_file())
+                .map(|path| {
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(1)
+                        .open(path)
+                        .unwrap()
+                })
+                .collect();
+            Some(Box::new(held))
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            struct Restore(PathBuf);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    let _ = std::fs::set_permissions(&self.0, PermissionsExt::from_mode(0o755));
+                }
+            }
+            std::fs::set_permissions(&admin, PermissionsExt::from_mode(0o555)).unwrap();
+            if std::fs::File::create(admin.join("probe")).is_ok() {
+                std::fs::remove_file(admin.join("probe")).unwrap();
+                return None;
+            }
+            Some(Box::new(Restore(admin)))
+        }
+    }
+
+    /// Git can delete a worktree's files and still fail to delete its own
+    /// metadata; that registration must keep the lease.
+    #[test]
+    fn a_surviving_registration_keeps_the_lease_even_when_the_directory_is_gone() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        let Some(block) = block_admin_deletion(repo_dir.path()) else {
+            eprintln!("skipped: permissions cannot block git here");
+            return;
+        };
+
+        let err = manager.release_lease(&lease, false).unwrap_err();
+        match &err {
+            WorktreeError::CleanupIncomplete { path, .. } => {
+                assert!(path.is_some(), "the registration survived: {err}");
+            }
+            other => panic!("expected CleanupIncomplete, got {other:?}"),
+        }
+        assert_eq!(manager.get_lease(&lease.path).as_ref(), Some(&lease));
+
+        drop(block);
+        manager.release_lease(&lease, true).unwrap();
+        assert!(!manager.is_registered(&lease.path).unwrap());
+        assert!(!branch_exists(repo_dir.path(), &lease.branch));
+        assert!(manager.get_lease(&lease.path).is_none());
+    }
+
+    /// Releasing one lease whose directory is gone must not delete the
+    /// registration of an unrelated worktree that is merely missing too.
+    #[test]
+    fn releasing_a_lease_with_a_missing_directory_keeps_unrelated_registrations() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        let bystander = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        std::fs::remove_dir_all(&lease.path).unwrap();
+        std::fs::remove_dir_all(&bystander.path).unwrap();
+
+        manager.release_lease(&lease, true).unwrap();
+
+        assert!(!manager.is_registered(&lease.path).unwrap());
+        assert!(!branch_exists(repo_dir.path(), &lease.branch));
+        assert!(
+            manager.is_registered(&bystander.path).unwrap(),
+            "the other worktree keeps its registration"
+        );
+        assert!(branch_exists(repo_dir.path(), &bystander.branch));
+        assert_eq!(
+            manager.get_lease(&bystander.path).as_ref(),
+            Some(&bystander)
+        );
+    }
+
+    /// A relative `gitdir` is relative to the registration's own directory,
+    /// not to the process cwd. Resolved against the cwd, a bystander's path
+    /// aliases the lease and its registration is deleted, while the lease's
+    /// own locked registration is never recognised.
+    #[test]
+    fn a_relative_gitdir_is_resolved_against_its_registration_not_the_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let repo_dir = init_git_repo_in(tempfile::tempdir_in(&cwd).unwrap());
+        let wt_dir = tempfile::tempdir_in(&cwd).unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        let bystander = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        git_in(
+            repo_dir.path(),
+            &["worktree", "lock", lease.path.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(&lease.path).unwrap();
+        std::fs::remove_dir_all(&bystander.path).unwrap();
+
+        // Both files become relative. The lease's resolves from its admin
+        // directory to the lease; the bystander's is written so that it would
+        // reach the lease only from the cwd.
+        let admin_root = repo_dir.path().join(".git").join("worktrees");
+        let (mut lease_admin, mut bystander_admin) = (None, None);
+        for admin in std::fs::read_dir(&admin_root).unwrap() {
+            let admin = admin.unwrap().path();
+            if admin.join("locked").exists() {
+                lease_admin = Some(admin);
+            } else {
+                bystander_admin = Some(admin);
+            }
+        }
+        let (lease_admin, bystander_admin) = (lease_admin.unwrap(), bystander_admin.unwrap());
+        let up = |admin: &Path| {
+            let depth = admin.strip_prefix(&cwd).unwrap().components().count();
+            PathBuf::from_iter(std::iter::repeat_n("..", depth))
+        };
+        let lease_git = lease.path.join(".git");
+        let from_admin = up(&lease_admin).join(lease_git.strip_prefix(&cwd).unwrap());
+        let from_cwd = lease_git.strip_prefix(&cwd).unwrap();
+        std::fs::write(
+            lease_admin.join("gitdir"),
+            format!("{}\n", from_admin.to_string_lossy().replace('\\', "/")),
+        )
+        .unwrap();
+        std::fs::write(
+            bystander_admin.join("gitdir"),
+            format!("{}\n", from_cwd.to_string_lossy().replace('\\', "/")),
+        )
+        .unwrap();
+
+        let err = manager.release_lease(&lease, true).unwrap_err();
+        assert!(
+            matches!(&err, WorktreeError::CleanupIncomplete { detail, .. }
+                if detail.contains("the registration is locked")),
+            "{err:?}"
+        );
+        assert!(
+            lease_admin.exists(),
+            "a locked registration is never deleted"
+        );
+        assert!(
+            bystander_admin.exists(),
+            "a relative path that only the cwd would resolve to the lease is not the lease"
+        );
+        assert_eq!(manager.get_lease(&lease.path).as_ref(), Some(&lease));
+    }
+
+    /// A git command that fails is not evidence that the thing is gone.
+    #[test]
+    fn a_failing_inspection_keeps_the_lease_instead_of_assuming_absence() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        // Directory already gone, registration and branch still present.
+        std::fs::remove_dir_all(&lease.path).unwrap();
+        let head_path = repo_dir.path().join(".git").join("HEAD");
+        let head = std::fs::read(&head_path).unwrap();
+        std::fs::write(&head_path, "garbage\n").unwrap();
+
+        let err = manager.release_lease(&lease, true).unwrap_err();
+        match &err {
+            WorktreeError::CleanupIncomplete { path, detail, .. } => {
+                assert!(path.is_some(), "registration state is unknown: {err}");
+                assert!(detail.contains("git"), "names the failed check: {err}");
+            }
+            other => panic!("expected CleanupIncomplete, got {other:?}"),
+        }
+        assert_eq!(manager.get_lease(&lease.path).as_ref(), Some(&lease));
+
+        std::fs::write(&head_path, head).unwrap();
+        manager.release_lease(&lease, true).unwrap();
+        assert!(!branch_exists(repo_dir.path(), &lease.branch));
+        assert!(manager.get_lease(&lease.path).is_none());
+    }
+
+    #[test]
+    fn branch_existence_tells_a_missing_ref_from_a_failed_check() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        assert!(!manager
+            .branch_exists("davinci/agent/never-created")
+            .unwrap());
+        let head_path = repo_dir.path().join(".git").join("HEAD");
+        let head = std::fs::read(&head_path).unwrap();
+        std::fs::write(&head_path, "garbage\n").unwrap();
+        assert!(manager
+            .branch_exists("davinci/agent/never-created")
+            .is_err());
+        std::fs::write(&head_path, head).unwrap();
+    }
+
+    #[test]
+    fn a_failing_branch_delete_is_reported_and_keeps_the_lease() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        git_in(
+            repo_dir.path(),
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                lease.path.to_str().unwrap(),
+            ],
+        );
+        // Git refuses to delete the branch checked out in the main checkout.
+        git_in(repo_dir.path(), &["checkout", &lease.branch]);
+
+        let err = manager.release_lease(&lease, true).unwrap_err();
+        match &err {
+            WorktreeError::CleanupIncomplete { path, branch, .. } => {
+                assert_eq!(path, &None, "the directory is already gone");
+                assert_eq!(branch.as_deref(), Some(lease.branch.as_str()));
+            }
+            other => panic!("expected CleanupIncomplete, got {other:?}"),
+        }
+        assert!(branch_exists(repo_dir.path(), &lease.branch));
+        assert_eq!(manager.get_lease(&lease.path).as_ref(), Some(&lease));
+
+        git_in(repo_dir.path(), &["checkout", "-"]);
+        manager.release_lease(&lease, true).unwrap();
+        assert!(!branch_exists(repo_dir.path(), &lease.branch));
+        assert!(manager.get_lease(&lease.path).is_none());
+    }
+
+    #[test]
+    fn releasing_an_already_cleaned_lease_is_idempotent() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        manager.release_lease(&lease, false).unwrap();
+        manager.release_lease(&lease, false).unwrap();
+        manager.release_lease(&lease, true).unwrap();
+    }
+
+    /// A holder whose lease the manager no longer records must not tear down
+    /// a worktree (or branch) someone created at the same path afterwards.
+    #[test]
+    fn a_stale_release_never_deletes_a_replacement_the_manager_does_not_own() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let old = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        manager.release_lease(&old, false).unwrap();
+        // A clean replacement at the same path on a recreated branch of the same name.
+        git_in(
+            repo_dir.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &old.branch,
+                old.path.to_str().unwrap(),
+            ],
+        );
+
+        let err = manager.release_lease(&old, false).unwrap_err();
+        assert!(matches!(err, WorktreeError::LeaseNotFound(_)), "{err:?}");
+        assert!(old.path.join("README.md").exists(), "replacement untouched");
+        assert!(manager.is_registered(&old.path).unwrap());
+        assert!(branch_exists(repo_dir.path(), &old.branch));
+
+        // Only the branch recreated: still refused, still untouched.
+        git_in(
+            repo_dir.path(),
+            &["worktree", "remove", old.path.to_str().unwrap()],
+        );
+        let err = manager.release_lease(&old, false).unwrap_err();
+        assert!(matches!(err, WorktreeError::LeaseNotFound(_)), "{err:?}");
+        assert!(branch_exists(repo_dir.path(), &old.branch));
+    }
+
+    /// Git decides cleanliness at removal time: a file created after the
+    /// manager's own check must survive, and the lease must be kept.
+    #[test]
+    fn a_file_created_between_the_check_and_the_removal_is_preserved() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        let late = lease.path.join("late.txt");
+        let hook_file = late.clone();
+        manager.set_before_remove_hook(move || {
+            std::fs::write(&hook_file, "created after check_dirty").unwrap();
+        });
+
+        let err = manager.release_lease(&lease, true).unwrap_err();
+        match &err {
+            WorktreeError::CleanupIncomplete { path, detail, .. } => {
+                assert_eq!(path.as_deref(), Some(lease.path.as_path()));
+                assert!(detail.contains("worktree remove"), "git's reason: {err}");
+            }
+            other => panic!("expected CleanupIncomplete, got {other:?}"),
+        }
+        assert!(late.exists(), "late work preserved");
+        assert_eq!(manager.get_lease(&lease.path).as_ref(), Some(&lease));
+    }
+
+    #[test]
+    fn orphan_scan_reports_unleased_directories_and_branches_without_deleting() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let leased = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        let orphan_dir = wt_dir.path().join("wt-deadbeef-orphan");
+        std::fs::create_dir_all(&orphan_dir).unwrap();
+        std::fs::write(orphan_dir.join("wip.txt"), "unknown work").unwrap();
+        let unrelated = wt_dir.path().join("notes");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        git_in(repo_dir.path(), &["branch", "davinci/agent/orphan"]);
+        git_in(repo_dir.path(), &["branch", "feature/mine"]);
+
+        let orphans = manager.scan_orphans().unwrap();
+
+        assert_eq!(orphans.len(), 2, "{orphans:?}");
+        assert!(orphans.contains(&WorktreeOrphan::Directory(orphan_dir.clone())));
+        assert!(orphans.contains(&WorktreeOrphan::Branch("davinci/agent/orphan".into())));
+        assert!(orphan_dir.join("wip.txt").exists(), "report only");
+        assert!(branch_exists(repo_dir.path(), "davinci/agent/orphan"));
+        assert!(leased.path.exists());
+        assert!(branch_exists(repo_dir.path(), &leased.branch));
+    }
+
+    #[test]
+    fn orphan_scan_reports_a_registration_whose_directory_and_branch_are_gone() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let first = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = first
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        std::fs::remove_dir_all(&lease.path).unwrap();
+        git_in(
+            repo_dir.path(),
+            &["update-ref", "-d", &format!("refs/heads/{}", lease.branch)],
+        );
+        // A fresh manager, as after a crash: no live lease owns the registration.
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+
+        let orphans = manager.scan_orphans().unwrap();
+
+        assert_eq!(orphans.len(), 1, "{orphans:?}");
+        assert!(
+            matches!(&orphans[0], WorktreeOrphan::Registration(path)
+                if path_key(path) == path_key(&lease.path)),
+            "{orphans:?}"
+        );
+        assert!(manager.is_registered(&lease.path).unwrap(), "report only");
+        // A leased registration is not an orphan.
+        assert!(first.scan_orphans().unwrap().is_empty());
     }
 
     /// WOR-54: once the worker's commit is merged, the lease is clean.
@@ -998,7 +1841,10 @@ mod tests {
         let worktree = lease.path.to_str().unwrap();
         git_in(repo.path(), &["worktree", "lock", worktree]);
         let err = manager.release_lease(&lease, true).unwrap_err();
-        assert!(matches!(err, WorktreeError::GitError(_)), "{err:?}");
+        assert!(
+            matches!(&err, WorktreeError::CleanupIncomplete { path: Some(_), detail, .. } if detail.contains("locked")),
+            "{err:?}"
+        );
         assert!(lease.path.join("README.md").exists());
         assert_eq!(manager.get_lease(&lease.path), Some(lease.clone()));
         git_in(repo.path(), &["worktree", "unlock", worktree]);

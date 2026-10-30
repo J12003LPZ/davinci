@@ -79,7 +79,13 @@ fn stale_owner_cannot_release_new_lease() {
     assert!(current.path.join("work.txt").exists());
     assert_eq!(manager.get_lease(&current.path), Some(current.clone()));
 
-    // The real owner still releases normally.
+    // The real owner is refused while its work is uncommitted, forced or not.
+    let error = manager.release_lease(&current, true).unwrap_err();
+    assert!(
+        matches!(error, WorktreeError::DirtyWorktreePreserved { .. }),
+        "{error:?}"
+    );
+    std::fs::remove_file(current.path.join("work.txt")).unwrap();
     manager.release_lease(&current, true).unwrap();
     assert!(manager.get_lease(&current.path).is_none());
 }

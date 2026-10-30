@@ -9,6 +9,10 @@
 //! `--chatty` emits 10,000 notifications after initialize,
 //! `--malformed-reply` sends a response containing both result and error,
 //! `--hang` never answers `tools/call` (and says so on stderr),
+//! `--commit-then-hang <log>` appends `call <id> <invocationId>` and
+//! `effect <id> <invocationId>` to the log file for every `tools/call` (the
+//! effect is committed), including ones that arrive while it hangs, then never
+//! answers; a `notifications/cancelled` is logged as `cancelled <requestId>`,
 //! `--die` writes to stderr and exits on `tools/call`,
 //! `--rpc-error` answers `tools/call` without `text` with `-32602`,
 //! `--paged` splits both lists over two `nextCursor` pages and lists a
@@ -32,6 +36,8 @@ struct Flags {
     paged: bool,
     list_error: bool,
     batch: bool,
+    /// Log file for `--commit-then-hang`.
+    effect_log: Option<String>,
 }
 
 fn main() {
@@ -49,6 +55,10 @@ fn main() {
         paged: has("--paged"),
         list_error: has("--list-error"),
         batch: has("--batch"),
+        effect_log: args
+            .iter()
+            .position(|arg| arg == "--commit-then-hang")
+            .and_then(|at| args.get(at + 1).cloned()),
     };
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
@@ -90,6 +100,29 @@ fn main() {
             ),
             "tools/list" if flags.list_error => error(&id, -32603, "list broke"),
             "tools/list" => ok(&id, tools_page(&flags, cursor.as_deref())),
+            "tools/call" if flags.effect_log.is_some() => {
+                let log = flags.effect_log.as_deref().unwrap_or_default();
+                commit_effect(log, &msg);
+                for line in lines.by_ref() {
+                    let Ok(line) = line else { break };
+                    let Ok(message) = serde_json::from_str::<Value>(line.trim()) else {
+                        continue;
+                    };
+                    match message.get("method").and_then(Value::as_str) {
+                        Some("notifications/cancelled") => {
+                            let request =
+                                message.pointer("/params/requestId").unwrap_or(&Value::Null);
+                            append_log(log, &format!("cancelled {request}"));
+                            break;
+                        }
+                        // A resend while hanging is still a call and still an
+                        // effect, so it must show up in the count.
+                        Some("tools/call") => commit_effect(log, &message),
+                        _ => {}
+                    }
+                }
+                continue;
+            }
             "tools/call" if flags.hang => {
                 eprintln!("hanging on purpose");
                 for line in lines.by_ref() {
@@ -165,6 +198,28 @@ fn main() {
             }
             let _ = stdout.flush();
         }
+    }
+}
+
+/// Log one received `tools/call` (`call <id> <invocationId>`) and the effect
+/// it commits (`effect <id> <invocationId>`).
+fn commit_effect(log: &str, request: &Value) {
+    let id = request.get("id").unwrap_or(&Value::Null);
+    let invocation = request
+        .pointer("/params/_meta/davinci~1invocationId")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    append_log(log, &format!("call {id} {invocation}"));
+    append_log(log, &format!("effect {id} {invocation}"));
+}
+
+fn append_log(path: &str, line: &str) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{line}");
     }
 }
 

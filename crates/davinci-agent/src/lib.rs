@@ -67,12 +67,13 @@ pub use branch::{
 pub use compaction::{
     branch_summary_context_message, build_history_prompt, calculate_context_tokens,
     compact_messages, compact_messages_with, compact_messages_with_options,
-    compact_messages_with_summary, compaction_context_message, compaction_threshold,
-    compute_file_lists, convert_to_llm, env_summarizer, estimate_context_tokens, estimate_tokens,
-    extract_file_ops, find_cut_point, format_file_operations, generate_summary_with_usage,
-    get_summarization_failure, serialize_conversation, should_compact, CompactionDetails,
-    CompactionResult, CompactionSettings, CompactionThreshold, CutPointResult, FileOperations,
-    SummarizeRequest, SummarizeResponse, Summarizer, BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX,
+    compact_messages_with_summary, compaction_context_message, compaction_context_message_carrying,
+    compaction_summary_meta, compaction_threshold, compute_file_lists, convert_to_llm,
+    env_summarizer, estimate_context_tokens, estimate_tokens, extract_file_ops, find_cut_point,
+    format_file_operations, generate_summary_with_usage, get_summarization_failure,
+    serialize_conversation, should_compact, CompactionDetails, CompactionResult,
+    CompactionSettings, CompactionThreshold, CutPointResult, FileOperations, SummarizeRequest,
+    SummarizeResponse, Summarizer, BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX,
     COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, CONTEXT_VM_FOLD_PROMPT,
     CONTEXT_VM_FOLD_SYSTEM_PROMPT, DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_RESERVE_TOKENS,
     SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT,
@@ -766,6 +767,9 @@ pub struct Agent {
     pub(crate) pending_tool_operations:
         Arc<Mutex<std::collections::HashMap<String, PendingToolOperation>>>,
     pub(crate) operation_presentations: Arc<Mutex<std::collections::HashMap<String, ToolResult>>>,
+    /// Permission revision each compatibility-route call was authorized under,
+    /// checked again right before its adapter runs.
+    pub(crate) prepared_permission_revisions: Arc<Mutex<std::collections::HashMap<String, u64>>>,
     /// Tool-call ids whose results are pruned from the provider view. Only
     /// grows; the session file keeps every body.
     pruned_tool_results: std::collections::HashSet<String>,
@@ -975,6 +979,7 @@ impl Agent {
             tool_ledger: Arc::new(std::sync::Mutex::new(ToolCallLedger::default())),
             pending_tool_operations: Arc::new(Mutex::new(std::collections::HashMap::new())),
             operation_presentations: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            prepared_permission_revisions: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pruned_tool_results: std::collections::HashSet::new(),
             pruned_evidence: std::collections::HashMap::new(),
             base_system_prompt: system_prompt,
@@ -4774,9 +4779,13 @@ impl Agent {
             );
         }
         for skill in &self.skills {
-            account.add(
+            // Accounting needs a size, not the text: a skill's body is read
+            // only when it is selected or invoked.
+            let size = skill.size_hint();
+            account.add_unloaded(
                 format!("skill::{}", skill.name),
-                skill.body.clone(),
+                format!("skill-file:{}:{size}", skill.path.display()),
+                size,
                 true,
                 ContextPriority::Deferred,
             );
@@ -5527,11 +5536,8 @@ impl Agent {
                     .rev()
                     .find(|entry| entry.entry_type == "compaction")
                     .and_then(|entry| {
-                        entry
-                            .extra
-                            .get("summary")
-                            .and_then(|value| value.as_str())
-                            .map(str::to_string)
+                        let text = entry.extra.get("summary")?.as_str()?.to_string();
+                        Some((text, compaction_entry_meta(entry)))
                     })
             });
             let provider = self.provider.clone();
@@ -5557,7 +5563,9 @@ impl Agent {
                 custom_instructions,
                 self.compaction.keep_recent_tokens,
                 self.compaction.reserve_tokens,
-                previous_summary.as_deref(),
+                previous_summary
+                    .as_ref()
+                    .map(|(text, meta)| crate::compaction::PreviousSummary { text, meta }),
                 bound.as_ref(),
             );
             self.finish_auxiliary_observations(
@@ -5603,6 +5611,18 @@ impl Agent {
                 serde_json::to_value(&result.details).unwrap_or_default(),
             );
             extra.insert("fromHook".into(), serde_json::json!(false));
+            if let Some(meta) = result.messages.first().and_then(compaction_summary_meta) {
+                extra.insert(
+                    COMPACTION_CARRIED_KEY.into(),
+                    serde_json::json!(meta.carried_user_requirements),
+                );
+                if let Some(legacy) = meta.carried_legacy_summary {
+                    extra.insert(
+                        COMPACTION_CARRIED_LEGACY_KEY.into(),
+                        serde_json::json!(legacy),
+                    );
+                }
+            }
             if let Some(usage) = &result.usage {
                 extra.insert(
                     "usage".into(),
@@ -6256,11 +6276,40 @@ pub(crate) fn is_legacy_verification_notice(message: &ChatMessage) -> bool {
     message.extra.contains_key("davinciVerificationStatus")
 }
 
+/// `extra` key of a `compaction` session entry holding the user requirements
+/// its summary carries. The summary text only displays them.
+const COMPACTION_CARRIED_KEY: &str = "carriedUserRequirements";
+/// `extra` key holding a legacy summary's text, carried apart from the
+/// requirements because the model wrote it.
+const COMPACTION_CARRIED_LEGACY_KEY: &str = "carriedLegacySummary";
+
+/// The requirements a `compaction` entry records. An entry saved before the
+/// metadata existed, or whose list does not parse, is `legacy`: its list is
+/// unknown, not empty, and its summary text is the only record.
+fn compaction_entry_meta(entry: &SessionEntry) -> crate::compaction::CompactionSummaryMeta {
+    let carried: Option<Vec<String>> = entry
+        .extra
+        .get(COMPACTION_CARRIED_KEY)
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    crate::compaction::CompactionSummaryMeta {
+        legacy: carried.is_none(),
+        carried_user_requirements: carried.unwrap_or_default(),
+        carried_legacy_summary: entry
+            .extra
+            .get(COMPACTION_CARRIED_LEGACY_KEY)
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    }
+}
+
 pub(crate) fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
     match entry.entry_type.as_str() {
         "compaction" => {
             let summary = entry.extra.get("summary")?.as_str()?;
-            Some(compaction_context_message(summary))
+            Some(crate::compaction::compaction_context_message_with_meta(
+                summary,
+                &compaction_entry_meta(entry),
+            ))
         }
         "branch_summary" => {
             let summary = entry.extra.get("summary")?.as_str()?;
