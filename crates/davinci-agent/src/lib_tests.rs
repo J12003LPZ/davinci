@@ -6473,7 +6473,10 @@ fn b3_an_unresolved_call_is_closed_before_the_next_request_and_never_rerun() {
         let path = seeded_session(
             dir.path(),
             vec![
-                SessionEntry::message("user", serde_json::json!("write it")),
+                SessionEntry::message(
+                    "user",
+                    serde_json::json!([{"type": "text", "text": "write it"}]),
+                ),
                 tool_call_entry("c1", "write"),
             ],
         );
@@ -6540,7 +6543,10 @@ fn b3_an_orphan_tool_result_is_refused_before_any_provider_request() {
     let path = seeded_session(
         dir.path(),
         vec![
-            SessionEntry::message("user", serde_json::json!("hello")),
+            SessionEntry::message(
+                "user",
+                serde_json::json!([{"type": "text", "text": "hello"}]),
+            ),
             tool_result_entry("ghost"),
         ],
     );
@@ -6571,7 +6577,7 @@ fn b3_a_fork_does_not_inherit_the_parents_ledger_records() {
     let path = seeded_session(
         dir.path(),
         vec![
-            SessionEntry::message("user", serde_json::json!("go")),
+            SessionEntry::message("user", serde_json::json!([{"type": "text", "text": "go"}])),
             tool_call_entry("live", "write"),
             tool_result_entry("done"),
         ],
