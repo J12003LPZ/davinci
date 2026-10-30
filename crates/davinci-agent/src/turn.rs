@@ -3022,14 +3022,9 @@ Issue the call again if it is still needed.";
                         }
                         Some(runtime) => match targets
                             .iter()
-                            .map(|target| {
-                                runtime.blob_store.capture_file_with(
-                                    task_id,
-                                    cwd,
-                                    target,
-                                    allow_linked,
-                                )
-                            })
+                            // A read grant never widens to a write: checkpointing
+                            // an edit target always refuses a multiply linked file.
+                            .map(|target| runtime.blob_store.capture_file(task_id, cwd, target))
                             .collect::<Result<Vec<_>, _>>()
                         {
                             Ok(captures) => captures,
@@ -3286,12 +3281,7 @@ Issue the call again if it is still needed.";
                 if mutating && !executed.is_error {
                     if let Some(runtime) = &self.runtime {
                         for pre in preimages {
-                            match runtime.blob_store.capture_file_with(
-                                task_id,
-                                cwd,
-                                &pre.path,
-                                allow_linked,
-                            ) {
+                            match runtime.blob_store.capture_file(task_id, cwd, &pre.path) {
                                 Ok(post) => {
                                     let kind = if !pre.exists && post.exists {
                                         crate::runtime::effects::FileEffectKind::Created

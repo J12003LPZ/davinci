@@ -1452,7 +1452,12 @@ fn read_whole(file: &mut fs::File, cap: u64, what: &str) -> Result<Vec<u8>, Tool
         .metadata()
         .map_err(|err| ToolError::Failed(err.to_string()))?
         .len();
-    read_whole_from(file, declared, cap, what)
+    #[cfg(test)]
+    let reader: Box<dyn std::io::Read> =
+        crate::test_seam::reader("read_whole", declared).unwrap_or_else(|| Box::new(&mut *file));
+    #[cfg(not(test))]
+    let reader = &mut *file;
+    read_whole_from(reader, declared, cap, what)
 }
 
 /// The stream half of [`read_whole`]: `declared` above `cap` is refused without
@@ -3276,8 +3281,8 @@ fn excludes_secret_descendants(search_path: &Path) -> bool {
 
 /// Render grep matches of one file with `context` lines around each, merging
 /// overlapping or adjacent windows so every line prints once and putting a
-/// `--` line between separate groups, as ripgrep does. `match_lines` are
-/// 1-based and ascending. Returns the lines and whether any line was cut.
+/// `--` line between separate groups, as ripgrep does. `hit_lines` are 1-based
+/// and ascending. Returns the lines and whether any line was cut.
 /// Davinci divergence from TS grep.ts, which repeated shared context lines.
 #[cfg(test)]
 fn render_grep_context(
@@ -3286,64 +3291,129 @@ fn render_grep_context(
     match_lines: &[usize],
     context: usize,
 ) -> (Vec<String>, bool) {
+    let body = file_lines.join("\n");
     let (out, truncated, _, _) =
-        render_grep_context_bounded(display, file_lines, match_lines, context, usize::MAX);
+        render_grep_context_bounded(display, &body, match_lines, context, usize::MAX);
     (out, truncated)
 }
 
-/// [`render_grep_context`] that stops once the rows hold `max_bytes`; the third
-/// value says it stopped.
+/// [`render_grep_context`] under an output allowance of `max_bytes`, reading
+/// the file text as a stream (no per-line index is built). The matching rows
+/// and the separators between their groups are reserved first; context rows
+/// then fill whatever allowance is left, in line order, so a hit is never
+/// displaced by its own context. Returns the rows, whether a line was cut for
+/// display, whether anything (a hit or context row) was dropped for space, and
+/// how many hits were rendered.
 fn render_grep_context_bounded(
     display: &str,
-    file_lines: &[&str],
-    match_lines: &[usize],
+    body: &str,
+    hit_lines: &[usize],
     context: usize,
     max_bytes: usize,
 ) -> (Vec<String>, bool, bool, usize) {
-    let mut out = Vec::new();
-    let mut hits = 0usize;
-    let mut used = 0usize;
     let mut lines_truncated = false;
+    let mut cut = false;
+    // Pass 1: the hit rows that fit, with the separators their groups need.
+    let mut hit_rows: Vec<(usize, String)> = Vec::new();
+    let mut reserved = 0usize;
+    let mut previous: Option<usize> = None;
+    let mut wanted = hit_lines.iter().copied().peekable();
+    for (index, line) in body.lines().enumerate() {
+        let number = index + 1;
+        let Some(&next) = wanted.peek() else {
+            break;
+        };
+        if number != next {
+            continue;
+        }
+        wanted.next();
+        let (text, truncated) = truncate_line(line);
+        let row = format!("{display}:{number}: {text}");
+        let separator = match previous {
+            Some(last)
+                if number.saturating_sub(context)
+                    > last.saturating_add(context).saturating_add(1) =>
+            {
+                3
+            }
+            _ => 0,
+        };
+        let need = separator + row.len() + 1;
+        if reserved.saturating_add(need) > max_bytes {
+            cut = true;
+            break;
+        }
+        reserved += need;
+        lines_truncated |= truncated;
+        previous = Some(number);
+        hit_rows.push((number, row));
+    }
+    if wanted.peek().is_some() {
+        cut = true;
+    }
+    if hit_rows.is_empty() {
+        return (Vec::new(), lines_truncated, cut, 0);
+    }
+    // Pass 2: the groups, emitted in line order.
+    let context_budget = max_bytes - reserved;
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    let total = file_lines.len();
-    // A window wider than the file adds nothing, and clamping first keeps every
-    // sum below from wrapping however large `context` was asked for.
-    let context = context.min(total);
-    for &line in match_lines {
-        let start = line.saturating_sub(context).max(1);
-        let end = line.saturating_add(context).min(total.max(line));
+    for (number, _) in &hit_rows {
+        let start = number.saturating_sub(context).max(1);
+        let end = number.saturating_add(context);
         match ranges.last_mut() {
             Some(last) if start <= last.1.saturating_add(1) => last.1 = last.1.max(end),
             _ => ranges.push((start, end)),
         }
     }
-    for (group, (start, end)) in ranges.into_iter().enumerate() {
-        if group > 0 {
-            used = used.saturating_add(3);
-            if used > max_bytes {
-                return (out, lines_truncated, true, hits);
-            }
-            out.push("--".to_string());
+    let last_line = ranges.last().map_or(0, |range| range.1);
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    let mut range_index = 0usize;
+    let mut started_range = usize::MAX;
+    let mut hit_index = 0usize;
+    for (index, line) in body.lines().enumerate() {
+        let number = index + 1;
+        if number > last_line {
+            break;
         }
-        for current in start..=end {
-            let (text, truncated) =
-                truncate_line(file_lines.get(current - 1).copied().unwrap_or(""));
-            let is_hit = match_lines.binary_search(&current).is_ok();
-            let row = if is_hit {
-                format!("{display}:{current}: {text}")
-            } else {
-                format!("{display}-{current}- {text}")
-            };
-            used = used.saturating_add(row.len() + 1);
-            if used > max_bytes {
-                return (out, lines_truncated, true, hits);
-            }
-            lines_truncated |= truncated;
-            hits += usize::from(is_hit);
-            out.push(row);
+        while range_index < ranges.len() && number > ranges[range_index].1 {
+            range_index += 1;
         }
+        let Some(&(start, _)) = ranges.get(range_index) else {
+            break;
+        };
+        if number < start {
+            continue;
+        }
+        let is_hit = hit_rows
+            .get(hit_index)
+            .is_some_and(|(hit, _)| *hit == number);
+        if !is_hit && used >= context_budget {
+            cut = true;
+            continue;
+        }
+        if started_range != range_index {
+            if started_range != usize::MAX {
+                out.push("--".to_string());
+            }
+            started_range = range_index;
+        }
+        if is_hit {
+            out.push(hit_rows[hit_index].1.clone());
+            hit_index += 1;
+            continue;
+        }
+        let (text, truncated) = truncate_line(line);
+        let row = format!("{display}-{number}- {text}");
+        if used.saturating_add(row.len() + 1) > context_budget {
+            cut = true;
+            continue;
+        }
+        used += row.len() + 1;
+        lines_truncated |= truncated;
+        out.push(row);
     }
-    (out, lines_truncated, false, hits)
+    (out, lines_truncated, cut, hit_rows.len())
 }
 
 /// Why a search covered less than everything it was asked to. Reported to the
@@ -3356,6 +3426,9 @@ const GREP_SKIP_OUTPUT: &str = "output stopped at 256 KiB";
 const GREP_SKIP_DISCOVERY: &str = "file discovery stopped at 200000 files";
 const GREP_SKIP_WALK: &str = "directory enumeration stopped at its entry budget";
 const GREP_SKIP_LIMIT: &str = "the match limit was capped at 32768";
+const GREP_SKIP_OUTSIDE: &str = "files outside the search root were not searched";
+const GREP_SKIP_UNREADABLE: &str = "some directories or entries could not be read";
+const GREP_SKIP_QUEUE: &str = "the directory queue limit was reached";
 /// Hard ceiling on `limit`, so the retained working set does not depend on a
 /// caller-chosen number.
 const GREP_MAX_LIMIT: usize = 32 * 1024;
@@ -3574,26 +3647,121 @@ impl GrepScan {
     }
 }
 
+/// Counts live bytes allocated by threads that opted in, so a test can bound the
+/// peak memory of a scan instead of only its returned rows.
+#[cfg(test)]
+mod counting_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
+
+    thread_local! {
+        static TRACK: Cell<bool> = const { Cell::new(false) };
+    }
+    static LIVE: AtomicIsize = AtomicIsize::new(0);
+    static PEAK: AtomicIsize = AtomicIsize::new(0);
+
+    pub struct Counting;
+
+    fn tracking() -> bool {
+        TRACK.try_with(Cell::get).unwrap_or(false)
+    }
+
+    // SAFETY: every call forwards to the system allocator unchanged; the
+    // counters are atomics and the flag is a const-initialized thread local.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let pointer = System.alloc(layout);
+            if !pointer.is_null() && tracking() {
+                let live = LIVE.fetch_add(layout.size() as isize, Relaxed) + layout.size() as isize;
+                PEAK.fetch_max(live, Relaxed);
+            }
+            pointer
+        }
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            if tracking() {
+                LIVE.fetch_sub(layout.size() as isize, Relaxed);
+            }
+            System.dealloc(pointer, layout);
+        }
+    }
+
+    /// Run `f` with this thread's allocations counted.
+    pub fn tracked<T>(f: impl FnOnce() -> T) -> T {
+        TRACK.with(|flag| flag.set(true));
+        let result = f();
+        TRACK.with(|flag| flag.set(false));
+        result
+    }
+
+    pub fn reset() {
+        LIVE.store(0, Relaxed);
+        PEAK.store(0, Relaxed);
+    }
+
+    pub fn peak() -> usize {
+        PEAK.load(Relaxed).max(0) as usize
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static COUNTING_ALLOCATOR: counting_alloc::Counting = counting_alloc::Counting;
+
+#[cfg(test)]
+const UNRESTRICTED: GrepAccess<'static> = GrepAccess {
+    allow_linked: false,
+    root: None,
+};
+
+/// Where one native grep may read: the policy switch and, when outside reads
+/// are not authorized, the canonical search root every read handle must resolve
+/// under.
+#[derive(Clone, Copy)]
+struct GrepAccess<'a> {
+    allow_linked: bool,
+    root: Option<&'a Path>,
+}
+
 /// Scan one file for the native grep. The file is opened once, admitted on
-/// that handle (single link, within the per-file and aggregate byte budgets)
-/// and read at most to the per-file cap. Returns `None` for a file that is not
-/// text or cannot be read.
+/// that handle (single link, resolving under the search root unless outside
+/// reads are authorized, within the per-file and aggregate byte budgets) and
+/// read at most to the per-file cap. `output_left` is what the answer still has
+/// room for: this file's rows are trimmed to it. Returns `None` for a file that
+/// is not text or cannot be read.
+#[allow(clippy::too_many_arguments)]
 fn grep_scan_file(
     file: &Path,
     matcher: &Matcher,
     context: usize,
     display: &str,
     remaining: usize,
+    output_left: usize,
     budget: &ScanBudget,
-    allow_linked: bool,
+    access: GrepAccess<'_>,
 ) -> Option<GrepScan> {
-    let mut handle = match open_unlinked(file, allow_linked) {
+    #[cfg(test)]
+    GREP_TEST_BEFORE_OPEN.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(file);
+        }
+    });
+    let mut handle = match open_unlinked(file, access.allow_linked) {
         Ok(handle) => handle,
         Err(err) if davinci_sys::fs::is_hard_link_refusal(&err) => {
             return Some(GrepScan::skipped(GREP_SKIP_LINKED));
         }
         Err(_) => return None,
     };
+    // The check is on the handle that supplies the bytes: a symlink inside the
+    // tree, or a link or junction put in place after discovery, that leads out
+    // of the search root is refused and reported, not read.
+    if let Some(root) = access.root {
+        match davinci_sys::fs::final_path(&handle) {
+            Ok(real) if real.starts_with(root) => {}
+            _ => return Some(GrepScan::skipped(GREP_SKIP_OUTSIDE)),
+        }
+    }
     let size = handle.metadata().ok()?.len();
     if size > GREP_MAX_FILE_BYTES {
         return Some(GrepScan::skipped(GREP_SKIP_LARGE));
@@ -3609,7 +3777,12 @@ fn grep_scan_file(
     });
     // Read no more than was charged: a file that grew after the size was
     // taken is refused, so the bytes consumed never exceed the bytes reserved.
-    let bytes = match davinci_sys::fs::read_bounded(&mut handle, size) {
+    #[cfg(test)]
+    let reader: Box<dyn std::io::Read> =
+        crate::test_seam::reader("grep", size).unwrap_or_else(|| Box::new(&mut handle));
+    #[cfg(not(test))]
+    let reader = &mut handle;
+    let bytes = match davinci_sys::fs::read_capped(reader, size, size) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::FileTooLarge => {
             return Some(GrepScan::skipped(GREP_SKIP_LARGE));
@@ -3645,7 +3818,7 @@ fn grep_scan_file(
                 let (text, truncated) = truncate_line(line);
                 let row = format!("{display}:{}: {text}", index + 1);
                 used = used.saturating_add(row.len() + 1);
-                if used > GREP_MAX_OUTPUT_BYTES {
+                if used > output_left.min(GREP_MAX_OUTPUT_BYTES) {
                     scan.skipped.push(GREP_SKIP_OUTPUT);
                     break;
                 }
@@ -3656,12 +3829,13 @@ fn grep_scan_file(
         }
         return Some(scan);
     }
-    let file_lines: Vec<&str> = body.lines().collect();
+    // Matching streams over the text: only the hit line numbers are kept, never
+    // an index of every line.
     let mut match_lines = Vec::new();
     // A rendered hit takes at least four bytes of answer, so more hits than
     // the output can hold are never collected.
     let collect = remaining.min(GREP_MAX_OUTPUT_BYTES / 4);
-    for (index, line) in file_lines.iter().enumerate() {
+    for (index, line) in body.lines().enumerate() {
         if match_lines.len() >= collect {
             break;
         }
@@ -3671,10 +3845,10 @@ fn grep_scan_file(
     }
     let (rendered, truncated, cut, rendered_hits) = render_grep_context_bounded(
         display,
-        &file_lines,
+        &body,
         &match_lines,
         context,
-        GREP_MAX_OUTPUT_BYTES,
+        output_left.min(GREP_MAX_OUTPUT_BYTES),
     );
     scan.hits = rendered_hits;
     scan.lines.extend(rendered);
@@ -3692,7 +3866,7 @@ fn scan_grep_batch(
     files: &[PathBuf],
     limit: usize,
     output_left: usize,
-    scan: &(dyn Fn(&Path, usize) -> Option<GrepScan> + Sync),
+    scan: &(dyn Fn(&Path, usize, usize) -> Option<GrepScan> + Sync),
 ) -> Vec<Option<GrepScan>> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(test)]
@@ -3705,7 +3879,7 @@ fn scan_grep_batch(
                 results.push(None);
                 continue;
             }
-            let result = scan(file, limit - found);
+            let result = scan(file, limit - found, output_left.saturating_sub(bytes));
             found += result.as_ref().map_or(0, |result| result.hits);
             bytes += result.as_ref().map_or(0, GrepScan::row_bytes);
             results.push(result);
@@ -3732,7 +3906,8 @@ fn scan_grep_batch(
                     break;
                 }
                 let remaining = limit.saturating_sub(found.load(Ordering::Relaxed)).max(1);
-                if let Some(result) = scan(&files[index], remaining) {
+                let room = output_left.saturating_sub(bytes.load(Ordering::Relaxed));
+                if let Some(result) = scan(&files[index], remaining, room) {
                     found.fetch_add(result.hits, Ordering::Relaxed);
                     bytes.fetch_add(result.row_bytes(), Ordering::Relaxed);
                     slots.lock().unwrap_or_else(|err| err.into_inner())[index] = Some(result);
@@ -3755,6 +3930,10 @@ thread_local! {
     /// Runs after a file's size is charged and before it is read, so a test
     /// can change the file in that window.
     static GREP_TEST_AFTER_RESERVE: std::cell::RefCell<Option<GrepReserveHook>> =
+        const { std::cell::RefCell::new(None) };
+    /// Runs before a file is opened for scanning, so a test can swap it for a
+    /// link after discovery.
+    static GREP_TEST_BEFORE_OPEN: std::cell::RefCell<Option<GrepReserveHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -3826,6 +4005,20 @@ fn grep_native(
     let matcher = Matcher::new(pattern, ignore_case, literal);
     let exclude_secrets = excludes_secret_descendants(&search_path);
     let budget = ScanBudget::new(GREP_MAX_SCAN_BYTES);
+    // Without an outside-read grant every read handle must resolve under the
+    // search root as it was when the search began. A file given by name was
+    // authorized by name and is not confined.
+    let confine = if is_dir && !tool_context.linked_files_allowed {
+        Some(search_path.canonicalize().map_err(|error| {
+            ToolError::Failed(format!("cannot resolve {}: {error}", search_path.display()))
+        })?)
+    } else {
+        None
+    };
+    let access = GrepAccess {
+        allow_linked: tool_context.linked_files_allowed,
+        root: confine.as_deref(),
+    };
 
     let mut matches: Vec<String> = Vec::new();
     let mut lines_truncated = false;
@@ -3837,7 +4030,7 @@ fn grep_native(
     let mut row_bytes = 0usize;
     let mut batch: Vec<PathBuf> = Vec::with_capacity(limits.batch_files);
     let mut discovered = 0usize;
-    let scan = |file: &Path, remaining: usize| {
+    let scan = |file: &Path, remaining: usize, output_left: usize| {
         let display = format_grep_path(file, &search_path, is_dir);
         grep_scan_file(
             file,
@@ -3845,53 +4038,52 @@ fn grep_native(
             context,
             &display,
             remaining,
+            output_left,
             &budget,
-            tool_context.linked_files_allowed,
+            access,
         )
     };
     // Scan the batch and merge it in walk order. Returns whether the search is
     // finished: the match limit is reached or a budget is gone.
-    let mut flush = |batch: &mut Vec<PathBuf>,
-                     matches: &mut Vec<String>,
-                     partial: &mut GrepPartial|
-     -> bool {
-        let scanned = scan_grep_batch(
-            batch,
-            limit.saturating_sub(hits),
-            GREP_MAX_OUTPUT_BYTES.saturating_sub(row_bytes),
-            &scan,
-        );
-        for (file, result) in batch.iter().zip(scanned) {
-            if hits >= limit || row_bytes >= GREP_MAX_OUTPUT_BYTES {
-                break;
-            }
-            let Some(mut result) = result else {
-                continue;
-            };
-            if result.hits > limit - hits {
-                // A parallel scan did not know what its neighbours would find;
-                // scan this file again for exactly what still fits.
-                match scan(file, limit - hits) {
-                    Some(again) => result = again,
-                    None => continue,
+    let mut flush =
+        |batch: &mut Vec<PathBuf>, matches: &mut Vec<String>, partial: &mut GrepPartial| -> bool {
+            let scanned = scan_grep_batch(
+                batch,
+                limit.saturating_sub(hits),
+                GREP_MAX_OUTPUT_BYTES.saturating_sub(row_bytes),
+                &scan,
+            );
+            for (file, result) in batch.iter().zip(scanned) {
+                if hits >= limit || row_bytes >= GREP_MAX_OUTPUT_BYTES {
+                    break;
                 }
+                let Some(mut result) = result else {
+                    continue;
+                };
+                let room = GREP_MAX_OUTPUT_BYTES.saturating_sub(row_bytes);
+                if result.hits > limit - hits || result.row_bytes() > room {
+                    // A parallel scan did not know what its neighbours would find
+                    // or take; scan this file again for exactly what still fits,
+                    // so its contribution is trimmed rather than dropped.
+                    match scan(file, limit - hits, room) {
+                        Some(again) => result = again,
+                        None => continue,
+                    }
+                }
+                lines_truncated |= result.truncated;
+                for reason in &result.skipped {
+                    partial.note(reason);
+                }
+                row_bytes += result.row_bytes().min(room);
+                hits += result.hits;
+                matches.extend(result.lines);
             }
-            lines_truncated |= result.truncated;
-            for reason in &result.skipped {
-                partial.note(reason);
-            }
-            if row_bytes.saturating_add(result.row_bytes()) > GREP_MAX_OUTPUT_BYTES {
-                partial.note(GREP_SKIP_OUTPUT);
-                row_bytes = GREP_MAX_OUTPUT_BYTES;
-                break;
-            }
-            row_bytes += result.row_bytes();
-            hits += result.hits;
-            matches.extend(result.lines);
-        }
-        batch.clear();
-        hits >= limit || row_bytes >= GREP_MAX_OUTPUT_BYTES || partial.0.contains(&GREP_SKIP_BUDGET)
-    };
+            batch.clear();
+            hits >= limit
+                || row_bytes >= GREP_MAX_OUTPUT_BYTES
+                || partial.0.contains(&GREP_SKIP_BUDGET)
+                || partial.0.contains(&GREP_SKIP_OUTPUT)
+        };
 
     // Walk and scan in bounded batches: only `GREP_BATCH_FILES` candidate
     // paths are held at once, and the walk stops as soon as the search is done.
@@ -3933,6 +4125,12 @@ fn grep_native(
     }
     if walk.exhausted {
         partial.note(GREP_SKIP_WALK);
+    }
+    if walk.incomplete {
+        partial.note(GREP_SKIP_UNREADABLE);
+    }
+    if walk.queue_full {
+        partial.note(GREP_SKIP_QUEUE);
     }
     if !finished && !batch.is_empty() {
         flush(&mut batch, &mut matches, &mut partial);
@@ -4048,17 +4246,29 @@ fn find_tool_native(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult,
             true
         },
     );
+    let walk_notice = walk_partial_notice(&walk);
     if hits.is_empty() {
         return Ok(ToolResult {
-            content: "No files found matching pattern".into(),
+            content: match &walk_notice {
+                Some(notice) => format!("No files found matching pattern\n\n[{notice}]"),
+                None => "No files found matching pattern".into(),
+            },
             is_error: false,
-            details: None,
+            details: walk_notice
+                .map(|notice| serde_json::json!({"partial": true, "reason": notice})),
         });
     }
     let result_limit_reached = hits.len() >= limit;
     hits.truncate(limit);
     let mut output = hits.join("\n");
+    if let Some(notice) = &walk_notice {
+        output.push_str(&format!("\n\n[{notice}]"));
+    }
     let mut details = serde_json::Map::new();
+    if let Some(notice) = walk_notice {
+        details.insert("partial".into(), Value::Bool(true));
+        details.insert("reason".into(), Value::String(notice));
+    }
     if result_limit_reached {
         output.push_str(&format!("\n\n[{limit} results limit reached]"));
         details.insert("resultLimitReached".into(), serde_json::json!(limit));
@@ -4280,13 +4490,18 @@ impl IgnoreRules {
     }
 }
 
-/// Directory entries a walk may still read. Every entry counts, whether a
-/// glob or an ignore rule later drops it, and empty directories included, so
-/// neither a flat directory of millions of files nor a deep tree of empty
-/// directories can make the walk hold unbounded state.
+/// Directory entries a walk may still read. Every raw result the file system
+/// hands back counts, whether a glob or an ignore rule later drops it, and
+/// empty directories included, so neither a flat directory of millions of files
+/// nor a deep tree of empty directories can make the walk hold unbounded state.
 struct WalkBudget {
     left: usize,
+    /// The entry budget ran out.
     exhausted: bool,
+    /// A directory or an entry could not be read, so coverage is partial.
+    incomplete: bool,
+    /// Directories were dropped because their queued paths hit the byte limit.
+    queue_full: bool,
 }
 
 impl WalkBudget {
@@ -4294,17 +4509,44 @@ impl WalkBudget {
         Self {
             left: entries,
             exhausted: false,
+            incomplete: false,
+            queue_full: false,
         }
     }
 }
 
-/// Depth-first walk in a stable order (entries sorted by name, so results
-/// do not depend on the file system's iteration order). The entry's own
-/// file type is used — `read_dir` already knows it — instead of a `stat`
-/// per path, and symlinked directories are not followed. At most
-/// `budget.left` entries are ever pulled from the file system; a directory
-/// that does not fit is visited only for the entries that were pulled (sorted
-/// within that window), then the walk stops and `budget.exhausted` is set.
+/// Entries pulled from a directory and sorted together. A directory of at most
+/// this many entries is visited in name order; a larger one is visited window
+/// by window, each window sorted, so its first window is available (and a
+/// search that ends early stops) without reading the rest.
+const WALK_WINDOW: usize = 4096;
+/// Bytes of directory paths a walk may hold queued at once.
+const WALK_MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
+
+/// Why a walk covered less than everything, for tools that have no richer
+/// partial-result channel.
+fn walk_partial_notice(walk: &WalkBudget) -> Option<String> {
+    let mut reasons = Vec::new();
+    if walk.exhausted {
+        reasons.push(GREP_SKIP_WALK);
+    }
+    if walk.incomplete {
+        reasons.push(GREP_SKIP_UNREADABLE);
+    }
+    if walk.queue_full {
+        reasons.push(GREP_SKIP_QUEUE);
+    }
+    (!reasons.is_empty()).then(|| format!("partial results: {}", reasons.join("; ")))
+}
+
+/// Depth-first walk (entries in name order within each window of
+/// [`WALK_WINDOW`], so results do not depend on the file system's iteration
+/// order for any directory that fits one window). The entry's own file type is
+/// used — `read_dir` already knows it — instead of a `stat` per path, and
+/// symlinked directories are not followed. Entries are pulled a window at a
+/// time and at most `budget.left` are ever pulled in total; once the budget is
+/// gone the current window is finished, the walk stops and `budget.exhausted`
+/// is set. A directory or entry that cannot be read sets `budget.incomplete`.
 fn walk_files(
     root: &Path,
     ignore: &IgnoreRules,
@@ -4316,48 +4558,82 @@ fn walk_files(
         return;
     }
     let mut stack = vec![root.to_path_buf()];
+    let mut queued_bytes = root.as_os_str().len();
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
+        queued_bytes = queued_bytes.saturating_sub(dir.as_os_str().len());
+        let mut entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => {
+                budget.incomplete = true;
+                continue;
+            }
         };
-        let mut entries: Vec<fs::DirEntry> = entries
-            .flatten()
-            .take(budget.left.saturating_add(1))
-            .collect();
-        if entries.len() > budget.left {
-            entries.truncate(budget.left);
-            budget.exhausted = true;
-        }
-        budget.left -= entries.len();
-        entries.sort_by_key(|entry| entry.file_name());
-        // Directories are pushed in reverse so the stack pops them in name
-        // order.
-        let mut dirs = Vec::new();
-        for entry in entries {
-            let path = entry.path();
-            if ignore.ignored(&path) {
-                continue;
-            }
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                dirs.push(path);
-            } else if file_type.is_file() {
-                if !visit(&path) {
-                    return;
-                }
-            } else if file_type.is_symlink() {
-                // A link to a file is searched like the file; a link to a
-                // directory is not followed (cycles).
-                if path.is_file() && !visit(&path) {
-                    return;
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        loop {
+            let take = WALK_WINDOW.min(budget.left.saturating_add(1));
+            let mut window: Vec<fs::DirEntry> = Vec::new();
+            let mut pulled = 0usize;
+            let mut last_was_entry = false;
+            for item in entries.by_ref().take(take) {
+                pulled += 1;
+                match item {
+                    Ok(entry) => {
+                        window.push(entry);
+                        last_was_entry = true;
+                    }
+                    Err(_) => {
+                        budget.incomplete = true;
+                        last_was_entry = false;
+                    }
                 }
             }
+            if pulled == 0 {
+                break;
+            }
+            if pulled > budget.left {
+                // The extra item only proved there was more than the budget.
+                if last_was_entry {
+                    window.pop();
+                }
+                budget.left = 0;
+                budget.exhausted = true;
+            } else {
+                budget.left -= pulled;
+            }
+            window.sort_by_key(|entry| entry.file_name());
+            for entry in window {
+                let path = entry.path();
+                if ignore.ignored(&path) {
+                    continue;
+                }
+                let Ok(file_type) = entry.file_type() else {
+                    budget.incomplete = true;
+                    continue;
+                };
+                if file_type.is_dir() {
+                    if queued_bytes.saturating_add(path.as_os_str().len()) > WALK_MAX_QUEUED_BYTES {
+                        budget.queue_full = true;
+                    } else {
+                        queued_bytes += path.as_os_str().len();
+                        dirs.push(path);
+                    }
+                } else if file_type.is_file() {
+                    if !visit(&path) {
+                        return;
+                    }
+                } else if file_type.is_symlink() {
+                    // A link to a file is searched like the file (the reader
+                    // confines it); a link to a directory is not followed.
+                    if path.is_file() && !visit(&path) {
+                        return;
+                    }
+                }
+            }
+            if budget.exhausted {
+                return;
+            }
         }
-        if budget.exhausted {
-            return;
-        }
+        // Directories are pushed in reverse so the stack pops them in order.
         stack.extend(dirs.into_iter().rev());
     }
 }
@@ -7209,7 +7485,17 @@ mod audit_wp01_review_regressions {
         for index in 0..4 {
             let file = dir.path().join(format!("{index}.txt"));
             fs::write(&file, "x".repeat(10)).unwrap();
-            let scan = grep_scan_file(&file, &matcher, 0, "f", 5, &budget, false).unwrap();
+            let scan = grep_scan_file(
+                &file,
+                &matcher,
+                0,
+                "f",
+                5,
+                usize::MAX,
+                &budget,
+                UNRESTRICTED,
+            )
+            .unwrap();
             reasons.push((scan.hits, scan.skipped.clone()));
         }
         assert_eq!(reasons[0].0, 1);
@@ -7235,8 +7521,9 @@ mod audit_wp01_review_regressions {
                 context,
                 "many.txt",
                 usize::MAX,
+                usize::MAX,
                 &budget,
-                false,
+                UNRESTRICTED,
             )
             .unwrap();
             assert!(
@@ -7583,5 +7870,548 @@ mod audit_wp01_review_regressions {
         )
         .unwrap_err();
         assert!(error.to_string().contains("larger than"), "{error}");
+    }
+
+    /// Planner security fix: a read grant never widens to a write. With outside
+    /// reads allowed, writing or editing an in-workspace hard link of an outside
+    /// file is refused and the outside bytes are unchanged, with and without a
+    /// runtime (checkpoint store); a single-link file still edits.
+    #[test]
+    fn audit_wp01_b001_linked_target_write_refused_even_with_read_grant() {
+        use crate::runtime::{
+            bus::RuntimeBus,
+            ids::{AgentId, RunId},
+            RuntimeHandle,
+        };
+        let runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+        let contexts = [
+            (
+                "no runtime",
+                ToolContext {
+                    linked_files_allowed: true,
+                    ..ToolContext::default()
+                },
+            ),
+            (
+                "runtime",
+                ToolContext {
+                    linked_files_allowed: true,
+                    runtime: Some(runtime.clone()),
+                    ..ToolContext::default()
+                },
+            ),
+        ];
+        for (label, context) in &contexts {
+            let (workspace, _outside, canary) = linked_fixture();
+            let cwd = workspace.path();
+            fs::write(
+                cwd.join("plain.txt"),
+                "needle plain
+",
+            )
+            .unwrap();
+            let before = fs::read(&canary).unwrap();
+
+            let write = execute_tool_with(
+                cwd,
+                "write",
+                &serde_json::json!({"path": "alias.txt", "content": "overwritten
+"}),
+                context,
+            );
+            assert!(
+                write.is_err(),
+                "{label}: write through a link must be refused"
+            );
+            let edit = execute_tool_with(
+                cwd,
+                "edit",
+                &serde_json::json!({"path": "alias.txt", "oldText": "needle", "newText": "pwned"}),
+                context,
+            );
+            assert!(
+                edit.is_err(),
+                "{label}: edit through a link must be refused"
+            );
+            assert!(
+                write.unwrap_err().to_string().contains("hard link"),
+                "{label}: the refusal names the cause"
+            );
+            assert_eq!(
+                fs::read(&canary).unwrap(),
+                before,
+                "{label}: the outside file changed"
+            );
+            assert_eq!(fs::read(cwd.join("alias.txt")).unwrap(), before);
+
+            // The checkpoint taken before any edit refuses the same target.
+            assert!(runtime
+                .blob_store
+                .capture_file(crate::runtime::ids::TaskId::new(), cwd, "alias.txt")
+                .is_err());
+
+            // A single-link file still edits normally.
+            execute_tool_with(
+                cwd,
+                "edit",
+                &serde_json::json!({"path": "plain.txt", "oldText": "plain", "newText": "edited"}),
+                context,
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read_to_string(cwd.join("plain.txt")).unwrap(),
+                "needle edited
+"
+            );
+        }
+    }
+
+    fn link_directory(link: &Path, target: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .is_ok_and(|out| out.status.success())
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+    }
+
+    fn link_file(link: &Path, target: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+    }
+
+    fn unauthorized() -> ToolContext {
+        ToolContext::default()
+    }
+
+    fn authorized() -> ToolContext {
+        ToolContext {
+            linked_files_allowed: true,
+            ..ToolContext::default()
+        }
+    }
+
+    fn run_grep(dir: &Path, context: &ToolContext, input: serde_json::Value) -> ToolResult {
+        grep_native(dir, &input, context, &GREP_LIMITS).unwrap()
+    }
+
+    /// Re-check N1: a symlink to an outside file, inside the tree, is not read
+    /// under the restricted (Ask/Deny) policy and is under the outside grant.
+    #[test]
+    fn audit_wp01_n1_grep_does_not_follow_a_file_symlink_out_of_the_search_root() {
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let canary = outside.path().join("canary.txt");
+        fs::write(&canary, "needle outside secret\n").unwrap();
+        fs::write(workspace.path().join("plain.txt"), "needle inside\n").unwrap();
+        if !link_file(&workspace.path().join("alias.txt"), &canary) {
+            eprintln!("file symlinks are unavailable here: static symlink case not executed");
+            return;
+        }
+        let input = serde_json::json!({"pattern": "needle", "path": "."});
+        let restricted = run_grep(workspace.path(), &unauthorized(), input.clone());
+        assert!(
+            restricted.content.contains("needle inside"),
+            "{}",
+            restricted.content
+        );
+        assert!(
+            !restricted.content.contains("outside secret"),
+            "{}",
+            restricted.content
+        );
+        assert!(restricted.details.unwrap()["partialReasons"]
+            .to_string()
+            .contains("outside the search root"));
+        let allowed = run_grep(workspace.path(), &authorized(), input);
+        assert!(
+            allowed.content.contains("outside secret"),
+            "{}",
+            allowed.content
+        );
+    }
+
+    /// Re-check N1, without needing link privileges: the confinement is judged
+    /// on the opened handle, so a file whose handle resolves outside the root is
+    /// refused and reported, and read once the root is lifted.
+    #[test]
+    fn audit_wp01_n1_a_handle_resolving_outside_the_root_is_refused() {
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let canary = outside.path().join("canary.txt");
+        fs::write(
+            &canary,
+            "needle outside secret
+",
+        )
+        .unwrap();
+        let root = workspace.path().canonicalize().unwrap();
+        let matcher = Matcher::new("needle", false, true);
+        let budget = ScanBudget::new(GREP_MAX_SCAN_BYTES);
+        let scan = |root: Option<&Path>| {
+            grep_scan_file(
+                &canary,
+                &matcher,
+                0,
+                "canary.txt",
+                10,
+                usize::MAX,
+                &budget,
+                GrepAccess {
+                    allow_linked: false,
+                    root,
+                },
+            )
+            .unwrap()
+        };
+        let refused = scan(Some(&root));
+        assert_eq!(refused.hits, 0);
+        assert!(refused.skipped.contains(&GREP_SKIP_OUTSIDE));
+        assert_eq!(scan(None).hits, 1);
+    }
+
+    /// Re-check N1, synchronized: the directory is swapped for a junction or
+    /// link to outside after discovery and before the file is opened.
+    #[test]
+    fn audit_wp01_n1_a_link_swapped_in_after_discovery_is_refused_on_the_read_handle() {
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("a.txt"), "needle outside secret\n").unwrap();
+        fs::create_dir(workspace.path().join("sub")).unwrap();
+        fs::write(
+            workspace.path().join("sub").join("a.txt"),
+            "needle inside\n",
+        )
+        .unwrap();
+        let swapped = std::cell::Cell::new(false);
+        let root = workspace.path().to_path_buf();
+        let target = outside.path().to_path_buf();
+        GREP_TEST_BEFORE_OPEN.with(|hook| {
+            let (root, target) = (root.clone(), target.clone());
+            let swapped = std::rc::Rc::new(swapped);
+            let flag = swapped.clone();
+            *hook.borrow_mut() = Some(Box::new(move |_| {
+                if flag.get() {
+                    return;
+                }
+                flag.set(true);
+                fs::remove_dir_all(root.join("sub")).unwrap();
+                if !link_directory(&root.join("sub"), &target) {
+                    // Links unavailable: put the directory back, nothing to test.
+                    fs::create_dir(root.join("sub")).unwrap();
+                    fs::write(root.join("sub").join("a.txt"), "needle inside\n").unwrap();
+                }
+            }));
+        });
+        let restricted = run_grep(
+            workspace.path(),
+            &unauthorized(),
+            serde_json::json!({"pattern": "needle", "path": "."}),
+        );
+        GREP_TEST_BEFORE_OPEN.with(|hook| *hook.borrow_mut() = None);
+        assert!(
+            !restricted.content.contains("outside secret"),
+            "{}",
+            restricted.content
+        );
+    }
+
+    /// Re-check item 13: a hit survives however much context precedes it.
+    #[test]
+    fn audit_wp01_b019_a_hit_is_reserved_before_its_context() {
+        let dir = tempdir().unwrap();
+        let wide = "\u{1F600}".repeat(500);
+        let mut text = String::new();
+        for _ in 0..200 {
+            text.push_str(&wide);
+            text.push('\n');
+        }
+        text.push_str("needle\n");
+        fs::write(dir.path().join("big.txt"), text).unwrap();
+        let result = run_grep(
+            dir.path(),
+            &unauthorized(),
+            serde_json::json!({"pattern": "needle", "context": 200, "limit": 1}),
+        );
+        assert!(
+            result.content.contains("big.txt:201: needle"),
+            "{}",
+            &result.content[..200.min(result.content.len())]
+        );
+        assert!(result.content.len() <= GREP_MAX_OUTPUT_BYTES + 512);
+    }
+
+    /// Re-check item 13, global allowance: a file whose output no longer fits
+    /// is trimmed to the room left, and its hit survives.
+    #[test]
+    fn audit_wp01_b019_a_nearly_full_answer_still_keeps_the_next_files_hit() {
+        let dir = tempdir().unwrap();
+        let filler = "x".repeat(480);
+        let first: String = (0..470).map(|_| format!("needle {filler}\n")).collect();
+        fs::write(dir.path().join("a.txt"), first).unwrap();
+        let mut second = String::new();
+        for _ in 0..60 {
+            second.push_str(&"y".repeat(480));
+            second.push('\n');
+        }
+        second.push_str("needle second file\n");
+        for _ in 0..60 {
+            second.push_str(&"z".repeat(480));
+            second.push('\n');
+        }
+        fs::write(dir.path().join("b.txt"), second).unwrap();
+        let result = run_grep(
+            dir.path(),
+            &unauthorized(),
+            serde_json::json!({"pattern": "needle", "context": 60, "limit": 100000}),
+        );
+        assert!(
+            result.content.contains("b.txt:61: needle second file"),
+            "the second file's hit was dropped"
+        );
+        assert!(
+            result.content.contains("output stopped"),
+            "partial output is reported"
+        );
+    }
+
+    /// Re-check item 8: scanning a file of newlines builds no per-line index.
+    /// Peak allocation on the scanning thread stays near the file's own size;
+    /// the old whole-file line index added 16 bytes for each of its 8M lines.
+    #[test]
+    fn audit_wp01_b005_a_no_match_scan_of_short_lines_retains_no_line_index() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("newlines.txt");
+        fs::write(&file, vec![b'\n'; GREP_MAX_FILE_BYTES as usize]).unwrap();
+        let matcher = Matcher::new("zzz", false, true);
+        let budget = ScanBudget::new(GREP_MAX_SCAN_BYTES);
+        counting_alloc::reset();
+        let scan = counting_alloc::tracked(|| {
+            grep_scan_file(
+                &file,
+                &matcher,
+                5,
+                "n",
+                usize::MAX,
+                usize::MAX,
+                &budget,
+                UNRESTRICTED,
+            )
+        })
+        .unwrap();
+        let peak = counting_alloc::peak();
+        assert_eq!(scan.hits, 0);
+        assert!(
+            peak < 3 * GREP_MAX_FILE_BYTES as usize,
+            "peak {peak} bytes: far more than the file, so a per-line index is back"
+        );
+    }
+
+    /// The same through the worker pool: eight workers, each scanning short-line
+    /// files, together stay near eight files' bytes.
+    #[test]
+    fn audit_wp01_b005_pooled_workers_retain_no_line_index() {
+        let dir = tempdir().unwrap();
+        let mut files = Vec::new();
+        for index in 0..40 {
+            let file = dir.path().join(format!("{index}.txt"));
+            fs::write(&file, vec![b'\n'; 2 << 20]).unwrap();
+            files.push(file);
+        }
+        let matcher = Matcher::new("zzz", false, true);
+        let budget = ScanBudget::new(GREP_MAX_SCAN_BYTES);
+        counting_alloc::reset();
+        let scan = |file: &Path, remaining: usize, left: usize| {
+            counting_alloc::tracked(|| {
+                grep_scan_file(
+                    file,
+                    &matcher,
+                    5,
+                    "n",
+                    remaining,
+                    left,
+                    &budget,
+                    UNRESTRICTED,
+                )
+            })
+        };
+        let results = scan_grep_batch(&files, 100, GREP_MAX_OUTPUT_BYTES, &scan);
+        let peak = counting_alloc::peak();
+        assert_eq!(results.len(), 40);
+        // Eight workers x 2 MiB of file bytes, plus slack; the old index added
+        // 32 MiB per worker.
+        assert!(peak < 40 << 20, "peak {peak} bytes across the pool");
+    }
+
+    /// Re-check item 9: a search that ends early pulls a window, not the whole
+    /// directory.
+    #[test]
+    fn audit_wp01_b015_an_early_stop_pulls_one_window_not_the_directory() {
+        let dir = tempdir().unwrap();
+        for index in 0..(WALK_WINDOW * 2 + 100) {
+            fs::write(dir.path().join(format!("f{index:05}.txt")), "x").unwrap();
+        }
+        let mut budget = WalkBudget::new(1_000_000);
+        let mut visited = 0usize;
+        walk_files(
+            dir.path(),
+            &IgnoreRules::load(dir.path()),
+            &mut budget,
+            &mut |_| {
+                visited += 1;
+                false
+            },
+        );
+        assert_eq!(visited, 1);
+        let pulled = 1_000_000 - budget.left;
+        assert!(
+            pulled <= WALK_WINDOW,
+            "pulled {pulled} entries before the first visit"
+        );
+        assert!(!budget.exhausted);
+    }
+
+    /// Re-check item 9: a directory that cannot be read is reported, not
+    /// skipped silently into a complete-looking answer.
+    #[test]
+    fn audit_wp01_b015_an_unreadable_directory_makes_the_walk_partial() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub").join("b.txt"), "needle\n").unwrap();
+        let root = dir.path().to_path_buf();
+        let mut budget = WalkBudget::new(1_000);
+        walk_files(
+            dir.path(),
+            &IgnoreRules::load(dir.path()),
+            &mut budget,
+            &mut |file| {
+                // The queued directory disappears after being discovered.
+                if file.ends_with("a.txt") {
+                    fs::remove_dir_all(root.join("sub")).unwrap();
+                }
+                true
+            },
+        );
+        assert!(budget.incomplete);
+
+        // And through grep: the answer says it is partial.
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub").join("b.txt"), "needle\n").unwrap();
+        GREP_TEST_BEFORE_OPEN.with(|hook| {
+            let root = dir.path().to_path_buf();
+            *hook.borrow_mut() = Some(Box::new(move |file| {
+                if file.ends_with("a.txt") {
+                    let _ = fs::remove_dir_all(root.join("sub"));
+                }
+            }));
+        });
+        // One-file batches scan `a.txt` while the walk is still running.
+        let result = grep_native(
+            dir.path(),
+            &serde_json::json!({"pattern": "needle", "path": "."}),
+            &unauthorized(),
+            &limits(1, 1_000_000),
+        )
+        .unwrap();
+        GREP_TEST_BEFORE_OPEN.with(|hook| *hook.borrow_mut() = None);
+        assert!(
+            result.content.contains("could not be read"),
+            "{}",
+            result.content
+        );
+    }
+
+    /// Re-check item 14, grep consumer: a file that grows after its last
+    /// metadata check is cut off one byte past the size that was charged, and
+    /// reports it. An unbounded read in `grep_scan_file` pulls all of it.
+    #[test]
+    fn audit_wp01_b005_grep_stops_a_file_that_outgrows_its_charged_size() {
+        use crate::test_seam::{clear, install, Outgrowing};
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("grows.txt");
+        fs::write(&file, "needle\n").unwrap();
+        let pulled = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let counter = pulled.clone();
+        install("grep", move |_| {
+            Box::new(Outgrowing {
+                left: 1 << 20,
+                pulled: counter.clone(),
+            })
+        });
+        let matcher = Matcher::new("needle", false, true);
+        let budget = ScanBudget::new(GREP_MAX_SCAN_BYTES);
+        let scan = grep_scan_file(
+            &file,
+            &matcher,
+            0,
+            "grows.txt",
+            10,
+            usize::MAX,
+            &budget,
+            UNRESTRICTED,
+        )
+        .unwrap();
+        clear("grep");
+        // Charged: the 7 declared bytes. Consumed: those plus one probe byte.
+        assert_eq!(
+            pulled.get(),
+            8,
+            "the read must stop one byte past the charged size"
+        );
+        assert!(scan.skipped.contains(&GREP_SKIP_LARGE));
+        assert_eq!(scan.hits, 0);
+    }
+
+    /// Re-check item 14, image and notebook entry points of the real `read`
+    /// tool: a file that outgrows its size is cut off at the limit plus one.
+    #[test]
+    fn audit_wp01_b004_read_stops_an_image_or_notebook_that_outgrows_its_size() {
+        use crate::test_seam::{clear, install, Outgrowing};
+        let dir = tempdir().unwrap();
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(&[0; 16]);
+        fs::write(dir.path().join("pic.png"), &png).unwrap();
+        fs::write(dir.path().join("nb.ipynb"), "{\"cells\": []}").unwrap();
+        for (name, cap) in [
+            ("pic.png", READ_IMAGE_MAX_BYTES),
+            ("nb.ipynb", READ_NOTEBOOK_MAX_BYTES),
+        ] {
+            let pulled = std::rc::Rc::new(std::cell::Cell::new(0u64));
+            let counter = pulled.clone();
+            install("read_whole", move |_| {
+                Box::new(Outgrowing {
+                    left: cap * 2,
+                    pulled: counter.clone(),
+                })
+            });
+            let result = execute_tool_with(
+                dir.path(),
+                "read",
+                &serde_json::json!({"path": name}),
+                &ToolContext::default(),
+            );
+            clear("read_whole");
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("larger than"), "{name}: {error}");
+            assert_eq!(
+                pulled.get(),
+                cap + 1,
+                "{name}: the read must stop one byte past the limit"
+            );
+        }
     }
 }

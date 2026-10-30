@@ -284,6 +284,8 @@ fn read_instruction_file(
         })?;
     }
     let cap = allowance.min(MAX_INSTRUCTION_FILE_BYTES);
+    #[cfg(test)]
+    INSTRUCTION_READS.with(|reads| reads.borrow_mut().push((path.to_path_buf(), cap)));
     match davinci_sys::fs::read_bounded(&mut file, cap) {
         Ok(bytes) => Ok(String::from_utf8(bytes).ok()),
         Err(error) if error.kind() == std::io::ErrorKind::FileTooLarge => {
@@ -298,6 +300,14 @@ fn read_instruction_file(
         }
         Err(_) => Ok(None),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every instruction file read on this thread with the byte cap it was
+    /// given, so a test can show how much a request was allowed to pull in.
+    pub(crate) static INSTRUCTION_READS: std::cell::RefCell<Vec<(PathBuf, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn total_limit_error(path: &Path) -> String {
@@ -593,7 +603,28 @@ pub(crate) fn governing_instruction_files(
     target: &Path,
     loaded: &HashSet<PathBuf>,
 ) -> Vec<ContextFile> {
-    governing_instruction_files_with(cwd, target, loaded, false)
+    let mut budget = NestedBudget::new(MAX_INSTRUCTION_TOTAL_BYTES);
+    governing_instruction_files_with(cwd, target, loaded, false, &mut budget)
+}
+
+/// What nested delivery may still read, shared by every target of one request:
+/// the aggregate allowance left after the loaded files, and the files already
+/// considered (so a path named by several targets is read once).
+pub(crate) struct NestedBudget {
+    pub remaining: u64,
+    seen: HashSet<PathBuf>,
+    /// A file could not be read because the allowance ran out.
+    pub overflow: bool,
+}
+
+impl NestedBudget {
+    pub(crate) fn new(remaining: u64) -> Self {
+        Self {
+            remaining,
+            seen: HashSet::new(),
+            overflow: false,
+        }
+    }
 }
 
 pub(crate) fn governing_instruction_files_with(
@@ -601,6 +632,7 @@ pub(crate) fn governing_instruction_files_with(
     target: &Path,
     loaded: &HashSet<PathBuf>,
     allow_linked: bool,
+    budget: &mut NestedBudget,
 ) -> Vec<ContextFile> {
     let Some(root) = repository_root(cwd) else {
         return Vec::new();
@@ -661,7 +693,7 @@ pub(crate) fn governing_instruction_files_with(
         })
         .filter_map(|dir| {
             let path = dir.join(INSTRUCTION_FILE);
-            if loaded.contains(&path) {
+            if loaded.contains(&path) || budget.overflow || !budget.seen.insert(path.clone()) {
                 return None;
             }
             // A symlinked AGENTS.md that leaves the checkout is not ours to read.
@@ -669,8 +701,19 @@ pub(crate) fn governing_instruction_files_with(
                 return None;
             }
             // Nested files are advisory: one that cannot be admitted is skipped.
-            let body = read_instruction_file(&path, allow_linked, MAX_INSTRUCTION_FILE_BYTES)
-                .ok()??;
+            // The read stops at what the shared allowance still has, and the
+            // first file that does not fit ends the chain.
+            let allowance = budget.remaining.min(MAX_INSTRUCTION_FILE_BYTES);
+            let body = match read_instruction_file(&path, allow_linked, allowance) {
+                Ok(body) => body?,
+                Err(_) => {
+                    if budget.remaining < MAX_INSTRUCTION_FILE_BYTES {
+                        budget.overflow = true;
+                    }
+                    return None;
+                }
+            };
+            budget.remaining -= body.len() as u64;
             Some(ContextFile {
                 path,
                 name: INSTRUCTION_FILE.to_string(),

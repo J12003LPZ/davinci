@@ -90,23 +90,29 @@ impl LaunchPlan {
     }
 }
 
-/// The capability name a mount's grant is keyed to: stable for one directory
-/// (its path and its volume and file identity) and an access level, so the
-/// grant is reused only for that directory. The key is the full SHA-256 of the
-/// path's UTF-16LE code units followed by the identity, with no case folding:
-/// lowercasing maps distinct paths (`İ` and `i` + combining dot) to one name,
-/// and a shared name is a shared grant. Case aliases of one directory just get
-/// separate grants. Binding the identity means a directory that was renamed
-/// away and a new one created under the old name do not share a capability, so
-/// the persistent ACL left on the first never reaches the second.
+/// The capability name a mount's grant is keyed to: unique to one launch, one
+/// directory (its path and its volume and file identity) and an access level.
+/// The key is the full SHA-256 of the path's UTF-16LE code units, the identity
+/// and the launch nonce, with no case folding: lowercasing maps distinct paths
+/// (`İ` and `i` + combining dot) to one name, and a shared name is a shared
+/// grant.
+///
+/// The launch nonce is what makes a grant safe to leave behind. Windows copies
+/// an inheritable ACE onto every existing child and a rename does not strip it,
+/// so a child moved out of the mount between launches would keep access under
+/// any capability name that could be derived again. A name that carries a fresh
+/// nonce is never derived twice: an ACE left on a moved child, or one that a
+/// failed revocation did not remove, names a capability nothing holds anymore.
 pub fn mount_capability(
     path: &str,
     write: bool,
     identity: &davinci_sys::fs::FileIdentity,
+    launch: &str,
 ) -> String {
     let mut utf16: Vec<u8> = path.encode_utf16().flat_map(u16::to_le_bytes).collect();
     utf16.extend_from_slice(&identity.volume.to_le_bytes());
     utf16.extend_from_slice(&identity.index.to_le_bytes());
+    utf16.extend_from_slice(launch.as_bytes());
     let digest = Sha256::digest(&utf16);
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     format!("davinciSandbox{}{hex}", if write { "W" } else { "R" })
@@ -126,6 +132,13 @@ pub struct PinnedMount {
 impl PinnedMount {
     pub fn identity(&self) -> &davinci_sys::fs::FileIdentity {
         &self.identity
+    }
+
+    /// The admitted directory's handle, opened with the right to change its
+    /// DACL: security is read and written through it, never by pathname.
+    #[cfg(windows)]
+    pub fn file(&self) -> &std::fs::File {
+        &self.handle
     }
 
     /// The name must still reach the pinned directory: the same identity on a
@@ -171,7 +184,7 @@ pub fn admitted_mount_path(path: &str) -> Result<PinnedMount, String> {
             resolved.display()
         ));
     }
-    let handle = davinci_sys::fs::open_directory_pinned(Path::new(path))
+    let handle = davinci_sys::fs::open_directory_for_acl(Path::new(path))
         .map_err(|error| format!("AppContainer mount path unavailable: {error}"))?;
     let identity = davinci_sys::fs::file_identity(&handle)
         .map_err(|error| format!("AppContainer mount {path} has no identity: {error}"))?;
@@ -457,7 +470,7 @@ pub fn process_confinement(_pid: u32) -> Option<ProcessConfinement> {
 
 #[cfg(windows)]
 mod native {
-    use super::{admitted_mount_path, mount_capability, LaunchPlan, PROFILE_NAME};
+    use super::{admitted_mount_path, mount_capability, LaunchPlan, PinnedMount, PROFILE_NAME};
     use std::ffi::{c_void, OsStr};
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::{null, null_mut};
@@ -466,9 +479,9 @@ mod native {
         INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::Authorization::{
-        GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-        GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
-        TRUSTEE_W,
+        GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo,
+        EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT,
+        TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeleteAppContainerProfile, GetAppContainerFolderPath,
@@ -663,6 +676,27 @@ mod native {
         Ok(Dacl { acl, descriptor })
     }
 
+    /// The DACL of an opened object, read through its handle.
+    fn dacl_of(handle: HANDLE) -> Result<Dacl, String> {
+        let (mut acl, mut descriptor) = (null_mut::<ACL>(), null_mut::<c_void>());
+        let status = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut acl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(format!("reading the ACL failed ({status})"));
+        }
+        Ok(Dacl { acl, descriptor })
+    }
+
     /// Whether an effective allow entry for one of `sids` covers `mask`.
     fn allows(dacl: &Dacl, sids: &[&Sid], mask: u32) -> bool {
         if dacl.acl.is_null() {
@@ -689,8 +723,17 @@ mod native {
         })
     }
 
-    fn apply(path: &[u16], sid: &Sid, mode: i32, mask: u32, directory: bool) -> Result<(), String> {
-        let current = dacl(path)?;
+    /// Add (`GRANT_ACCESS`) or remove (`REVOKE_ACCESS`) `sid`'s entry on the
+    /// object `handle` names. Inheritable entries propagate to existing children
+    /// as Windows does for any DACL write.
+    fn apply(
+        handle: HANDLE,
+        sid: &Sid,
+        mode: i32,
+        mask: u32,
+        directory: bool,
+    ) -> Result<(), String> {
+        let current = dacl_of(handle)?;
         let entry = EXPLICIT_ACCESS_W {
             grfAccessPermissions: mask,
             grfAccessMode: mode,
@@ -713,8 +756,8 @@ mod native {
             return Err(format!("building the ACL failed ({status})"));
         }
         let status = unsafe {
-            SetNamedSecurityInfoW(
-                path.as_ptr(),
+            SetSecurityInfo(
+                handle,
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION,
                 null_mut(),
@@ -781,15 +824,46 @@ mod native {
         Ok(())
     }
 
-    /// Grant `mask` on `path` to `cap` unless an entry already covers it.
-    fn grant(path: &str, cap: &Sid, everyone: &Sid, mask: u32) -> Result<(), String> {
-        let wide_path = wide(path);
-        if allows(&dacl(&wide_path)?, &[cap, everyone], mask) {
+    fn raw(pin: &PinnedMount) -> HANDLE {
+        use std::os::windows::io::AsRawHandle;
+        pin.file().as_raw_handle()
+    }
+
+    /// Grant `mask` on the pinned mount to `cap` unless an entry already covers
+    /// it, through the pinned handle.
+    fn grant(
+        pin: &PinnedMount,
+        path: &str,
+        cap: &Sid,
+        everyone: &Sid,
+        mask: u32,
+    ) -> Result<(), String> {
+        let handle = raw(pin);
+        if allows(&dacl_of(handle)?, &[cap, everyone], mask) {
             return Ok(());
         }
-        let directory = std::path::Path::new(path).is_dir();
-        apply(&wide_path, cap, GRANT_ACCESS, mask, directory)
+        apply(handle, cap, GRANT_ACCESS, mask, true)
             .map_err(|error| format!("granting sandbox access to {path}: {error}"))
+    }
+
+    /// Removes this launch's grants from their mounts when the launch ends, on
+    /// every exit path and after the job (declared before it, so dropped after
+    /// it) has stopped the child tree. Failure is not an error to report: the
+    /// capability names carry a per-launch nonce, so an entry that stays names
+    /// a capability nothing will ever hold again.
+    struct Revoker<'a> {
+        pins: &'a std::collections::HashMap<String, PinnedMount>,
+        grants: Vec<(String, String)>,
+    }
+
+    impl Drop for Revoker<'_> {
+        fn drop(&mut self) {
+            for (path, capability) in &self.grants {
+                if let (Some(pin), Ok(cap)) = (self.pins.get(path), capability_sid(capability)) {
+                    let _ = apply(raw(pin), &cap, REVOKE_ACCESS, 0, true);
+                }
+            }
+        }
     }
 
     fn quote(argument: &str) -> String {
@@ -908,18 +982,28 @@ mod native {
             check_read_mount(path, &everyone)?;
         }
         let package = package_sid()?;
+        // Fresh capabilities for this launch only, never derived again, and
+        // revoked when it ends.
+        let launch_id = uuid::Uuid::new_v4().simple().to_string();
+        let mut revoker = Revoker {
+            pins: &pins,
+            grants: Vec::new(),
+        };
         let mut capabilities = Vec::new();
         for (paths, write) in [(&plan.read, false), (&plan.write, true)] {
             for path in paths {
                 let pin = &pins[path];
-                let cap = capability_sid(&mount_capability(path, write, pin.identity()))?;
+                let name = mount_capability(path, write, pin.identity(), &launch_id);
+                let cap = capability_sid(&name)?;
                 let mask = if write {
                     FILE_TEMP_ACCESS
                 } else {
                     FILE_READ_EXECUTE
                 };
-                grant(path, &cap, &everyone, mask)?;
-                // The ACL change was by pathname: prove it landed on the pin.
+                // Recorded first so a partial failure still revokes.
+                revoker.grants.push((path.clone(), name));
+                grant(pin, path, &cap, &everyone, mask)?;
+                // The name must still reach the directory the handle holds.
                 pin.recheck()?;
                 capabilities.push(cap);
             }
@@ -1226,6 +1310,82 @@ mod native {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+
+    /// Real ACLs, no AppContainer launch: the cross-launch hole in the review
+    /// (a child with an inherited capability ACE is moved out of the mount, and
+    /// the next launch derives the same capability) is closed because every
+    /// launch has its own capability, and this launch's grants are revoked.
+    #[cfg(test)]
+    mod acl_tests {
+        use super::*;
+        use std::path::Path;
+
+        fn holds(path: &Path, cap: &Sid, mask: u32) -> bool {
+            allows(&dacl(&wide(path.as_os_str())).unwrap(), &[cap], mask)
+        }
+
+        #[test]
+        fn audit_wp01_b002_a_child_moved_out_between_launches_gains_nothing_and_grants_are_revoked()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let base =
+                crate::permission::strip_verbatim_prefix(&dir.path().canonicalize().unwrap());
+            let mount = base.join("p");
+            let elsewhere = base.join("q");
+            std::fs::create_dir(&mount).unwrap();
+            std::fs::create_dir(&elsewhere).unwrap();
+            std::fs::write(mount.join("f.txt"), "child").unwrap();
+            let mount_text = mount.to_string_lossy().into_owned();
+            let everyone = string_sid(ALL_APP_PACKAGES).unwrap();
+
+            let mut pins = std::collections::HashMap::new();
+            pins.insert(
+                mount_text.clone(),
+                admitted_mount_path(&mount_text).unwrap(),
+            );
+            let pin = &pins[&mount_text];
+
+            // Launch 1 grants the mount; Windows copies the entry onto the child.
+            let name1 = mount_capability(&mount_text, false, pin.identity(), "launch-1");
+            let cap1 = capability_sid(&name1).unwrap();
+            grant(pin, &mount_text, &cap1, &everyone, FILE_READ_EXECUTE).unwrap();
+            assert!(holds(&mount, &cap1, FILE_READ_EXECUTE));
+            assert!(
+                holds(&mount.join("f.txt"), &cap1, FILE_READ_EXECUTE),
+                "premise: the child inherited it"
+            );
+
+            // The child leaves the mount between launches and keeps the entry.
+            std::fs::rename(mount.join("f.txt"), elsewhere.join("f.txt")).unwrap();
+            assert!(
+                holds(&elsewhere.join("f.txt"), &cap1, FILE_READ_EXECUTE),
+                "premise: the moved child kept it"
+            );
+
+            // Launch 2 for the same, unchanged mount derives a different
+            // capability, so what launch 1 left behind opens nothing for it.
+            let name2 = mount_capability(&mount_text, false, pin.identity(), "launch-2");
+            assert_ne!(name1, name2);
+            let cap2 = capability_sid(&name2).unwrap();
+            grant(pin, &mount_text, &cap2, &everyone, FILE_READ_EXECUTE).unwrap();
+            assert!(holds(&mount, &cap2, FILE_READ_EXECUTE));
+            assert!(
+                !holds(&elsewhere.join("f.txt"), &cap2, FILE_READ_EXECUTE),
+                "launch 2's capability must not reach the moved child"
+            );
+
+            // Revocation removes both launches' entries from the mount, and a
+            // file created afterwards inherits neither.
+            drop(Revoker {
+                pins: &pins,
+                grants: vec![(mount_text.clone(), name1), (mount_text.clone(), name2)],
+            });
+            assert!(!holds(&mount, &cap1, FILE_READ_EXECUTE));
+            assert!(!holds(&mount, &cap2, FILE_READ_EXECUTE));
+            std::fs::write(mount.join("g.txt"), "new").unwrap();
+            assert!(!holds(&mount.join("g.txt"), &cap2, FILE_READ_EXECUTE));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1259,11 +1419,34 @@ mod tests {
 
     #[test]
     fn mount_capabilities_are_stable_per_path_and_access() {
-        let read = mount_capability(r"C:\Runtime\Node", false, &id(1));
-        assert_eq!(read, mount_capability(r"C:\Runtime\Node", false, &id(1)));
-        assert_ne!(read, mount_capability(r"C:\Runtime\Node", true, &id(1)));
-        assert_ne!(read, mount_capability(r"C:\Runtime\Other", false, &id(1)));
+        let read = mount_capability(r"C:\Runtime\Node", false, &id(1), "launch");
+        assert_eq!(
+            read,
+            mount_capability(r"C:\Runtime\Node", false, &id(1), "launch")
+        );
+        assert_ne!(
+            read,
+            mount_capability(r"C:\Runtime\Node", true, &id(1), "launch")
+        );
+        assert_ne!(
+            read,
+            mount_capability(r"C:\Runtime\Other", false, &id(1), "launch")
+        );
         assert!(read.starts_with("davinciSandboxR") && read.len() == 15 + 64);
+    }
+
+    #[test]
+    fn audit_wp01_b002_every_launch_gets_its_own_capability() {
+        let one = mount_capability(r"C:\Runtime\Node", false, &id(1), "launch-a");
+        assert_eq!(
+            one,
+            mount_capability(r"C:\Runtime\Node", false, &id(1), "launch-a")
+        );
+        assert_ne!(
+            one,
+            mount_capability(r"C:\Runtime\Node", false, &id(1), "launch-b")
+        );
+        assert!(one.starts_with("davinciSandboxR") && one.len() == 15 + 64);
     }
 
     #[test]
@@ -1273,17 +1456,17 @@ mod tests {
         let decomposed = "C:\\work\\i\u{307}";
         assert_eq!(dotted.to_lowercase(), decomposed.to_lowercase());
         assert_ne!(
-            mount_capability(dotted, false, &id(1)),
-            mount_capability(decomposed, false, &id(1))
+            mount_capability(dotted, false, &id(1), "launch"),
+            mount_capability(decomposed, false, &id(1), "launch")
         );
         assert_ne!(
-            mount_capability(dotted, false, &id(1)),
-            mount_capability(dotted, true, &id(1))
+            mount_capability(dotted, false, &id(1), "launch"),
+            mount_capability(dotted, true, &id(1), "launch")
         );
         // Case aliases are separate (redundant) grants, never a merged one.
         assert_ne!(
-            mount_capability(r"C:\Runtime\Node", false, &id(1)),
-            mount_capability(r"c:\runtime\node", false, &id(1))
+            mount_capability(r"C:\Runtime\Node", false, &id(1), "launch"),
+            mount_capability(r"c:\runtime\node", false, &id(1), "launch")
         );
     }
 
@@ -1316,7 +1499,7 @@ mod tests {
         let name = p.to_string_lossy().into_owned();
 
         let first = admitted_mount_path(&name).unwrap();
-        let first_cap = mount_capability(&name, true, first.identity());
+        let first_cap = mount_capability(&name, true, first.identity(), "launch");
         // While it is pinned the directory cannot be renamed away (Windows);
         // elsewhere the swap below is caught by the identity in the key.
         let blocked = std::fs::rename(&p, &q).is_err();
@@ -1329,7 +1512,7 @@ mod tests {
         }
         std::fs::create_dir_all(&p).unwrap();
         let second = admitted_mount_path(&name).unwrap();
-        let second_cap = mount_capability(&name, true, second.identity());
+        let second_cap = mount_capability(&name, true, second.identity(), "launch");
         assert_ne!(first_cap, second_cap, "same name, different directory");
         second.recheck().unwrap();
 

@@ -165,6 +165,75 @@ pub fn isolated_git_command() -> Command {
     command
 }
 
+/// [`isolated_git_command`] for a command that will run in `dir`, with the
+/// repository's own filter and diff drivers neutralized.
+///
+/// A clean/smudge/process filter is a program the repository's config names
+/// and its attributes select; `status` and `diff` run it while comparing
+/// content. Git has no switch for "no filters", so the filters present are
+/// listed (`git config` runs none of them, and `--includes` follows config
+/// includes; system and global config are the null file) and each is overridden
+/// on the command line with an empty command, which Git treats as "no filter",
+/// plus `required=false` so a skipped filter is not an error. The list is read
+/// once, when the command is built: a config edited between that and the run is
+/// not covered, which is the limit of this approach.
+///
+/// Diff drivers (`diff.<name>.textconv` and `.command`) cannot be neutralized
+/// this way: Git tries to spawn an empty driver command and the diff dies
+/// ("cannot spawn"). The supported switches are `--no-ext-diff` and
+/// `--no-textconv`, and every `diff`/`log -p`/`show` run through this command
+/// must pass both.
+pub fn isolated_git_command_in(dir: &Path) -> Command {
+    let mut command = isolated_git_command();
+    command.current_dir(dir);
+    for setting in driver_overrides(dir) {
+        command.arg("-c").arg(setting);
+    }
+    command
+}
+
+/// `-c` settings that disable every repository-defined filter found in the
+/// configuration visible from `dir`.
+fn driver_overrides(dir: &Path) -> Vec<String> {
+    let output = isolated_git_command()
+        .current_dir(dir)
+        .args([
+            "config",
+            "--includes",
+            "--name-only",
+            "--get-regexp",
+            "^(filter|diff)\\.",
+        ])
+        .stdin(Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    // Exit 1 is "no matching key"; anything else (not a repository, unreadable
+    // config) leaves nothing to neutralize or fails the real command anyway.
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let mut settings = std::collections::BTreeSet::new();
+    for key in String::from_utf8_lossy(&output.stdout).lines() {
+        // section.subsection.variable; the subsection may itself contain dots.
+        let (Some(first), Some(last)) = (key.find('.'), key.rfind('.')) else {
+            continue;
+        };
+        if first == last {
+            continue;
+        }
+        let (section, name) = (&key[..first], &key[first + 1..last]);
+        if section == "filter" {
+            for driver in ["clean", "smudge", "process"] {
+                settings.insert(format!("filter.{name}.{driver}="));
+            }
+            settings.insert(format!("filter.{name}.required=false"));
+        }
+    }
+    settings.into_iter().collect()
+}
+
 /// Kill `pid` and its descendants. On Unix, `pid` must be the leader of its
 /// own process group (see [`set_own_process_group`]).
 ///
@@ -856,6 +925,7 @@ mod tests {
     /// and must under plain Git, or the canary proves nothing.
     #[test]
     fn audit_wp01_isolated_git_does_not_run_repository_hooks() {
+        let _guard = GIT_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let repo = tempfile::tempdir().unwrap();
         commit_repo(repo.path(), "one\n");
         let hooks = repo.path().join(".git").join("hooks");
@@ -916,5 +986,130 @@ mod tests {
             marker.exists(),
             "control: plain git must run post-index-change"
         );
+    }
+
+    /// Planner item A: repository-defined filters are not run by `status` or
+    /// `diff` through `isolated_git_command_in`, diff drivers are not run when
+    /// the diff passes `--no-ext-diff --no-textconv`, and plain git runs the
+    /// very same drivers (positive control).
+    #[test]
+    fn audit_wp01_isolated_git_does_not_run_repository_filters_or_diff_drivers() {
+        let _guard = GIT_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        git_in(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            dir.join(".gitattributes"),
+            "f.txt filter=canary\nh.txt filter=lazy\ng.txt diff=viewer\n",
+        )
+        .unwrap();
+        for name in ["f.txt", "h.txt", "g.txt"] {
+            std::fs::write(dir.join(name), "one\n").unwrap();
+        }
+        git_in(dir, &["add", "."]);
+        git_in(dir, &["commit", "-q", "-m", "c"]);
+
+        let slash = |name: &str| dir.join(name).to_string_lossy().replace('\\', "/");
+        let marks = ["clean-ran", "process-ran", "textconv-ran", "command-ran"];
+        // Configure after the commit so setup does not run them.
+        git_in(
+            dir,
+            &[
+                "config",
+                "filter.canary.clean",
+                &format!("echo ran >> '{}'; cat", slash(marks[0])),
+            ],
+        );
+        git_in(dir, &["config", "filter.canary.smudge", "cat"]);
+        git_in(
+            dir,
+            &[
+                "config",
+                "filter.lazy.process",
+                &format!("echo ran >> '{}'", slash(marks[1])),
+            ],
+        );
+        git_in(
+            dir,
+            &[
+                "config",
+                "diff.viewer.textconv",
+                &format!("sh -c 'echo ran >> {}; cat \"$1\"' --", slash(marks[2])),
+            ],
+        );
+        git_in(
+            dir,
+            &[
+                "config",
+                "diff.viewer.command",
+                &format!("echo ran >> '{}'", slash(marks[3])),
+            ],
+        );
+
+        let make_stale = || {
+            // Same length, newer mtime: status must compare content (clean
+            // filter); and a real change so diff converts both sides.
+            for name in ["f.txt", "h.txt"] {
+                std::fs::write(dir.join(name), "one\n").unwrap();
+                let file = std::fs::File::options()
+                    .write(true)
+                    .open(dir.join(name))
+                    .unwrap();
+                file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+            std::fs::write(dir.join("g.txt"), "two\n").unwrap();
+        };
+        let run = |mut command: Command| {
+            let out = command.current_dir(dir).output().unwrap();
+            assert!(out.status.success(), "{out:?}");
+        };
+        let ran = |names: &[&str]| names.iter().filter(|n| dir.join(n).exists()).count();
+        let clear = || {
+            for mark in marks {
+                let _ = std::fs::remove_file(dir.join(mark));
+            }
+        };
+        let plain = |args: &[&str]| {
+            let mut c = Command::new("git");
+            c.env("GIT_CONFIG_NOSYSTEM", "1")
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
+                .args(args);
+            c
+        };
+
+        // Control: plain git runs the clean filter and the diff drivers.
+        make_stale();
+        run(plain(&["status", "--porcelain"]));
+        run(plain(&["diff", "--ext-diff", "--textconv"]));
+        assert!(
+            dir.join(marks[0]).exists(),
+            "control: clean filter must run under plain git"
+        );
+        assert!(
+            dir.join(marks[2]).exists() || dir.join(marks[3]).exists(),
+            "control: a diff driver must run under plain git"
+        );
+        clear();
+
+        // Isolated: none of them.
+        make_stale();
+        let mut status = isolated_git_command_in(dir);
+        status.args(["status", "--porcelain"]);
+        run(status);
+        let mut diff = isolated_git_command_in(dir);
+        diff.args(["diff", "--no-ext-diff", "--no-textconv"]);
+        run(diff);
+        assert_eq!(ran(&marks), 0, "a repository filter or diff driver ran");
+
+        // The real answer is still reported.
+        let out = isolated_git_command_in(dir)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("g.txt"));
     }
 }

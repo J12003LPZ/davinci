@@ -10,6 +10,8 @@ pub mod host_operation;
 mod permission_state;
 pub mod process_manager;
 pub mod subagent_progress;
+#[cfg(test)]
+mod test_seam;
 pub use permission_state::PermissionState;
 mod batch;
 mod branch;

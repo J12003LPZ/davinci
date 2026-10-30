@@ -83,7 +83,12 @@ fn read_preimage(path: &Path, allow_linked: bool) -> Result<Vec<u8>, CheckpointE
         davinci_sys::fs::ensure_single_link(&file)?;
     }
     let declared = file.metadata()?.len();
-    read_preimage_from(&mut file, declared)
+    #[cfg(test)]
+    let reader: Box<dyn std::io::Read> =
+        crate::test_seam::reader("checkpoint", declared).unwrap_or_else(|| Box::new(&mut file));
+    #[cfg(not(test))]
+    let reader = &mut file;
+    read_preimage_from(reader, declared)
 }
 
 /// The stream half of [`read_preimage`]: a declared size over a blob is refused
@@ -514,5 +519,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(exact.len() as u64, limit);
+    }
+
+    /// Re-check item 14, the real entry point: `capture_file` of a file that
+    /// outgrows its declared size pulls at most one byte past the blob limit,
+    /// stores no blob and charges no task usage. An unbounded read in
+    /// `read_preimage` pulls all three limits' worth.
+    #[test]
+    fn audit_wp01_b006_capture_file_bounds_a_growing_preimage_and_stores_nothing() {
+        use crate::test_seam::{clear, install, Outgrowing};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("grows.bin"), b"small").unwrap();
+        let limit = MAX_BLOB_BYTES as u64;
+        let pulled = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let counter = pulled.clone();
+        install("checkpoint", move |_| {
+            Box::new(Outgrowing {
+                left: limit * 3,
+                pulled: counter.clone(),
+            })
+        });
+        let store = BlobStore::new();
+        let task_id = TaskId::new();
+        let err = store
+            .capture_file(task_id, dir.path(), "grows.bin")
+            .unwrap_err();
+        clear("checkpoint");
+        assert!(matches!(err, CheckpointError::BlobTooLarge { .. }), "{err}");
+        assert_eq!(pulled.get(), limit + 1);
+        assert_eq!(blob_files(&store), 0, "no blob was inserted");
+        assert_eq!(
+            store
+                .task_usage
+                .read()
+                .unwrap()
+                .get(&task_id)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "no task usage was charged"
+        );
     }
 }

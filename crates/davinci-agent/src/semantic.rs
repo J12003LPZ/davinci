@@ -304,20 +304,61 @@ struct Source {
     prefix_only: bool,
 }
 
+/// The workspace as it was when a fallback began: its resolved path, read from
+/// an opened directory handle, and that handle kept open for the whole search
+/// (on Windows an open directory cannot be renamed or replaced, so the name
+/// stays the same directory). Every source is judged against this path, never
+/// against a later resolution of the workspace name, so a workspace renamed
+/// and replaced by a link to elsewhere mid-search admits nothing new.
+struct AdmittedRoot {
+    path: PathBuf,
+    _pin: fs::File,
+}
+
+impl AdmittedRoot {
+    fn open(root: &Path) -> Result<Self, String> {
+        let pin = davinci_sys::fs::open_directory_pinned(root)
+            .map_err(|error| format!("cannot open the workspace: {error}"))?;
+        let path = davinci_sys::fs::final_path(&pin)
+            .map_err(|error| format!("cannot resolve the workspace: {error}"))?;
+        Ok(Self { path, _pin: pin })
+    }
+}
+
+#[cfg(test)]
+type ReadHook = Box<dyn Fn(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs before each fallback source is opened, so a test can change the
+    /// workspace after discovery.
+    static SEMANTIC_BEFORE_READ: std::cell::RefCell<Option<ReadHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Read `path` on its opened handle, admitting only a regular, singly linked
 /// file that resolves beneath `root`, and reading at most
 /// `FALLBACK_MAX_FILE_BYTES + 1` bytes of it. The confinement is judged on the
 /// handle that supplies the bytes, so a link or junction put in place of the
 /// file or one of its directories after discovery cannot redirect the read.
-fn read_source(root: &Path, path: &Path, allow_linked: bool) -> Result<Source, &'static str> {
+fn read_source(
+    root: &AdmittedRoot,
+    path: &Path,
+    allow_linked: bool,
+) -> Result<Source, &'static str> {
     use std::io::Read;
+    #[cfg(test)]
+    SEMANTIC_BEFORE_READ.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(path);
+        }
+    });
     let file = fs::File::open(path).map_err(|_| INCOMPLETE_UNREADABLE)?;
     if !file.metadata().is_ok_and(|meta| meta.is_file()) {
         return Err(INCOMPLETE_UNREADABLE);
     }
-    let root = fs::canonicalize(root).map_err(|_| INCOMPLETE_UNREADABLE)?;
     match davinci_sys::fs::final_path(&file) {
-        Ok(real) if real.starts_with(&root) => {}
+        Ok(real) if real.starts_with(&root.path) => {}
         Ok(_) => return Err(INCOMPLETE_UNSAFE_ENTRY),
         // Where the platform cannot name the object, do not read it.
         Err(_) => return Err(INCOMPLETE_UNSAFE_ENTRY),
@@ -436,6 +477,7 @@ pub fn text_fallback_definition_authorized(
 
     let mut locations = Vec::new();
     let mut incomplete = Incomplete::default();
+    let root = AdmittedRoot::open(cwd)?;
     let def_keywords = [
         "fn ",
         "function ",
@@ -457,7 +499,7 @@ pub fn text_fallback_definition_authorized(
         if is_aborted(aborted) {
             return Err("Operation aborted".into());
         }
-        let source = match read_source(cwd, &file, allow_linked) {
+        let source = match read_source(&root, &file, allow_linked) {
             Ok(source) => source,
             Err(reason) => {
                 incomplete.note(reason);
@@ -552,6 +594,7 @@ pub fn text_fallback_references_authorized(
 
     let mut locations = Vec::new();
     let mut incomplete = Incomplete::default();
+    let root = AdmittedRoot::open(cwd)?;
     let search_files = fallback_search_files(cwd, target_path, &mut incomplete)?;
     // A symbol that starts or ends with an identifier character must not sit
     // inside a longer identifier (`foo` in `foobar`, `_foo` or `foo2`).
@@ -562,7 +605,7 @@ pub fn text_fallback_references_authorized(
         if is_aborted(aborted) {
             return Err("Operation aborted".into());
         }
-        let source = match read_source(cwd, &file, allow_linked) {
+        let source = match read_source(&root, &file, allow_linked) {
             Ok(source) => source,
             Err(reason) => {
                 incomplete.note(reason);
@@ -637,8 +680,9 @@ pub fn text_fallback_outline_authorized(
     file_path: &str,
     allow_linked: bool,
 ) -> Result<SemanticResult, String> {
+    let root = AdmittedRoot::open(cwd)?;
     let full = safe_workspace_path(cwd, Path::new(file_path))?;
-    let source = read_source(cwd, &full, allow_linked)
+    let source = read_source(&root, &full, allow_linked)
         .map_err(|reason| format!("Could not read file {file_path}: {reason}"))?;
     let mut incomplete = Incomplete::default();
     if source.prefix_only {
@@ -1286,7 +1330,12 @@ fn helper() {
         let collected = workspace.path().join("src").join("a.rs");
         fs::write(&collected, "fn inside() {}\n").unwrap();
         // A collected, in-workspace file reads normally.
-        let source = read_source(workspace.path(), &collected, false).unwrap();
+        let source = read_source(
+            &AdmittedRoot::open(workspace.path()).unwrap(),
+            &collected,
+            false,
+        )
+        .unwrap();
         assert!(source.text.contains("inside"));
 
         // Replace the parent directory with a link to the outside directory.
@@ -1299,7 +1348,12 @@ fn helper() {
         // single-link file, but the handle resolves outside the workspace.
         assert!(collected.is_file());
         assert_eq!(
-            read_source(workspace.path(), &collected, false).err(),
+            read_source(
+                &AdmittedRoot::open(workspace.path()).unwrap(),
+                &collected,
+                false
+            )
+            .err(),
             Some(INCOMPLETE_UNSAFE_ENTRY)
         );
         // Scanning through the public entry point never surfaces the canary.
@@ -1317,6 +1371,101 @@ fn helper() {
         if let Ok(outline) = outline {
             assert!(outline.symbols.is_empty(), "{:?}", outline.symbols);
         }
+    }
+
+    /// Re-check item 5: the workspace itself is renamed and a link to outside
+    /// put at its name after discovery. The sources are judged against the
+    /// workspace as admitted at the start, so nothing from outside surfaces
+    /// through definition, references or outline. Where the platform refuses
+    /// to rename an open directory (Windows) the swap cannot happen at all.
+    #[test]
+    fn audit_wp01_b013_a_replaced_workspace_root_admits_nothing_from_outside() {
+        for which in ["definition", "references", "outline"] {
+            let parent = tempdir().unwrap();
+            let outside = tempdir().unwrap();
+            let workspace = parent.path().join("ws");
+            fs::create_dir_all(workspace.join("src")).unwrap();
+            fs::write(workspace.join("src").join("a.rs"), "fn inside() {}\n").unwrap();
+            fs::create_dir_all(outside.path().join("src")).unwrap();
+            fs::write(
+                outside.path().join("src").join("a.rs"),
+                "fn canary() {}\ncanary();\n",
+            )
+            .unwrap();
+            let moved = parent.path().join("ws-moved");
+            let renamed = std::rc::Rc::new(std::cell::Cell::new(None::<bool>));
+            let (ws, mv, out, flag) = (
+                workspace.clone(),
+                moved.clone(),
+                outside.path().to_path_buf(),
+                renamed.clone(),
+            );
+            SEMANTIC_BEFORE_READ.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |_| {
+                    if flag.get().is_some() {
+                        return;
+                    }
+                    let ok = fs::rename(&ws, &mv).is_ok();
+                    flag.set(Some(ok));
+                    if ok && !link_directory(&ws, &out) {
+                        // No links here: restore and treat as not executed.
+                        fs::rename(&mv, &ws).unwrap();
+                        flag.set(Some(false));
+                    }
+                }));
+            });
+            let target = Path::new("src/a.rs");
+            let leaked = match which {
+                "definition" => text_fallback_definition(&workspace, "canary", Some(target), None)
+                    .map(|r| !r.locations.is_empty())
+                    .unwrap_or(false),
+                "references" => text_fallback_references(&workspace, "canary", Some(target), None)
+                    .map(|r| !r.locations.is_empty())
+                    .unwrap_or(false),
+                _ => text_fallback_outline(&workspace, "src/a.rs")
+                    .map(|r| r.symbols.iter().any(|s| s.name.contains("canary")))
+                    .unwrap_or(false),
+            };
+            SEMANTIC_BEFORE_READ.with(|hook| *hook.borrow_mut() = None);
+            assert!(
+                !leaked,
+                "{which}: a symbol from outside the workspace surfaced"
+            );
+            if cfg!(windows) {
+                assert_eq!(
+                    renamed.get(),
+                    Some(false),
+                    "{which}: an open workspace must not be renamable"
+                );
+            }
+        }
+    }
+
+    /// The admitted root is a fixed path: a source under any other tree is
+    /// refused whatever the workspace name resolves to now (the part of the
+    /// root-replacement race that needs no rename).
+    #[test]
+    fn audit_wp01_b013_sources_are_judged_against_the_root_as_admitted() {
+        let admitted = tempdir().unwrap();
+        let other = tempdir().unwrap();
+        fs::write(
+            other.path().join("a.rs"),
+            "fn canary() {}
+",
+        )
+        .unwrap();
+        fs::write(
+            admitted.path().join("a.rs"),
+            "fn inside() {}
+",
+        )
+        .unwrap();
+        let root = AdmittedRoot::open(admitted.path()).unwrap();
+        assert!(read_source(&root, &admitted.path().join("a.rs"), false).is_ok());
+        assert_eq!(
+            read_source(&root, &other.path().join("a.rs"), false).err(),
+            Some(INCOMPLETE_UNSAFE_ENTRY)
+        );
     }
 
     #[test]

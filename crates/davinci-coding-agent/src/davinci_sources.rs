@@ -24,24 +24,50 @@ pub struct GitChange {
 /// workspace root as a bare repository it discovered by itself: sandboxed code
 /// can write a root `HEAD`, `objects/`, `refs/` and a `config` with
 /// `core.fsmonitor`, which the next `git status` would then run on the host.
-/// `isolated_git_command` also forces `core.fsmonitor` off for repositories
-/// found normally and drops user config and inherited `GIT_*` overrides.
+/// `isolated_git_command_in` also forces `core.fsmonitor` and hooks off for
+/// repositories found normally, neutralizes the repository's filter drivers,
+/// and drops user config and inherited `GIT_*` overrides. Callers that diff
+/// must pass `--no-ext-diff --no-textconv` (diff drivers have no safe override).
 pub(crate) fn host_git(cwd: &Path) -> Command {
-    let mut command = davinci_sys::process::isolated_git_command();
+    let mut command = davinci_sys::process::isolated_git_command_in(cwd);
     command.arg("-C").arg(cwd);
     command
 }
 
-/// `git status --porcelain` for `cwd`, or an empty list outside a repository.
-pub fn git_changes(cwd: &Path) -> Vec<GitChange> {
-    let output = host_git(cwd).args(["status", "--porcelain"]).output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
+/// A git failure as text: stderr when git said something, the exit status
+/// otherwise.
+fn git_failure(what: &str, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // First line only: usage dumps run to hundreds of lines.
+    let stderr = stderr
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if stderr.is_empty() {
+        format!("{what} failed ({})", output.status)
+    } else {
+        format!("{what} failed: {stderr}")
     }
-    parse_porcelain(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// `git status --porcelain` for `cwd`. An empty list means a clean tree or a
+/// directory git establishes is not a repository; a spawn failure or any other
+/// git failure (a missing object with lazy fetching off, a corrupt index) is an
+/// error, so the caller can say the state is unavailable instead of showing a
+/// clean tree.
+pub fn git_changes(cwd: &Path) -> Result<Vec<GitChange>, String> {
+    let output = host_git(cwd)
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|error| format!("git status could not start: {error}"))?;
+    if !output.status.success() {
+        if String::from_utf8_lossy(&output.stderr).contains("not a git repository") {
+            return Ok(Vec::new());
+        }
+        return Err(git_failure("git status", &output));
+    }
+    Ok(parse_porcelain(&String::from_utf8_lossy(&output.stdout)))
 }
 
 /// Pure form of [`git_changes`].
@@ -69,7 +95,7 @@ pub fn parse_porcelain(text: &str) -> Vec<GitChange> {
 
 /// `Δn +a -d` for the status bar, from `git diff --numstat` plus the count of
 /// changed files. Untracked files count as changed but contribute no lines.
-pub fn git_delta(cwd: &Path, changes: &[GitChange]) -> (u32, u32, u32) {
+pub fn git_delta(cwd: &Path, changes: &[GitChange]) -> Result<(u32, u32, u32), String> {
     let output = host_git(cwd)
         .args([
             "diff",
@@ -78,14 +104,21 @@ pub fn git_delta(cwd: &Path, changes: &[GitChange]) -> (u32, u32, u32) {
             "--numstat",
             "HEAD",
         ])
-        .output();
-    let (adds, dels) = match output {
-        Ok(output) if output.status.success() => {
-            parse_numstat(&String::from_utf8_lossy(&output.stdout))
+        .output()
+        .map_err(|error| format!("git diff could not start: {error}"))?;
+    if !output.status.success() {
+        // A repository with no commit yet has no HEAD to compare with: there
+        // are no tracked lines to count, which is an answer, not a failure.
+        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        let no_head =
+            stderr.contains("bad revision 'head'") || stderr.contains("ambiguous argument 'head'");
+        if no_head || stderr.contains("not a git repository") {
+            return Ok((changes.len() as u32, 0, 0));
         }
-        _ => (0, 0),
-    };
-    (changes.len() as u32, adds, dels)
+        return Err(git_failure("git diff", &output));
+    }
+    let (adds, dels) = parse_numstat(&String::from_utf8_lossy(&output.stdout));
+    Ok((changes.len() as u32, adds, dels))
 }
 
 /// Pure form of the `--numstat` half of [`git_delta`].
@@ -341,15 +374,28 @@ pub struct WorkspaceDress {
 /// Read everything the workspace can answer. Safe on any thread.
 pub fn compute_workspace_dress(cwd: &Path, session_dir: &Path) -> WorkspaceDress {
     let branch = davinci_tui::resolve_git_branch(cwd).unwrap_or_default();
-    let changes = git_changes(cwd);
+    // Unavailable git state is said, never shown as a clean tree.
+    let mut unavailable = None;
+    let changes = git_changes(cwd).unwrap_or_else(|error| {
+        unavailable = Some(error);
+        Vec::new()
+    });
+    let delta = if unavailable.is_some() {
+        (0, 0, 0)
+    } else {
+        git_delta(cwd, &changes).unwrap_or_else(|error| {
+            unavailable = Some(error);
+            (changes.len() as u32, 0, 0)
+        })
+    };
     let sessions = sessions(session_dir, davinci_session::now_ms());
     let startup = startup(cwd, &branch, !sessions.is_empty());
     WorkspaceDress {
         pr: None,
-        hint: None,
+        hint: unavailable.map(|error| format!("git state unavailable: {error}")),
         cwd: cwd.display().to_string(),
         branch,
-        changes: git_delta(cwd, &changes),
+        changes: delta,
         changes_list: change_rows(cwd, &changes),
         tree: workspace_tree(cwd, &changes),
         paths: completion_paths(cwd),
@@ -650,27 +696,73 @@ mod tests {
     #[test]
     fn git_helpers_are_quiet_outside_a_repository() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let changes = git_changes(temp.path());
+        let changes = git_changes(temp.path()).unwrap();
         assert!(changes.is_empty());
-        assert_eq!(git_delta(temp.path(), &changes), (0, 0, 0));
+        assert_eq!(git_delta(temp.path(), &changes), Ok((0, 0, 0)));
+    }
+
+    /// Review re-check item 1: a git failure inside a repository is an error
+    /// the workspace dress reports, not an empty change list. Missing objects
+    /// are the realistic case now that lazy fetching is off.
+    #[test]
+    fn audit_wp01_git_failure_is_reported_not_shown_as_a_clean_tree() {
+        let git = |root: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        git(root, &["init", "-q"]);
+        std::fs::write(root.join("a.txt"), "one").unwrap();
+        git(root, &["add", "."]);
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "c",
+            ],
+        );
+        std::fs::write(root.join("a.txt"), "two").unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+
+        // Healthy: the change is listed and nothing is hinted.
+        let dress = compute_workspace_dress(root, sessions.path());
+        assert_eq!(dress.changes.0, 1, "{:?}", dress.hint);
+        assert!(dress.hint.is_none(), "{:?}", dress.hint);
+
+        // Corrupt the index: status now fails. It must be said, not hidden.
+        std::fs::write(root.join(".git").join("index"), b"not an index").unwrap();
+        let error = git_changes(root).unwrap_err();
+        assert!(error.contains("git status failed"), "{error}");
+        let dress = compute_workspace_dress(root, sessions.path());
+        let hint = dress.hint.expect("unavailable state must be reported");
+        assert!(hint.contains("git state unavailable"), "{hint}");
+
+        // A directory git says is not a repository is an explicit empty answer.
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(git_changes(plain.path()), Ok(Vec::new()));
     }
 
     #[test]
     fn host_git_never_discovers_a_bare_repository_implicitly() {
         let command = host_git(Path::new("work"));
         let args: Vec<_> = command.get_args().collect();
-        assert_eq!(
-            args,
-            [
-                "-c",
-                "safe.bareRepository=explicit",
-                "-c",
-                "core.fsmonitor=false",
-                "-C",
-                "work"
-            ]
-            .map(std::ffi::OsStr::new)
-        );
+        let has = |setting: &str| {
+            args.windows(2)
+                .any(|pair| pair[0] == "-c" && pair[1] == setting)
+        };
+        assert!(has("safe.bareRepository=explicit"));
+        assert!(has("core.fsmonitor=false"));
+        assert!(args.ends_with(&["-C", "work"].map(std::ffi::OsStr::new)));
     }
 
     #[test]
@@ -695,8 +787,8 @@ mod tests {
             ),
         )
         .unwrap();
-        let changes = git_changes(root);
-        git_delta(root, &changes);
+        let changes = git_changes(root).unwrap_or_default();
+        let _ = git_delta(root, &changes);
         change_rows(root, &changes);
         assert!(changes.is_empty());
         assert!(!marker.exists(), "host git ran the planted core.fsmonitor");
@@ -730,8 +822,8 @@ mod tests {
         }
         std::fs::remove_file(&marker).unwrap();
 
-        let changes = git_changes(root);
-        git_delta(root, &changes);
+        let changes = git_changes(root).unwrap();
+        git_delta(root, &changes).unwrap();
         assert!(
             changes.iter().any(|change| change.path == "new.txt"),
             "real status must still be reported: {changes:?}"

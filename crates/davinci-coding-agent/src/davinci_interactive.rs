@@ -7398,7 +7398,13 @@ fn open_tree_sheet(agent: &Agent, model: &mut Model) -> bool {
 /// legacy chrome has no such screen.
 fn open_diff_sheet(shell: &mut Shell<'_>) -> Next {
     let cwd = shell.cwd;
-    let changes = crate::davinci_sources::git_changes(cwd);
+    let changes = match crate::davinci_sources::git_changes(cwd) {
+        Ok(changes) => changes,
+        Err(error) => {
+            shell.note(&format!("git state unavailable: {error}"));
+            return Next::Go;
+        }
+    };
     if changes.is_empty() {
         shell.note("nothing to review — the working tree is clean");
         return Next::Go;

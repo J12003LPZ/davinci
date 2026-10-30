@@ -384,6 +384,38 @@ pub fn open_directory_pinned(path: &Path) -> io::Result<fs::File> {
     }
 }
 
+/// [`open_directory_pinned`] with the right to read and rewrite the directory's
+/// DACL, so security can be changed through this very handle instead of by
+/// pathname. The handle is opened once and the ACL calls name it, never the
+/// path, so a directory swapped in under the name is not the one modified.
+pub fn open_directory_for_acl(path: &Path) -> io::Result<fs::File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+        const READ_CONTROL: u32 = 0x0002_0000;
+        const WRITE_DAC: u32 = 0x0004_0000;
+        const FILE_READ_ATTRIBUTES: u32 = 0x80;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        // Listing the directory counts as data access, which is what makes the
+        // share mode below bind: a handle opened for attributes and security
+        // alone would not stop a rename.
+        const FILE_LIST_DIRECTORY: u32 = 0x1;
+        fs::OpenOptions::new()
+            .access_mode(
+                READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES | SYNCHRONIZE | FILE_LIST_DIRECTORY,
+            )
+            .share_mode(FILE_SHARE_READ_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::File::open(path)
+    }
+}
+
 /// Why [`ensure_single_link`] refused a file: it is named by `0` entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HardLinked(pub u64);
