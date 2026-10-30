@@ -393,13 +393,32 @@ pub fn fuzzy_models<'a>(models: &'a [Model], query: &str) -> Vec<&'a Model> {
     models
         .iter()
         .filter(|model| {
-            model.id.to_ascii_lowercase().contains(&query)
-                || model.name.to_ascii_lowercase().contains(&query)
-                || format!("{}/{}", model.provider, model.id)
-                    .to_ascii_lowercase()
-                    .contains(&query)
+            fuzzy_subsequence(&model.id.to_ascii_lowercase(), &query)
+                || fuzzy_subsequence(&model.name.to_ascii_lowercase(), &query)
+                || fuzzy_subsequence(
+                    &format!("{}/{}", model.provider, model.id).to_ascii_lowercase(),
+                    &query,
+                )
         })
         .collect()
+}
+
+/// Case-insensitive ordered-subsequence match: `gpt6luna` matches
+/// `gpt-6-luna`, while reversed characters do not.
+fn fuzzy_subsequence(haystack: &str, needle: &str) -> bool {
+    let mut chars = needle.chars();
+    let Some(mut wanted) = chars.next() else {
+        return true;
+    };
+    for ch in haystack.chars() {
+        if ch == wanted {
+            match chars.next() {
+                Some(next) => wanted = next,
+                None => return true,
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -491,5 +510,36 @@ mod audit_wp02_b023_tests {
         );
         // Text that is not an object is still the invalid-arguments sentinel.
         assert!(args("[1.0]").get(crate::INVALID_ARGUMENTS_KEY).is_some());
+    }
+
+    #[test]
+    fn audit_wp19_b195_fuzzy_models_match_ordered_subsequences() {
+        use crate::{fuzzy_models, Model};
+        let model = |id: &str, name: &str| Model {
+            id: id.into(),
+            name: name.into(),
+            api: String::new(),
+            provider: "openai".into(),
+            base_url: None,
+            reasoning: false,
+            input: Vec::new(),
+            cost: crate::catalog::ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: 1,
+            max_tokens: 1,
+            compat: serde_json::Value::Null,
+            headers: Default::default(),
+            thinking_level_map: Default::default(),
+        };
+        let models = vec![model("gpt-6-luna", "GPT-6 Luna"), model("other", "Other")];
+        let hits = fuzzy_models(&models, "gpt6luna");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "gpt-6-luna");
+        assert!(fuzzy_models(&models, "anul").is_empty());
+        assert_eq!(fuzzy_models(&models, "").len(), models.len());
     }
 }
