@@ -37,8 +37,8 @@ pub use runtime_log::{
 };
 pub use tree::{
     branch_entries, build_context_entries, build_session_path, build_session_tree, entries_since,
-    export_session_jsonl, fork_user_messages, resolved_labels, session_usage_stats,
-    SessionUsageStats,
+    export_session_jsonl, fork_user_messages, format_cost_display, resolved_labels,
+    session_usage_stats, SessionUsageStats,
 };
 pub use types::*;
 

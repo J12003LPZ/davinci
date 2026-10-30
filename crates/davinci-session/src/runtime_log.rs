@@ -4,7 +4,7 @@
 //! the upstream session format.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -60,8 +60,19 @@ impl RuntimeLogWriter {
         if let Some(parent) = path.parent() {
             davinci_sys::fs::create_private_dir_all(parent)?;
         }
-        davinci_sys::fs::truncate_torn_tail(&path)?;
-        let file = davinci_sys::fs::open_append_private(&path)?;
+        // Admit the opened handle itself: repair and append must act on the
+        // file that passed the checks, not on whatever the path names later.
+        let mut file = davinci_sys::fs::open_read_write_private(&path)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("runtime log {} is not a regular file", path.display()),
+            )
+            .into());
+        }
+        davinci_sys::fs::ensure_single_link(&file)?;
+        davinci_sys::fs::truncate_torn_tail_handle(&mut file)?;
+        file.seek(SeekFrom::End(0))?;
         Ok(Self {
             path,
             file,
@@ -111,16 +122,16 @@ impl RuntimeLogWriter {
         self.file.sync_data()
     }
 
-    /// The append handle cannot truncate on every platform, so use a separate
-    /// write handle.
+    /// Truncate the admitted handle itself, so a path replaced after open
+    /// cannot redirect the rollback to another file.
     fn rollback(&mut self, len: u64) -> std::io::Result<()> {
         #[cfg(test)]
         if std::mem::take(&mut self.fail_rollback_once) {
             return Err(std::io::Error::other("injected rollback failure"));
         }
-        let file = std::fs::OpenOptions::new().write(true).open(&self.path)?;
-        file.set_len(len)?;
-        file.sync_data()
+        self.file.set_len(len)?;
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.sync_data()
     }
 }
 
@@ -509,5 +520,43 @@ mod tests {
                 supported: CURRENT_RUNTIME_SCHEMA_VERSION
             })
         ));
+    }
+
+    #[test]
+    fn audit_wp04_b043_hard_links_and_path_swaps_cannot_redirect_the_log() {
+        let dir = tempdir().unwrap();
+        let canary = dir.path().join("outside.txt");
+        let torn = b"canary\n{\"torn\":";
+        fs::write(&canary, torn).unwrap();
+        let log = dir.path().join("session.runtime.jsonl");
+        fs::hard_link(&canary, &log).unwrap();
+        assert!(RuntimeLogWriter::open(&log).is_err());
+        assert_eq!(fs::read(&canary).unwrap(), torn);
+
+        fs::remove_file(&log).unwrap();
+        let mut writer = RuntimeLogWriter::open(&log).unwrap();
+        writer
+            .append(&DummyEnvelope {
+                schema_version: 1,
+                sequence: 1,
+                session_id: "s".into(),
+                event: "first".into(),
+            })
+            .unwrap();
+        let first_len = fs::metadata(&log).unwrap().len();
+        let moved = dir.path().join("moved.runtime.jsonl");
+        fs::rename(&log, &moved).unwrap();
+        fs::write(&log, b"replacement\n").unwrap();
+        writer.fail_sync_once = true;
+        assert!(writer
+            .append(&DummyEnvelope {
+                schema_version: 1,
+                sequence: 2,
+                session_id: "s".into(),
+                event: "second".into(),
+            })
+            .is_err());
+        assert_eq!(fs::read(&log).unwrap(), b"replacement\n");
+        assert_eq!(fs::metadata(&moved).unwrap().len(), first_len);
     }
 }

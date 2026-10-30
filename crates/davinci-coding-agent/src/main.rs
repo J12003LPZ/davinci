@@ -9216,16 +9216,18 @@ pub fn format_session_cost(parsed: &Args, agent: &Agent) -> String {
         .find(|item| item.provider == agent.provider && item.id == agent.model_id);
     let stats = rpc::session_stats_for_agent(agent, found);
     let foreground = format!(
-        "input {} · output {} · cache read {} · cache write {} · total {} · ${:.4}",
+        "input {} · output {} · cache read {} · cache write {} · total {} · {}",
         stats["tokens"]["input"].as_u64().unwrap_or(0),
         stats["tokens"]["output"].as_u64().unwrap_or(0),
         stats["tokens"]["cacheRead"].as_u64().unwrap_or(0),
         stats["tokens"]["cacheWrite"].as_u64().unwrap_or(0),
         stats["tokens"]["total"].as_u64().unwrap_or(0),
-        stats
-            .get("cost")
-            .and_then(|value| value.as_f64())
-            .unwrap_or(0.0),
+        davinci_session::format_cost_display(
+            stats
+                .get("cost")
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0)
+        ),
     );
     format!(
         "{foreground}\n{}\nBackground accounting: {}",

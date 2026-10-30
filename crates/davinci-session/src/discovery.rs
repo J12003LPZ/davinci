@@ -76,11 +76,25 @@ pub fn default_agent_dir() -> PathBuf {
     davinci_dir
 }
 
+fn session_dir_override() -> Option<PathBuf> {
+    for key in [
+        "DAVINCI_CODING_AGENT_SESSION_DIR",
+        "PI_CODING_AGENT_SESSION_DIR",
+        "PI_SESSION_DIR",
+    ] {
+        if let Ok(dir) = std::env::var(key) {
+            let trimmed = dir.trim();
+            if !trimmed.is_empty() {
+                return Some(expand_tilde(trimmed));
+            }
+        }
+    }
+    None
+}
+
 pub fn default_session_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("DAVINCI_CODING_AGENT_SESSION_DIR")
-        .or_else(|_| std::env::var("PI_CODING_AGENT_SESSION_DIR"))
-    {
-        return expand_tilde(&dir);
+    if let Some(dir) = session_dir_override() {
+        return dir;
     }
     default_agent_dir().join("sessions")
 }
@@ -94,13 +108,8 @@ pub fn resolve_session_dir_from(explicit: Option<&str>, settings_dir: Option<&st
     if let Some(dir) = explicit.map(str::trim).filter(|dir| !dir.is_empty()) {
         return expand_tilde(dir);
     }
-    if let Ok(dir) = std::env::var("DAVINCI_CODING_AGENT_SESSION_DIR")
-        .or_else(|_| std::env::var("PI_CODING_AGENT_SESSION_DIR"))
-    {
-        let trimmed = dir.trim();
-        if !trimmed.is_empty() {
-            return expand_tilde(trimmed);
-        }
+    if let Some(dir) = session_dir_override() {
+        return dir;
     }
     if let Some(dir) = settings_dir.map(str::trim).filter(|dir| !dir.is_empty()) {
         return expand_tilde(dir);
@@ -175,33 +184,55 @@ fn modified_at(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-fn summarize_file(path: &Path) -> Option<SessionSummary> {
+fn summarize_file(path: &Path) -> Result<SessionSummary, SessionError> {
     // One streamed pass serves both the header and the message-text digest;
     // reading the file for the header and re-opening it through
     // `JsonlSession::open` for the text doubled I/O and parsing across every
     // session in a listing. Only one line is resident at a time, so a listing
     // never holds a whole transcript besides the digest it returns.
-    let mut reader = BufReader::new(fs::File::open(path).ok()?);
+    let mut reader = BufReader::new(fs::File::open(path).map_err(|err| {
+        SessionError::storage(format!("Failed to read session {}: {err}", path.display()))
+    })?);
     let mut first_line = Vec::new();
     // A header too long to be one is not a session, and must not be
     // buffered whole (or handed to the full legacy loader) to find that out.
-    if read_line_capped(&mut reader, MAX_HEADER_LINE_BYTES, &mut first_line).ok()? != Line::Complete
-    {
-        return None;
+    match read_line_capped(&mut reader, MAX_HEADER_LINE_BYTES, &mut first_line).map_err(|err| {
+        SessionError::storage(format!("Failed to read session {}: {err}", path.display()))
+    })? {
+        Line::Complete => {}
+        Line::TooLong => {
+            return Err(SessionError::invalid_entry(format!(
+                "Session file {} has a header longer than {MAX_HEADER_LINE_BYTES} bytes",
+                path.display()
+            )))
+        }
+        Line::Eof => {
+            return Err(SessionError::invalid_entry(format!(
+                "Session file {} is empty",
+                path.display()
+            )))
+        }
     }
-    let first_line = String::from_utf8(first_line).ok()?;
+    let first_line = String::from_utf8(first_line).map_err(|_| {
+        SessionError::invalid_entry(format!(
+            "Session file {} has a header that is not valid UTF-8",
+            path.display()
+        ))
+    })?;
     if let Ok(header) = parse_header(first_line.trim_end()) {
         let mut summary = crate::codec::metadata_from_header(&header, path, modified_at(path));
-        let (text, count, bytes) = messages_text_from_reader(reader).ok()?;
+        let (text, count, bytes) = messages_text_from_reader(reader).map_err(|err| {
+            SessionError::storage(format!("Failed to read session {}: {err}", path.display()))
+        })?;
         summary.all_messages_text = text;
         summary.messages_text_bytes = bytes;
         summary.message_count = count;
-        return Some(summary);
+        return Ok(summary);
     }
     // Legacy v3 file: a full open performs the migration.
-    let session = JsonlSession::open(path).ok()?;
+    let session = JsonlSession::open(path)?;
     let (legacy_text, legacy_count, legacy_bytes) = messages_text_from_entries(&session.entries);
-    Some(SessionSummary {
+    Ok(SessionSummary {
         id: session.header.id,
         path: path.to_path_buf(),
         cwd: session.header.cwd,
@@ -472,7 +503,7 @@ pub fn discover_sessions(
         for entry in entries.flatten() {
             let path = entry.path();
             if is_session_file(&entry) {
-                if let Some(summary) = summarize_file(&path) {
+                if let Ok(summary) = summarize_file(&path) {
                     if keep_for_cwd(&summary, cwd) {
                         sessions.push(summary);
                     }
@@ -549,9 +580,7 @@ pub fn resolve_session_ref(
 ) -> Result<SessionSummary, SessionError> {
     let expanded = expand_tilde(reference);
     if expanded.exists() {
-        return summarize_file(&expanded).ok_or_else(|| {
-            SessionError::not_found(format!("Session file not found: {reference}"))
-        });
+        return summarize_file(&expanded);
     }
     let sessions = discover_sessions(session_dir, cwd)?;
     if let Some(exact) = sessions.iter().find(|s| s.id == reference) {
@@ -580,7 +609,11 @@ pub fn resolve_session_ref(
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    /// Environment-variable tests run one at a time.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn cwd_encoding_matches_ts_style() {
@@ -831,6 +864,7 @@ mod tests {
 
     #[test]
     fn session_dir_resolution_matches_ts_order() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let previous = std::env::var_os("PI_CODING_AGENT_SESSION_DIR");
         std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
         assert_eq!(
@@ -851,6 +885,74 @@ mod tests {
             Some(value) => std::env::set_var("PI_CODING_AGENT_SESSION_DIR", value),
             None => std::env::remove_var("PI_CODING_AGENT_SESSION_DIR"),
         }
+    }
+
+    #[test]
+    fn audit_wp04_b038_pi_session_dir_controls_storage() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let keys = [
+            "DAVINCI_CODING_AGENT_SESSION_DIR",
+            "PI_CODING_AGENT_SESSION_DIR",
+            "PI_SESSION_DIR",
+        ];
+        let saved: Vec<_> = keys
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        for key in keys {
+            std::env::remove_var(key);
+        }
+
+        std::env::set_var("PI_SESSION_DIR", "/tmp/pi-session");
+        assert_eq!(default_session_dir(), PathBuf::from("/tmp/pi-session"));
+        assert_eq!(
+            resolve_session_dir_from(None, Some("/settings/sessions")),
+            PathBuf::from("/tmp/pi-session")
+        );
+
+        // A blank higher-priority override falls through to the next alias.
+        std::env::set_var("DAVINCI_CODING_AGENT_SESSION_DIR", "   ");
+        assert_eq!(default_session_dir(), PathBuf::from("/tmp/pi-session"));
+
+        std::env::set_var("PI_CODING_AGENT_SESSION_DIR", "/tmp/pi-coding");
+        assert_eq!(default_session_dir(), PathBuf::from("/tmp/pi-coding"));
+        assert_eq!(
+            resolve_session_dir_from(None, Some("/settings/sessions")),
+            PathBuf::from("/tmp/pi-coding")
+        );
+
+        std::env::set_var("DAVINCI_CODING_AGENT_SESSION_DIR", "/tmp/davinci");
+        assert_eq!(default_session_dir(), PathBuf::from("/tmp/davinci"));
+        assert_eq!(
+            resolve_session_dir_from(None, None),
+            PathBuf::from("/tmp/davinci")
+        );
+
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn audit_wp04_b044_malformed_explicit_session_is_not_missing() {
+        let dir = tempdir().unwrap();
+        let bad = dir.path().join("bad.jsonl");
+        std::fs::write(&bad, "not a header\n").unwrap();
+        let error = resolve_session_ref(dir.path(), None, bad.to_str().unwrap()).unwrap_err();
+        assert_eq!(error.code, "invalid_entry", "{error}");
+        assert!(error.message.contains("line 1"), "{error}");
+
+        let missing = dir.path().join("missing.jsonl");
+        let error = resolve_session_ref(dir.path(), None, missing.to_str().unwrap()).unwrap_err();
+        assert_eq!(error.code, "not_found", "{error}");
+
+        let id = session_in(dir.path(), "/tmp/work", "prefix");
+        let prefix = &id[..8];
+        let resolved = resolve_session_ref(dir.path(), None, prefix).unwrap();
+        assert_eq!(resolved.id, id);
     }
 
     #[test]

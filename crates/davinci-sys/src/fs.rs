@@ -58,6 +58,17 @@ pub fn open_append_private(path: &Path) -> io::Result<fs::File> {
     private_options().create(true).append(true).open(path)
 }
 
+/// Open `path` for reading and writing, creating it 0600 on Unix when missing.
+/// The caller positions the cursor; this is for private append logs that must
+/// inspect and repair their own admitted handle.
+pub fn open_read_write_private(path: &Path) -> io::Result<fs::File> {
+    private_options()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
+}
+
 /// Restrict an existing file to its owner (0600 on Unix). No-op elsewhere.
 pub fn restrict_to_owner(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
@@ -455,13 +466,19 @@ pub fn ensure_single_link(file: &fs::File) -> io::Result<()> {
 /// Returns the number of bytes removed. A missing file is treated as empty.
 /// The caller must exclude concurrent writers while scanning and truncating.
 pub fn truncate_torn_tail(path: &Path) -> io::Result<u64> {
-    const CHUNK_SIZE: u64 = 64 * 1024;
-
     let mut file = match fs::OpenOptions::new().read(true).write(true).open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
         Err(err) => return Err(err),
     };
+    truncate_torn_tail_handle(&mut file)
+}
+
+/// [`truncate_torn_tail`] on an already admitted handle, so a path swapped
+/// after opening cannot redirect the repair to another file.
+pub fn truncate_torn_tail_handle(file: &mut fs::File) -> io::Result<u64> {
+    const CHUNK_SIZE: u64 = 64 * 1024;
+
     let original_len = file.metadata()?.len();
     if original_len == 0 {
         return Ok(0);
@@ -842,5 +859,19 @@ mod tests {
             io::ErrorKind::PermissionDenied
         )));
         assert_eq!(std::fs::read(&original).unwrap(), b"canary");
+    }
+
+    #[test]
+    fn audit_wp04_b043_handle_repair_never_follows_a_replaced_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        std::fs::write(&path, b"one\ntwo\npartial").unwrap();
+        let mut file = open_read_write_private(&path).unwrap();
+        let moved = dir.path().join("moved.jsonl");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::write(&path, b"replacement\n").unwrap();
+        assert_eq!(truncate_torn_tail_handle(&mut file).unwrap(), 7);
+        assert_eq!(std::fs::read(&moved).unwrap(), b"one\ntwo\n");
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement\n");
     }
 }

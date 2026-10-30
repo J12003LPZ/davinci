@@ -5824,3 +5824,11 @@ fn audit_wp02_b034_registered_worker_reports_the_model_it_runs_on() {
     assert_eq!(built, (other.provider.clone(), other.id.clone()));
     assert_eq!(reported(), built);
 }
+
+#[test]
+fn audit_wp04_b045_cost_display_rounds_midpoints_up() {
+    assert_eq!(davinci_session::format_cost_display(0.00375), "$0.0038");
+    assert_eq!(davinci_session::format_cost_display(0.003749), "$0.0037");
+    assert_eq!(davinci_session::format_cost_display(12.34565), "$12.3457");
+    assert_eq!(davinci_session::format_cost_display(f64::NAN), "$unknown");
+}
