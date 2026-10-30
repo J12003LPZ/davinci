@@ -4514,9 +4514,12 @@ fn run_print_turns(
         } else {
             if !json_mode {
                 if let Some(error) = error {
-                    eprintln!("{error}");
+                    eprintln!("{}", davinci_tui::davinci::sanitize::terminal_safe(&error));
                 } else if !last_reply.is_empty() {
-                    println!("{last_reply}");
+                    println!(
+                        "{}",
+                        davinci_tui::davinci::sanitize::terminal_safe(last_reply)
+                    );
                 }
             }
             exit_code

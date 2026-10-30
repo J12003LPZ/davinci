@@ -92,6 +92,72 @@ impl Default for Theme {
     }
 }
 
+fn validated_hex(value: &str, fallback: &str) -> String {
+    let candidate = value.trim();
+    let body = candidate.strip_prefix('#').unwrap_or("");
+    if body.len() == 6 && body.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        format!("#{body}")
+    } else {
+        fallback.to_string()
+    }
+}
+
+/// Every colour variable the exported HTML stylesheet consumes, with validated
+/// values only, plus the background used by the page shell.
+pub fn export_css(theme: &Theme) -> (String, String) {
+    let background = validated_hex(&theme.background, "#1e1e1e");
+    let foreground = validated_hex(&theme.foreground, "#e6e6e6");
+    let palette = theme.palette.clone().unwrap_or_else(Palette::vox);
+    let role = |value: &str, fallback: &str| validated_hex(value, fallback);
+    let mut css = String::from(":root{");
+    let mut add = |name: &str, value: &str, fallback: &str| {
+        css.push_str(&format!("--{name}:{};", role(value, fallback)));
+    };
+    add("text", &theme.foreground, &foreground);
+    add("muted", &palette.muted, &foreground);
+    add("dim", &palette.dim, &foreground);
+    add("border", &palette.border, &foreground);
+    add("accent", &theme.accent, &foreground);
+    add("success", &palette.success, &foreground);
+    add("warning", &palette.warning, &foreground);
+    add("error", &palette.error, &foreground);
+    add("hover", &palette.surface, &background);
+    add("selectedBg", &palette.surface, &background);
+    add("userMessageBg", &palette.surface, &background);
+    add("userMessageText", &theme.foreground, &foreground);
+    add("toolPendingBg", &palette.surface, &background);
+    add("toolSuccessBg", &palette.surface, &background);
+    add("toolErrorBg", &palette.surface, &background);
+    add("toolOutput", &palette.muted, &foreground);
+    add("toolDiffAdded", &palette.success, &foreground);
+    add("toolDiffRemoved", &palette.error, &foreground);
+    add("toolDiffContext", &palette.muted, &foreground);
+    add("mdCode", &palette.primary, &foreground);
+    add("mdCodeBlockBorder", &palette.border, &foreground);
+    add("mdHeading", &palette.primary, &foreground);
+    add("mdHr", &palette.border, &foreground);
+    add("mdLink", &palette.primary, &foreground);
+    add("mdListBullet", &palette.secondary, &foreground);
+    add("mdQuote", &palette.muted, &foreground);
+    add("mdQuoteBorder", &palette.border, &foreground);
+    add("customMessageBg", &palette.surface, &background);
+    add("customMessageLabel", &palette.secondary, &foreground);
+    add("customMessageText", &theme.foreground, &foreground);
+    add("thinkingText", &palette.muted, &foreground);
+    add("syntaxComment", &palette.muted, &foreground);
+    add("syntaxFunction", &palette.primary, &foreground);
+    add("syntaxKeyword", &palette.secondary, &foreground);
+    add("syntaxNumber", &palette.warning, &foreground);
+    add("syntaxOperator", &palette.text, &foreground);
+    add("syntaxPunctuation", &palette.muted, &foreground);
+    add("syntaxString", &palette.success, &foreground);
+    add("syntaxType", &palette.primary, &foreground);
+    add("syntaxVariable", &palette.text, &foreground);
+    add("borderAccent", &palette.primary, &foreground);
+    css.push('}');
+    (css, background)
+}
+
 /// `NO_COLOR` (https://no-color.org) drops every color code; state still
 /// reads through glyphs. Read per call so tests can toggle it.
 pub fn no_color() -> bool {

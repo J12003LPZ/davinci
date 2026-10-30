@@ -1614,11 +1614,13 @@
           },
           // Sanitize image src URLs with the same scheme allow-list.
           image(token) {
-            const href = sanitizeMarkdownUrl(token.href);
-            if (href === null) {
+            const safe = /^data:(image\/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/=]+)$/i.exec(String(token.href || '').trim());
+            if (!safe) {
+              // Only generated embedded images are trusted; external,
+              // protocol-relative and other schemes stay inert text.
               return escapeHtml(token.text || '');
             }
-            let out = '<img src="' + escapeHtml(href) + '" alt="' + escapeHtml(token.text || '') + '"';
+            let out = '<img src="data:' + safe[1] + ';base64,' + safe[2] + '" alt="' + escapeHtml(token.text || '') + '"';
             if (token.title) {
               out += ' title="' + escapeHtml(token.title) + '"';
             }

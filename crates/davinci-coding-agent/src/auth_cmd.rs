@@ -129,13 +129,14 @@ pub fn parse_auth_command(args: &[String]) -> Result<Option<AuthCommand>, AuthCo
 fn parse_duration(value: &str) -> Option<u64> {
     let (amount, unit) = value.split_at(value.find(|c: char| !c.is_ascii_digit())?);
     let amount: u64 = amount.parse().ok()?;
-    Some(match unit {
-        "ms" => amount,
-        "s" => amount * 1000,
-        "m" => amount * 60_000,
-        "h" => amount * 3_600_000,
+    let factor = match unit {
+        "ms" => 1u64,
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
         _ => return None,
-    })
+    };
+    amount.checked_mul(factor)
 }
 
 pub fn validate_auth_command_args(
@@ -178,4 +179,22 @@ pub fn validate_auth_command_args(
 
 pub fn parsed_auth_args(command: &AuthCommand) -> Args {
     parse_args(&command.args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_wp11_b100_duration_overflow_is_rejected() {
+        assert_eq!(parse_duration("0ms"), Some(0));
+        assert_eq!(parse_duration("250ms"), Some(250));
+        assert_eq!(parse_duration("2s"), Some(2_000));
+        assert_eq!(parse_duration("3m"), Some(180_000));
+        assert_eq!(parse_duration("2h"), Some(7_200_000));
+        assert_eq!(parse_duration(""), None);
+        assert_eq!(parse_duration("5d"), None);
+        assert_eq!(parse_duration(&format!("{}h", u64::MAX)), None);
+        assert_eq!(parse_duration(&format!("{}s", u64::MAX)), None);
+    }
 }

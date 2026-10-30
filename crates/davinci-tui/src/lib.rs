@@ -215,7 +215,9 @@ pub use terminal::{
     KITTY_KEYBOARD_PROTOCOL_QUERY, MODIFY_OTHER_KEYS_DISABLE, MODIFY_OTHER_KEYS_ENABLE,
     NATIVE_SHIFT_ENTER_SEQUENCE,
 };
-pub use themes::{builtin_themes, glyphs, load_themes_from_dir, no_color, Palette, Theme};
+pub use themes::{
+    builtin_themes, export_css, glyphs, load_themes_from_dir, no_color, Palette, Theme,
+};
 pub use thinking_selector::{
     ThinkingSelector, ThinkingSelectorAction, LEVEL_DESCRIPTIONS as THINKING_LEVEL_DESCRIPTIONS,
 };

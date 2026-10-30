@@ -156,33 +156,15 @@ pub fn write_project_export(
 }
 
 fn sanitize_parameter(parameter: &SavedParameter) -> ExportParameter {
-    let sensitive_name = parameter.name.to_ascii_lowercase();
-    let sensitive = ["secret", "token", "password", "api_key", "apikey"]
-        .iter()
-        .any(|marker| sensitive_name.contains(marker));
     ExportParameter {
         name: parameter.name.clone(),
         description: parameter.description.as_deref().map(redact_text),
         param_type: parameter.param_type.clone(),
-        default: if sensitive {
-            None
-        } else {
-            sanitize_value(parameter.default.as_deref())
-        },
-        allowed_values: if sensitive {
-            Vec::new()
-        } else {
-            parameter
-                .allowed_values
-                .iter()
-                .filter_map(|value| sanitize_value(Some(value)))
-                .collect()
-        },
+        // Share export never carries defaults or allowed values: a generic
+        // parameter name would otherwise leak a credential-shaped default.
+        default: None,
+        allowed_values: Vec::new(),
     }
-}
-
-fn sanitize_value(value: Option<&str>) -> Option<String> {
-    value.map(redact_text).filter(|value| value != "[REDACTED]")
 }
 
 fn redact_text(value: &str) -> String {
@@ -280,7 +262,7 @@ mod tests {
         };
         let sanitized = sanitize_parameter(&ordinary);
         assert!(sanitized.default.is_none());
-        assert_eq!(sanitized.allowed_values, vec!["safe"]);
+        assert!(sanitized.allowed_values.is_empty());
     }
 
     #[test]
