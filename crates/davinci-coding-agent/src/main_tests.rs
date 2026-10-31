@@ -1,4 +1,46 @@
 #[test]
+fn shutdown_steps_end_owned_children_before_user_code_runs() {
+    let names: Vec<_> = super::session_cleanup_steps(super::Args::default(), None)
+        .iter()
+        .map(|step| step.name)
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "background jobs",
+            "MCP servers",
+            "JS pool",
+            "session_shutdown event",
+            "stop hooks"
+        ]
+    );
+}
+
+#[test]
+fn signal_path_gets_the_startup_context_captured_at_install_time() {
+    let context = crate::native_extensions::graph::GraphWorkerContext::from_parts(
+        Some("writer"),
+        Some("patch-report"),
+        Some("artifact.json"),
+        None,
+    )
+    .expect("context");
+    super::WORKER_STARTUP_CONTEXT.with(|slot| *slot.borrow_mut() = Some(context.clone()));
+    let read_later = super::capture_startup_context();
+    super::WORKER_STARTUP_CONTEXT.with(|slot| *slot.borrow_mut() = None);
+
+    // The watcher thread has its own empty thread-local; the capture must
+    // still hand it the context the agent was built with.
+    let seen = std::thread::spawn(move || {
+        assert!(super::current_startup_context().is_none());
+        read_later()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(seen, Some(context));
+}
+
+#[test]
 fn contextual_dispatch_attachments_require_context_and_live_cancellation() {
     for shared in [false, true] {
         let mut agent = davinci_agent::Agent::new_builtin(davinci_agent::PromptProfile::Stable);
@@ -2739,7 +2781,7 @@ fn f01_rpc_denial_instructions_use_confirmed_bounded_dialogs() {
             rpc_resolve_challenge(&request, &challenge, false, dir.path(), &policy, |call| {
                 calls += 1;
                 assert!(call["timeout"].as_u64().is_some_and(|ms| ms <= 60_000));
-                let wire = rpc::extension_ui_requests_from_calls(&[call.clone()]);
+                let wire = rpc::extension_ui_requests_from_calls(std::slice::from_ref(call));
                 assert_eq!(wire.len(), 1);
                 assert_eq!(wire[0]["method"], call["op"]);
                 match calls {
@@ -3578,7 +3620,7 @@ fn rebind_print_extensions_rediscovers_skills_and_emits_session_start() {
         ..Args::default()
     };
     let mut host = ExtensionHost::default();
-    rebind_print_extensions(&parsed, &mut agent, &mut host);
+    rebind_print_extensions(&parsed, &mut agent, &mut host).unwrap();
     assert!(
         agent.skills.iter().any(|skill| skill.name == "demo"),
         "print-mode rebind should rediscover project skills: {:?}",
@@ -4808,7 +4850,7 @@ fn switching_sessions_replaces_the_plugin_context_with_the_new_sessions() {
     let first_id = SessionStartPlugin::session_id(&agent);
     assert_eq!(
         SessionStartPlugin::context_session_ids(&agent),
-        [first_id.clone()]
+        std::slice::from_ref(&first_id)
     );
 
     davinci_coding_agent::plugins::load_session(&mut agent, second).unwrap();
@@ -4822,7 +4864,7 @@ fn switching_sessions_replaces_the_plugin_context_with_the_new_sessions() {
 #[test]
 fn print_verification_notice_is_a_separate_event_and_not_a_provider_error() {
     let notice = AgentEvent::VerificationNotice {
-        status: davinci_agent::CompletionEvidence::Unverified,
+        status: davinci_agent::CompletionStatus::Unverified,
         generation: 1,
         text: "Verification is incomplete".into(),
     };
@@ -5718,5 +5760,238 @@ fn a_refresh_that_errors_is_reported_not_swallowed() {
     assert_eq!(
         super::maybe_refresh_auth(&mut storage, "openai-codex", 2_000_000, 0, true),
         None
+    );
+}
+
+/// The status a worker reports is the model it was built with, for an omitted
+/// launch provider, a bare override, a qualified override, a profile's model
+/// and the inherited model alike. Registration cannot know it; the builder
+/// publishes it.
+#[test]
+fn audit_wp02_b034_registered_worker_reports_the_model_it_runs_on() {
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let workspace = dir.path().join("workspace");
+    let (_lead, base) = lead_and_worker_request(&workspace, &["read"], false);
+    let id = base.runtime_agent_id.expect("a registered worker");
+    let registry = base
+        .runtime
+        .as_ref()
+        .expect("worker runtime")
+        .registry
+        .clone();
+    assert!(
+        registry.get(&id).unwrap().provider.is_empty(),
+        "premise: registration does not know it"
+    );
+    let models = davinci_ai::load_builtin_models();
+    let configured = models
+        .iter()
+        .find(|m| {
+            models
+                .iter()
+                .any(|o| o.provider == m.provider && o.id != m.id)
+        })
+        .expect("a provider with two models");
+    // The worker's own configured model (launch flags), with no provider
+    // passed down by the parent.
+    let parsed = Args {
+        project_trust_override: Some(true),
+        provider: Some(configured.provider.clone()),
+        model: Some(configured.id.clone()),
+        ..offline_args()
+    };
+    let mcp = davinci_agent::McpRegistry::default();
+    let reported = || {
+        let record = registry.get(&id).unwrap();
+        let serialized = serde_json::to_string(&record).unwrap();
+        assert!(serialized.contains(&record.provider) && serialized.contains(&record.model_id));
+        (record.provider, record.model_id)
+    };
+    let build = |request: &davinci_agent::SubagentRequest| {
+        let (child, _) = build_worker(&parsed, &workspace, &mcp, request).unwrap();
+        (child.provider.clone(), child.model_id.clone())
+    };
+
+    // Inherited: no override, no launch provider.
+    let inherited = build(&base);
+    assert_eq!(reported(), inherited);
+    assert_eq!(
+        inherited,
+        (configured.provider.clone(), configured.id.clone())
+    );
+
+    let other = models
+        .iter()
+        .find(|m| m.provider == inherited.0 && m.id != inherited.1)
+        .expect("a second model of the inherited provider");
+
+    // A bare override with the launch provider omitted resolves against the
+    // worker's own provider.
+    let mut bare = base.clone();
+    bare.provider = None;
+    bare.model_id = None;
+    bare.model_override = Some(other.id.clone());
+    let built = build(&bare);
+    assert_eq!(built, (other.provider.clone(), other.id.clone()));
+    assert_eq!(reported(), built);
+
+    // The same model, qualified.
+    let mut qualified = base.clone();
+    qualified.model_override = Some(format!("{}/{}", other.provider, other.id));
+    let built = build(&qualified);
+    assert_eq!(built, (other.provider.clone(), other.id.clone()));
+    assert_eq!(reported(), built);
+
+    // Back to the inherited model: the record follows the worker, not history.
+    assert_eq!(build(&base), inherited);
+    assert_eq!(reported(), inherited);
+
+    // A profile that names a model.
+    let profiles = workspace.join(".davinci/agents");
+    std::fs::create_dir_all(&profiles).unwrap();
+    std::fs::write(
+        profiles.join("pinned.md"),
+        format!(
+            "---\nname: pinned\nmodel: {}/{}\ntools: [read]\n---\nPinned fixture",
+            other.provider, other.id
+        ),
+    )
+    .unwrap();
+    let mut profiled = base.clone();
+    profiled.agent = Some("pinned".into());
+    profiled.parent_tools = Some(vec!["read".into()]);
+    let built = build(&profiled);
+    assert_eq!(built, (other.provider.clone(), other.id.clone()));
+    assert_eq!(reported(), built);
+}
+
+#[test]
+fn audit_wp04_b045_cost_display_rounds_midpoints_up() {
+    assert_eq!(davinci_session::format_cost_display(0.00375), "$0.0038");
+    assert_eq!(davinci_session::format_cost_display(0.003749), "$0.0037");
+    assert_eq!(davinci_session::format_cost_display(12.34565), "$12.3457");
+    assert_eq!(davinci_session::format_cost_display(f64::NAN), "$unknown");
+}
+
+#[test]
+fn audit_wp05_b046_tools_allowlist_survives_late_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions");
+    let cwd = dir.path().join("cwd");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    let parsed = Args {
+        offline: true,
+        tools: vec!["write".into()],
+        ..Args::default()
+    };
+    let mut agent = build_agent(&parsed, &session_dir, &cwd).unwrap();
+    assert_eq!(agent.tools, vec!["write".to_string()]);
+    agent.apply_extension_tools(&["native_late".into()]);
+    apply_tool_admission(&parsed, &mut agent, None).unwrap();
+    assert_eq!(agent.tools, vec!["write".to_string()]);
+
+    let unknown = Args {
+        offline: true,
+        tools: vec!["not_a_tool".into()],
+        ..Args::default()
+    };
+    assert!(build_agent(&unknown, &session_dir, &cwd).is_err());
+}
+
+#[test]
+fn audit_wp05_b047_no_tools_covers_late_native_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions");
+    let cwd = dir.path().join("cwd");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    let parsed = Args {
+        offline: true,
+        no_tools: true,
+        ..Args::default()
+    };
+    let mut agent = build_agent(&parsed, &session_dir, &cwd).unwrap();
+    assert!(agent.tools.is_empty(), "{:?}", agent.tools);
+    agent.apply_extension_tools(&["native_late".into(), "js_late".into()]);
+    apply_tool_admission(&parsed, &mut agent, None).unwrap();
+    assert!(agent.tools.is_empty(), "{:?}", agent.tools);
+}
+
+#[test]
+fn audit_wp05_b048_excluded_native_tools_stay_uncallable() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().join("sessions");
+    let cwd = dir.path().join("cwd");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    let parsed = Args {
+        offline: true,
+        exclude_tools: vec!["native_late".into()],
+        ..Args::default()
+    };
+    let mut agent = build_agent(&parsed, &session_dir, &cwd).unwrap();
+    agent.apply_extension_tools(&["native_late".into(), "other".into()]);
+    apply_tool_admission(&parsed, &mut agent, None).unwrap();
+    assert!(!agent.tools.iter().any(|name| name == "native_late"));
+    assert!(agent.tools.iter().any(|name| name == "other"));
+}
+
+#[test]
+fn audit_wp05_b049_structured_denials_count_for_fail_on_denied() {
+    let event = AgentEvent::ToolExecutionEnd {
+        tool_call_id: "call-1".into(),
+        tool_name: "write".into(),
+        result: serde_json::json!({"ok": false}),
+        is_error: true,
+        details: Some(serde_json::json!({
+            "denied": true,
+            "target": "outside.txt",
+            "permissionMode": "read-only"
+        })),
+    };
+    let denied = tool_event_denials(&[event]);
+    assert_eq!(denied.len(), 1);
+    assert_eq!(denied[0]["action"], "write");
+    assert_eq!(denied[0]["target"], "outside.txt");
+    assert_eq!(denied[0]["permission_mode"], "read-only");
+}
+
+#[test]
+fn audit_review_default_tools_allowlist_survives_reload_and_syncs_authorization() {
+    let mut agent = davinci_agent::Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+    agent.tools = vec!["read".into(), "native_late".into()];
+    agent.tool_registry = vec!["read".into(), "native_late".into()];
+    let defaults = vec!["read".to_string()];
+    let parsed = Args::default();
+    apply_tool_admission(&parsed, &mut agent, Some(&defaults)).unwrap();
+    assert_eq!(agent.tools, vec!["read".to_string()]);
+    let authorized = agent
+        .tool_context
+        .authorized_tools
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone();
+    assert_eq!(
+        authorized.into_iter().collect::<Vec<_>>(),
+        vec!["read".to_string()]
+    );
+
+    // A reload adds another tool, then admission must both filter it and
+    // rebuild the shared authorization view.
+    agent.apply_extension_tools(&["js_late".into()]);
+    apply_tool_admission(&parsed, &mut agent, Some(&defaults)).unwrap();
+    assert_eq!(agent.tools, vec!["read".to_string()]);
+    let authorized = agent
+        .tool_context
+        .authorized_tools
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone();
+    assert_eq!(
+        authorized.into_iter().collect::<Vec<_>>(),
+        vec!["read".to_string()]
     );
 }

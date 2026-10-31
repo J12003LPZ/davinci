@@ -1905,6 +1905,7 @@ mod tests {
         let admission = WorkerAdmission::new(Some(WorkerResourceConfig {
             memory_budget_bytes: 1,
             estimated_worker_bytes: 1,
+            ..Default::default()
         }))
         .unwrap();
         let _parent = admission.acquire_worker(|| false).unwrap();

@@ -37,7 +37,7 @@ fn lazy_summarizer(calls: Arc<AtomicUsize>) -> Summarizer {
             } else {
                 "## Goal\nContinue.".into()
             },
-            usage: Default::default(),
+            usage: Some(Default::default()),
             stop_reason: Some(StopReason::Stop),
             error_message: None,
             has_tool_call: false,

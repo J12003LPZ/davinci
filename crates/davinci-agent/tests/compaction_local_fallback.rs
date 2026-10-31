@@ -39,16 +39,25 @@ fn local_fallback_summary_is_a_bounded_share_of_the_history() {
 
 #[test]
 fn local_fallback_respects_the_reserve_budget_and_utf8() {
+    // User text is carried verbatim, so the bulk here is assistant output.
     let messages: Vec<ChatMessage> = (0..40)
-        .map(|n| ChatMessage::text("user", format!("é漢字 {n} ").repeat(500)))
+        .map(|n| {
+            if n % 2 == 0 {
+                ChatMessage::text("user", format!("é漢字 {n}"))
+            } else {
+                ChatMessage::text("assistant", format!("é漢字 {n} ").repeat(500))
+            }
+        })
         .collect();
     let result = compact_messages_with_options(&messages, None, 500, 256, None, None);
     assert!(result.compacted);
-    assert!(
-        result.summary.len() <= 256 * 4 + 512,
-        "{}",
-        result.summary.len()
-    );
+    let local_part = result
+        .summary
+        .split("<user-requirements-carried-verbatim>")
+        .next()
+        .unwrap();
+    assert!(local_part.len() <= 256 * 4 + 512, "{}", local_part.len());
+    assert!(result.summary.contains("é漢字 0"));
 }
 
 #[test]

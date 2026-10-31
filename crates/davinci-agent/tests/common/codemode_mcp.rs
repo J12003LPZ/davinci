@@ -2,10 +2,11 @@
 use super::*;
 use serde_json::json;
 
-struct LostMutationResponse(Arc<std::sync::atomic::AtomicUsize>);
+/// Counts `tools/call`s and keeps their params, then loses the reply.
+struct LostMutationResponse(Arc<std::sync::atomic::AtomicUsize>, Arc<Mutex<Vec<Value>>>);
 
 impl davinci_mcp::RpcTransport for LostMutationResponse {
-    fn call(&mut self, method: &str, _: Value) -> davinci_mcp::Result<Value> {
+    fn call(&mut self, method: &str, params: Value) -> davinci_mcp::Result<Value> {
         match method {
             "initialize" => Ok(json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}}})),
             "tools/list" => Ok(
@@ -13,6 +14,7 @@ impl davinci_mcp::RpcTransport for LostMutationResponse {
             ),
             "tools/call" => {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.1.lock().unwrap().push(params);
                 Err(davinci_mcp::Error::Transport(
                     "fixture response lost after effect".into(),
                 ))
@@ -34,17 +36,16 @@ fn controlled_broker_lost_mutation_response_closes_admission() {
     use crate::runtime::operations::*;
     use crate::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
     let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let received = Arc::new(Mutex::new(Vec::new()));
     let client = davinci_mcp::Client::connect_transport(
         "lost",
-        Box::new(LostMutationResponse(effects.clone())),
+        Box::new(LostMutationResponse(effects.clone(), received.clone())),
     )
     .unwrap();
     let registry = McpRegistry::default();
     {
         let mut inner = registry.lock();
-        inner
-            .clients
-            .insert("lost".into(), Arc::new(Mutex::new(client)));
+        inner.clients.insert("lost".into(), ClientSlot::new(client));
         inner
             .routes
             .insert("mcp__lost__effect".into(), ("lost".into(), "effect".into()));
@@ -129,6 +130,16 @@ fn controlled_broker_lost_mutation_response_closes_admission() {
         "{error:?}"
     );
     assert_eq!(error.code, "RECOVERY_REQUIRED", "{error:?}");
+    // The server was told which logical call this was: the script's id and
+    // the child's position, so a repeat is recognisable on its side.
+    {
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        let id = received[0]["_meta"][davinci_mcp::INVOCATION_ID_META_KEY]
+            .as_str()
+            .expect("the codemode child call carries an invocation id");
+        assert!(id.starts_with("lost-script#codemode:"), "{id}");
+    }
     assert!(matches!(
         broker.children()[0].status,
         CodeModeChildStatus::RecoveryRequired
@@ -221,8 +232,10 @@ fn full_accessor_preserves_data_while_direct_presentation_is_unchanged() {
     registry
         .lock()
         .clients
-        .insert("fixture".into(), Arc::new(Mutex::new(client)));
-    let full = registry.call_full("fixture", "items", &json!({})).unwrap();
+        .insert("fixture".into(), ClientSlot::new(client));
+    let full = registry
+        .call_full("fixture", "items", &json!({}), "full-call")
+        .unwrap();
     assert_eq!(full.text(), "visible fixture text");
     let encoded = serde_json::to_value(full).unwrap();
     assert_eq!(
@@ -231,7 +244,9 @@ fn full_accessor_preserves_data_while_direct_presentation_is_unchanged() {
     );
     assert!(encoded.get("_meta").is_none());
     assert!(encoded.get("_operation_result_committed").is_none());
-    let direct = registry.call("fixture", "items", &json!({})).unwrap();
+    let direct = registry
+        .call("fixture", "items", &json!({}), "direct-call")
+        .unwrap();
     assert_eq!(direct.content, "visible fixture text");
     assert!(!direct.is_error);
     assert!(direct.details.is_none());
@@ -250,7 +265,7 @@ fn guarded_mcp_delivery_retains_schema_and_rejects_incomplete_or_failed_payloads
             let mut inner = registry.lock();
             inner
                 .clients
-                .insert("fixture".into(), Arc::new(Mutex::new(client)));
+                .insert("fixture".into(), ClientSlot::new(client));
             inner.routes.insert(
                 "mcp__fixture__items".into(),
                 ("fixture".into(), "items".into()),

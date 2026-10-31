@@ -329,7 +329,13 @@ pub fn banner(model: &Model, info: &Startup) -> Vec<Line<'static>> {
     let mut name = span("DaVinci", th.text);
     name.style = name.style.add_modifier(Modifier::BOLD);
     let (title, provider) = model_and_provider(model);
-    let mut serving = vec![span(title, th.text)];
+    // "GPT-6-Luna" reads as "GPT 6 Luna"; the effort follows it while the
+    // model thinks at all, and changes with `/effort`.
+    let mut serving = vec![span(title.replace('-', " "), th.text)];
+    let effort = model.thinking_level.to_lowercase();
+    if !effort.is_empty() && effort != "off" {
+        serving.push(span(format!(" with {effort} effort"), cc.inactive));
+    }
     if !provider.is_empty() {
         serving.push(span(" • ", cc.inactive));
         serving.push(span(provider, cc.inactive));
@@ -530,7 +536,7 @@ mod tests {
             }
         }
         assert!(text(&rows[1]).ends_with(&format!("DaVinci v{}", env!("CARGO_PKG_VERSION"))));
-        assert!(text(&rows[2]).contains(&m.model_name));
+        assert!(text(&rows[2]).contains("gpt 6 luna"));
     }
 
     #[test]
@@ -541,7 +547,7 @@ mod tests {
         m.startup.cwd = r"C:\Users\sergi".into();
         let rows: Vec<String> = banner(&m, &m.startup).iter().map(text).collect();
         assert!(
-            rows[2].ends_with("gpt-6-luna • openai-codex"),
+            rows[2].ends_with("gpt 6 luna • openai-codex"),
             "{:?}",
             rows[2]
         );
@@ -550,18 +556,35 @@ mod tests {
         m.provider_title = "OpenAI Codex".into();
         let rows: Vec<String> = banner(&m, &m.startup).iter().map(text).collect();
         assert!(
-            rows[2].ends_with("GPT-6-Luna • OpenAI Codex"),
+            rows[2].ends_with("GPT 6 Luna • OpenAI Codex"),
             "{:?}",
             rows[2]
         );
         assert!(rows[3].ends_with(r"C:\Users\sergi"), "{:?}", rows[3]);
-        assert!(!rows.join("\n").contains("effort"));
+        assert!(!rows.join("\n").contains("effort"), "no effort while off");
+
+        // The effort reads after the model and follows `/effort`.
+        m.thinking_level = "medium".into();
+        let rows: Vec<String> = banner(&m, &m.startup).iter().map(text).collect();
+        assert!(
+            rows[2].ends_with("GPT 6 Luna with medium effort • OpenAI Codex"),
+            "{:?}",
+            rows[2]
+        );
+        m.thinking_level = "High".into();
+        let rows: Vec<String> = banner(&m, &m.startup).iter().map(text).collect();
+        assert!(
+            rows[2].contains("GPT 6 Luna with high effort"),
+            "{:?}",
+            rows[2]
+        );
+        m.thinking_level = "off".into();
 
         // A model with no provider reads as the model alone.
         m.provider_title.clear();
         m.active_provider.clear();
         let rows: Vec<String> = banner(&m, &m.startup).iter().map(text).collect();
-        assert!(rows[2].ends_with("GPT-6-Luna"), "{:?}", rows[2]);
+        assert!(rows[2].ends_with("GPT 6 Luna"), "{:?}", rows[2]);
     }
 
     #[test]

@@ -37,13 +37,16 @@ pub(crate) fn set_header<S>(
 
 /// ureq 2's `into_json` had no size cap (`read_json` caps at 10 MB), and an
 /// image answer is base64 in JSON.
+/// The largest decoded JSON response body accepted from a provider.
+pub(crate) const MAX_JSON_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
 pub(crate) fn read_json<T: serde::de::DeserializeOwned>(
     response: &mut ureq::http::Response<ureq::Body>,
 ) -> Result<T, ureq::Error> {
     response
         .body_mut()
         .with_config()
-        .limit(u64::MAX)
+        .limit(MAX_JSON_RESPONSE_BYTES)
         .read_json()
 }
 

@@ -153,6 +153,9 @@ fn bold(content: impl Into<String>, color: Color) -> Span<'static> {
 fn legend(theme: &Theme, view: &ContextUsageView) -> Vec<Vec<Span<'static>>> {
     let cc = theme.cc();
     let used = view.used();
+    // The header counts against what the session can fill before it
+    // compacts: the window less the autocompact buffer.
+    let usable = view.window.saturating_sub(view.buffer);
     let mut rows = vec![
         vec![
             span(format!("{} · ", view.model), theme.text),
@@ -160,8 +163,8 @@ fn legend(theme: &Theme, view: &ContextUsageView) -> Vec<Vec<Span<'static>>> {
                 format!(
                     "{}/{} tokens ({:.0}%)",
                     format_tokens(used),
-                    format_tokens(view.window),
-                    percent(used, view.window)
+                    format_tokens(usable),
+                    percent(used, usable)
                 ),
                 theme.text,
             ),
@@ -411,6 +414,24 @@ mod tests {
     }
 
     #[test]
+    fn the_header_counts_against_the_window_less_the_autocompact_buffer() {
+        let mut half = view();
+        half.model = "gpt-6-luna".into();
+        half.window = 272_000;
+        half.buffer = 136_000;
+        let rows = plain_lines(&half, 120);
+        assert!(
+            rows[1].ends_with("gpt-6-luna · 40k/136k tokens (29%)"),
+            "{:?}",
+            rows[1]
+        );
+        // The legend still reports the buffer as a share of the whole window.
+        assert!(rows
+            .iter()
+            .any(|row| row.ends_with("Autocompact buffer: 136k tokens (50.0%)")));
+    }
+
+    #[test]
     fn full_window_never_overflows_the_grid() {
         let mut full = view();
         full.categories[3].tokens = 400_000;
@@ -423,7 +444,7 @@ mod tests {
         let rows = plain_lines(&view(), 120);
         assert_eq!(rows[0], "  ⎿  Context Usage");
         assert!(rows[1].starts_with("     ■ ■ "));
-        assert!(rows[1].ends_with("claude-opus-5-5 · 40k/200k tokens (20%)"));
+        assert!(rows[1].ends_with("claude-opus-5-5 · 40k/167.6k tokens (24%)"));
         assert!(rows[3].ends_with("Estimated usage by category"));
         assert!(rows
             .iter()

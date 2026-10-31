@@ -300,20 +300,22 @@ impl LocalBehaviorReport {
         } else if turns.len() % 2 == 1 {
             turns[turns.len() / 2] as f64
         } else {
-            (turns[turns.len() / 2 - 1] + turns[turns.len() / 2]) as f64 / 2.0
+            // Convert before adding: two large u64 counts overflow in integer.
+            (turns[turns.len() / 2 - 1] as f64 + turns[turns.len() / 2] as f64) / 2.0
         };
-        let total_perm_prompts: u64 = matching.iter().map(|r| r.permission_prompts).sum();
-        let total_user_steers: u64 = matching.iter().map(|r| r.user_steers).sum();
-        let verification_failures_recovered: u64 = matching
+        let total_perm_prompts = matching
             .iter()
-            .map(|r| {
-                if r.verification_failures > 0 && !r.aborted {
-                    r.verification_failures
-                } else {
-                    0
-                }
-            })
-            .sum();
+            .fold(0u64, |sum, r| sum.saturating_add(r.permission_prompts));
+        let total_user_steers = matching
+            .iter()
+            .fold(0u64, |sum, r| sum.saturating_add(r.user_steers));
+        let verification_failures_recovered: u64 = matching.iter().fold(0u64, |sum, r| {
+            if r.verification_failures > 0 && !r.aborted {
+                sum.saturating_add(r.verification_failures)
+            } else {
+                sum
+            }
+        });
 
         Self {
             prompt_profile: profile_label,
@@ -543,6 +545,58 @@ mod behavior_telemetry_tests {
             formatted,
             "Prompt profile: stable v2\nRuns: 42\nMedian turns: 6\nVerification failures recovered: 8\nPermission prompts/run: 0.9\nUser steers/run: 0.4"
         );
+    }
+
+    fn audit_wp03_run(turns: u64, prompts: u64, steers: u64, failures: u64) -> BehaviorTelemetry {
+        BehaviorTelemetry {
+            prompt_profile: "stable v2".to_string(),
+            prompt_version: 2,
+            prompt_stable_hash_prefix: "a1b2c3d4".to_string(),
+            model_family: "openai".to_string(),
+            model_policy: "default".to_string(),
+            model_policy_version: 0,
+            model_turns: turns,
+            tool_calls: 0,
+            permission_prompts: prompts,
+            permission_denials: 0,
+            files_changed_count: 0,
+            verification_commands_run: 0,
+            verification_failures: failures,
+            capability_incomplete_evidence: 0,
+            aborted: false,
+            user_steers: steers,
+        }
+    }
+
+    #[test]
+    fn audit_wp03_b037_report_survives_max_counters() {
+        let max = u64::MAX;
+        let report = LocalBehaviorReport::from_runs(
+            "stable v2",
+            &[
+                audit_wp03_run(max, max, max, max),
+                audit_wp03_run(max, max, max, max),
+            ],
+        );
+        assert_eq!(report.runs, 2);
+        assert_eq!(report.median_turns, max as f64);
+        assert_eq!(report.verification_failures_recovered, max);
+        assert!(report.permission_prompts_per_run.is_finite());
+        assert_eq!(report.permission_prompts_per_run, max as f64 / 2.0);
+        assert_eq!(report.user_steers_per_run, max as f64 / 2.0);
+
+        // Ordinary values stay exact, and an empty set keeps its defined zeros.
+        let small = LocalBehaviorReport::from_runs(
+            "stable v2",
+            &[audit_wp03_run(2, 1, 3, 4), audit_wp03_run(5, 2, 1, 0)],
+        );
+        assert_eq!(small.median_turns, 3.5);
+        assert_eq!(small.verification_failures_recovered, 4);
+        assert_eq!(small.permission_prompts_per_run, 1.5);
+        assert_eq!(small.user_steers_per_run, 2.0);
+        let empty = LocalBehaviorReport::from_runs("stable v2", &[]);
+        assert_eq!(empty.runs, 0);
+        assert_eq!(empty.permission_prompts_per_run, 0.0);
     }
 
     #[test]

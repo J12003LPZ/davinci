@@ -99,7 +99,7 @@ fn changed_legacy_record_with_same_source_identity_is_rejected() {
     .unwrap();
     fixture
         .journal
-        .import_legacy_observations(&[first.clone()])
+        .import_legacy_observations(std::slice::from_ref(&first))
         .unwrap();
     let mut changed = first;
     changed.state = "completed".into();

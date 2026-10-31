@@ -283,6 +283,38 @@ fn stamp(
     }))
 }
 
+/// How many observed paths the unverified-change reminder names.
+const REMINDER_PATHS: usize = 5;
+
+/// The reminder shown when the model ends a turn with changes no check has
+/// verified. Observed changed paths are named (as quoted file data). When none
+/// were observed, the snapshot could not see the whole workspace, so the text
+/// says that coverage is unknown and does not claim any file changed.
+pub(crate) fn unverified_change_reminder(observed: &[PathBuf], coverage_unknown: bool) -> String {
+    const ACTION: &str =
+        "Run the narrowest appropriate test, check, or lint command before finalizing.";
+    if !observed.is_empty() {
+        let mut named: Vec<String> = observed
+            .iter()
+            .take(REMINDER_PATHS)
+            .map(|path| serde_json::to_string(&path.to_string_lossy()).unwrap_or_default())
+            .collect();
+        if observed.len() > REMINDER_PATHS {
+            named.push("...".into());
+        }
+        return format!(
+            "You changed files ({}) but have not completed a verification command. {ACTION}",
+            named.join(", ")
+        );
+    }
+    if coverage_unknown {
+        return format!(
+            "The harness could not observe the whole workspace after your shell commands, so it cannot tell whether any file changed, and you have not completed a verification command since. {ACTION}"
+        );
+    }
+    format!("You changed files but have not completed a verification command. {ACTION}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,5 +443,39 @@ mod tests {
         std::os::unix::fs::symlink("alias.py", &alias).unwrap();
         let cycle = Snapshot::capture_inputs(&workspace, &paths);
         assert!(!cycle.required_inputs_observed(&cycle));
+    }
+
+    #[test]
+    fn audit_wp02_b031_unknown_coverage_does_not_claim_a_file_changed() {
+        // A read-only command whose snapshot was incomplete: no observed path.
+        let unknown = unverified_change_reminder(&[], true);
+        assert!(unknown.contains("could not observe"), "{unknown}");
+        assert!(
+            unknown.contains("cannot tell whether any file changed"),
+            "{unknown}"
+        );
+        assert!(
+            unknown.contains("have not completed a verification command"),
+            "{unknown}"
+        );
+        assert!(!unknown.contains("You changed files"), "{unknown}");
+
+        // An observed mutation still says so and lists its path.
+        let observed = unverified_change_reminder(&[PathBuf::from("src/app.py")], true);
+        assert!(
+            observed.contains("You changed files (\"src/app.py\")"),
+            "{observed}"
+        );
+        assert!(!observed.contains("could not observe"), "{observed}");
+
+        // Many paths are bounded; a fully known empty change keeps the old text.
+        let many: Vec<_> = (0..9).map(|i| PathBuf::from(format!("f{i}.py"))).collect();
+        let bounded = unverified_change_reminder(&many, false);
+        assert!(
+            bounded.contains("f4.py") && !bounded.contains("f5.py"),
+            "{bounded}"
+        );
+        assert!(bounded.contains("..."), "{bounded}");
+        assert!(unverified_change_reminder(&[], false).starts_with("You changed files but"));
     }
 }

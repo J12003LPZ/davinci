@@ -41,6 +41,11 @@ fn call(agent: &crate::Agent, id: &str, name: &str, args: &Value) -> ToolResult 
     }
 }
 
+/// Writes `delayed.txt` and exits 0 only after the test creates `release.txt`:
+/// the test decides when the child finishes, so no timer races its assertions.
+/// The unref'd timer only bounds a child the test never released.
+const EXCLUSIVE_UNTIL_RELEASED: &str = "const fs=require('fs');setTimeout(()=>process.exit(2),240000).unref();const wait=setInterval(()=>{if(fs.existsSync('release.txt')){clearInterval(wait);fs.writeFileSync('delayed.txt','done')}},20)";
+
 fn server() -> Value {
     json!({"executable":"node", "argv":["-e", "process.stdout.write('READY\\n');process.stdin.on('data',b=>process.stdout.write(b));setTimeout(()=>process.exit(0),240000)"]})
 }
@@ -89,7 +94,7 @@ fn exclusive_managed_process_holds_writer_ownership_until_exit() {
     let agent = agent(root.path(), PermissionMode::AlwaysApprove).with_runtime(runtime.clone());
     let args = json!({
         "executable":"node",
-        "argv":["-e", "setTimeout(()=>require('fs').writeFileSync('delayed.txt','done'),250)"],
+        "argv":["-e", EXCLUSIVE_UNTIL_RELEASED],
         "exclusive_workspace": true
     });
     let result = call(&agent, "start", "process_start", &args);
@@ -106,15 +111,27 @@ fn exclusive_managed_process_holds_writer_ownership_until_exit() {
             other.err()
         ),
     }
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let lease = loop {
-        match runtime.team.acquire_shared_write(None) {
-            Ok(lease) => break lease,
-            Err(_) => {
-                assert!(Instant::now() < deadline, "the process never released");
-                std::thread::sleep(Duration::from_millis(25));
-            }
-        }
+    // Let the child finish only now, so the Busy check above cannot race a
+    // timer. Wait for its terminal status, then the lease must already be free:
+    // a consumer that sees an exited job may start another writer at once.
+    std::fs::write(root.path().join("release.txt"), "go").unwrap();
+    let manager = agent.tool_context.processes.as_ref().unwrap();
+    let status_of = || {
+        manager
+            .execute(root.path(), "process_status", &json!({"id":id}), None, None)
+            .unwrap()
+            .details
+            .unwrap()
+    };
+    wait_for(|| status_of()["state"] == "exited");
+    let status = status_of();
+    assert_eq!(
+        status["exit_code"], 0,
+        "the child must complete successfully: {status}"
+    );
+    let lease = match runtime.team.acquire_shared_write(None) {
+        Ok(lease) => lease,
+        Err(error) => panic!("the exited process still holds the workspace: {error:?}"),
     };
     assert!(
         root.path().join("delayed.txt").exists(),

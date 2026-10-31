@@ -15,6 +15,40 @@ const EXTENSION_CONFLICT: &str =
 const POSITIONAL_CONFLICT: &str =
     "positional update targets cannot be combined with --self, --extensions, or --all";
 
+/// `--help` text for a package subcommand, or `None` when `command` is not one.
+pub fn package_command_help(command: &str) -> Option<&'static str> {
+    match command {
+        "install" => Some(
+            "Usage: davinci install <source> [-l|--local]\n\
+             Install a package from a local path, npm:<name>[@version], or a Git URL.\n\
+             -l, --local  install into the project instead of user settings (project must be trusted)",
+        ),
+        "remove" | "uninstall" => Some(
+            "Usage: davinci remove <source> [-l|--local]\n       davinci uninstall <source> [-l|--local]\n\
+             Remove an installed package.\n\
+             -l, --local  remove from the project instead of user settings (project must be trusted)",
+        ),
+        "update" => Some(
+            "Usage: davinci update [source] [--extensions|--extension <name>|--models|--all|--self] [--force]\n\
+             Update installed extensions (the default), or the surface you pick.\n\
+             [source], --extension <name>  update one extension\n\
+             --extensions                  update all extensions\n\
+             --models                      refresh model catalogs\n\
+             --all                         update extensions and refresh model catalogs\n\
+             --self                        not supported: prints how to reinstall davinci manually\n\
+             --force                       accepted, currently has no effect\n\
+             Conflicting selector combinations are rejected.",
+        ),
+        "list" => Some("Usage: davinci list\nList installed extensions."),
+        "config" => Some(
+            "Usage: davinci config [-l|--local]\n\
+             Show the package resource configuration panel.\n\
+             -l, --local  use the project scope instead of user settings",
+        ),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct UpdateFlags {
     self_flag: bool,
@@ -56,9 +90,8 @@ pub fn handle_package_command_in(
         }
         "remove" | "uninstall" => {
             let source = source.ok_or("remove <source> [-l]")?;
-            if local {
-                ensure_project_trusted_for_packages(agent_dir, cwd, &settings)?;
-            }
+            // Removal unregisters and deletes installed files without loading
+            // package code, so it must stay possible after trust is revoked.
             let normalized = match parse_package_source(&source) {
                 ParsedSource::Local(path) => normalize_local_source(&path, cwd)?,
                 _ => source.clone(),
@@ -231,7 +264,7 @@ pub fn update_extensions(
 /// own settings must not decide what runs. Same store and host settings as the
 /// startup gate.
 fn project_packages_trusted(agent_dir: &Path, cwd: &Path, user: &Settings) -> bool {
-    crate::trust::resolve_project_trusted(
+    crate::trust::explicitly_project_trusted(
         agent_dir,
         cwd,
         None,
@@ -1094,6 +1127,52 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn package_command_help_is_specific_per_command() {
+        let install = package_command_help("install").unwrap();
+        assert!(install.starts_with("Usage: davinci install <source>"));
+        let list = package_command_help("list").unwrap();
+        assert!(list.starts_with("Usage: davinci list"));
+        assert!(package_command_help("config")
+            .unwrap()
+            .starts_with("Usage: davinci config"));
+        assert_ne!(install, list);
+        assert_eq!(
+            package_command_help("remove"),
+            package_command_help("uninstall")
+        );
+        assert!(package_command_help("remove")
+            .unwrap()
+            .contains("davinci uninstall <source>"));
+        assert_eq!(package_command_help("bogus"), None);
+        assert_eq!(package_command_help("--help"), None);
+    }
+
+    #[test]
+    fn update_help_names_every_flag_the_parser_accepts() {
+        let help = package_command_help("update").unwrap();
+        for flag in [
+            "--self",
+            "--extensions",
+            "--models",
+            "--all",
+            "--force",
+            "--extension",
+        ] {
+            assert!(help.contains(flag), "update help is missing {flag}");
+            // The parser must accept it too, so the list cannot drift to flags that do nothing.
+            let args: Vec<String> = if flag == "--extension" {
+                vec![flag.into(), "x".into()]
+            } else {
+                vec![flag.into()]
+            };
+            assert!(
+                parse_update_flags(&args).is_ok(),
+                "{flag} rejected by parser"
+            );
+        }
+    }
+
+    #[test]
     fn local_sources_are_stored_absolute() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("ext")).unwrap();
@@ -1280,16 +1359,16 @@ mod tests {
         fs::create_dir_all(&agent).unwrap();
         let project = project_with_packages(dir.path());
         let settings = project.join(".pi").join("settings.json");
-        let before = fs::read_to_string(&settings).unwrap();
         let args = vec!["-l".to_string(), "npm:project-owned".to_string()];
 
-        // The real entry point, as `davinci remove -l <pkg>` reaches it.
-        let error = handle_package_command_in("remove", &args, &agent, &project).unwrap_err();
-        assert!(error.starts_with("UNTRUSTED_PROJECT: "), "{error}");
-        assert_eq!(
-            fs::read_to_string(&settings).unwrap(),
-            before,
-            "an untrusted project's settings were rewritten"
+        // Removal runs no package code, so an untrusted project can still be
+        // cleaned up after trust is revoked.
+        handle_package_command_in("remove", &args, &agent, &project).unwrap();
+        assert!(
+            !fs::read_to_string(&settings)
+                .unwrap()
+                .contains("project-owned"),
+            "the registration survived an untrusted removal"
         );
     }
 
@@ -1371,6 +1450,34 @@ mod tests {
             .unwrap();
         let user_scope = vec![package.display().to_string()];
         assert!(handle_package_command_in("install", &user_scope, &agent, &project).is_ok());
+    }
+
+    #[test]
+    fn audit_wp06_b054_pristine_project_install_needs_explicit_trust_and_removal_survives_revocation(
+    ) {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        fs::create_dir_all(&agent).unwrap();
+        let project = dir.path().join("pristine");
+        fs::create_dir_all(&project).unwrap();
+        let package = dir.path().join("pkg");
+        fs::create_dir_all(&package).unwrap();
+        let package_arg = package.display().to_string();
+        let args = vec!["-l".to_string(), package_arg.clone()];
+
+        let error = handle_package_command_in("install", &args, &agent, &project).unwrap_err();
+        assert!(error.starts_with("UNTRUSTED_PROJECT: "), "{error}");
+        assert!(!project.join(".davinci/settings.json").exists());
+
+        crate::trust::ProjectTrustStore::open(&agent)
+            .set(&project, Some(true))
+            .unwrap();
+        handle_package_command_in("install", &args, &agent, &project).unwrap();
+        crate::trust::ProjectTrustStore::open(&agent)
+            .set(&project, Some(false))
+            .unwrap();
+        let removed = handle_package_command_in("remove", &args, &agent, &project).unwrap();
+        assert!(removed.starts_with("Removed "), "{removed}");
     }
 
     #[test]

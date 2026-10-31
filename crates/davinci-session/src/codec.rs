@@ -531,12 +531,20 @@ fn parse_iso_ms(text: &str) -> Option<u64> {
     if text.get(timezone_start..) != Some("Z") {
         return None;
     }
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    };
+    if day == 0 || day > days_in_month || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
     // Howard Hinnant's days-from-civil.
@@ -591,5 +599,19 @@ mod tests {
                 .to_string(),
             "has unsupported session version"
         );
+    }
+
+    #[test]
+    fn audit_wp04_b042_impossible_calendar_dates_are_rejected() {
+        assert_eq!(parse_iso_ms("2000-02-29T00:00:00Z"), Some(951_782_400_000));
+        assert_eq!(
+            parse_iso_ms("2024-02-29T00:00:00.000Z"),
+            Some(1_709_164_800_000)
+        );
+        assert_eq!(parse_iso_ms("2024-02-30T00:00:00Z"), None);
+        assert_eq!(parse_iso_ms("2024-04-31T00:00:00Z"), None);
+        assert_eq!(parse_iso_ms("2024-02-29T24:00:00Z"), None);
+        assert_eq!(parse_iso_ms("1900-02-29T00:00:00Z"), None);
+        assert_eq!(parse_iso_ms("2023-02-29T00:00:00Z"), None);
     }
 }

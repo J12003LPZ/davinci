@@ -13,7 +13,7 @@ pub fn tool_spec(name: &str) -> Option<davinci_ai::ToolSpec> {
             json!({
                 "type": "object",
                 "properties": {
-                    "paths": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 4096}, "maxItems": 128},
+                    "paths": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 4096}, "maxItems": 64},
                     "path": {"type": "string", "minLength": 1, "maxLength": 4096},
                     "transactionId": {"type": "string", "minLength": 1, "maxLength": 128},
                     "label": {"type": "string", "maxLength": 256}

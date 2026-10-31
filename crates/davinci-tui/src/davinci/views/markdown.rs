@@ -105,6 +105,10 @@ impl Face {
     /// HTML, otherwise the block's base colour. Strong is `theme.emphasis`,
     /// which is what makes headings bold under `NO_COLOR` (§9).
     fn span(self, text: String, ctx: &Ctx) -> Span<'static> {
+        // Entity decoding and raw HTML happen inside the Markdown parser, so
+        // this final span boundary is where untrusted text becomes terminal
+        // text; sanitizing the source first would miss them.
+        let text = crate::davinci::sanitize::terminal_safe(&text).into_owned();
         let theme = ctx.theme;
         let color = if self.code || self.link {
             theme.cc().permission
@@ -1326,5 +1330,21 @@ fn main() {}
                 }
             }
         }
+    }
+
+    #[test]
+    fn audit_wp07_b069_entity_decoded_controls_are_sanitized_at_the_span_boundary() {
+        let rendered = render(
+            "safe &#27;[2J text &#7; bell &#x202e; bidi and [label](https://example.test)",
+            80,
+        );
+        let joined = texts(&rendered).join("\n");
+        assert!(
+            !joined.chars().any(|ch| ch.is_control()
+                || crate::davinci::sanitize::terminal_safe(&ch.to_string()) != ch.to_string()),
+            "{joined:?}"
+        );
+        assert!(joined.contains("safe"), "{joined}");
+        assert!(!joined.contains('\u{202e}'), "{joined:?}");
     }
 }

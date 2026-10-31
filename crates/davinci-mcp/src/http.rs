@@ -5,7 +5,7 @@
 
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::time::Duration;
 
 use crate::jsonrpc::{Notification, Request, Response};
@@ -104,7 +104,7 @@ impl HttpTransport {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let value = if content_type.contains("text/event-stream") {
+        let value = if is_sse_content_type(&content_type) {
             self.read_sse_response(response.into_body().into_reader(), want)?
         } else {
             let text = read_response_body(response.into_body().into_reader(), MAX_BODY_BYTES)?;
@@ -176,76 +176,63 @@ impl HttpTransport {
     }
 
     fn read_sse_response(&self, reader: impl Read, want: Option<&Value>) -> Result<Value> {
-        // Bound the underlying stream before read_line so one unterminated
-        // SSE line cannot allocate past the response cap before we inspect it.
-        let mut reader = BufReader::new(reader.take((MAX_BODY_BYTES + 1) as u64));
-        let mut line = String::new();
+        // Incremental so a reply is returned before the server closes its
+        // stream; EOF itself never dispatches an unterminated event.
+        let mut reader = reader.take((MAX_BODY_BYTES + 1) as u64);
+        let mut byte = [0u8; 1];
+        let mut line = Vec::new();
         let mut data = String::new();
         let mut total = 0usize;
         let mut last = None;
+        let mut after_cr = false;
+        let mut started = false;
         loop {
-            line.clear();
             let read = reader
-                .read_line(&mut line)
+                .read(&mut byte)
                 .map_err(|err| Error::Transport(format!("mcp http SSE: {err}")))?;
             if read == 0 {
                 break;
             }
-            total = total.saturating_add(read);
+            let byte = byte[0];
+            total = total.saturating_add(1);
             if total > MAX_BODY_BYTES {
                 return Err(Error::Transport(format!(
                     "mcp http body exceeds {MAX_BODY_BYTES} bytes"
                 )));
             }
-            let trimmed = line.trim_end_matches(['\r', '\n']);
-            if trimmed.is_empty() {
-                if data.is_empty() {
-                    continue;
-                }
-                let event = std::mem::take(&mut data);
-                let Ok(value) = serde_json::from_str::<Value>(&event) else {
-                    continue;
-                };
-                // Answer every server request before selecting our response:
-                // a later batch member still requires a reply.
-                self.answer_batch_requests(&value)?;
-                // A 2025-03-26 server may send a JSON-RPC batch as one event.
-                for message in flatten_batch(value) {
-                    if message.get("id").is_some()
-                        && message.get("method").and_then(Value::as_str).is_some()
-                    {
-                        continue;
-                    }
-                    match want {
-                        Some(id) if message.get("id") == Some(id) => {
-                            validate_response(&message, id)?;
-                            return Ok(message);
-                        }
-                        Some(_) => {}
-                        None => last = Some(message),
-                    }
-                }
+            if byte == b'\n' && after_cr {
+                after_cr = false;
                 continue;
             }
-            if let Some(rest) = trimmed.strip_prefix("data:") {
-                if !data.is_empty() {
-                    data.push('\n');
-                }
-                data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
-            }
-        }
-        if !data.is_empty() {
-            let value: Value = serde_json::from_str(&data)
-                .map_err(|err| Error::Transport(format!("mcp http SSE: {err}")))?;
-            self.answer_batch_requests(&value)?;
-            for message in flatten_batch(value) {
-                if let Some(id) = want {
-                    if message.get("method").is_none() && message.get("id") == Some(id) {
-                        validate_response(&message, id)?;
-                        return Ok(message);
+            after_cr = byte == b'\r';
+            if byte == b'\r' || byte == b'\n' {
+                if !started {
+                    started = true;
+                    if line.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                        line.drain(..3);
                     }
-                } else {
-                    last = Some(message);
+                }
+                let text = String::from_utf8_lossy(&line);
+                if text.is_empty() {
+                    if !data.is_empty() {
+                        if let Some(reply) = self.handle_sse_event(&data, want, &mut last)? {
+                            return Ok(reply);
+                        }
+                    }
+                    data.clear();
+                } else if let Some(rest) = text.strip_prefix("data:") {
+                    if !data.is_empty() {
+                        data.push('\n');
+                    }
+                    data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+                }
+                line.clear();
+            } else {
+                line.push(byte);
+                if line.len() > MAX_BODY_BYTES {
+                    return Err(Error::Transport(format!(
+                        "mcp http body exceeds {MAX_BODY_BYTES} bytes"
+                    )));
                 }
             }
         }
@@ -255,6 +242,34 @@ impl HttpTransport {
             ))),
             None => last.ok_or_else(|| Error::Transport("SSE body had no data frame".into())),
         }
+    }
+
+    fn handle_sse_event(
+        &self,
+        data: &str,
+        want: Option<&Value>,
+        last: &mut Option<Value>,
+    ) -> Result<Option<Value>> {
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            return Ok(None);
+        };
+        self.answer_batch_requests(&value)?;
+        for message in flatten_batch(value) {
+            if message.get("id").is_some()
+                && message.get("method").and_then(Value::as_str).is_some()
+            {
+                continue;
+            }
+            match want {
+                Some(id) if message.get("id") == Some(id) => {
+                    validate_response(&message, id)?;
+                    return Ok(Some(message));
+                }
+                Some(_) => {}
+                None => *last = Some(message),
+            }
+        }
+        Ok(None)
     }
 
     fn fixture_answer(fixture: &Value, method: &str) -> Result<Value> {
@@ -406,7 +421,9 @@ fn build_agent(timeout: Duration) -> ureq::Agent {
         .http_status_as_error(false)
         // ureq 2 never read the proxy environment.
         .proxy(None)
-        .max_redirects(5)
+        // Never forward a POST body or custom credential headers to another
+        // origin. A 3xx is returned as a visible transport error instead.
+        .max_redirects(0)
         .timeout_global(Some(timeout))
         .build()
         .into()
@@ -429,6 +446,16 @@ fn load_fixture(url: &str) -> Option<Value> {
         .and_then(|body| serde_json::from_str(&body).ok())
 }
 
+/// The media-type essence is case-insensitive and parameters are irrelevant.
+fn is_sse_content_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case("text/event-stream")
+}
+
 /// Decode one HTTP reply. An empty body is `Null` (a `202 Accepted` to a
 /// notification). An SSE body is split into events, each event's `data:`
 /// lines joined, and the response whose `id` is `want` returned — server
@@ -443,7 +470,7 @@ pub fn parse_http_body(content_type: &str, text: &str, want: Option<&Value>) -> 
     if text.trim().is_empty() {
         return Ok(Value::Null);
     }
-    if !content_type.contains("text/event-stream") {
+    if !is_sse_content_type(content_type) {
         let value: Value =
             serde_json::from_str(text).map_err(|err| Error::Transport(format!("json: {err}")))?;
         let Some(id) = want else {
@@ -492,32 +519,33 @@ pub fn parse_http_body(content_type: &str, text: &str, want: Option<&Value>) -> 
     }
 }
 
-/// The `data` payload of every event in an SSE body, multi-line `data:`
-/// fields joined with `\n` as the spec says.
-fn sse_events(text: &str) -> impl Iterator<Item = String> + '_ {
-    // Materialize only one event at a time, and stop when the caller finds its
-    // reply. The aggregate input was already bounded before reaching this point.
-    let mut lines = text.lines().chain(std::iter::once(""));
-    std::iter::from_fn(move || {
-        let mut data = String::new();
-        let mut seen = false;
-        for line in lines.by_ref() {
-            if line.is_empty() {
-                if seen {
-                    return Some(data);
-                }
-                continue;
+/// The `data` payload of every terminated event in an SSE body, multi-line
+/// `data:` fields joined with `\n` as the spec says. Only a real blank line
+/// ends an event; an unterminated final event is not dispatched.
+fn sse_events(text: &str) -> std::vec::IntoIter<String> {
+    let normalized = if text.contains('\r') {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        text.to_string()
+    };
+    let text = normalized.strip_prefix('\u{feff}').unwrap_or(&normalized);
+    let mut events = Vec::new();
+    let mut data = String::new();
+    for line in text.split('\n') {
+        if line.is_empty() {
+            if !data.is_empty() {
+                events.push(std::mem::take(&mut data));
             }
-            if let Some(rest) = line.strip_prefix("data:") {
-                if seen {
-                    data.push('\n');
-                }
-                data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
-                seen = true;
-            }
+            continue;
         }
-        None
-    })
+        if let Some(rest) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+        }
+    }
+    events.into_iter()
 }
 
 #[cfg(test)]
@@ -528,7 +556,7 @@ mod tests {
     #[test]
     fn agent_keeps_the_redirect_budget_and_header_override_behavior() {
         let agent = build_agent(Duration::from_secs(1));
-        assert_eq!(agent.config().max_redirects(), 5);
+        assert_eq!(agent.config().max_redirects(), 0);
         let request = agent
             .post("http://localhost/")
             .header("Authorization", "old")
@@ -557,13 +585,51 @@ mod tests {
     }
 
     #[test]
+    fn audit_wp09_b085_sse_media_type_is_case_and_parameter_insensitive() {
+        let id = json!(7);
+        let body = r#"data: {"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#;
+        let reply = parse_http_body(
+            "Text/Event-Stream; charset=utf-8",
+            &format!("{body}\n\n"),
+            Some(&id),
+        )
+        .unwrap();
+        assert_eq!(reply["result"]["ok"], true);
+        let json_body = r#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#;
+        assert!(parse_http_body("application/json", json_body, Some(&id)).is_ok());
+        assert!(parse_http_body(
+            "application/x-text/event-streaming",
+            &format!("{body}\n\n"),
+            Some(&id)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn audit_wp09_b086_b087_b088_cr_bom_and_termination_rules() {
+        let transport = HttpTransport::new("http://127.0.0.1:1/mcp", BTreeMap::new()).unwrap();
+        let id = json!(1);
+        let payload = r#"data: {"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+        for body in [
+            format!("{payload}\r\r"),
+            format!("\u{feff}{payload}\n\n"),
+            format!("{payload}\n\n"),
+        ] {
+            let reply = transport
+                .read_sse_response(body.as_bytes(), Some(&id))
+                .unwrap();
+            assert_eq!(reply["result"]["ok"], true, "{body:?}");
+        }
+        // An unterminated event is not a reply.
+        assert!(transport
+            .read_sse_response(payload.as_bytes(), Some(&id))
+            .is_err());
+    }
+
+    #[test]
     fn batches_answer_server_requests_after_the_correlated_reply() {
         use std::io::Write;
-        for (content_type, suffix) in [
-            ("text/event-stream", "\n\n"),
-            ("text/event-stream", ""),
-            ("application/json", ""),
-        ] {
+        for (content_type, suffix) in [("text/event-stream", "\n\n"), ("application/json", "")] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {

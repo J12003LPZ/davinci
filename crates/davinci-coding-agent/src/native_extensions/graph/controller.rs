@@ -3726,7 +3726,7 @@ fn deliver_goal(
                 if !chunk_review.reviewed_chunk_ids.is_empty() {
                     coverage.record_reviewed(&chunk_review.reviewed_chunk_ids);
                 } else {
-                    coverage.record_reviewed(&[chunk.id.clone()]);
+                    coverage.record_reviewed(std::slice::from_ref(&chunk.id));
                 }
                 let issues_count = chunk_review.issues.len();
                 all_issues.extend(chunk_review.issues);
@@ -3814,7 +3814,7 @@ fn deliver_goal(
                 if !r.reviewed_chunk_ids.is_empty() {
                     coverage.record_reviewed(&r.reviewed_chunk_ids);
                 } else {
-                    coverage.record_reviewed(&[c.id.clone()]);
+                    coverage.record_reviewed(std::slice::from_ref(&c.id));
                 }
             }
             review

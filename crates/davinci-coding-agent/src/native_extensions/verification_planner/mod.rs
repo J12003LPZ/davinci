@@ -389,8 +389,19 @@ fn validate_request(
         .chain(request.changed_symbols.iter())
         .chain(request.user_requirements.iter())
     {
-        if value.len() > 4096 || value.contains('\0') {
+        if value.chars().count() > 4096 || value.contains('\0') {
             return Err("verification_plan: argument is oversized or contains NUL".into());
+        }
+    }
+    if request.user_requirements.len() > 32 {
+        return Err("verification_plan: at most 32 userRequirements are supported".into());
+    }
+    for requirement in &request.user_requirements {
+        let length = requirement.chars().count();
+        if length == 0 || length > 1024 {
+            return Err(
+                "verification_plan: each userRequirements entry must be 1..1024 characters".into(),
+            );
         }
     }
     Ok(())

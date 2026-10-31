@@ -395,7 +395,8 @@ mod tests {
         assert!(warnings[0].contains("`../missing`") && warnings[0].contains("does not exist"));
 
         let trusted = PermissionSources::load(agent_dir.path(), &project, Some(true));
-        let (roots, _) = trusted.additional_directories(&[flag.clone()], &project, None);
+        let (roots, _) =
+            trusted.additional_directories(std::slice::from_ref(&flag), &project, None);
         assert_eq!(roots, [flag, user, shared], "deduplicated, flags first");
     }
 

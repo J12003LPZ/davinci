@@ -923,10 +923,17 @@ pub fn job_id(input: &Value) -> Result<u32, String> {
         .or_else(|| input.get("job"))
         .ok_or("Missing jobId")?;
     match raw {
-        Value::Number(n) => n
-            .as_u64()
-            .map(|n| n as u32)
-            .ok_or_else(|| "jobId must be a positive integer".into()),
+        Value::Number(n) => {
+            let wide = n
+                .as_u64()
+                .ok_or_else(|| "jobId must be a positive integer".to_string())?;
+            u32::try_from(wide).map_err(|_| {
+                format!(
+                    "jobId {wide} is out of range (job numbers go up to {})",
+                    u32::MAX
+                )
+            })
+        }
         Value::String(s) => s
             .trim()
             .trim_start_matches("job ")
@@ -966,6 +973,25 @@ pub fn started_result(id: u32, pid: u32, command: &str) -> crate::ToolResult {
     }
 }
 
+/// The requested `wait` as a bounded duration. Absent, null and zero mean no
+/// wait; a value that is not a finite non-negative number is an error, and a
+/// large one is capped at `MAX_WAIT` before it becomes a `Duration`.
+fn wait_duration(input: &Value) -> Result<Option<Duration>, String> {
+    let Some(raw) = input.get("wait").filter(|raw| !raw.is_null()) else {
+        return Ok(None);
+    };
+    let seconds = raw
+        .as_f64()
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .ok_or_else(|| "wait must be a finite, non-negative number of seconds".to_string())?;
+    if seconds == 0.0 {
+        return Ok(None);
+    }
+    let requested = Duration::try_from_secs_f64(seconds)
+        .map_err(|_| format!("wait of {seconds} seconds is too large to represent"))?;
+    Ok(Some(requested.min(MAX_WAIT)))
+}
+
 /// `job_output { jobId, wait?, tail? }`. `abort` ends a wait early when the
 /// turn is interrupted; the job itself keeps running.
 pub fn output_tool(
@@ -974,11 +1000,7 @@ pub fn output_tool(
     abort: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<crate::ToolResult, String> {
     let id = job_id(input)?;
-    let wait = input
-        .get("wait")
-        .and_then(Value::as_f64)
-        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
-        .map(|seconds| Duration::from_secs_f64(seconds).min(MAX_WAIT));
+    let wait = wait_duration(input)?;
     let tail = input
         .get("tail")
         .and_then(Value::as_u64)
@@ -1641,5 +1663,82 @@ mod tests {
         // id2 is not killed by agent1 kill call
         assert_eq!(book.get(id2).unwrap().agent_id, Some(agent2));
         assert!(book.get(id2).unwrap().status().is_running());
+    }
+
+    fn sleeper() -> Child {
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("powershell");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep 30",
+            ]);
+            command
+        } else {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn audit_wp02_b021_job_ids_do_not_wrap_to_32_bits() {
+        let book = Arc::new(Mutex::new(JobBook::default()));
+        let id = book.lock().unwrap().register("sleeper", sleeper());
+        assert_eq!(id, 1);
+        for tool in ["output", "kill"] {
+            let input = json!({"jobId": 4_294_967_297_u64});
+            let error = if tool == "output" {
+                output_tool(&book, &input, None).unwrap_err()
+            } else {
+                kill_tool(&book, &input).unwrap_err()
+            };
+            assert!(error.contains("out of range"), "{tool}: {error}");
+        }
+        assert!(book.lock().unwrap().get(1).unwrap().status().is_running());
+        assert_eq!(job_id(&json!({"jobId": u32::MAX})).unwrap(), u32::MAX);
+        assert!(job_id(&json!({"jobId": -1}))
+            .unwrap_err()
+            .contains("positive integer"));
+        assert!(job_id(&json!({})).unwrap_err().contains("Missing jobId"));
+        assert!(job_id(&json!({"jobId": true}))
+            .unwrap_err()
+            .contains("positive integer"));
+        book.lock().unwrap().kill(1);
+    }
+
+    #[test]
+    fn audit_wp02_b022_huge_wait_neither_panics_nor_blocks() {
+        let book = Arc::new(Mutex::new(JobBook::default()));
+        let id = book.lock().unwrap().register("sleeper", sleeper());
+        let error = output_tool(&book, &json!({"jobId": id, "wait": 1e308}), None).unwrap_err();
+        assert!(error.contains("too large"), "{error}");
+        let error = output_tool(&book, &json!({"jobId": id, "wait": -1}), None).unwrap_err();
+        assert!(error.contains("non-negative"), "{error}");
+        let error = output_tool(&book, &json!({"jobId": id, "wait": "5"}), None).unwrap_err();
+        assert!(error.contains("non-negative"), "{error}");
+
+        // Zero and null are "do not wait"; a long valid wait is capped.
+        let started = Instant::now();
+        output_tool(&book, &json!({"jobId": id, "wait": 0}), None).unwrap();
+        output_tool(&book, &json!({"jobId": id, "wait": null}), None).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            wait_duration(&json!({"wait": 1e6})).unwrap(),
+            Some(MAX_WAIT)
+        );
+        assert_eq!(wait_duration(&json!({"wait": 0})).unwrap(), None);
+        assert_eq!(
+            wait_duration(&json!({"wait": 2.5})).unwrap(),
+            Some(Duration::from_millis(2500))
+        );
+        book.lock().unwrap().kill(id);
     }
 }

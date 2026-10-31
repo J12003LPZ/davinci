@@ -196,7 +196,7 @@ fn retryable_provider_pattern() -> &'static Regex {
             "overloaded",
             "rate.?limit",
             "too many requests",
-            r"\b(?:429|5\d\d)\b",
+            r"\b(?:408|409|429|5\d\d)\b",
             "service.?unavailable",
             "server.?error",
             "internal.?error",
@@ -497,6 +497,16 @@ mod tests {
             "input exceeds the context window",
             "Request too large: 500 server error while counting; prompt is too long",
         ] {
+            assert!(!is_retryable_error_text(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn audit_wp08_b080_http_408_and_409_are_retryable_but_4xx_validation_is_not() {
+        for text in ["HTTP 408 request timeout", "HTTP 409 conflict"] {
+            assert!(is_retryable_error_text(text), "{text}");
+        }
+        for text in ["HTTP 400 bad request", "HTTP 401 unauthorized"] {
             assert!(!is_retryable_error_text(text), "{text}");
         }
     }

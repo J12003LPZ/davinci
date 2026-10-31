@@ -89,8 +89,106 @@ pub fn transcript() -> Vec<Entry> {
                 Hunk::new(HunkKind::Del, "    self.execute(req).await"),
             ],
         },
+        Entry::Gap,
+        Entry::tool(
+            State::Failed,
+            "manus",
+            "du -h -d 2 . 2>/dev/null | sort -h | tail -30",
+            Some("60.00s"),
+        )
+        .with_output("Command timed out after 60 seconds"),
+        Entry::Gap,
+        Entry::tool(
+            State::Delta,
+            "instrumenta",
+            r"edit notes\scratch.md",
+            Some("0.02s"),
+        )
+        .summarised("+30 -0"),
+        Entry::Gap,
+        Entry::prose(
+            "The block is intentional: mode cycling needs `set_permission_mode` to reach the \
+             running agent, so **shift+tab** only updates the footer.\n\n\
+             When it lands:\n\n\
+             - switch the mode in the footer immediately\n\
+             - apply it from the agent's next tool call",
+        ),
+        Entry::Gap,
+        Entry::Done {
+            verb: "Worked".into(),
+            seconds: 59,
+            at: Some("10:03 PM".into()),
+            shells: 1,
+            landed: 0,
+        },
     ]
 }
+
+/// `cc` — the rows Claude Code draws that the mockups do not: a command's
+/// outcome under its prompt, an image chip, an `Update` card with numbered
+/// rows, a group of reads and a shell command in flight.
+pub fn cc_parity_transcript() -> Vec<Entry> {
+    let numbered = |kind: HunkKind, line: u32, text: &str| Hunk::at(kind, line, text);
+    vec![
+        Entry::user("/model"),
+        Entry::result(
+            "Set model to Opus 5.5 and saved as your default for new sessions",
+            Some("Opus 5.5"),
+        ),
+        Entry::Gap,
+        Entry::user("[Image #1] label \"with X effort\" before the model's name"),
+        Entry::result("[Image #1]", None),
+        Entry::Gap,
+        Entry::prose("I'll switch to the Edit tool; the Python heredoc escaping is fighting me."),
+        Entry::Gap,
+        Entry::tool(
+            State::Delta,
+            "instrumenta",
+            "edit crates\\davinci-tui\\src\\editor.rs",
+            Some("0.02s"),
+        ),
+        Entry::Delta {
+            path: "crates\\davinci-tui\\src\\editor.rs".into(),
+            adds: 4,
+            dels: 1,
+            hunks: vec![
+                numbered(HunkKind::Context, 1662, "    }"),
+                numbered(HunkKind::Context, 1663, ""),
+                numbered(HunkKind::Context, 1664, "    #[test]"),
+                numbered(
+                    HunkKind::Add,
+                    1665,
+                    "    fn an_image_chip_deletes_and_steps_as_one_unit() {",
+                ),
+                numbered(
+                    HunkKind::Add,
+                    1666,
+                    "        let mut editor = Editor::new();",
+                ),
+                numbered(
+                    HunkKind::Add,
+                    1667,
+                    "        editor.set_text(\"see [Image #1] and [Image #12]\");",
+                ),
+                numbered(HunkKind::Add, 1668, "        editor.backspace();"),
+                numbered(HunkKind::Del, 1700, "        assert!(old_behavior());"),
+                numbered(HunkKind::Context, 1669, "    }"),
+            ],
+        },
+        Entry::Gap,
+        Entry::tool(
+            State::Read,
+            "instrumenta",
+            "read crates\\davinci-tui\\src\\editor.rs",
+            None,
+        ),
+        Entry::Gap,
+        Entry::tool(State::Done, "manus", CC_PARITY_COMMAND, None),
+    ]
+}
+
+/// The shell command in flight on the `cc` screen, as the reference shows it.
+const CC_PARITY_COMMAND: &str = "git show --stat ca295348 && git branch -a --contains ca295348 | head; git log --oneline -S \"painter\" main | head";
 
 /// `1g` / `1h` — the narrow transcript.
 pub fn narrow_transcript() -> Vec<Entry> {
@@ -775,7 +873,7 @@ pub fn keymap() -> Vec<KeymapGroup> {
                 ("alt+enter", "queue as follow-up"),
                 ("alt+up", "take the last queued back"),
                 ("tab", "complete command, file, skill"),
-                ("shift+tab", "cycle permission mode · idle only"),
+                ("shift+tab", "cycle permission mode"),
                 ("ctrl+v", "paste image from clipboard"),
                 ("ctrl+g", "open $EDITOR on the draft"),
                 ("ctrl+x", "copy last agent message"),
@@ -2058,6 +2156,22 @@ pub fn dress_screen(model: &mut Model, id: &str) {
             model.composer = "now fix the store.rs type error".into();
             model.working = Some(working());
         }
+        "cc" => {
+            model.transcript = cc_parity_transcript().into();
+            model.running = true;
+            model.shell_runs.push(crate::davinci::model::ShellRun {
+                index: model.transcript.len() - 1,
+                started: std::time::Instant::now(),
+                command: CC_PARITY_COMMAND.into(),
+            });
+            model.working = Some(crate::davinci::model::Working {
+                seconds: 222,
+                tokens: 18_500,
+                thinking: Some("medium".into()),
+                reasoning: true,
+                ..working()
+            });
+        }
         "1d" => {
             model.toggle_overlay(Overlay::Instrumenta);
             model.query = "git".into();
@@ -2465,6 +2579,45 @@ impl AgentParityScenario {
 mod tests {
     use super::*;
     use crate::davinci::theme::{ColorDepth, Theme};
+
+    #[test]
+    fn the_cc_parity_screen_draws_each_reference_row() {
+        let mut m = Model::new(
+            Theme::da_vinci(ColorDepth::TrueColor, false),
+            120,
+            40,
+            false,
+        );
+        dress_screen(&mut m, "cc");
+        let rows: Vec<String> = crate::davinci::app::compose(&m, 40)
+            .iter()
+            .map(|line| line.to_string().replace('\u{a0}', " "))
+            .collect();
+        let has = |needle: &str| rows.iter().any(|row| row.contains(needle));
+        assert!(has("❯ /model"), "{rows:#?}");
+        assert!(has(
+            "  ⎿  Set model to Opus 5.5 and saved as your default for new sessions"
+        ));
+        assert!(has("  ⎿  [Image #1]"));
+        assert!(has("● Update(crates\\davinci-tui\\src\\editor.rs)"));
+        assert!(has("  ⎿  Added 4 lines, removed 1 line"));
+        assert!(has(
+            "      1665 +    fn an_image_chip_deletes_and_steps_as_one_unit() {"
+        ));
+        assert!(has("  Reading 1 file…"));
+        assert!(has(
+            "● Running git show --stat ca295348 && git branch -a --contains ca295348 |"
+        ));
+        assert!(has(
+            "  ⎿  $ git show --stat ca295348 && git branch -a --contains ca295348 | head; git log"
+        ));
+        assert!(has(
+            "(3m 42s · ↓ 18.5k tokens · thinking with medium effort)"
+        ));
+        assert!(has(
+            "  ⎿  Tip: Hit shift+tab to cycle between manual mode, accept edits mode, and plan mode"
+        ));
+    }
 
     #[test]
     fn the_mockup_transcripts_carry_every_block_kind() {

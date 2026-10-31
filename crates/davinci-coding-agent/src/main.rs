@@ -38,6 +38,7 @@ mod experimental {
         Pi {
             options: Args,
             listen: Vec<UnixAddress>,
+            auth: Option<ExperimentalAuth>,
         },
         Server {
             listen: Vec<UnixAddress>,
@@ -69,7 +70,7 @@ mod experimental {
     ) -> Result<Option<String>, String> {
         Ok(None)
     }
-    pub fn bind_listen_addresses(_: &[UnixAddress]) -> Result<String, String> {
+    pub fn bind_listen_addresses(_: &[UnixAddress], _: Option<&str>) -> Result<String, String> {
         Ok(String::new())
     }
     pub fn run_server(_: ServerCommand) -> Result<String, String> {
@@ -91,6 +92,7 @@ mod experimental {
             _ => Ok(ExperimentalCli::Pi {
                 options: parse_args(raw),
                 listen: vec![],
+                auth: None,
             }),
         }
     }
@@ -478,7 +480,10 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
     if is_package_command(raw.first().map(String::as_str)) {
         let command = raw[0].as_str();
         if raw.iter().any(|a| a == "--help" || a == "-h") {
-            println!("{}", print_help());
+            let help = packages::package_command_help(command)
+                .map(str::to_string)
+                .unwrap_or_else(print_help);
+            println!("{help}");
             return Ok(0);
         }
         let agent_dir = default_agent_dir();
@@ -521,10 +526,13 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
                 return Ok(0);
             }
             experimental::ExperimentalCli::Pi {
-                listen, options, ..
+                listen,
+                auth,
+                options,
             } => {
                 if !listen.is_empty() {
-                    let _ = experimental::bind_listen_addresses(&listen)?;
+                    let token = experimental::resolve_experimental_auth(auth)?;
+                    let _ = experimental::bind_listen_addresses(&listen, token.as_deref())?;
                 }
                 options
             }
@@ -840,6 +848,61 @@ fn offline_stub_message(current: &Agent, last_user: usize) -> AssistantMessage {
 static BACKGROUND_MCP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 thread_local! {
     static WORKER_STARTUP_CONTEXT: std::cell::RefCell<Option<crate::native_extensions::graph::GraphWorkerContext>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Apply the user's final tool selection after every built-in, native and
+/// extension source has merged. `--no-tools` clears the merged set, `--tools`
+/// is an allowlist over it, and `--exclude-tools` removes names from it. The
+/// same predicate is reused after reloads so latency cannot reintroduce a tool.
+fn apply_tool_admission(
+    parsed: &Args,
+    agent: &mut Agent,
+    default_tools: Option<&[String]>,
+) -> Result<(), String> {
+    if !parsed.tools.is_empty() {
+        let unknown: Vec<&String> = parsed
+            .tools
+            .iter()
+            .filter(|name| {
+                !agent.tool_registry.iter().any(|known| known == *name)
+                    && !davinci_agent::tools::BUILTIN_TOOLS.contains(&name.as_str())
+            })
+            .collect();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "Unknown tool{} requested by --tools: {}",
+                if unknown.len() == 1 { "" } else { "s" },
+                unknown
+                    .iter()
+                    .map(|name| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    if parsed.no_tools {
+        agent.tools.clear();
+    } else {
+        // The CLI override wins; otherwise the configured default tool list
+        // remains an allowlist over tools added after startup.
+        let effective = if !parsed.tools.is_empty() {
+            Some(parsed.tools.as_slice())
+        } else {
+            default_tools
+        };
+        if let Some(allowed) = effective {
+            agent
+                .tools
+                .retain(|name| allowed.iter().any(|known| known == name));
+        }
+    }
+    agent
+        .tools
+        .retain(|name| !parsed.exclude_tools.contains(name));
+    // The rejection above changed the active set, so the shared authorization
+    // view must be rebuilt here as well as in apply_extension_tools.
+    agent.sync_tool_authorization();
+    Ok(())
 }
 
 fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, String> {
@@ -1357,6 +1420,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         let _ = ext.handlers.as_slice();
     }
     agent.apply_extension_tools(&names);
+    apply_tool_admission(parsed, &mut agent, settings.default_tools.as_deref())?;
     sync_visual_verification_availability(&mut agent, &host);
     if let Some(graph_worker) = &graph_worker {
         agent.tool_context.transaction_owner.graph_node = Some(graph_worker.node_id.clone());
@@ -1470,7 +1534,6 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     if let Some(key) = &parsed.api_key {
         if let Ok(mut storage) = AuthStorage::create() {
             storage.set_runtime_override(&agent.provider, key);
-            let _ = storage.login_api_key(&agent.provider, key);
         }
     }
     agent.summarizer = Some(live_compaction_summarizer(parsed, &agent));
@@ -1652,6 +1715,7 @@ fn complete_simple_summarization(
         install_telemetry: Some(load_settings(&default_agent_dir()).install_telemetry_enabled()),
         abort_signal: None,
         output_schema: None,
+        retry_after_sink: None,
     };
     let response = complete_simple(
         &model,
@@ -1670,7 +1734,7 @@ fn complete_simple_summarization(
             })
             .collect::<Vec<_>>()
             .join(""),
-        usage: response.usage.unwrap_or_default(),
+        usage: response.usage,
         stop_reason: response.stop_reason,
         error_message: response.error_message,
         has_tool_call: response
@@ -2814,6 +2878,14 @@ fn build_worker(
             progress.observe(event)
         })));
     }
+    // The registered worker record learns what it really runs on: the override,
+    // the profile's model or the inherited one, resolved above. This happens
+    // before the worker's first provider request.
+    if let (Some(runtime), Some(id)) = (&req.runtime, req.runtime_agent_id) {
+        runtime
+            .registry
+            .set_model_identity(id, &child.provider, &child.model_id);
+    }
     Ok((child, profile_allows_codemode))
 }
 
@@ -2858,13 +2930,31 @@ fn run_nested_subagent(
 ) -> Result<String, String> {
     let (mut child, profile_allows_codemode) = build_worker(parsed, cwd, mcp, req)?;
     let teammate = req.mode == davinci_agent::AgentSpawnMode::Teammate;
+    let workspace = req
+        .worktree_path
+        .clone()
+        .unwrap_or_else(|| cwd.to_path_buf());
+    let receipt_slot = req.receipt_slot.clone();
     // Shared-workspace write ownership is taken per mutating call by the
     // turn's dispatch (`turn.rs`), the same path as the lead's own calls.
     let mut turn = |prompt: &str| {
         if teammate {
             refresh_worker_settings(&mut child, profile_allows_codemode);
         }
-        run_worker_turn(parsed, &mut child, prompt)
+        let before = davinci_agent::WorkspaceSnapshot::capture(&workspace).ok();
+        let result = run_worker_turn(parsed, &mut child, prompt);
+        let after = davinci_agent::WorkspaceSnapshot::capture(&workspace).ok();
+        if let Some(slot) = &receipt_slot {
+            let receipt = davinci_agent::VerificationReceipt::from_worker(
+                child.completion_status(),
+                &child.mutation_verification_state(),
+                before.as_ref(),
+                after.as_ref(),
+                Some(&workspace),
+            );
+            davinci_agent::publish_subagent_receipt(slot, receipt);
+        }
+        result
     };
     if teammate {
         let runtime = req
@@ -3209,8 +3299,32 @@ fn complete_prompt_with_host(
     .with_cache(agent.tool_context.cache.clone());
     // Leases belong to the repository, not to the directory davinci was
     // launched from (a subdirectory would lease the wrong tree).
-    let lease_root = davinci_agent::runtime::worktree::git_toplevel(&agent.cwd)
-        .unwrap_or_else(|| agent.cwd.clone());
+    let lease_root = match davinci_agent::runtime::worktree::git_toplevel(&agent.cwd) {
+        Ok(root) => root.unwrap_or_else(|| agent.cwd.clone()),
+        Err(error) => {
+            // A refusal to inspect the repository is not "not a repository":
+            // say so instead of leasing worktrees from the wrong root.
+            let reply = format!("Repository unavailable: {error}");
+            let end = AgentEvent::AgentEnd {
+                messages: vec![davinci_ai::ChatMessage::text("assistant", &reply)],
+                will_retry: false,
+            };
+            if stream_json {
+                if let Ok(value) = to_json_print_event(&end) {
+                    if let Ok(encoded) = serde_json::to_string(&value) {
+                        let _ = output::write_raw_stdout_line(&encoded);
+                    }
+                }
+            } else {
+                agent.emit_live(end.clone());
+            }
+            let mut host = host.lock().unwrap_or_else(|error| error.into_inner());
+            host.emit(ExtensionEvent::TurnEnd);
+            host.emit(ExtensionEvent::AgentEnd);
+            host.emit(ExtensionEvent::AgentSettled);
+            return (reply, vec![end]);
+        }
+    };
     let wt_mgr =
         davinci_agent::WorktreeManager::new(lease_root, default_agent_dir().join("worktrees"))
             .with_bus(runtime_bus.clone());
@@ -3228,7 +3342,8 @@ fn complete_prompt_with_host(
     let wf_store = davinci_agent::WorkflowStateStore::with_options(
         davinci_agent::runtime::workflow::state::DEFAULT_MAX_INLINE_ARTIFACT_BYTES,
         default_agent_dir().join("workflow_artifacts"),
-    );
+    )
+    .with_source_root(agent.cwd.clone());
     runtime_handle = match runtime_host::configure_session_workflow_with_journal(
         runtime_handle,
         &agent.cwd,
@@ -3593,6 +3708,7 @@ fn complete_prompt_with_host(
                             install_telemetry: Some(current.install_telemetry),
                             abort_signal: current.abort_signal.clone(),
                             output_schema: current.output_schema.clone(),
+                            retry_after_sink: Some(current.retry_after_sink()),
                         },
                         &mut sink,
                     );
@@ -3778,7 +3894,11 @@ fn complete_prompt_with_host(
         for skill in &agent.skills {
             let tag = format!("<skill name=\"{}\"", skill.name);
             if latest_user_text.contains(&tag) {
-                host.native_record_skill_outcome_for_skill(&skill.name, &skill.body, skill_outcome);
+                host.native_record_skill_outcome_for_skill(
+                    &skill.name,
+                    &skill.read_body(),
+                    skill_outcome,
+                );
             }
         }
 
@@ -3898,7 +4018,9 @@ fn complete_prompt_with_host(
                 Some("newSession" | "fork" | "switchSession" | "reload")
             )
         }) {
-            rebind_print_extensions(parsed, agent, &mut host);
+            if let Err(error) = rebind_print_extensions(parsed, agent, &mut host) {
+                session_failure = Some(error);
+            }
         }
         // The davinci transcript is the only place those calls can be seen;
         // print mode stays silent about them, as the TS reference is.
@@ -4056,6 +4178,43 @@ fn denied_actions_summary(actions: &[serde_json::Value]) -> String {
         if actions.len() == 1 { "" } else { "s" },
         listed.join("; ")
     )
+}
+
+/// Structured denials from tool results, so a policy that refuses without an
+/// interactive challenge (read-only, for example) still counts for
+/// `--fail-on-denied` and the final summary.
+fn tool_event_denials(events: &[AgentEvent]) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                details: Some(details),
+                ..
+            } = event
+            else {
+                return None;
+            };
+            if details.get("denied").and_then(serde_json::Value::as_bool) != Some(true) {
+                return None;
+            }
+            Some(serde_json::json!({
+                "tool_call_id": tool_call_id,
+                "action": tool_name,
+                "target": details
+                    .get("target")
+                    .or_else(|| details.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(native_extensions::vector_memory::redact_secrets)
+                    .unwrap_or_default(),
+                "permission_mode": details
+                    .get("permissionMode")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("policy"),
+            }))
+        })
+        .collect()
 }
 
 /// `denials` selects `--approval-policy deny-continue`: a challenge is denied
@@ -4334,7 +4493,7 @@ fn run_print_turns(
         }
         other => (exit_code, other),
     };
-    let denied = denials
+    let mut denied = denials
         .map(|denials| {
             std::mem::take(
                 &mut denials
@@ -4344,6 +4503,21 @@ fn run_print_turns(
             )
         })
         .unwrap_or_default();
+    if parsed.fail_on_denied && parsed.approval_policy != ApprovalPolicy::DenyContinue {
+        for action in tool_event_denials(&all_events) {
+            let call_id = action
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str);
+            if !denied.iter().any(|known| {
+                known
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str)
+                    == call_id
+            }) {
+                denied.push(action);
+            }
+        }
+    }
     // Written before any approval_required, which stays the final line.
     if json_mode {
         let encoded = serde_json::to_string(&output::harness_stats_record(agent))
@@ -4396,9 +4570,12 @@ fn run_print_turns(
         } else {
             if !json_mode {
                 if let Some(error) = error {
-                    eprintln!("{error}");
+                    eprintln!("{}", davinci_tui::davinci::sanitize::terminal_safe(&error));
                 } else if !last_reply.is_empty() {
-                    println!("{last_reply}");
+                    println!(
+                        "{}",
+                        davinci_tui::davinci::sanitize::terminal_safe(last_reply)
+                    );
                 }
             }
             exit_code
@@ -5064,7 +5241,7 @@ fn run_rpc_with_host(
         ) && response.success
         {
             let mut locked = host.lock().unwrap_or_else(|err| err.into_inner());
-            rebind_print_extensions(parsed, &mut runtime.agent, &mut locked);
+            rebind_print_extensions(parsed, &mut runtime.agent, &mut locked)?;
             runtime.invocable_commands = slash::invocable_commands(
                 &locked
                     .js
@@ -5676,17 +5853,58 @@ fn run_stop_hooks_for(parsed: &Args, cwd: &Path) {
     davinci_coding_agent::plugins::run_session_end(&default_agent_dir(), cwd);
 }
 
+/// The exit cleanup, once per process and bounded by
+/// `shutdown::CLEANUP_DEADLINE`, whether the normal exit or a signal gets here
+/// first. A step that hangs is abandoned at the deadline, not waited for.
 fn emit_session_shutdown(parsed: &Args) {
-    loaded_extension_host(parsed).emit(ExtensionEvent::SessionShutdown {
-        reason: "quit".into(),
-    });
-    crate::js_host::shutdown_js_pool();
-    // `process::exit` follows: nothing below runs a destructor, so the
-    // children are reaped here.
-    davinci_agent::jobs::kill_every_job();
-    davinci_agent::McpRegistry::shutdown_all();
-    let cwd = std::env::current_dir().unwrap_or_default();
-    run_stop_hooks_for(parsed, &cwd);
+    emit_session_shutdown_with(parsed, current_startup_context());
+}
+
+/// The graph worker context the session was built with. It is a thread-local
+/// of the thread that built the agent, so a trigger on another thread (the
+/// signal watcher) must be handed it rather than read it.
+fn current_startup_context() -> Option<crate::native_extensions::graph::GraphWorkerContext> {
+    WORKER_STARTUP_CONTEXT.with(|context| context.borrow().clone())
+}
+
+fn emit_session_shutdown_with(
+    parsed: &Args,
+    startup: Option<crate::native_extensions::graph::GraphWorkerContext>,
+) {
+    let cleanup = shutdown::session_cleanup();
+    let finished = cleanup.run_steps(
+        shutdown::CLEANUP_DEADLINE,
+        session_cleanup_steps(parsed.clone(), startup),
+    );
+    if let Some(warning) = cleanup.report(finished) {
+        shutdown::warn_best_effort(warning);
+    }
+}
+
+/// Independent steps, ordered so the children we own are terminated first and
+/// the steps that run user or extension code, which may hang, come last.
+/// `process::exit` follows: nothing runs a destructor, so children are reaped
+/// here.
+fn session_cleanup_steps(
+    parsed: Args,
+    startup: Option<crate::native_extensions::graph::GraphWorkerContext>,
+) -> Vec<shutdown::Step> {
+    let event_args = parsed.clone();
+    vec![
+        shutdown::Step::new("background jobs", davinci_agent::jobs::kill_every_job),
+        shutdown::Step::new("MCP servers", davinci_agent::McpRegistry::shutdown_all),
+        shutdown::Step::new("JS pool", crate::js_host::shutdown_js_pool),
+        shutdown::Step::new("session_shutdown event", move || {
+            WORKER_STARTUP_CONTEXT.with(|context| *context.borrow_mut() = startup);
+            loaded_extension_host(&event_args).emit(ExtensionEvent::SessionShutdown {
+                reason: "quit".into(),
+            });
+        }),
+        shutdown::Step::new("stop hooks", move || {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            run_stop_hooks_for(&parsed, &cwd);
+        }),
+    ]
 }
 
 fn immediate_shutdown_if_fixture(parsed: &Args) -> Option<i32> {
@@ -5697,9 +5915,19 @@ fn immediate_shutdown_if_fixture(parsed: &Args) -> Option<i32> {
 
 fn install_mode_shutdown_watchers(parsed: &Args) {
     let parsed = parsed.clone();
+    let startup = capture_startup_context();
     shutdown::install_shutdown_watchers(move |_| {
-        emit_session_shutdown(&parsed);
+        emit_session_shutdown_with(&parsed, startup());
     });
+}
+
+/// Reads the startup context now, on the thread that built the agent, and
+/// returns a reader any thread may call later. The signal watcher thread has
+/// its own empty thread-local, so reading it there would lose the context.
+fn capture_startup_context(
+) -> impl Fn() -> Option<crate::native_extensions::graph::GraphWorkerContext> + Send + Sync {
+    let startup = std::sync::Mutex::new(current_startup_context());
+    move || startup.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// UI brand: the identity mark follows the installed binary name, so a copy
@@ -7034,10 +7262,11 @@ fn apply_session_action(
                 }
                 return Ok(true);
             }
-            match davinci_agent::execute_tool(
+            match davinci_agent::execute_tool_with(
                 &agent.cwd,
                 "bash",
                 &serde_json::json!({ "command": command }),
+                &agent.tool_context,
             ) {
                 Ok(result) => {
                     let value = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
@@ -9182,16 +9411,18 @@ pub fn format_session_cost(parsed: &Args, agent: &Agent) -> String {
         .find(|item| item.provider == agent.provider && item.id == agent.model_id);
     let stats = rpc::session_stats_for_agent(agent, found);
     let foreground = format!(
-        "input {} · output {} · cache read {} · cache write {} · total {} · ${:.4}",
+        "input {} · output {} · cache read {} · cache write {} · total {} · {}",
         stats["tokens"]["input"].as_u64().unwrap_or(0),
         stats["tokens"]["output"].as_u64().unwrap_or(0),
         stats["tokens"]["cacheRead"].as_u64().unwrap_or(0),
         stats["tokens"]["cacheWrite"].as_u64().unwrap_or(0),
         stats["tokens"]["total"].as_u64().unwrap_or(0),
-        stats
-            .get("cost")
-            .and_then(|value| value.as_f64())
-            .unwrap_or(0.0),
+        davinci_session::format_cost_display(
+            stats
+                .get("cost")
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0)
+        ),
     );
     format!(
         "{foreground}\n{}\nBackground accounting: {}",
@@ -10174,7 +10405,11 @@ fn sync_visual_verification_availability(agent: &mut Agent, host: &ExtensionHost
     agent.set_visual_verification_available(host.visual_verification_available());
 }
 
-fn rebind_print_extensions(parsed: &Args, agent: &mut Agent, host: &mut ExtensionHost) {
+fn rebind_print_extensions(
+    parsed: &Args,
+    agent: &mut Agent,
+    host: &mut ExtensionHost,
+) -> Result<(), String> {
     apply_discovered_resources(parsed, agent);
     *host = loaded_extension_host(parsed);
     host.runtime_flag_values = flag_values_json(parsed);
@@ -10185,9 +10420,16 @@ fn rebind_print_extensions(parsed: &Args, agent: &mut Agent, host: &mut Extensio
         names.extend(ext.commands.iter().cloned());
     }
     agent.apply_extension_tools(&names);
+    let settings = load_merged_settings_with_override(
+        &default_agent_dir(),
+        &agent.cwd,
+        parsed.project_trust_override,
+    );
+    apply_tool_admission(parsed, agent, settings.default_tools.as_deref())?;
     sync_visual_verification_availability(agent, host);
     attach_tool_executor(agent, host);
     host.emit(ExtensionEvent::SessionStart);
+    Ok(())
 }
 
 fn show_loaded_resources(

@@ -400,120 +400,132 @@ impl GitResolver {
         let limit = limit.unwrap_or(10).min(50);
         let limit_str = format!("-n{limit}");
 
-        let mut args: Vec<&str> = vec![
-            "log",
-            &limit_str,
-            "--format=COMMIT%x00%H%x00%an%x00%ae%x00%aI%x00%s%x00%b",
-            "--numstat",
-        ];
-
-        let grep_arg: String;
-        if let Some(q) = query {
-            grep_arg = format!("--grep={q}");
-            args.push(&grep_arg);
-        } else if let Some(sym) = symbol {
-            grep_arg = format!("--grep={sym}");
-            args.push(&grep_arg);
-        }
-
-        let validated_path: PathBuf;
+        let mut path_rel: Option<String> = None;
         if let Some(p) = path {
-            validated_path = runner::validate_path(&self.root, p)?;
-            let rel = validated_path
-                .strip_prefix(&self.root)
-                .unwrap()
-                .to_str()
-                .unwrap();
-            args.push("--");
-            args.push(rel);
+            let validated_path = runner::validate_path(&self.root, p)?;
+            path_rel = Some(
+                validated_path
+                    .strip_prefix(&self.root)
+                    .map_err(|_| "path is outside the repository".to_string())?
+                    .to_str()
+                    .ok_or_else(|| "path is not valid UTF-8".to_string())?
+                    .replace('\\', "/"),
+            );
         }
 
-        let out = run(&self.root, &args)?;
+        let format_arg = "--format=COMMIT%x00%H%x00%an%x00%ae%x00%aI%x00%s%x00%b";
+        let mut args: Vec<String> = vec!["log".into(), limit_str.clone(), format_arg.into()];
+        if let Some(q) = query {
+            if q.trim().is_empty() {
+                return Err("query filter cannot be empty".into());
+            }
+            args.push(format!("--grep={q}"));
+        }
+        let mut line_history = false;
+        if let Some(sym) = symbol {
+            let sym = sym.trim();
+            if sym.is_empty() {
+                return Err("symbol filter cannot be empty".into());
+            }
+            if let Some(rel) = &path_rel {
+                // Function history follows the declaration even when the
+                // changed body lines do not mention the symbol.
+                line_history = true;
+                args.push(format!("-L:{sym}:{rel}"));
+            } else {
+                // Any patch whose changed hunk mentions the symbol, including
+                // implementation edits that keep the occurrence count.
+                args.push(format!("-G{}", regex::escape(sym)));
+            }
+        }
+        if !line_history {
+            args.push("--numstat".into());
+        }
+        if let Some(rel) = &path_rel {
+            if !line_history {
+                args.push("--".into());
+                args.push(rel.clone());
+            }
+        }
+
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = match run(&self.root, &arg_refs) {
+            Ok(out) => out,
+            Err(error) if line_history => {
+                // `-L` needs a recognizable function; fall back to the
+                // broader patch-text search for types, classes and methods.
+                let mut fallback: Vec<String> =
+                    vec!["log".into(), limit_str.clone(), format_arg.into()];
+                if let Some(q) = query {
+                    fallback.push(format!("--grep={q}"));
+                }
+                if let Some(sym) = symbol {
+                    fallback.push(format!("-G{}", regex::escape(sym.trim())));
+                }
+                fallback.push("--numstat".into());
+                fallback.push("--".into());
+                if let Some(rel) = &path_rel {
+                    fallback.push(rel.clone());
+                }
+                let _ = error;
+                let fallback_refs: Vec<&str> = fallback.iter().map(String::as_str).collect();
+                run(&self.root, &fallback_refs)?
+            }
+            Err(error) => return Err(error),
+        };
         let text = String::from_utf8_lossy(&out);
 
-        let mut commits = Vec::new();
-        let mut cur_header: Option<(String, String, String, String, String, String)> = None;
-        let mut cur_files = 0usize;
-        let mut cur_ins = 0usize;
-        let mut cur_del = 0usize;
+        let mut result = parse_related_commits(&text, query, path, symbol);
 
-        let flush = |commits: &mut Vec<RelatedCommit>,
-                     header: Option<(String, String, String, String, String, String)>,
-                     files: usize,
-                     ins: usize,
-                     del: usize| {
-            if let Some((sha, author, email, date, subject, body)) = header {
-                let full_msg = if body.trim().is_empty() {
-                    subject.clone()
-                } else {
-                    format!("{subject}\n\n{body}")
-                };
-                let pr_number = Self::extract_pr_number(&full_msg);
-                let intent = Self::extract_intent_summary(&subject);
-                commits.push(RelatedCommit {
-                    commit: sha,
-                    author,
-                    author_email: email,
-                    date,
-                    message: full_msg,
-                    facts: CommitFacts {
-                        files_changed: files,
-                        insertions: ins,
-                        deletions: del,
-                    },
-                    inference: CommitInference {
-                        pr_number,
-                        intent_summary: intent,
-                    },
-                });
-            }
-        };
-
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("COMMIT\0") {
-                flush(&mut commits, cur_header.take(), cur_files, cur_ins, cur_del);
-                cur_files = 0;
-                cur_ins = 0;
-                cur_del = 0;
-
-                let parts: Vec<&str> = rest.split('\0').collect();
-                if parts.len() >= 6 {
-                    cur_header = Some((
-                        parts[0].to_string(),
-                        parts[1].to_string(),
-                        parts[2].to_string(),
-                        parts[3].to_string(),
-                        parts[4].to_string(),
-                        parts[5].to_string(),
-                    ));
-                }
-            } else {
-                // numstat line: added \t deleted \t file
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 3 {
-                    cur_files += 1;
-                    if let Ok(i) = parts[0].parse::<usize>() {
-                        cur_ins += i;
-                    }
-                    if let Ok(d) = parts[1].parse::<usize>() {
-                        cur_del += d;
+        // Without an explicit path, `-G` only sees changed lines and misses a
+        // body-only edit whose hunk does not repeat the symbol. Locate files
+        // that declare or mention the symbol and follow the declaration with
+        // `-L`, unioning those commits with the patch-text candidates.
+        if path_rel.is_none() {
+            if let Some(sym) = symbol {
+                let mut seen: std::collections::BTreeSet<String> =
+                    result.commits.iter().map(|c| c.commit.clone()).collect();
+                for file in self.symbol_candidate_files(sym).into_iter().take(8) {
+                    let history: Vec<String> = vec![
+                        "log".into(),
+                        limit_str.clone(),
+                        format_arg.into(),
+                        format!("-L:{sym}:{file}"),
+                    ];
+                    let refs: Vec<&str> = history.iter().map(String::as_str).collect();
+                    let Ok(out) = run(&self.root, &refs) else {
+                        continue;
+                    };
+                    let extra = parse_related_commits(
+                        &String::from_utf8_lossy(&out),
+                        query,
+                        Some(&file),
+                        symbol,
+                    );
+                    for commit in extra.commits {
+                        if seen.insert(commit.commit.clone()) {
+                            result.commits.push(commit);
+                        }
                     }
                 }
+                result.total_commits = result.commits.len();
             }
         }
-        flush(&mut commits, cur_header.take(), cur_files, cur_ins, cur_del);
+        Ok(result)
+    }
 
-        Ok(RelatedCommitsResult {
-            query: query.map(str::to_string),
-            path: path.map(str::to_string),
-            symbol: symbol.map(str::to_string),
-            total_commits: commits.len(),
-            commits,
-        })
+    fn symbol_candidate_files(&self, symbol: &str) -> Vec<String> {
+        let args = ["grep", "-l", "-w", "-F", "-e", symbol];
+        run(&self.root, &args)
+            .map(|out| {
+                String::from_utf8_lossy(&out)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     // ------------------------------------------------------------------------
@@ -1162,4 +1174,178 @@ fn scoped_symbols(
             (key, symbol)
         })
         .collect()
+}
+
+fn parse_related_commits(
+    text: &str,
+    query: Option<&str>,
+    path: Option<&str>,
+    symbol: Option<&str>,
+) -> RelatedCommitsResult {
+    let mut commits = Vec::new();
+    let mut cur_header: Option<(String, String, String, String, String, String)> = None;
+    let mut cur_files = 0usize;
+    let mut cur_ins = 0usize;
+    let mut cur_del = 0usize;
+
+    let flush = |commits: &mut Vec<RelatedCommit>,
+                 header: Option<(String, String, String, String, String, String)>,
+                 files: usize,
+                 ins: usize,
+                 del: usize| {
+        if let Some((sha, author, email, date, subject, body)) = header {
+            let full_msg = if body.trim().is_empty() {
+                subject.clone()
+            } else {
+                format!("{subject}\n\n{body}")
+            };
+            let pr_number = GitResolver::extract_pr_number(&full_msg);
+            let intent = GitResolver::extract_intent_summary(&subject);
+            commits.push(RelatedCommit {
+                commit: sha,
+                author,
+                author_email: email,
+                date,
+                message: full_msg,
+                facts: CommitFacts {
+                    files_changed: files,
+                    insertions: ins,
+                    deletions: del,
+                },
+                inference: CommitInference {
+                    pr_number,
+                    intent_summary: intent,
+                },
+            });
+        }
+    };
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("COMMIT\0") {
+            flush(&mut commits, cur_header.take(), cur_files, cur_ins, cur_del);
+            cur_files = 0;
+            cur_ins = 0;
+            cur_del = 0;
+            let parts: Vec<&str> = rest.split('\0').collect();
+            if parts.len() >= 6 {
+                cur_header = Some((
+                    parts[0].to_string(),
+                    parts[1].to_string(),
+                    parts[2].to_string(),
+                    parts[3].to_string(),
+                    parts[4].to_string(),
+                    parts[5].to_string(),
+                ));
+            }
+        } else {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                cur_files += 1;
+                if let Ok(i) = parts[0].parse::<usize>() {
+                    cur_ins += i;
+                }
+                if let Ok(d) = parts[1].parse::<usize>() {
+                    cur_del += d;
+                }
+            }
+        }
+    }
+    flush(&mut commits, cur_header.take(), cur_files, cur_ins, cur_del);
+    RelatedCommitsResult {
+        query: query.map(str::to_string),
+        path: path.map(str::to_string),
+        symbol: symbol.map(str::to_string),
+        total_commits: commits.len(),
+        commits,
+    }
+}
+
+#[cfg(test)]
+mod audit_review_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_AUTHOR_NAME", "review")
+            .env("GIT_AUTHOR_EMAIL", "review@example.test")
+            .env("GIT_COMMITTER_NAME", "review")
+            .env("GIT_COMMITTER_EMAIL", "review@example.test")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn audit_review_symbol_history_finds_body_only_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        std::fs::write(
+            dir.path().join("a.js"),
+            "function Foo() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-qm", "first"]);
+        std::fs::write(
+            dir.path().join("a.js"),
+            "function Foo() {\n  return 2;\n}\n",
+        )
+        .unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-qm", "second"]);
+        std::fs::write(dir.path().join("notes.txt"), "unrelated\n").unwrap();
+        git(dir.path(), &["add", "."]);
+        git(
+            dir.path(),
+            &["commit", "-qm", "mentions Foo in the message only"],
+        );
+
+        let resolver = GitResolver::new(dir.path(), GitIntelligenceConfig::default()).unwrap();
+        let result = resolver
+            .related_commits(None, Some("a.js"), Some("Foo"), None)
+            .unwrap();
+        let messages: Vec<&str> = result
+            .commits
+            .iter()
+            .map(|commit| commit.message.as_str())
+            .collect();
+        assert!(
+            messages.iter().any(|message| message.contains("second")),
+            "{messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("message only")),
+            "{messages:?}"
+        );
+
+        let symbol_only = resolver
+            .related_commits(None, None, Some("Foo"), None)
+            .unwrap();
+        assert!(
+            symbol_only
+                .commits
+                .iter()
+                .any(|commit| commit.message.contains("second")),
+            "{:?}",
+            symbol_only
+                .commits
+                .iter()
+                .map(|commit| commit.message.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
 }

@@ -170,7 +170,13 @@ impl ContextVmRuntime {
         let recorded = self.events.read().unwrap_or_else(|e| e.into_inner());
         recorded.len() <= events.len()
             && recorded.iter().zip(events).all(|(a, b)| {
-                a.source_ref == b.source_ref && a.content_hash == b.content_hash && a.seq == b.seq
+                // Role and provenance decide whether an event can state a goal,
+                // so a same-content event that changed either is a different one.
+                a.source_ref == b.source_ref
+                    && a.content_hash == b.content_hash
+                    && a.seq == b.seq
+                    && a.kind == b.kind
+                    && a.provenance_kind == b.provenance_kind
             })
     }
 
@@ -1113,6 +1119,37 @@ mod persistence_tests {
             previous = Some(image.messages);
         }
         changes
+    }
+
+    #[test]
+    fn audit_wp02_b026_a_role_change_invalidates_the_recorded_prefix() {
+        let as_user = vec![ChatMessage::text("user", "build the parser")];
+        let as_assistant = vec![ChatMessage::text("assistant", "build the parser")];
+        let (user_events, assistant_events) = (
+            events_from_messages(&as_user),
+            events_from_messages(&as_assistant),
+        );
+        // Same source ref, hash and seq: only role and provenance differ.
+        assert_eq!(user_events[0].source_ref, assistant_events[0].source_ref);
+        assert_eq!(
+            user_events[0].content_hash,
+            assistant_events[0].content_hash
+        );
+
+        let vm = vm();
+        vm.append_delta(&user_events).unwrap();
+        assert_eq!(goals(&vm), ["build the parser"]);
+        // Identical history, and the same history with a newer event, stay reusable.
+        assert!(vm.continues(&user_events));
+        let mut longer = as_user.clone();
+        longer.push(ChatMessage::text("user", "and add tests"));
+        assert!(vm.continues(&events_from_messages(&longer)));
+        // The prior user event turned into an assistant event: not a continuation.
+        assert!(!vm.continues(&assistant_events));
+
+        // Recompiling from the changed history drops the old user goal.
+        vm.rebuild_from_events(&assistant_events).unwrap();
+        assert!(goals(&vm).is_empty(), "{:?}", goals(&vm));
     }
 
     #[test]

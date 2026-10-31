@@ -1816,7 +1816,11 @@ fn delayed_response_loss_is_not_no_effect_or_an_automatic_retry() {
         let result = client.call_tool("counted_effect", json!({}));
         assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
         if lose_response {
-            assert!(matches!(result, Err(davinci_mcp::Error::Transport(_))));
+            // The effect ran, but its reply was lost: the outcome is unknown,
+            // not a plain transport failure the caller could safely retry.
+            let error = result.expect_err("a lost reply cannot become a result");
+            assert!(error.may_have_run(), "{error}");
+            assert!(!error.definitely_not_delivered(), "{error}");
         } else {
             assert_eq!(result.unwrap().text(), "fixture effect recorded");
         }

@@ -228,10 +228,11 @@ impl TestImpact {
         if let Some(path) = request.path.take() {
             request.paths.push(path);
         }
-        if request.paths.len() + request.symbol_ids.len() > 64
+        if request.paths.len() > 64
+            || request.symbol_ids.len() > 64
             || !(1..=100).contains(&request.limit)
         {
-            return Err("query_invalid: maximum 64 inputs and limit 1..100".into());
+            return Err("query_invalid: maximum 64 paths and 64 symbolIds, limit 1..100".into());
         }
         if request.paths.is_empty() && request.symbol_ids.is_empty() {
             return Err("query_invalid: paths or symbolIds required".into());
@@ -239,7 +240,7 @@ impl TestImpact {
         if request
             .symbol_ids
             .iter()
-            .any(|id| id.is_empty() || id.len() > 4096)
+            .any(|id| id.is_empty() || id.chars().count() > 4096)
         {
             return Err("query_invalid: symbolId length".into());
         }

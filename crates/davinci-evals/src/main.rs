@@ -65,7 +65,14 @@ pub enum TopLevelCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum CorpusCommand {
+    /// Verify that the success-scored corpus is fully valid and offline.
     Verify,
+    /// Print a machine-readable validity report for every corpus.
+    Validity {
+        /// Also write the JSON report to this path.
+        #[arg(long)]
+        report: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -269,6 +276,7 @@ struct CompetitorComparisonArtifact {
 fn load_behavior_suite(name: &str) -> Result<Vec<BehaviorScenario>, String> {
     match name {
         "core-200" => davinci_evals::behavior::load_core_200_corpus(),
+        "verified-core" => davinci_evals::behavior::load_verified_core_corpus(),
         "debugging-hard" => davinci_evals::behavior::load_debugging_hard_corpus(),
         "gpt6-astra" | "gpt6-sol" | "gpt6-luna" => Ok(
             davinci_evals::behavior::load_regression_suite(name)?
@@ -277,7 +285,7 @@ fn load_behavior_suite(name: &str) -> Result<Vec<BehaviorScenario>, String> {
                 .collect(),
         ),
         _ => Err(format!(
-            "unknown behavior suite '{name}'; valid suites: core-200, debugging-hard, gpt6-astra, gpt6-sol, gpt6-luna"
+            "unknown behavior suite '{name}'; valid suites: core-200, verified-core, debugging-hard, gpt6-astra, gpt6-sol, gpt6-luna"
         )),
     }
 }
@@ -1515,8 +1523,50 @@ fn dispatch(command: TopLevelCommand) -> Result<String, String> {
         TopLevelCommand::Corpus {
             command: CorpusCommand::Verify,
         } => {
-            let scenarios = davinci_evals::behavior::load_core_200_corpus()?;
+            let scenarios = davinci_evals::behavior::load_verified_core_corpus()?;
+            let report = davinci_evals::behavior::CorpusValidityReport::build(
+                "verified-core",
+                &scenarios,
+                &davinci_evals::behavior::default_fixture_root(),
+            );
+            report.require_all_verified()?;
             Ok(format!("verified {} behavior scenarios", scenarios.len()))
+        }
+        TopLevelCommand::Corpus {
+            command: CorpusCommand::Validity { report },
+        } => {
+            let fixture_root = davinci_evals::behavior::default_fixture_root();
+            let mut corpora = Vec::new();
+            for (name, scenarios) in [
+                (
+                    "verified-core",
+                    davinci_evals::behavior::load_verified_core_corpus()?,
+                ),
+                ("core-200", davinci_evals::behavior::load_core_200_corpus()?),
+            ] {
+                corpora.push(davinci_evals::behavior::CorpusValidityReport::build(
+                    name,
+                    &scenarios,
+                    &fixture_root,
+                ));
+            }
+            let json = serde_json::to_string_pretty(&serde_json::json!({
+                "corpora": corpora,
+            }))
+            .map_err(|error| format!("failed to encode validity report: {error}"))?;
+            if let Some(path) = report {
+                if let Some(parent) = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                {
+                    std::fs::create_dir_all(parent).map_err(|error| {
+                        format!("failed to create {}: {error}", parent.display())
+                    })?;
+                }
+                std::fs::write(&path, &json)
+                    .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+            }
+            Ok(json)
         }
         TopLevelCommand::Behavior { command } => match command {
             BehaviorCommand::Run(args) => run_behavior_once(args),
@@ -1843,6 +1893,31 @@ mod tests {
             command: CorpusCommand::Verify,
         })
         .unwrap();
-        assert_eq!(output, "verified 200 behavior scenarios");
+        assert_eq!(output, "verified 6 behavior scenarios");
+    }
+
+    #[test]
+    fn corpus_validity_report_excludes_unscorable_scenarios() {
+        let output = dispatch(TopLevelCommand::Corpus {
+            command: CorpusCommand::Validity { report: None },
+        })
+        .unwrap();
+        let report: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let corpora = report["corpora"].as_array().unwrap();
+        assert_eq!(corpora.len(), 2);
+
+        let verified = &corpora[0];
+        assert_eq!(verified["corpus"], "verified-core");
+        assert_eq!(verified["invalid_scenarios"], 0);
+        assert_eq!(verified["structural_only_scenarios"], 0);
+        assert_eq!(
+            verified["success_scored_scenarios"],
+            verified["total_scenarios"]
+        );
+
+        let legacy = &corpora[1];
+        assert_eq!(legacy["corpus"], "core-200");
+        assert_eq!(legacy["total_scenarios"], 200);
+        assert_eq!(legacy["success_scored_scenarios"], 0);
     }
 }

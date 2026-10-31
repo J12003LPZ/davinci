@@ -1,6 +1,7 @@
 //! The transcript is the interface (design.md §1). No bubbles, no timestamps,
 //! user turns retain the prompt glyph, replies start with a bullet, and tool
-//! results hang from an indented elbow. Prose keeps a readable measure.
+//! results hang from an indented elbow. Prose wraps to the window, as in
+//! Claude Code; only reasoning keeps a readable measure.
 //!
 //! Mirrors `docs/ui/davinci_tui/lib/davinci/views/transcript.ex`.
 
@@ -9,7 +10,8 @@ use ratatui::text::{Line, Span};
 
 use super::{markdown, studio};
 use crate::davinci::model::{
-    Entry, HunkKind, Model, StampSlot, SubagentRow, SubagentRowState, NOTICE_INSTRUMENT,
+    is_shell_instrument, Entry, HunkKind, Model, StampSlot, SubagentRow, SubagentRowState,
+    NOTICE_INSTRUMENT,
 };
 use crate::davinci::theme::{glyph, State, Theme};
 use crate::davinci::ui::{
@@ -383,13 +385,30 @@ enum Explore {
     Search,
     List,
     Shell,
+    Edit,
 }
 
-fn explore_kind(instrument: &str, target: &str) -> Option<Explore> {
-    if instrument == "manus" {
+/// One call in a collapsed group: its kind, target, whether it has ended, and
+/// for an edit the lines it added and removed.
+type Call<'a> = (Explore, &'a str, bool, Option<(u32, u32)>);
+
+/// `+31 -8` as `(31, 8)`: what an edit that came back without a diff says.
+fn edit_counts(summary: &str) -> Option<(u32, u32)> {
+    let (adds, dels) = summary.split_once(' ')?;
+    Some((
+        adds.strip_prefix('+')?.parse().ok()?,
+        dels.strip_prefix('-')?.parse().ok()?,
+    ))
+}
+
+fn explore_kind(instrument: &str, target: &str, summary: Option<&str>) -> Option<Explore> {
+    if is_shell_instrument(instrument) {
         return Some(Explore::Shell);
     }
     match target.split_once(' ').map_or(target, |(verb, _)| verb) {
+        // An edit with a diff draws its own block; one that came back with
+        // only its counts folds into a line.
+        "edit" => summary.and_then(edit_counts).map(|_| Explore::Edit),
         "read" => Some(Explore::Read),
         "search" | "grep" | "find" => Some(Explore::Search),
         "list" | "ls" => Some(Explore::List),
@@ -425,7 +444,7 @@ fn visit_rendered_blocks<'a>(
     let mut index = 0usize;
     while index < entries.len() {
         if !model.show_tool_output {
-            let mut calls: Vec<(Explore, &str, bool)> = Vec::new();
+            let mut calls: Vec<Call> = Vec::new();
             let mut cursor = index;
             let mut consumed = index;
             while cursor < entries.len() {
@@ -438,9 +457,11 @@ fn visit_rendered_blocks<'a>(
                                     state,
                                     instrument,
                                     target,
+                                    summary,
                                     ..
                                 }) if !matches!(state, State::Failed | State::Attention)
-                                    && explore_kind(instrument, target).is_some()
+                                    && explore_kind(instrument, target, summary.as_deref())
+                                        .is_some()
                             );
                         if !next_groupable {
                             break;
@@ -453,12 +474,14 @@ fn visit_rendered_blocks<'a>(
                         instrument,
                         target,
                         duration,
+                        summary,
                         ..
                     } if !matches!(state, State::Failed | State::Attention)
                         && !live_shell(model, base, cursor) =>
                     {
-                        if let Some(kind) = explore_kind(instrument, target) {
-                            calls.push((kind, target.as_str(), duration.is_some()));
+                        if let Some(kind) = explore_kind(instrument, target, summary.as_deref()) {
+                            let counts = summary.as_deref().and_then(edit_counts);
+                            calls.push((kind, target.as_str(), duration.is_some(), counts));
                             cursor += 1;
                             consumed = cursor;
                         } else {
@@ -538,20 +561,19 @@ fn live_shell(model: &Model, base: Option<usize>, at: usize) -> bool {
         && base.is_some_and(|base| model.shell_runs.iter().any(|run| run.index == base + at))
 }
 
-/// The command under its elbow, wrapped to the window and cut to
-/// [`SHELL_COMMAND_ROWS`] rows. A cut ends in `…` and says how many lines the
-/// command has, so a pasted script never takes over the screen.
+/// The command under its elbow, one row per line of it clipped to the window
+/// and cut to [`SHELL_COMMAND_ROWS`] rows. A cut ends in `…` and says how many
+/// lines the command has, so a pasted script never takes over the screen.
 fn command_rows(command: &str, width: u16, ink: Color, quiet: Color) -> Vec<Line<'static>> {
     let lead = u16::try_from(ELBOW.chars().count()).unwrap_or(5);
     let room = width.saturating_sub(lead).max(1);
     let mut wrapped: Vec<String> = Vec::new();
     for (n, line) in command.lines().enumerate() {
-        let text = if n == 0 {
+        wrapped.push(if n == 0 {
             format!("$ {line}")
         } else {
             line.to_string()
-        };
-        wrapped.extend(wrap(&text, room));
+        });
     }
     if wrapped.is_empty() {
         wrapped.push("$".to_string());
@@ -589,10 +611,21 @@ fn command_rows(command: &str, width: u16, ink: Color, quiet: Color) -> Vec<Line
         .collect()
 }
 
-/// A shell command in flight, as Claude Code draws it: one header for all the
-/// commands running (`Running 2 shell commands · 1m 21s…`, the oldest one's
-/// clock), then each command under an elbow, clipped to a few lines. Only the
-/// oldest run draws the header, so parallel calls read as one block.
+/// The bullet of a row still running: it blinks on the shared clock, and
+/// stays lit under reduced motion.
+fn live_bullet(model: &Model) -> &'static str {
+    if model.animate && (model.tick / 2) % 2 == 1 {
+        "  "
+    } else {
+        "● "
+    }
+}
+
+/// A shell command in flight, as Claude Code draws it: `● Running <command>…`
+/// clipped to the window, then the command under an elbow. Several at once
+/// read as one header (`Running 2 shell commands · 1m 21s…`, the oldest one's
+/// clock) with each command under its own elbow, clipped to a few lines. Only
+/// the oldest run draws the header, so parallel calls read as one block.
 fn shell_running_lines(model: &Model, at: usize, width: u16) -> Option<Vec<Line<'static>>> {
     if !model.running {
         return None;
@@ -604,21 +637,23 @@ fn shell_running_lines(model: &Model, at: usize, width: u16) -> Option<Vec<Line<
     let mut rows = Vec::new();
     if position == 0 {
         let count = model.shell_runs.len();
-        let elapsed = duration_words(run.started.elapsed().as_secs());
-        rows.push(Line::from(truncate_run(
-            vec![
-                span_strong(
-                    format!(
-                        "Running {count} shell command{}",
-                        if count == 1 { "" } else { "s" }
-                    ),
-                    cc.text,
-                    th,
-                ),
-                span(format!(" · {elapsed}…"), cc.inactive),
-            ],
-            width,
-        )));
+        let mut header = vec![span(live_bullet(model), cc.inactive)];
+        if count == 1 {
+            let first = run.command.lines().next().unwrap_or("").trim();
+            header.push(span(
+                clip_ellipsis(&format!("Running {first}…"), width.saturating_sub(2)),
+                th.text,
+            ));
+        } else {
+            let elapsed = duration_words(run.started.elapsed().as_secs());
+            header.push(span_strong(
+                format!("Running {count} shell commands"),
+                cc.text,
+                th,
+            ));
+            header.push(span(format!(" · {elapsed}…"), cc.inactive));
+        }
+        rows.push(Line::from(truncate_run(header, width)));
     }
     rows.extend(command_rows(&run.command, width, cc.text, cc.inactive));
     Some(rows)
@@ -660,21 +695,16 @@ impl FlowBlock<'_> {
                 let safe = crate::davinci::sanitize::terminal_safe(&text[..cut]);
                 let mut index = 0;
                 let mut last = None;
-                markdown::visit_lines(
-                    &model.theme,
-                    &safe,
-                    MEASURE.min(width.saturating_sub(2)),
-                    &mut |row| {
-                        let mut spans =
-                            vec![span(if index == 0 { "● " } else { "  " }, model.theme.text)];
-                        spans.extend(row.spans);
-                        let row = Line::from(truncate_run(spans, width));
-                        if let Some(previous) = last.replace(row) {
-                            emit(previous);
-                        }
-                        index += 1;
-                    },
-                );
+                markdown::visit_lines(&model.theme, &safe, width.saturating_sub(2), &mut |row| {
+                    let mut spans =
+                        vec![span(if index == 0 { "● " } else { "  " }, model.theme.text)];
+                    spans.extend(row.spans);
+                    let row = Line::from(truncate_run(spans, width));
+                    if let Some(previous) = last.replace(row) {
+                        emit(previous);
+                    }
+                    index += 1;
+                });
                 let caret = reveal.is_some_and(|(at, _)| {
                     model.revealing()
                         || model.working.is_some()
@@ -699,12 +729,12 @@ impl FlowBlock<'_> {
     }
 }
 
-fn group_rows(model: &Model, calls: &[(Explore, &str, bool)], width: u16) -> Vec<Line<'static>> {
+fn group_rows(model: &Model, calls: &[Call], width: u16) -> Vec<Line<'static>> {
     let th = &model.theme;
     let cc = th.cc();
-    let running = model.running && calls.iter().any(|(_, _, done)| !done);
+    let running = model.running && calls.iter().any(|(_, _, done, _)| !done);
     let mut order: Vec<Explore> = Vec::new();
-    for (kind, _, _) in calls {
+    for (kind, ..) in calls {
         if !order.contains(kind) {
             order.push(*kind);
         }
@@ -726,6 +756,8 @@ fn group_rows(model: &Model, calls: &[(Explore, &str, bool)], width: u16) -> Vec
             (Explore::List, true) => format!("listing {n} {}", noun("directory", "directories")),
             (Explore::Shell, false) => format!("ran {n} shell {}", noun("command", "commands")),
             (Explore::Shell, true) => format!("running {n} shell {}", noun("command", "commands")),
+            (Explore::Edit, false) => format!("made {n} {}", noun("edit", "edits")),
+            (Explore::Edit, true) => format!("making {n} {}", noun("edit", "edits")),
         }
     };
     let mut sentence = order
@@ -735,7 +767,7 @@ fn group_rows(model: &Model, calls: &[(Explore, &str, bool)], width: u16) -> Vec
                 *kind,
                 calls
                     .iter()
-                    .filter(|(candidate, _, _)| candidate == kind)
+                    .filter(|(candidate, ..)| candidate == kind)
                     .count(),
             )
         })
@@ -744,19 +776,36 @@ fn group_rows(model: &Model, calls: &[(Explore, &str, bool)], width: u16) -> Vec
     if let Some(first) = sentence.get(0..1) {
         sentence = format!("{}{}", first.to_uppercase(), &sentence[1..]);
     }
+    // What the edits in the group came to: ` +30 -4`.
+    let (adds, dels) = calls
+        .iter()
+        .filter_map(|(_, _, _, counts)| *counts)
+        .fold((0, 0), |(adds, dels), (a, d)| (adds + a, dels + d));
+    let mut counts = Vec::new();
+    if adds > 0 {
+        counts.push(span(format!(" +{adds}"), cc.diff_add));
+    }
+    if dels > 0 {
+        counts.push(span(format!(" -{dels}"), cc.diff_del));
+    }
     if !running {
         let mut spans = vec![span("  ", cc.inactive)];
         spans.extend(bold_numbers(&sentence, cc.inactive));
+        spans.extend(counts);
         return vec![Line::from(truncate_run(spans, width))];
     }
-    let bullet = if (model.tick / 2) % 2 == 1 {
-        "  "
+    // A group of reads, searches and listings sits at the prose's indent; a
+    // shell command among them is what earns the running bullet.
+    let bullet = if calls.iter().any(|(kind, ..)| *kind == Explore::Shell) {
+        live_bullet(model)
     } else {
-        "● "
+        "  "
     };
     let mut spans = vec![span(bullet, cc.inactive)];
-    spans.extend(bold_numbers(&format!("{sentence}…"), th.text));
-    let (kind, target, _) = calls.last().expect("a group has a call");
+    spans.extend(bold_numbers(&sentence, th.text));
+    spans.extend(counts);
+    spans.push(span("…", th.text));
+    let (kind, target, ..) = calls.last().expect("a group has a call");
     let newest = match kind {
         Explore::Shell => format!("$ {target}"),
         _ => target
@@ -851,11 +900,16 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             if delegated && !model.show_tool_output {
                 return rows;
             }
+            // The first result row hangs from the elbow; one that follows a
+            // summary row continues under it.
+            let mut hung = true;
             if let Some(summary) = summary.as_deref().filter(|s| !s.is_empty()) {
                 rows.push(tool_result(th, summary, width));
+                hung = false;
             } else if !model.show_tool_output && *state != State::Failed {
                 if let Some(first) = output.first() {
                     rows.push(tool_result(th, first, width));
+                    hung = false;
                 }
             }
             rows.extend(output_rows(
@@ -863,6 +917,7 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
                 *state,
                 output,
                 model.show_tool_output,
+                hung,
                 width,
             ));
             rows
@@ -872,13 +927,15 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
 
         Entry::Detail(text) => vec![detail_line(th, text)],
 
+        Entry::Result { text, accent } => result_lines(th, text, accent.as_deref(), width),
+
         Entry::Failure { what, subject } => vec![failure_line(th, what, subject)],
 
         Entry::Prose(text) => {
             // Streaming deltas can mutate a prose entry after its constructor,
             // so sanitize again at the final rendering boundary.
             let safe = crate::davinci::sanitize::terminal_safe(text);
-            markdown::lines(th, safe.as_ref(), MEASURE.min(width.saturating_sub(2)))
+            markdown::lines(th, safe.as_ref(), width.saturating_sub(2))
                 .into_iter()
                 .enumerate()
                 .map(|(index, row)| {
@@ -942,6 +999,8 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
         Entry::Done {
             verb,
             seconds,
+            at,
+            shells,
             landed,
         } => {
             let cc = th.cc();
@@ -954,15 +1013,37 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             } else {
                 ("✻", 0.0)
             };
+            let lead = format!("{glyph} ");
+            let room = width.saturating_sub(run_width(&[span(lead.clone(), cc.inactive)]));
             vec![Line::from(vec![
-                span(format!("{glyph} "), mix(cc.inactive, cc.claude, warmth)),
+                span(lead, mix(cc.inactive, cc.claude, warmth)),
                 span(
-                    format!("{verb} for {}", duration_words(*seconds)),
+                    done_text(verb, *seconds, at.as_deref(), *shells, room),
                     mix(cc.inactive, cc.text, warmth),
                 ),
             ])]
         }
     }
+}
+
+/// `Worked for 59s · done 10:03 PM · 1 shell still running`, fitted to `max`
+/// cells: trailing ` · …` facts drop first, then what is left is clipped.
+fn done_text(verb: &str, seconds: u64, at: Option<&str>, shells: usize, max: u16) -> String {
+    let mut facts = vec![format!("{verb} for {}", duration_words(seconds))];
+    if let Some(at) = at {
+        facts.push(format!("done {at}"));
+    }
+    match shells {
+        0 => {}
+        1 => facts.push("1 shell still running".to_string()),
+        n => facts.push(format!("{n} shells still running")),
+    }
+    while facts.len() > 1
+        && unicode_width::UnicodeWidthStr::width(facts.join(" · ").as_str()) > usize::from(max)
+    {
+        facts.pop();
+    }
+    clip_ellipsis(&facts.join(" · "), max)
 }
 
 /// The ink a tool name rests at while its light sweeps: the theme's text,
@@ -1214,11 +1295,68 @@ fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'
 fn tool_result(theme: &Theme, text: &str, width: u16) -> Line<'static> {
     let cc = theme.cc();
     let mut spans = vec![span(ELBOW, cc.inactive)];
-    spans.extend(bold_numbers(
+    spans.extend(count_spans(
         &clip_ellipsis(text, width.saturating_sub(5)),
-        theme.text,
+        theme,
     ));
     Line::from(truncate_run(spans, width))
+}
+
+/// A result's words in the normal ink with bold numbers; a `+N` or `-N`
+/// word takes the diff's green or red.
+fn count_spans(text: &str, theme: &Theme) -> Vec<Span<'static>> {
+    let cc = theme.cc();
+    let mut out = Vec::new();
+    let mut plain = String::new();
+    for word in text.split_inclusive(' ') {
+        let bare = word.trim_end();
+        let counted = bare
+            .strip_prefix(['+', '-'])
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
+        if counted {
+            out.extend(bold_numbers(&std::mem::take(&mut plain), theme.text));
+            let ink = if bare.starts_with('+') {
+                cc.diff_add
+            } else {
+                cc.diff_del
+            };
+            out.push(span(bare.to_string(), ink));
+            plain.push_str(&word[bare.len()..]);
+        } else {
+            plain.push_str(word);
+        }
+    }
+    out.extend(bold_numbers(&plain, theme.text));
+    out
+}
+
+/// A line hung from the prompt above it: the elbow, then the text in the
+/// normal ink with `accent` (a model's name) in the accent ink. Long text
+/// wraps under itself.
+fn result_lines(th: &Theme, text: &str, accent: Option<&str>, width: u16) -> Vec<Line<'static>> {
+    let cc = th.cc();
+    let lead = u16::try_from(ELBOW.chars().count()).unwrap_or(5);
+    wrap(text, width.saturating_sub(lead).max(1))
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let hang = if index == 0 {
+                ELBOW.to_string()
+            } else {
+                " ".repeat(usize::from(lead))
+            };
+            let mut spans = vec![span(hang, cc.inactive)];
+            match accent.and_then(|accent| Some((accent, row.split_once(accent)?))) {
+                Some((accent, (before, after))) => {
+                    spans.push(span(before.to_string(), th.text));
+                    spans.push(span(accent.to_string(), cc.permission));
+                    spans.push(span(after.to_string(), th.text));
+                }
+                None => spans.push(span(row, th.text)),
+            }
+            Line::from(truncate_run(spans, width))
+        })
+        .collect()
 }
 
 fn user_lines(theme: &Theme, text: &str, width: u16) -> Vec<Line<'static>> {
@@ -1369,7 +1507,7 @@ fn change_summary(adds: u32, dels: u32) -> String {
     }
 }
 
-fn duration_words(seconds: u64) -> String {
+pub(super) fn duration_words(seconds: u64) -> String {
     match seconds {
         seconds if seconds < 60 => format!("{seconds}s"),
         seconds if seconds < 3600 => format!("{}m {}s", seconds / 60, seconds % 60),
@@ -1391,6 +1529,7 @@ fn output_rows(
     state: State,
     output: &[String],
     expanded: bool,
+    hung: bool,
     width: u16,
 ) -> Vec<Line<'static>> {
     let shown = if expanded {
@@ -1403,20 +1542,33 @@ fn output_rows(
     if shown == 0 || output.is_empty() {
         return Vec::new();
     }
-    let room = width.saturating_sub(6);
+    let cc = theme.cc();
+    let ink = if matches!(state, State::Failed | State::Attention) {
+        cc.error
+    } else {
+        theme.muted
+    };
+    let room = width.saturating_sub(5);
     let mut rows: Vec<Line<'static>> = output
         .iter()
         .take(shown)
-        .map(|row| detail_line(theme, &clip_ellipsis(row, room)))
+        .enumerate()
+        .map(|(index, row)| {
+            let lead = if index == 0 && hung { ELBOW } else { ELBOW_GAP };
+            Line::from(truncate_run(
+                vec![span(lead, cc.inactive), span(clip_ellipsis(row, room), ink)],
+                width,
+            ))
+        })
         .collect();
     if output.len() > shown {
-        rows.push(indent(
-            4,
+        rows.push(Line::from(truncate_run(
             vec![span(
-                format!("… {} more lines", output.len() - shown),
+                format!("{ELBOW_GAP}… {} more lines", output.len() - shown),
                 theme.border,
             )],
-        ));
+            width,
+        )));
     }
     rows
 }
@@ -1639,6 +1791,8 @@ mod tests {
         let done = Entry::Done {
             verb: "Baked".into(),
             seconds: 12,
+            at: None,
+            shells: 0,
             landed: 100,
         };
         let cc = m.theme.cc();
@@ -1981,11 +2135,11 @@ mod tests {
     }
 
     #[test]
-    fn a_running_shell_command_shows_a_header_with_its_clock_and_its_command() {
+    fn a_running_shell_command_shows_its_headline_and_the_command_under_an_elbow() {
         let m = shell_model(&["cargo test -p davinci-tui"]);
         let rows = shell_rows(&m);
-        assert_eq!(rows[0], "Running 1 shell command · 1m 21s…", "{rows:?}");
-        assert!(rows[1].contains("⎿") && rows[1].ends_with("$ cargo test -p davinci-tui"));
+        assert_eq!(rows[0], "● Running cargo test -p davinci-tui…", "{rows:?}");
+        assert_eq!(rows[1], "  ⎿ \u{a0}$ cargo test -p davinci-tui", "{rows:?}");
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(!rows.iter().any(|row| row.contains("Shell(")));
     }
@@ -2010,7 +2164,7 @@ mod tests {
     }
 
     #[test]
-    fn one_very_long_line_wraps_to_the_window_and_is_cut_with_an_ellipsis() {
+    fn one_very_long_line_is_clipped_to_the_window_with_an_ellipsis() {
         let command = format!(
             "cd /c/Users/x && {}",
             "grep -n pattern file.rs; ".repeat(40)
@@ -2038,8 +2192,11 @@ mod tests {
     #[test]
     fn parallel_commands_share_one_header_that_counts_them() {
         let rows = shell_rows(&shell_model(&["sleep 1", "sleep 2"]));
-        assert_eq!(rows.iter().filter(|r| r.starts_with("Running")).count(), 1);
-        assert!(rows[0].starts_with("Running 2 shell commands"), "{rows:?}");
+        assert_eq!(rows.iter().filter(|r| r.contains("Running")).count(), 1);
+        assert!(
+            rows[0].starts_with("● Running 2 shell commands · 1m 21s…"),
+            "{rows:?}"
+        );
         assert!(rows.iter().any(|r| r.ends_with("$ sleep 2")), "{rows:?}");
     }
 
@@ -2047,10 +2204,10 @@ mod tests {
     fn a_finished_or_idle_shell_call_goes_back_to_its_tool_line() {
         let mut m = shell_model(&["ls"]);
         m.running = false;
-        assert!(!shell_rows(&m).iter().any(|r| r.starts_with("Running")));
+        assert!(!shell_rows(&m).iter().any(|r| r.contains("Running")));
         let mut m = shell_model(&["ls"]);
         m.transcript[0] = Entry::tool(State::Done, "manus", "ls", Some("1s"));
-        assert!(!shell_rows(&m).iter().any(|r| r.starts_with("Running")));
+        assert!(!shell_rows(&m).iter().any(|r| r.contains("Running")));
     }
 
     #[test]
@@ -2431,22 +2588,89 @@ mod tests {
     }
 
     #[test]
-    fn prose_wraps_at_the_measure_however_wide_the_terminal() {
+    fn prose_wraps_to_the_window_minus_the_bullet_indent() {
         let m = model(200);
-        let entry = Entry::prose(
-            "A request enters davinci-agent as a Turn, is planned, then dispatched to the \
-             provider adapter. Session state is written after every tool call, so an \
-             interrupt never loses the transcript.",
-        );
+        let words = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu ".repeat(8);
+        let entry = Entry::prose(words.trim());
         for width in [80u16, 100, 160, 200] {
-            for row in lines(&m, std::slice::from_ref(&entry), width) {
-                let drawn = text(&row);
-                assert!(
-                    UnicodeWidthStr::width(drawn.as_str()) <= MEASURE as usize + 2,
-                    "prose exceeded the measure at width {width}: {drawn:?}"
-                );
-            }
+            let rows: Vec<String> = lines(&m, std::slice::from_ref(&entry), width)
+                .iter()
+                .map(text)
+                .collect();
+            let widths: Vec<usize> = rows
+                .iter()
+                .map(|row| UnicodeWidthStr::width(row.as_str()))
+                .collect();
+            assert!(
+                widths.iter().all(|w| *w <= width as usize),
+                "{width}: {rows:?}"
+            );
+            // Every row but the last is filled to within one word of the edge,
+            // which the old 74-cell measure never allowed past 80 columns.
+            let (last, full) = widths.split_last().unwrap();
+            assert!(
+                full.iter().all(|w| *w + 8 >= width as usize),
+                "{width}: {rows:?}"
+            );
+            assert!(*last > 0);
+            assert!(rows[0].starts_with("● "), "{rows:?}");
+            assert!(
+                rows[1..].iter().all(|row| row.starts_with("  ")),
+                "{rows:?}"
+            );
         }
+    }
+
+    #[test]
+    fn markdown_blocks_use_the_full_width_too() {
+        let m = model(160);
+        let rule = "x".repeat(120);
+        let half = "y".repeat(70);
+        let entry = Entry::prose(&format!(
+            "```\n{rule}\n```\n\n| a | b |\n|---|---|\n| {rule} | 2 |\n\n- {half} {half}"
+        ));
+        let rows: Vec<String> = lines(&m, &[entry], 160).iter().map(text).collect();
+        assert!(rows.iter().any(|row| row.contains(&rule)), "{rows:?}");
+        let list = rows
+            .iter()
+            .find(|row| row.contains("- y"))
+            .unwrap_or_else(|| panic!("{rows:?}"));
+        assert!(list.chars().count() > 140, "{list:?}");
+    }
+
+    #[test]
+    fn inline_code_has_no_backticks_and_takes_the_lavender() {
+        let m = model(100);
+        let rows = lines(
+            &m,
+            &[Entry::prose(
+                "needs `set_permission_mode` and **bold**\n\n- one\n- two",
+            )],
+            100,
+        );
+        let drawn: Vec<String> = rows.iter().map(text).collect();
+        assert_eq!(
+            drawn,
+            [
+                "● needs set_permission_mode and bold",
+                "  ",
+                "  - one",
+                "  - two"
+            ]
+        );
+        let code = rows[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "set_permission_mode")
+            .expect("code span");
+        assert_eq!(code.style.fg, Some(m.theme.cc().permission));
+        let bold = rows[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "bold")
+            .unwrap();
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(rows[0].spans[0].style.fg, Some(m.theme.text));
     }
 
     #[test]
@@ -2494,6 +2718,205 @@ mod tests {
         let last = text(&rows[rows.len() - 1]);
         assert!(last.contains("… 8 more lines"), "{last}");
         assert!(text(&rows[1]).contains("line 0"));
+    }
+
+    #[test]
+    fn a_failed_call_is_a_red_dot_name_and_its_error_under_the_elbow() {
+        let m = model(100);
+        let cc = m.theme.cc();
+        let entry = Entry::tool(
+            State::Failed,
+            "manus",
+            "du -h -d 2 . 2>/dev/null | sort -h | tail -30",
+            Some("60.00s"),
+        )
+        .with_output("Command timed out after 60 seconds");
+        let rows = lines(&m, &[entry], 100);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            text(&rows[0]),
+            "● Bash(du -h -d 2 . 2>/dev/null | sort -h | tail -30)"
+        );
+        assert_eq!(rows[0].spans[0].style.fg, Some(cc.error));
+        assert_eq!(
+            text(&rows[1]),
+            "  ⎿ \u{a0}Command timed out after 60 seconds"
+        );
+        assert_eq!(rows[1].spans[0].style.fg, Some(cc.inactive));
+        assert_eq!(rows[1].spans[1].style.fg, Some(cc.error));
+    }
+
+    #[test]
+    fn a_powershell_call_is_named_powershell_and_a_finished_one_is_green() {
+        let mut m = model(100);
+        m.show_tool_output = true;
+        let cc = m.theme.cc();
+        let entry = Entry::tool(
+            State::Done,
+            crate::davinci::model::POWERSHELL_INSTRUMENT,
+            "Get-ChildItem",
+            Some("0.10s"),
+        )
+        .with_output("a.txt\nb.txt");
+        let rows = lines(&m, &[entry], 100);
+        let drawn: Vec<String> = rows.iter().map(text).collect();
+        assert_eq!(
+            drawn,
+            [
+                "● PowerShell(Get-ChildItem)",
+                "  ⎿ \u{a0}a.txt",
+                "     b.txt"
+            ]
+        );
+        assert_eq!(rows[0].spans[0].style.fg, Some(cc.success));
+        assert_eq!(rows[1].spans[1].style.fg, Some(m.theme.muted));
+    }
+
+    #[test]
+    fn edits_that_came_back_with_counts_fold_into_one_summary() {
+        let m = model(100);
+        let cc = m.theme.cc();
+        let edit = |path: &str, counts: &str| {
+            Entry::tool(
+                State::Delta,
+                "instrumenta",
+                &format!("edit {path}"),
+                Some("0.02s"),
+            )
+            .summarised(counts)
+        };
+        let rows = lines(&m, &[edit("a.md", "+30 -0")], 100);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(text(&rows[0]), "  Made 1 edit +30");
+        assert_eq!(rows[0].spans[0].style.fg, Some(cc.inactive));
+        let plus = rows[0]
+            .spans
+            .iter()
+            .find(|span| span.content == " +30")
+            .unwrap();
+        assert_eq!(plus.style.fg, Some(cc.diff_add));
+
+        let two = lines(
+            &m,
+            &[edit("a.md", "+30 -2"), Entry::Gap, edit("b.md", "+1 -4")],
+            100,
+        );
+        assert_eq!(two.len(), 1);
+        assert_eq!(text(&two[0]), "  Made 2 edits +31 -6");
+        let minus = two[0]
+            .spans
+            .iter()
+            .find(|span| span.content == " -6")
+            .unwrap();
+        assert_eq!(minus.style.fg, Some(cc.diff_del));
+    }
+
+    #[test]
+    fn an_edit_without_counts_keeps_its_own_row() {
+        let m = model(100);
+        let rows = lines(
+            &m,
+            &[Entry::tool(
+                State::Delta,
+                "instrumenta",
+                "edit a.md",
+                Some("0.02s"),
+            )],
+            100,
+        );
+        assert_eq!(text(&rows[0]), "● Update(a.md)");
+    }
+
+    #[test]
+    fn a_result_summary_colours_its_plus_and_minus_counts() {
+        let m = model(100);
+        let cc = m.theme.cc();
+        let entry = Entry::tool(State::Done, "instrumenta", "write a.md", Some("0.1s"))
+            .summarised("12 lines +5 -3");
+        let rows = lines(&m, &[entry], 100);
+        assert_eq!(text(&rows[1]), "  ⎿ \u{a0}12 lines +5 -3");
+        let colour = |word: &str| {
+            rows[1]
+                .spans
+                .iter()
+                .find(|span| span.content == word)
+                .and_then(|span| span.style.fg)
+        };
+        assert_eq!(colour("+5"), Some(cc.diff_add));
+        assert_eq!(colour("-3"), Some(cc.diff_del));
+    }
+
+    #[test]
+    fn count_spans_survives_words_that_start_with_a_multibyte_char() {
+        let m = model(100);
+        let cc = m.theme.cc();
+        let spans = count_spans("2 lines · running é5 中文 +12 -3", &m.theme);
+        let joined: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(joined, "2 lines · running é5 中文 +12 -3");
+        let coloured: Vec<&str> = spans
+            .iter()
+            .filter(|span| span.style.fg == Some(cc.diff_add) || span.style.fg == Some(cc.diff_del))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(coloured, ["+12", "-3"]);
+    }
+
+    #[test]
+    fn the_turn_complete_line_fits_narrow_widths() {
+        let mut m = model(100);
+        m.animate = false;
+        let done = Entry::Done {
+            verb: "Worked".into(),
+            seconds: 59,
+            at: Some("10:03 PM".into()),
+            shells: 1,
+            landed: 0,
+        };
+        for (width, expect) in [
+            (
+                60,
+                "✻ Worked for 59s · done 10:03 PM · 1 shell still running",
+            ),
+            (40, "✻ Worked for 59s · done 10:03 PM"),
+            (20, "✻ Worked for 59s"),
+            (10, "✻ Worked …"),
+        ] {
+            let row = &lines(&m, std::slice::from_ref(&done), width)[0];
+            assert!(run_width(&row.spans) <= width, "{width}: {}", text(row));
+            assert_eq!(text(row), expect, "width {width}");
+        }
+    }
+
+    #[test]
+    fn the_turn_complete_line_says_when_and_what_still_runs() {
+        let mut m = model(100);
+        m.animate = false;
+        let cc = m.theme.cc();
+        let done = |at: Option<&str>, shells: usize| Entry::Done {
+            verb: "Worked".into(),
+            seconds: 59,
+            at: at.map(str::to_string),
+            shells,
+            landed: 0,
+        };
+        let row = &lines(&m, &[done(Some("10:03 PM"), 1)], 100)[0];
+        assert_eq!(
+            text(row),
+            "✻ Worked for 59s · done 10:03 PM · 1 shell still running"
+        );
+        assert!(row
+            .spans
+            .iter()
+            .all(|span| span.style.fg == Some(cc.inactive)));
+        let row = &lines(&m, &[done(Some("9:00 AM"), 3)], 100)[0];
+        assert_eq!(
+            text(row),
+            "✻ Worked for 59s · done 9:00 AM · 3 shells still running"
+        );
+        let row = &lines(&m, &[done(Some("9:00 AM"), 0)], 100)[0];
+        assert_eq!(text(row), "✻ Worked for 59s · done 9:00 AM");
+        let row = &lines(&m, &[done(None, 0)], 100)[0];
+        assert_eq!(text(row), "✻ Worked for 59s");
     }
 
     #[test]
@@ -3011,5 +3434,203 @@ mod tests {
         assert!(split_with_tool <= 10, "the call in flight is not settled");
         m.running = false;
         assert!(settled_len(&m) > 10, "once the run ends it settles again");
+    }
+
+    fn plain(row: &Line<'_>) -> String {
+        text(row).replace('\u{a0}', " ")
+    }
+
+    /// `Update(path)` over the card of two added lines under three of
+    /// context, as the reference draws it.
+    fn update_card() -> Vec<Entry> {
+        vec![
+            Entry::tool(
+                State::Delta,
+                "instrumenta",
+                "edit crates\\davinci-tui\\src\\editor.rs",
+                Some("0.1s"),
+            ),
+            Entry::Delta {
+                path: "crates\\davinci-tui\\src\\editor.rs".into(),
+                adds: 2,
+                dels: 0,
+                hunks: vec![
+                    Hunk::at(HunkKind::Context, 1662, "    }"),
+                    Hunk::at(HunkKind::Context, 1663, ""),
+                    Hunk::at(HunkKind::Context, 1664, "    #[test]"),
+                    Hunk::at(HunkKind::Add, 1665, "    fn an_image_chip_deletes() {"),
+                    Hunk::at(
+                        HunkKind::Add,
+                        1666,
+                        "        let mut editor = Editor::new();",
+                    ),
+                ],
+            },
+        ]
+    }
+
+    #[test]
+    fn an_update_card_hangs_from_its_call_and_numbers_its_rows() {
+        let m = model(100);
+        let rows = lines(&m, &update_card(), 100);
+        let drawn: Vec<String> = rows.iter().map(plain).collect();
+        assert_eq!(drawn[0], "● Update(crates\\davinci-tui\\src\\editor.rs)");
+        assert_eq!(drawn[1], "  ⎿  Added 2 lines");
+        assert_eq!(drawn[2], "      1662      }");
+        assert_eq!(drawn[3].trim_end(), "      1663");
+        // The changed rows run on to the right edge in their background.
+        assert_eq!(
+            drawn[5].trim_end(),
+            "      1665 +    fn an_image_chip_deletes() {"
+        );
+        assert_eq!(
+            drawn[6].trim_end(),
+            "      1666 +        let mut editor = Editor::new();"
+        );
+        assert_eq!(drawn.len(), 7, "{drawn:?}");
+        assert_eq!(rows[0].spans[0].style.fg, Some(m.theme.cc().success));
+    }
+
+    #[test]
+    fn changed_rows_fill_to_the_right_edge_and_context_rows_have_no_background() {
+        let m = model(100);
+        let cc = m.theme.cc();
+        assert_eq!(cc.diff_add_bg, Color::Rgb(0x22, 0x5C, 0x2B));
+        assert_eq!(cc.diff_del_bg, Color::Rgb(0x7A, 0x29, 0x36));
+        let mut entries = update_card();
+        if let Entry::Delta { hunks, .. } = &mut entries[1] {
+            hunks.push(Hunk::at(HunkKind::Del, 1700, "    old();"));
+        }
+        let rows = lines(&m, &entries, 100);
+        let added = &rows[5];
+        assert_eq!(run_width(&added.spans), 100);
+        assert_eq!(added.spans.last().unwrap().style.bg, Some(cc.diff_add_bg));
+        let removed = &rows[7];
+        assert!(
+            plain(removed).contains("1700 -    old();"),
+            "{}",
+            plain(removed)
+        );
+        assert_eq!(removed.spans.last().unwrap().style.bg, Some(cc.diff_del_bg));
+        let context = &rows[2];
+        assert!(context.spans.iter().all(|span| span.style.bg.is_none()));
+        assert!(
+            context
+                .spans
+                .iter()
+                .any(|span| span.content.contains("1662")
+                    && span.style.add_modifier.contains(Modifier::DIM)),
+            "line numbers of context rows are dim: {context:?}"
+        );
+    }
+
+    #[test]
+    fn the_numbered_card_keeps_its_collapse_and_expand() {
+        let hunks: Vec<Hunk> = (0..12)
+            .map(|i| Hunk::at(HunkKind::Add, 10 + i, "x"))
+            .collect();
+        let entry = Entry::Delta {
+            path: "a.rs".into(),
+            adds: 12,
+            dels: 0,
+            hunks,
+        };
+        let m = model(80);
+        let rows = lines(&m, std::slice::from_ref(&entry), 80);
+        assert_eq!(rows.len(), 1 + DELTA_ROWS_COLLAPSED + 1);
+        assert!(plain(&rows[1]).contains("10 +x"), "{}", plain(&rows[1]));
+        assert!(plain(&rows[9]).contains("… 4 more rows"));
+        let mut expanded = model(80);
+        expanded.show_tool_output = true;
+        assert_eq!(lines(&expanded, &[entry], 80).len(), 13);
+    }
+
+    #[test]
+    fn a_command_result_hangs_from_its_prompt_with_the_model_in_the_accent_ink() {
+        let mut m = model(120);
+        m.transcript.push(Entry::user("/model"));
+        m.transcript.push(Entry::Gap);
+        m.transcript.push(Entry::agent("davinci"));
+        m.confirm(
+            "Set model to Opus 5.5 and saved as your default for new sessions",
+            Some("Opus 5.5"),
+        );
+        let rows = lines(&m, &m.transcript, 120);
+        assert_eq!(rows.len(), 2, "no blank row, no agent anchor: {rows:?}");
+        assert_eq!(plain(&rows[0]), "❯ /model ");
+        assert_eq!(
+            plain(&rows[1]),
+            "  ⎿  Set model to Opus 5.5 and saved as your default for new sessions"
+        );
+        let accent: Vec<_> = rows[1]
+            .spans
+            .iter()
+            .filter(|span| span.style.fg == Some(m.theme.cc().permission))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(accent, ["Opus 5.5"]);
+        assert_eq!(rows[1].spans[0].style.fg, Some(m.theme.cc().inactive));
+    }
+
+    #[test]
+    fn a_long_result_wraps_under_its_elbow_and_never_overruns() {
+        let m = model(40);
+        let entry = Entry::result(
+            "Set model to Opus 5.5 and saved as your default for new sessions",
+            Some("Opus 5.5"),
+        );
+        let rows = lines(&m, &[entry], 40);
+        assert!(rows.len() >= 2);
+        assert!(plain(&rows[0]).starts_with("  ⎿  Set model"));
+        assert!(plain(&rows[1]).starts_with("     "));
+        assert!(rows.iter().all(|row| run_width(&row.spans) <= 40));
+    }
+
+    #[test]
+    fn an_image_chip_is_one_elbow_row_under_the_prompt() {
+        let mut m = model(100);
+        m.transcript
+            .push(Entry::user("[Image #1] and [Image #2] look"));
+        m.transcript.push(Entry::Gap);
+        m.transcript.push(Entry::agent("davinci"));
+        m.attach_chips(
+            "[Image #1] and [Image #2] look",
+            &["[Image #1]".to_string(), "[Image #2]".to_string()],
+        );
+        let rows = lines(&m, &m.transcript, 100);
+        let drawn: Vec<String> = rows.iter().map(plain).collect();
+        assert_eq!(drawn[1], "  ⎿  [Image #1]");
+        assert_eq!(drawn[2], "  ⎿  [Image #2]");
+        assert_eq!(drawn[3], "");
+    }
+
+    #[test]
+    fn a_live_read_group_sits_at_the_prose_indent_and_a_finished_one_keeps_its_sentence() {
+        let mut m = model(100);
+        m.running = true;
+        m.transcript
+            .push(Entry::tool(State::Read, "instrumenta", "read a.rs", None));
+        let live: Vec<String> = lines(&m, &m.transcript, 100).iter().map(plain).collect();
+        assert_eq!(live[0], "  Reading 1 file…");
+        m.transcript[0] = Entry::tool(State::Read, "instrumenta", "read a.rs", Some("0.1s"));
+        let done: Vec<String> = lines(&m, &m.transcript, 100).iter().map(plain).collect();
+        assert_eq!(done, ["  Read 1 file"]);
+    }
+
+    #[test]
+    fn a_reply_starts_with_a_bullet_in_the_text_ink_and_wraps_two_cells_in() {
+        let m = model(40);
+        let rows = lines(
+            &m,
+            &[Entry::prose(
+                "I'll switch to the Edit tool; the Python heredoc escaping is fighting me.",
+            )],
+            40,
+        );
+        assert!(rows.len() >= 2);
+        assert!(plain(&rows[0]).starts_with("● I'll switch"));
+        assert_eq!(rows[0].spans[0].style.fg, Some(m.theme.text));
+        assert!(plain(&rows[1]).starts_with("  ") && !plain(&rows[1]).starts_with("● "));
+        assert!(!plain(&rows[1]).starts_with("   "), "{}", plain(&rows[1]));
     }
 }

@@ -37,7 +37,7 @@ fn agent_with_history(threshold: Option<CompactionThreshold>) -> Agent {
     agent.summarizer = Some(Summarizer::new(|_| {
         Ok(SummarizeResponse {
             text: "## Goal\nContinue the requests.".into(),
-            usage: Default::default(),
+            usage: Some(Default::default()),
             stop_reason: Some(StopReason::Stop),
             error_message: None,
             has_tool_call: false,

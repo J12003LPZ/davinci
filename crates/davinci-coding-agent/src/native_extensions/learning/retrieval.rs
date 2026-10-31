@@ -326,7 +326,8 @@ pub fn select_graph_skill_candidates_with_embeddings(
     struct ScoredCandidate<'a> {
         skill: &'a Skill,
         version: u64,
-        content_hash: String,
+        /// The ledger's hash; `None` hashes the body once the skill is selected.
+        content_hash: Option<String>,
         score: f32,
     }
 
@@ -345,8 +346,7 @@ pub fn select_graph_skill_candidates_with_embeddings(
         let version = record.map(|r| r.version as u64).unwrap_or(1);
         let content_hash = record
             .map(|r| r.content_hash.clone())
-            .filter(|h| !h.is_empty())
-            .unwrap_or_else(|| crate::native_extensions::vector_memory::content_hash(&skill.body));
+            .filter(|h| !h.is_empty());
 
         let role_boost = role_bias(role, &skill.name, &skill.description);
         let applicability = record
@@ -380,17 +380,23 @@ pub fn select_graph_skill_candidates_with_embeddings(
         if selected_names.contains(&c.skill.name) {
             continue;
         }
-        let est_tokens = c.skill.body.chars().count().div_ceil(4);
+        // Costed from file metadata: the body of a skill that does not make
+        // the cut is never read.
+        let est_tokens = c.skill.size_hint().div_ceil(4);
         if accumulated_tokens + est_tokens > token_cap {
             continue;
         }
         accumulated_tokens += est_tokens;
         selected_names.insert(c.skill.name.clone());
+        let body = c.skill.read_body();
+        let content_hash = c
+            .content_hash
+            .unwrap_or_else(|| crate::native_extensions::vector_memory::content_hash(&body));
         selected.push(SkillContextCandidate {
             name: c.skill.name.clone(),
             version: c.version,
-            content_hash: c.content_hash,
-            body: c.skill.body.clone(),
+            content_hash,
+            body,
             score: c.score,
             estimated_tokens: est_tokens,
         });
@@ -717,6 +723,54 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].name, "debug-rust-compact");
         assert!(selected[0].body.contains("Run the failing test"));
+    }
+
+    #[test]
+    fn graph_skill_candidates_are_costed_from_file_metadata_and_read_only_when_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        // Not UTF-8: a body read fails and answers with the tiny inline text,
+        // so only the file size can rule the oversized skill out.
+        let big_path = dir.path().join("big").join("SKILL.md");
+        std::fs::create_dir_all(big_path.parent().unwrap()).unwrap();
+        std::fs::write(&big_path, vec![0xff_u8; 8_000]).unwrap();
+        let mut oversized = fixture_skill_with_body(
+            "debug-rust-deep",
+            "Debug Rust compiler failures with deep diagnostics",
+            "/unused/SKILL.md",
+            "# Deep".into(),
+        );
+        oversized.path = big_path;
+        let small_path = dir.path().join("small").join("SKILL.md");
+        std::fs::create_dir_all(small_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &small_path,
+            "# Compact\nRun the failing test, patch, verify.",
+        )
+        .unwrap();
+        let mut compact = fixture_skill_with_body(
+            "debug-rust-compact",
+            "Debug Rust compiler failures",
+            "/unused/SKILL.md",
+            String::new(),
+        );
+        compact.path = small_path;
+
+        let selected = select_graph_skill_candidates(
+            "debug rust compiler failure",
+            Role::Writer,
+            &[oversized, compact],
+            &[],
+            2,
+            200,
+        );
+
+        assert_eq!(selected.len(), 1, "{selected:?}");
+        assert_eq!(selected[0].name, "debug-rust-compact");
+        assert!(selected[0].body.contains("Run the failing test"));
+        assert_eq!(
+            selected[0].content_hash,
+            crate::native_extensions::vector_memory::content_hash(&selected[0].body)
+        );
     }
 
     #[test]

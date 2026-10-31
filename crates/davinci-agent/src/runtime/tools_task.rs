@@ -3,10 +3,16 @@
 use serde_json::{json, Value};
 use std::str::FromStr;
 
+use davinci_protocol::json_number::as_u64_exact;
+
 use super::ids::{AgentId, TaskId};
 use super::task_store::TaskCreateRequest;
 use super::tasks::{TaskOwner, TaskRecord, TaskState};
 use crate::tools::{AgentTool, ToolContext, ToolError, ToolResult};
+
+/// Most decision prerequisites one task carries (the registry's own limit).
+const MAX_DECISION_PREREQUISITES: usize = 64;
+use crate::decisions::MAX_ID_BYTES as MAX_DECISION_ID_BYTES;
 
 pub fn task_tool_specs() -> Vec<AgentTool> {
     vec![
@@ -32,6 +38,30 @@ pub fn task_tool_specs() -> Vec<AgentTool> {
                     "assigned_to": {
                         "type": "string",
                         "description": "Optional own Agent ID (UUID) for self-assignment."
+                    },
+                    "decision_prerequisites": {
+                        "type": "array",
+                        "maxItems": MAX_DECISION_PREREQUISITES,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "decision_id": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": MAX_DECISION_ID_BYTES,
+                                    "pattern": format!("^[A-Za-z0-9_-]{{1,{MAX_DECISION_ID_BYTES}}}$"),
+                                    "description": "ID of the plan decision this task waits on: ASCII letters, digits, hyphens or underscores."
+                                },
+                                "expected_revision": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "description": "Plan revision the decision must have been verified at."
+                                }
+                            },
+                            "required": ["decision_id", "expected_revision"],
+                            "additionalProperties": false
+                        },
+                        "description": "Optional plan decisions that must be verified before this task is ready."
                     },
                     "operation_id": {
                         "type": "string",
@@ -233,20 +263,39 @@ pub fn task_create_tool(input: &Value, context: &ToolContext) -> Result<ToolResu
         let prereqs_arr = value
             .as_array()
             .ok_or_else(|| ToolError::Failed("Expected decision_prerequisites array".into()))?;
+        if prereqs_arr.len() > MAX_DECISION_PREREQUISITES {
+            return Err(ToolError::Failed(format!(
+                "decision_prerequisites allows at most {MAX_DECISION_PREREQUISITES} items"
+            )));
+        }
         let mut prereqs = Vec::new();
         for item in prereqs_arr {
             let obj = item
                 .as_object()
                 .ok_or_else(|| ToolError::Failed("Expected decision prerequisite object".into()))?;
+            if obj
+                .keys()
+                .any(|key| !matches!(key.as_str(), "decision_id" | "expected_revision"))
+            {
+                return Err(ToolError::Failed(
+                    "Unknown field in decision prerequisite".into(),
+                ));
+            }
             let decision_id = obj
                 .get("decision_id")
                 .and_then(Value::as_str)
-                .ok_or_else(|| ToolError::Failed("Missing decision_id in prerequisite".into()))?;
+                .ok_or_else(|| {
+                    ToolError::Failed("decision_id in prerequisite must be a string".into())
+                })?;
+            crate::decisions::valid_id(decision_id, "decision_id in prerequisite")
+                .map_err(ToolError::Failed)?;
             let expected_revision = obj
                 .get("expected_revision")
-                .and_then(Value::as_u64)
+                .and_then(as_u64_exact)
                 .ok_or_else(|| {
-                    ToolError::Failed("Missing expected_revision in prerequisite".into())
+                    ToolError::Failed(
+                        "expected_revision in prerequisite must be a non-negative integer".into(),
+                    )
                 })?;
             prereqs.push(super::tasks::DecisionPrerequisiteRef::new(
                 decision_id,
@@ -314,7 +363,7 @@ pub fn task_update_tool(input: &Value, context: &ToolContext) -> Result<ToolResu
     }
     let revision = input
         .get("expected_revision")
-        .and_then(Value::as_u64)
+        .and_then(as_u64_exact)
         .ok_or_else(|| ToolError::Failed("Expected unsigned integer 'expected_revision'".into()))?;
     let optional_string = |key: &str| -> Result<Option<&str>, ToolError> {
         input
@@ -567,8 +616,7 @@ pub fn task_list_tool(input: &Value, context: &ToolContext) -> Result<ToolResult
         input
             .get(key)
             .map(|value| {
-                value
-                    .as_u64()
+                as_u64_exact(value)
                     .and_then(|n| usize::try_from(n).ok())
                     .ok_or_else(|| ToolError::Failed(format!("Invalid {key}")))
             })
@@ -1260,6 +1308,309 @@ mod tests {
         assert_eq!(
             list_ready.details.as_ref().unwrap()["tasks"][0]["task_id"],
             t2_id
+        );
+    }
+
+    fn registry_revision(context: &ToolContext, id: &TaskId) -> u64 {
+        context
+            .runtime
+            .as_ref()
+            .unwrap()
+            .task_registry
+            .get_task(id)
+            .unwrap()
+            .revision
+    }
+
+    #[test]
+    fn audit_wp02_b023_integral_decimal_revisions_are_accepted_exactly() {
+        use davinci_protocol::json_number::parse_exact;
+        let context = make_test_context(RunId::new(), AgentId::new());
+        let rt = context.runtime.as_ref().unwrap();
+        let id = rt
+            .task_registry
+            .create_task(TaskRecord::new(rt.run_id, "owned").with_assigned(rt.agent_id))
+            .unwrap();
+        let before = registry_revision(&context, &id);
+        assert_eq!(before, 1);
+        // The wire text goes through the same admission the provider streams
+        // use, then the real task tool.
+        let update_task = |id: &TaskId, revision: &str| {
+            let text = format!(
+                r#"{{"operation_id":"{}","task_id":"{}","status":"completed","expected_revision":{revision}}}"#,
+                uuid::Uuid::new_v4(),
+                id
+            );
+            parse_exact(&text).map(|input| task_update_tool(&input, &context))
+        };
+        let update = |revision: &str| update_task(&id, revision);
+        // Fractions that an f64 would round onto revision 1, negatives, values
+        // beyond u64, and u64s that are not the current revision all fail before
+        // any mutation.
+        for bad in [
+            "1.5",
+            "-1.0",
+            "18446744073709551616",
+            "18446744073709551616.0",
+            "1e30",
+            "18446744073709551615",
+            "1.0000000000000001",
+            "0.9999999999999999999",
+            "1.00000000000000000000001e0",
+            "9007199254740993.0",
+            "9007199254740994.0",
+        ] {
+            if let Ok(result) = update(bad) {
+                assert!(result.is_err(), "{bad}");
+            }
+            assert_eq!(registry_revision(&context, &id), before, "{bad}");
+        }
+        // An exact integral decimal beyond 2^53 is read as that integer, not
+        // refused as "not an integer": the refusal is about the revision.
+        let error = update("9007199254740993.0")
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("unsigned integer"), "{error}");
+        let error = update("18446744073709551615.0")
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("unsigned integer"), "{error}");
+
+        update("1.0").unwrap().expect("1.0 is revision 1");
+        assert_eq!(registry_revision(&context, &id), before + 1);
+        // And an exponent form, on a second task.
+        let second = rt
+            .task_registry
+            .create_task(TaskRecord::new(rt.run_id, "second").with_assigned(rt.agent_id))
+            .unwrap();
+        assert!(update_task(&second, "1.0000000000000002").unwrap().is_err());
+        assert_eq!(registry_revision(&context, &second), 1);
+        update_task(&second, "0.1e1")
+            .unwrap()
+            .expect("0.1e1 is revision 1");
+        assert_eq!(registry_revision(&context, &second), 2);
+
+        // The same converter reads task_list integers and prerequisite revisions.
+        let listed = task_list_tool(
+            &parse_exact(r#"{"limit": 5.0, "offset": 0.0}"#).unwrap(),
+            &context,
+        )
+        .unwrap();
+        assert!(listed.details.is_some());
+        assert!(task_list_tool(&parse_exact(r#"{"limit": 5.5}"#).unwrap(), &context).is_err());
+        assert!(task_list_tool(
+            &parse_exact(r#"{"limit": 5.0000000000000001}"#).unwrap(),
+            &context
+        )
+        .is_err());
+        let create = |prerequisite: &str| {
+            let text = format!(
+                r#"{{"title":"t","operation_id":"{}","decision_prerequisites":[{prerequisite}]}}"#,
+                uuid::Uuid::new_v4()
+            );
+            task_create_tool(&parse_exact(&text).unwrap(), &context)
+        };
+        let created = create(r#"{"decision_id":"dec_1","expected_revision":2.0}"#).unwrap();
+        assert_eq!(
+            created.details.unwrap()["decision_prerequisites"][0]["expected_revision"],
+            2
+        );
+        assert!(create(r#"{"decision_id":"dec_1","expected_revision":2.5}"#).is_err());
+        assert!(
+            create(r#"{"decision_id":"dec_1","expected_revision":2.0000000000000001}"#).is_err()
+        );
+    }
+
+    /// The parts of JSON Schema the advertised `task_create` schema uses, with
+    /// the standard's semantics: `minLength`/`maxLength` count Unicode code
+    /// points (not bytes), `pattern` is an unanchored search, `minimum` and
+    /// `integer` follow the exact-integer reader, and a keyword the validator
+    /// does not implement fails the test instead of being ignored. No JSON
+    /// Schema crate is in the lockfile; adding one is a dependency decision.
+    fn schema_accepts(schema: &Value, value: &Value) -> bool {
+        const KNOWN: [&str; 14] = [
+            "type",
+            "properties",
+            "required",
+            "additionalProperties",
+            "items",
+            "maxItems",
+            "minLength",
+            "maxLength",
+            "pattern",
+            "minimum",
+            "description",
+            "title",
+            "$schema",
+            "enum",
+        ];
+        for key in schema
+            .as_object()
+            .into_iter()
+            .flat_map(|object| object.keys())
+        {
+            assert!(
+                KNOWN.contains(&key.as_str()),
+                "schema keyword `{key}` is not checked by this test"
+            );
+        }
+        match schema["type"].as_str() {
+            Some("object") => {
+                let Some(object) = value.as_object() else {
+                    return false;
+                };
+                let properties = schema["properties"].as_object().unwrap();
+                let required = schema["required"].as_array().cloned().unwrap_or_default();
+                required
+                    .iter()
+                    .all(|key| object.contains_key(key.as_str().unwrap()))
+                    && object.iter().all(|(key, value)| match properties.get(key) {
+                        Some(property) => schema_accepts(property, value),
+                        None => schema["additionalProperties"] != json!(false),
+                    })
+            }
+            Some("array") => value.as_array().is_some_and(|items| {
+                items.len() <= schema["maxItems"].as_u64().unwrap_or(u64::MAX) as usize
+                    && items
+                        .iter()
+                        .all(|item| schema_accepts(&schema["items"], item))
+            }),
+            Some("string") => value.as_str().is_some_and(|text| {
+                let characters = text.chars().count();
+                characters >= schema["minLength"].as_u64().unwrap_or(0) as usize
+                    && characters <= schema["maxLength"].as_u64().unwrap_or(u64::MAX) as usize
+                    && schema["pattern"].as_str().is_none_or(|pattern| {
+                        regex::Regex::new(pattern)
+                            .expect("schema pattern")
+                            .is_match(text)
+                    })
+            }),
+            Some("integer") => as_u64_exact(value)
+                .is_some_and(|number| number >= schema["minimum"].as_u64().unwrap_or(0)),
+            _ => true,
+        }
+    }
+
+    /// The advertised schema and the handler agree on every decision ID,
+    /// including the ones a byte/character mix-up lets through: 65 or 64
+    /// two-byte characters, ASCII at both length boundaries, and characters
+    /// outside the grammar.
+    #[test]
+    fn audit_wp02_b028_schema_and_handler_agree_on_decision_ids() {
+        let spec = task_tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "task_create")
+            .unwrap();
+        let schema = &spec.parameters;
+        let id_schema =
+            &schema["properties"]["decision_prerequisites"]["items"]["properties"]["decision_id"];
+        assert_eq!(id_schema["maxLength"], 64);
+        assert_eq!(id_schema["minLength"], 1);
+        let context = make_test_context(RunId::new(), AgentId::new());
+        let max = MAX_DECISION_ID_BYTES;
+        let cases: Vec<(String, bool)> = vec![
+            ("d".into(), true),
+            ("dec_1-A".into(), true),
+            ("x".repeat(max), true),
+            ("x".repeat(max + 1), false),
+            (String::new(), false),
+            // 65 and 64 two-byte characters: the old schema (128 characters)
+            // accepted both, the old handler (128 bytes) only the second.
+            ("\u{e9}".repeat(65), false),
+            ("\u{e9}".repeat(64), false),
+            ("\u{e9}".repeat(max / 2), false),
+            ("caf\u{e9}".into(), false),
+            ("has space".into(), false),
+            ("dot.ted".into(), false),
+            ("slash/ed".into(), false),
+            ("line\nfeed".into(), false),
+            ("\u{1f600}".into(), false),
+        ];
+        for (id, allowed) in cases {
+            let input = json!({
+                "title": "gated",
+                "operation_id": uuid::Uuid::new_v4().to_string(),
+                "decision_prerequisites": [{"decision_id": id, "expected_revision": 1}]
+            });
+            let shown = id.chars().take(24).collect::<String>();
+            assert_eq!(
+                schema_accepts(schema, &input),
+                allowed,
+                "schema on {shown:?} ({} chars)",
+                id.chars().count()
+            );
+            assert_eq!(
+                task_create_tool(&input, &context).is_ok(),
+                allowed,
+                "handler on {shown:?} ({} bytes)",
+                id.len()
+            );
+        }
+    }
+
+    #[test]
+    fn audit_wp02_b028_task_create_advertises_decision_prerequisites() {
+        let spec = task_tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "task_create")
+            .unwrap();
+        let schema = &spec.parameters;
+        let property = &schema["properties"]["decision_prerequisites"];
+        assert_eq!(property["type"], "array");
+        assert_eq!(property["items"]["additionalProperties"], false);
+        assert_eq!(schema["additionalProperties"], false);
+
+        let context = make_test_context(RunId::new(), AgentId::new());
+        let valid = json!({
+            "title": "gated",
+            "operation_id": uuid::Uuid::new_v4().to_string(),
+            "decision_prerequisites": [{"decision_id": "dec_1", "expected_revision": 3}]
+        });
+        assert!(schema_accepts(schema, &valid));
+        let created = task_create_tool(&valid, &context).unwrap();
+        let id = TaskId::from_str(created.details.unwrap()["task_id"].as_str().unwrap()).unwrap();
+        let stored = context
+            .runtime
+            .as_ref()
+            .unwrap()
+            .task_registry
+            .get_task(&id)
+            .unwrap();
+        assert_eq!(stored.decision_prerequisites.len(), 1);
+        assert_eq!(stored.decision_prerequisites[0].decision_id, "dec_1");
+        assert_eq!(stored.decision_prerequisites[0].expected_revision, 3);
+
+        for bad in [
+            json!([{"decision_id": "dec_1"}]),
+            json!([{"expected_revision": 1}]),
+            json!([{"decision_id": "", "expected_revision": 1}]),
+            json!([{"decision_id": 7, "expected_revision": 1}]),
+            json!([{"decision_id": "d", "expected_revision": -1}]),
+            json!([{"decision_id": "d", "expected_revision": 1, "extra": true}]),
+            json!([{"decision_id": "x".repeat(MAX_DECISION_ID_BYTES + 1), "expected_revision": 1}]),
+        ] {
+            let input = json!({
+                "title": "bad",
+                "operation_id": uuid::Uuid::new_v4().to_string(),
+                "decision_prerequisites": bad
+            });
+            assert!(!schema_accepts(schema, &input), "schema accepted {bad}");
+            assert!(
+                task_create_tool(&input, &context).is_err(),
+                "handler accepted {bad}"
+            );
+        }
+        assert_eq!(
+            context
+                .runtime
+                .as_ref()
+                .unwrap()
+                .task_registry
+                .list_tasks(None)
+                .len(),
+            1
         );
     }
 }

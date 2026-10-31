@@ -418,6 +418,63 @@ enum Tail {
 /// lock as held by a long-lived writer. Appends hold it for milliseconds.
 const REPAIR_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Upper bound on one JSONL record. Full valid histories still load; a single
+/// record larger than this is corruption or an unbounded paste, not history.
+const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
+
+/// A torn final record needs no bytes kept: report it, load the intact prefix
+/// read-only, or rewrite the prefix without ever buffering the whole file.
+fn repair_or_report(
+    path: &Path,
+    tail: &Tail,
+    session: Session,
+    header: &JsonlV4Header,
+    prefix_len: u64,
+) -> Result<Option<JsonlStoredSession>, SessionError> {
+    match tail {
+        Tail::Detect => Ok(None),
+        Tail::ReadOnly => Ok(Some(JsonlStoredSession::read_only(session, header, path))),
+        Tail::Repair(_) => {
+            publish_atomically(path, |temp_path| {
+                let mut source = fs::File::open(path).map_err(|err| {
+                    SessionError::storage(format!(
+                        "Failed to read session {} for tail repair: {err}",
+                        path.display()
+                    ))
+                })?;
+                let mut target = fs::File::create(temp_path).map_err(|err| {
+                    SessionError::storage(format!(
+                        "Failed to stage torn-tail repair {}: {err}",
+                        path.display()
+                    ))
+                })?;
+                std::io::copy(
+                    &mut std::io::Read::take(&mut source, prefix_len),
+                    &mut target,
+                )
+                .map_err(|err| {
+                    SessionError::storage(format!(
+                        "Failed to stage torn-tail repair {}: {err}",
+                        path.display()
+                    ))
+                })?;
+                target.sync_all().map_err(|err| {
+                    SessionError::storage(format!(
+                        "Failed to stage torn-tail repair {}: {err}",
+                        path.display()
+                    ))
+                })
+            })?;
+            Ok(Some(JsonlStoredSession {
+                persistence_error: None,
+                durable_len: prefix_len,
+                session,
+                info: JsonlSessionInfo::from_header(header, path),
+            }))
+        }
+    }
+}
+
 fn session_lock_path(path: &Path) -> PathBuf {
     let mut lock_path = path.as_os_str().to_owned();
     lock_path.push(".lock");
@@ -458,86 +515,107 @@ impl JsonlStoredSession {
     /// `tail`: report it (`None`), rewrite it (the lock is held), or leave
     /// it and return the complete records with writes refused.
     fn load_with(path: &Path, tail: &Tail) -> Result<Option<Self>, SessionError> {
-        let (content, torn_utf8_tail) = crate::read_session_text(path).map_err(|err| {
+        let mut reader = std::io::BufReader::new(fs::File::open(path).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
                 SessionError::not_found(format!("Session not found: {}", path.display()))
             } else {
                 SessionError::storage(format!("Failed to read session {}: {err}", path.display()))
             }
-        })?;
-        let mut physical_lines: Vec<&str> = content.split('\n').collect();
-        if physical_lines.last() == Some(&"") {
-            physical_lines.pop();
-        }
-        if physical_lines.is_empty() || physical_lines[0].is_empty() {
-            return Err(invalid_file(path, 1, "is missing a header"));
-        }
-        let header = parse_header(physical_lines[0]).map_err(|err| invalid_file(path, 1, err))?;
-        let mut session = Session::with_metadata(
-            header.id.clone(),
-            header.created_at,
-            header.parent_session_id.clone(),
-        );
-        for (index, line) in physical_lines.iter().enumerate().skip(1) {
-            match parse_mutation(line) {
+        })?);
+        let mut line = Vec::new();
+        let mut line_no = 0usize;
+        let mut header = None;
+        let mut session: Option<Session> = None;
+        let mut valid_prefix_len = 0u64;
+        let mut last_terminated = true;
+        loop {
+            let kind = crate::bounded::read_line_bounded(&mut reader, MAX_RECORD_BYTES, &mut line)
+                .map_err(|err| {
+                    SessionError::storage(format!(
+                        "Failed to read session {}: {err}",
+                        path.display()
+                    ))
+                })?;
+            let terminated = match kind {
+                crate::bounded::BoundedLine::Eof => break,
+                crate::bounded::BoundedLine::TooLong => {
+                    return Err(invalid_file(
+                        path,
+                        line_no + 1,
+                        format!("record is longer than {MAX_RECORD_BYTES} bytes"),
+                    ))
+                }
+                crate::bounded::BoundedLine::Complete { terminated } => terminated,
+            };
+            line_no += 1;
+            last_terminated = terminated;
+            if line_no == 1 {
+                if line.is_empty() {
+                    return Err(invalid_file(path, 1, "is missing a header"));
+                }
+                let text = std::str::from_utf8(&line)
+                    .map_err(|_| invalid_file(path, 1, "header is not valid UTF-8"))?;
+                let parsed = parse_header(text).map_err(|err| invalid_file(path, 1, err))?;
+                session = Some(Session::with_metadata(
+                    parsed.id.clone(),
+                    parsed.created_at,
+                    parsed.parent_session_id.clone(),
+                ));
+                header = Some(parsed);
+                valid_prefix_len += line.len() as u64 + u64::from(terminated);
+                continue;
+            }
+            let text = match std::str::from_utf8(&line) {
+                Ok(text) => text,
+                Err(_) if !terminated => {
+                    // A crash can cut a multi-byte character in the final
+                    // unterminated record; drop the torn bytes.
+                    return repair_or_report(
+                        path,
+                        tail,
+                        session.expect("header admitted first"),
+                        header.as_ref().expect("header admitted first"),
+                        valid_prefix_len,
+                    );
+                }
+                Err(_) => return Err(invalid_file(path, line_no, "record is not valid UTF-8")),
+            };
+            match parse_mutation(text) {
                 Ok(mutation) => {
-                    if let Err(err) = session.apply_mutation(mutation) {
+                    if let Err(err) = session
+                        .as_mut()
+                        .expect("header admitted first")
+                        .apply_mutation(mutation)
+                    {
                         if err.code == "invalid_entry" {
-                            return Err(invalid_file(path, index + 1, err));
+                            return Err(invalid_file(path, line_no, err));
                         }
                         return Err(err);
                     }
+                    valid_prefix_len += line.len() as u64 + u64::from(terminated);
                 }
-                Err(err)
-                    if err.kind == "syntax"
-                        && index + 1 == physical_lines.len()
-                        && !content.ends_with('\n')
-                        && !torn_utf8_tail =>
-                {
-                    let valid_prefix = format!("{}\n", physical_lines[..index].join("\n"));
-                    match tail {
-                        Tail::Detect => return Ok(None),
-                        Tail::ReadOnly => {
-                            return Ok(Some(Self::read_only(session, &header, path)));
-                        }
-                        Tail::Repair(_) => {}
-                    }
-                    publish_atomically(path, |temp_path| {
-                        fs::write(temp_path, &valid_prefix).map_err(|write_err| {
-                            SessionError::storage(format!(
-                                "Failed to stage torn-tail repair {}: {write_err}",
-                                path.display()
-                            ))
-                        })
-                    })?;
-                    return Ok(Some(Self {
-                        persistence_error: None,
-                        durable_len: valid_prefix.len() as u64,
-                        session,
-                        info: JsonlSessionInfo::from_header(&header, path),
-                    }));
+                Err(err) if err.kind == "syntax" && !terminated => {
+                    return repair_or_report(
+                        path,
+                        tail,
+                        session.expect("header admitted first"),
+                        header.as_ref().expect("header admitted first"),
+                        valid_prefix_len,
+                    );
                 }
-                Err(err) => return Err(invalid_file(path, index + 1, err)),
+                Err(err) => return Err(invalid_file(path, line_no, err)),
             }
         }
-        if torn_utf8_tail || !content.ends_with('\n') {
+        let Some(header) = header else {
+            return Err(invalid_file(path, 1, "is missing a header"));
+        };
+        let session = session.expect("a header constructs a session");
+        if !last_terminated {
             match tail {
                 Tail::Detect => return Ok(None),
                 Tail::ReadOnly => return Ok(Some(Self::read_only(session, &header, path))),
                 Tail::Repair(_) => {}
             }
-        }
-        if torn_utf8_tail {
-            // `content` is the complete-record prefix; drop the torn bytes.
-            publish_atomically(path, |temp_path| {
-                fs::write(temp_path, &content).map_err(|write_err| {
-                    SessionError::storage(format!(
-                        "Failed to stage torn-tail repair {}: {write_err}",
-                        path.display()
-                    ))
-                })
-            })?;
-        } else if !content.ends_with('\n') {
             let mut file = OpenOptions::new().append(true).open(path).map_err(|err| {
                 SessionError::storage(format!(
                     "Failed to repair unterminated session tail {}: {err}",
@@ -552,10 +630,11 @@ impl JsonlStoredSession {
                         path.display()
                     ))
                 })?;
+            valid_prefix_len += 1;
         }
         Ok(Some(Self {
             persistence_error: None,
-            durable_len: content.len() as u64 + u64::from(!content.ends_with('\n')),
+            durable_len: valid_prefix_len,
             session,
             info: JsonlSessionInfo::from_header(&header, path),
         }))
@@ -1512,5 +1591,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["valid"]
         );
+    }
+
+    #[test]
+    fn audit_wp04_b040_streams_history_and_caps_one_record() {
+        let dir = tempdir().unwrap();
+        let repo = JsonlSessionRepo::new(dir.path());
+        let mut writer = create_fixture(&repo, "streamed", "/fixture");
+        for index in 0..200 {
+            writer.append_message(&format!("message {index}")).unwrap();
+        }
+        let path = writer.info.path.clone();
+        let loaded = JsonlStoredSession::load(&path).unwrap();
+        assert_eq!(loaded.get_stats().message_count, 200);
+
+        // A single record beyond the per-record cap fails with its line, and
+        // leaves the valid prefix alone.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&vec![b'x'; MAX_RECORD_BYTES + 1]).unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+        let error = JsonlStoredSession::load(&path).unwrap_err();
+        assert_eq!(error.code, "invalid_entry", "{error}");
+        assert!(error.message.contains("line 202"), "{error}");
+        assert!(error.message.contains("longer than"), "{error}");
     }
 }

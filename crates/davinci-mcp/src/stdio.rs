@@ -252,10 +252,25 @@ impl StdioTransport {
                 "mcp server stdin: write timed out after {}s; the server is not reading its input",
                 self.call_timeout.as_secs_f32()
             ))),
-            Err(WriteError::Backlog) => Err(self.transport_error(
-                "mcp server stdin: not written; earlier lines are still unread by the server",
+            Err(WriteError::Backlog) => Err(Error::NotDelivered(
+                "mcp server stdin: not written; earlier lines are still unread by the server"
+                    .into(),
             )),
-            Err(WriteError::Io(err)) => Err(self.closed_error(&format!("mcp server stdin: {err}"))),
+            Err(WriteError::Incomplete(err)) => {
+                let error = self.closed_error(&format!("mcp server stdin: {err}"));
+                // Not one byte reached the pipe, so the server saw nothing.
+                Err(Error::NotDelivered(error.to_string()))
+            }
+            Err(WriteError::Partial(err)) => {
+                let error = self.closed_error(&format!("mcp server stdin: {err}"));
+                Err(Error::ambiguous(error.to_string()))
+            }
+            Err(WriteError::Unflushed(err)) => Err(Error::ambiguous(format!(
+                "mcp server stdin: the line was written but flushing it failed: {err}"
+            ))),
+            Err(WriteError::Unconfirmed(err)) => Err(Error::ambiguous(format!(
+                "mcp server stdin: the writer stopped before confirming the write: {err}"
+            ))),
         }
     }
 
@@ -342,7 +357,7 @@ const MAX_QUEUED_STDIN_LINES: usize = 16;
 
 struct WriteJob {
     line: Vec<u8>,
-    done: Option<SyncSender<std::io::Result<()>>>,
+    done: Option<SyncSender<std::result::Result<(), WriteError>>>,
     /// Set by a caller that stopped waiting. A job still queued when its
     /// caller gave up is skipped, so a request the caller already reported
     /// as failed does not reach the server later.
@@ -352,7 +367,19 @@ struct WriteJob {
 enum WriteError {
     TimedOut,
     Backlog,
-    Io(std::io::Error),
+    /// No byte of the line reached the pipe (refused by a stopped writer or
+    /// failed on the first write), so this request cannot have run.
+    Incomplete(std::io::Error),
+    /// Some, but not all, of the line reached the pipe. A server with a
+    /// streaming JSON parser can dispatch a complete object before the
+    /// trailing newline, so delivery cannot be excluded.
+    Partial(std::io::Error),
+    /// The whole line was accepted but flushing it failed. Delivery cannot be
+    /// excluded, so the outcome is unknown rather than absent.
+    Unflushed(std::io::Error),
+    /// The writer stopped before acknowledging. It may have taken the line, so
+    /// delivery cannot be excluded.
+    Unconfirmed(std::io::Error),
 }
 
 /// Owns the child's stdin on a dedicated thread (WOR-51). `write_all` on a
@@ -368,6 +395,33 @@ struct StdinWriter {
     jobs: SyncSender<WriteJob>,
 }
 
+/// `write_all` that also reports how many bytes the pipe accepted before it
+/// failed, which is what separates "never sent" from "possibly sent".
+fn write_counted(
+    out: &mut impl Write,
+    mut line: &[u8],
+) -> std::result::Result<(), (std::io::Error, usize)> {
+    let mut written = 0;
+    while !line.is_empty() {
+        match out.write(line) {
+            Ok(0) => {
+                let error = std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write the whole line",
+                );
+                return Err((error, written));
+            }
+            Ok(n) => {
+                written += n;
+                line = &line[n..];
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err((error, written)),
+        }
+    }
+    Ok(())
+}
+
 impl StdinWriter {
     fn spawn(mut stdin: impl Write + Send + 'static) -> Self {
         let (jobs, queue) = mpsc::sync_channel::<WriteJob>(MAX_QUEUED_STDIN_LINES);
@@ -378,10 +432,25 @@ impl StdinWriter {
                     continue;
                 }
                 let result = match &broken {
-                    Some((kind, message)) => Err(std::io::Error::new(*kind, message.clone())),
-                    None => stdin.write_all(&job.line).and_then(|()| stdin.flush()),
+                    Some((kind, message)) => Err(WriteError::Incomplete(std::io::Error::new(
+                        *kind,
+                        message.clone(),
+                    ))),
+                    None => match write_counted(&mut stdin, &job.line) {
+                        Ok(()) => stdin.flush().map_err(WriteError::Unflushed),
+                        // Nothing reached the pipe, so nothing can have run.
+                        Err((error, 0)) => Err(WriteError::Incomplete(error)),
+                        Err((error, _)) => Err(WriteError::Partial(error)),
+                    },
                 };
                 if let Err(error) = &result {
+                    let error = match error {
+                        WriteError::Incomplete(error)
+                        | WriteError::Partial(error)
+                        | WriteError::Unflushed(error)
+                        | WriteError::Unconfirmed(error) => error,
+                        WriteError::TimedOut | WriteError::Backlog => continue,
+                    };
                     broken.get_or_insert_with(|| (error.kind(), error.to_string()));
                 }
                 if let Some(done) = job.done {
@@ -400,7 +469,7 @@ impl StdinWriter {
     }
 
     fn write(&self, value: &Value, deadline: Instant) -> std::result::Result<(), WriteError> {
-        let line = Self::encode(value).map_err(WriteError::Io)?;
+        let line = Self::encode(value).map_err(WriteError::Incomplete)?;
         let (done, ack) = mpsc::sync_channel(1);
         let abandoned = Arc::new(AtomicBool::new(false));
         match self.jobs.try_send(WriteJob {
@@ -411,7 +480,7 @@ impl StdinWriter {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => return Err(WriteError::Backlog),
             Err(TrySendError::Disconnected(_)) => {
-                return Err(WriteError::Io(std::io::Error::new(
+                return Err(WriteError::Incomplete(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "stdin writer stopped",
                 )))
@@ -419,15 +488,14 @@ impl StdinWriter {
         }
         let wait = deadline.saturating_duration_since(Instant::now());
         match ack.recv_timeout(wait) {
-            Ok(result) => result.map_err(WriteError::Io),
+            Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => {
                 abandoned.store(true, Ordering::SeqCst);
                 Err(WriteError::TimedOut)
             }
-            Err(RecvTimeoutError::Disconnected) => Err(WriteError::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "stdin writer stopped",
-            ))),
+            Err(RecvTimeoutError::Disconnected) => Err(WriteError::Unconfirmed(
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin writer stopped"),
+            )),
         }
     }
 
@@ -681,6 +749,131 @@ mod tests {
     }
 
     #[test]
+    fn a_line_refused_before_queueing_is_provably_not_delivered() {
+        let (release, gate) = mpsc::channel();
+        let writer = StdinWriter::spawn(GatedPipe {
+            gate: Some(gate),
+            written: Arc::default(),
+        });
+        // One line blocks in the stalled pipe, then the queue fills.
+        writer.enqueue(&json!({"blocked": true})).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        while writer
+            .jobs
+            .try_send(WriteJob {
+                line: Vec::new(),
+                done: None,
+                abandoned: Arc::new(AtomicBool::new(true)),
+            })
+            .is_ok()
+        {}
+
+        let mut transport = transport_over(writer);
+        let error = transport.call("ping", json!({})).unwrap_err();
+        drop(release);
+
+        // The request never entered the pipe, so its effect provably did not
+        // happen and must not be reported as an unknown outcome.
+        assert!(error.definitely_not_delivered(), "{error}");
+        assert!(!error.may_have_run(), "{error}");
+        assert!(error.to_string().contains("not written"), "{error}");
+    }
+
+    /// Writer that accepts one byte of a line and then fails. `write_all`
+    /// aborts, so the line is incomplete and cannot be parsed by a
+    /// line-framed server.
+    struct HalfLine {
+        wrote: bool,
+    }
+
+    impl Write for HalfLine {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.wrote {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "pipe broke mid-line",
+                ));
+            }
+            self.wrote = true;
+            Ok(buf.len().min(1))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Writer that accepts the whole line but cannot flush it.
+    struct FailingFlush;
+
+    impl Write for FailingFlush {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "flush failed",
+            ))
+        }
+    }
+
+    fn transport_over(writer: StdinWriter) -> StdioTransport {
+        let stderr: Arc<(Mutex<StderrTail>, Condvar)> = Arc::default();
+        stderr.0.lock().unwrap().closed = true;
+        let (_sender, lines) = mpsc::channel();
+        StdioTransport {
+            stdin: writer,
+            lines,
+            stderr,
+            next_id: 1,
+            call_timeout: Duration::from_millis(50),
+        }
+    }
+
+    /// Writer whose very first write fails, so no byte reaches the pipe.
+    struct DeadPipe;
+
+    impl Write for DeadPipe {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "pipe already closed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_partly_written_line_is_an_unknown_outcome() {
+        // A streaming parser may dispatch a complete object before the newline.
+        let mut transport = transport_over(StdinWriter::spawn(HalfLine { wrote: false }));
+        let error = transport.call("ping", json!({})).unwrap_err();
+        assert!(error.may_have_run(), "{error}");
+        assert!(!error.definitely_not_delivered(), "{error}");
+    }
+
+    #[test]
+    fn a_line_with_no_byte_written_is_provably_not_delivered() {
+        let mut transport = transport_over(StdinWriter::spawn(DeadPipe));
+        let error = transport.call("ping", json!({})).unwrap_err();
+        assert!(error.definitely_not_delivered(), "{error}");
+        assert!(!error.may_have_run(), "{error}");
+    }
+
+    #[test]
+    fn a_line_written_but_not_flushed_is_an_unknown_outcome() {
+        let mut transport = transport_over(StdinWriter::spawn(FailingFlush));
+        let error = transport.call("ping", json!({})).unwrap_err();
+        assert!(error.may_have_run(), "{error}");
+        assert!(!error.definitely_not_delivered(), "{error}");
+    }
+
+    #[test]
     fn child_environment_is_allowlisted_plus_config() {
         let parent = vec![
             (OsString::from("PATH"), OsString::from("/bin")),
@@ -781,13 +974,13 @@ mod tests {
         );
         // Within one directory the PATHEXT order wins.
         assert_eq!(
-            resolve_command_in("npx", &[second.clone()], &exts),
+            resolve_command_in("npx", std::slice::from_ref(&second), &exts),
             Some(second.join("npx.exe"))
         );
         assert_eq!(resolve_command_in("missing", &[first], &exts), None);
         // Explicit extensions and paths are left alone.
         assert_eq!(
-            resolve_command_in("npx.cmd", &[second.clone()], &exts),
+            resolve_command_in("npx.cmd", std::slice::from_ref(&second), &exts),
             Some(PathBuf::from("npx.cmd"))
         );
         assert_eq!(

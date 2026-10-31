@@ -126,14 +126,11 @@ pub fn parse_hook_document(doc: &Value, out: &mut Vec<PluginHook>, unsupported: 
     out.sort_by(|a, b| a.event.cmp(&b.event));
 }
 
-/// Files larger than this, and everything under `node_modules`, are
-/// fingerprinted by size and modification time instead of content.
-const CONTENT_HASH_LIMIT: u64 = 8 * 1024 * 1024;
-
 /// Fingerprint of everything a hook can execute: the hook definitions plus
 /// the whole plugin tree except `.git`. A hook runs through a shell and may
 /// reach any plugin file (an unbraced `$CLAUDE_PLUGIN_ROOT`, a script that
-/// imports a library), so no subset of files is safe to leave out.
+/// imports a library), so no subset of files is safe to leave out and no file
+/// is large enough to trust by size and mtime alone.
 pub fn digest(root: &Path, hooks: &[PluginHook]) -> Option<String> {
     if hooks.is_empty() {
         return None;
@@ -291,27 +288,23 @@ fn hash_tree(root: &Path, hasher: &mut Sha256) {
             hasher.update(b"L");
             hasher.update(target.to_string_lossy().as_bytes());
         } else {
-            let meta = entry.metadata().ok();
-            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            let by_stat = size > CONTENT_HASH_LIMIT
-                || rel_path
-                    .components()
-                    .any(|part| part.as_os_str() == "node_modules");
-            if by_stat {
-                let modified = meta
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                hasher.update(format!("S{size}:{modified}").as_bytes());
-            } else {
-                match std::fs::read(entry.path()) {
-                    Ok(bytes) => {
-                        hasher.update(b"C");
-                        hasher.update(&bytes);
+            match std::fs::File::open(entry.path()) {
+                Ok(mut file) => {
+                    use std::io::Read as _;
+                    hasher.update(b"C");
+                    let mut buffer = [0u8; 64 * 1024];
+                    loop {
+                        match file.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(read) => hasher.update(&buffer[..read]),
+                            Err(_) => {
+                                hasher.update(b"<unreadable>");
+                                break;
+                            }
+                        }
                     }
-                    Err(_) => hasher.update(b"<unreadable>"),
                 }
+                Err(_) => hasher.update(b"<unreadable>"),
             }
         }
         hasher.update([0]);
@@ -954,5 +947,33 @@ mod tests {
         let mut powershell = hook.clone();
         powershell.shell = Some("powershell".into());
         assert!(build_command_with(&powershell, &ctx, None).is_ok());
+    }
+
+    #[test]
+    fn audit_wp06_b058_large_node_modules_content_change_invalidates_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node_modules");
+        std::fs::create_dir_all(&path).unwrap();
+        let dependency = path.join("lib.js");
+        std::fs::write(&dependency, vec![b'a'; 9 * 1024 * 1024]).unwrap();
+        let hooks = vec![PluginHook {
+            event: HookEvent::PreToolUse,
+            matcher: None,
+            command: "bash \"$CLAUDE_PLUGIN_ROOT/run.sh\"".into(),
+            timeout_secs: 60,
+            shell: None,
+            is_async: false,
+        }];
+        let approved = digest(dir.path(), &hooks).unwrap();
+        let metadata = std::fs::metadata(&dependency).unwrap();
+        std::fs::write(&dependency, vec![b'b'; 9 * 1024 * 1024]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&dependency)
+            .unwrap()
+            .set_modified(metadata.modified().unwrap())
+            .unwrap();
+        let changed = digest(dir.path(), &hooks).unwrap();
+        assert_ne!(changed, approved);
     }
 }

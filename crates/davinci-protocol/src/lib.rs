@@ -3,6 +3,7 @@
 mod cbor;
 mod codec;
 mod framing;
+pub mod json_number;
 mod sandbox;
 mod schemas;
 

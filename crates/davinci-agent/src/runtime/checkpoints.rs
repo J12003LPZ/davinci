@@ -74,6 +74,44 @@ pub fn may_mutate_with_checkpoint(
     authorized && (durable_checkpoint || explicit_nonrewindable_exception)
 }
 
+/// Read a file to capture, admitting it on the opened handle: a file named by
+/// more than one hard link could alias content outside the workspace, and a
+/// file larger than a blob is refused after at most `MAX_BLOB_BYTES + 1` bytes.
+fn read_preimage(path: &Path, allow_linked: bool) -> Result<Vec<u8>, CheckpointError> {
+    let mut file = std::fs::File::open(path)?;
+    if !allow_linked {
+        davinci_sys::fs::ensure_single_link(&file)?;
+    }
+    let declared = file.metadata()?.len();
+    #[cfg(test)]
+    let reader: Box<dyn std::io::Read> =
+        crate::test_seam::reader("checkpoint", declared).unwrap_or_else(|| Box::new(&mut file));
+    #[cfg(not(test))]
+    let reader = &mut file;
+    read_preimage_from(reader, declared)
+}
+
+/// The stream half of [`read_preimage`]: a declared size over a blob is refused
+/// without reading, and a source that outgrows its declared size is cut off one
+/// byte past the limit. Split out so a test can count what capture pulls.
+fn read_preimage_from<R: std::io::Read>(
+    reader: R,
+    declared: u64,
+) -> Result<Vec<u8>, CheckpointError> {
+    let too_large = |declared: u64| CheckpointError::BlobTooLarge {
+        size: usize::try_from(declared)
+            .unwrap_or(usize::MAX)
+            .max(MAX_BLOB_BYTES + 1),
+    };
+    if declared > MAX_BLOB_BYTES as u64 {
+        return Err(too_large(declared));
+    }
+    match davinci_sys::fs::read_capped(reader, declared, MAX_BLOB_BYTES as u64) {
+        Err(err) if err.kind() == std::io::ErrorKind::FileTooLarge => Err(too_large(declared)),
+        other => Ok(other?),
+    }
+}
+
 pub fn compute_sha256(bytes: &[u8]) -> String {
     format!("{:x}", davinci_sys::hex::Lower(&Sha256::digest(bytes)))
 }
@@ -155,6 +193,19 @@ impl BlobStore {
         base_dir: &Path,
         relative_path: &str,
     ) -> Result<FileCapture, CheckpointError> {
+        self.capture_file_with(task_id, base_dir, relative_path, false)
+    }
+
+    /// [`Self::capture_file`] for a caller authorized to read outside the
+    /// workspace (`allow_linked`): a hard-linked file is then captured, so the
+    /// grant is not defeated by the checkpoint that precedes every edit.
+    pub fn capture_file_with(
+        &self,
+        task_id: TaskId,
+        base_dir: &Path,
+        relative_path: &str,
+        allow_linked: bool,
+    ) -> Result<FileCapture, CheckpointError> {
         let full_path = base_dir.join(relative_path);
         let symlink_meta = std::fs::symlink_metadata(&full_path);
 
@@ -193,7 +244,7 @@ impl BlobStore {
                     let hash = self.store_blob_for_task(task_id, target_bytes)?;
                     (Some(hash), target_bytes.len() as u64)
                 } else if meta.is_file() {
-                    let bytes = std::fs::read(&full_path)?;
+                    let bytes = read_preimage(&full_path, allow_linked)?;
                     let size = bytes.len() as u64;
                     let hash = self.store_blob_for_task(task_id, &bytes)?;
                     (Some(hash), size)
@@ -315,6 +366,198 @@ mod tests {
                 .get_blob(cap_existing.blob_hash.as_ref().unwrap())
                 .unwrap(),
             b"original dirty content"
+        );
+    }
+
+    fn blob_files(store: &BlobStore) -> usize {
+        store.blobs.read().unwrap().len()
+    }
+
+    #[test]
+    fn audit_wp01_b006_oversized_preimage_is_refused_before_a_blob_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::new();
+        let task_id = TaskId::new();
+        let over = dir.path().join("big.bin");
+        let file = std::fs::File::create(&over).unwrap();
+        file.set_len(MAX_BLOB_BYTES as u64 + 1).unwrap();
+        let err = store
+            .capture_file(task_id, dir.path(), "big.bin")
+            .unwrap_err();
+        assert!(matches!(err, CheckpointError::BlobTooLarge { .. }), "{err}");
+        assert_eq!(blob_files(&store), 0);
+
+        // Exactly at the limit round-trips.
+        let exact = dir.path().join("exact.bin");
+        std::fs::write(&exact, vec![7u8; MAX_BLOB_BYTES]).unwrap();
+        let capture = store
+            .capture_file(task_id, dir.path(), "exact.bin")
+            .unwrap();
+        assert_eq!(capture.size, MAX_BLOB_BYTES as u64);
+        let hash = capture.blob_hash.unwrap();
+        assert_eq!(store.get_blob(&hash).unwrap().len(), MAX_BLOB_BYTES);
+    }
+
+    #[test]
+    fn audit_wp01_b006_growing_preimage_is_bounded_at_the_cap() {
+        // The bounded reader is what stops a file that grows after the metadata
+        // check: it never takes more than cap + 1 bytes from the handle.
+        struct Growing(usize);
+        impl std::io::Read for Growing {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0 += buf.len();
+                buf.fill(1);
+                Ok(buf.len())
+            }
+        }
+        let mut growing = Growing(0);
+        let err = davinci_sys::fs::read_capped(&mut growing, 0, MAX_BLOB_BYTES as u64).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+        assert_eq!(growing.0, MAX_BLOB_BYTES + 1);
+    }
+
+    #[test]
+    fn audit_wp01_b001_capture_refuses_a_hard_linked_preimage() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let canary = outside.path().join("canary.txt");
+        std::fs::write(&canary, "outside secret").unwrap();
+        std::fs::hard_link(&canary, dir.path().join("alias.txt")).unwrap();
+        std::fs::write(dir.path().join("plain.txt"), "fine").unwrap();
+        let store = BlobStore::new();
+        let task_id = TaskId::new();
+
+        let err = store
+            .capture_file(task_id, dir.path(), "alias.txt")
+            .unwrap_err();
+        assert!(matches!(err, CheckpointError::Io(_)), "{err}");
+        assert_eq!(blob_files(&store), 0, "no outside bytes were stored");
+        store
+            .capture_file(task_id, dir.path(), "plain.txt")
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&canary).unwrap(), "outside secret");
+    }
+
+    /// Review finding 6: an outside-read grant must not be defeated by the
+    /// checkpoint that precedes every edit.
+    #[test]
+    fn audit_wp01_b001_capture_follows_a_link_when_outside_reads_are_authorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let canary = outside.path().join("canary.txt");
+        std::fs::write(&canary, "outside secret").unwrap();
+        std::fs::hard_link(&canary, dir.path().join("alias.txt")).unwrap();
+        let store = BlobStore::new();
+        let task_id = TaskId::new();
+        assert!(store
+            .capture_file_with(task_id, dir.path(), "alias.txt", false)
+            .is_err());
+        assert_eq!(blob_files(&store), 0);
+        let capture = store
+            .capture_file_with(task_id, dir.path(), "alias.txt", true)
+            .unwrap();
+        assert_eq!(capture.size, "outside secret".len() as u64);
+        assert!(capture.blob_hash.is_some());
+    }
+
+    /// Review finding 14: capture itself is bounded. The previous tests passed
+    /// even when capture read the whole file first, because storing the blob
+    /// also refuses an oversize one. Here the consumer's reader is fed a source
+    /// that outgrows its declared size and what it pulled is counted.
+    #[test]
+    fn audit_wp01_b006_capture_reads_at_most_one_byte_past_the_blob_limit() {
+        struct Outgrowing {
+            left: u64,
+            pulled: std::rc::Rc<std::cell::Cell<u64>>,
+        }
+        impl std::io::Read for Outgrowing {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = (buf.len() as u64).min(self.left) as usize;
+                buf[..n].fill(7);
+                self.left -= n as u64;
+                self.pulled.set(self.pulled.get() + n as u64);
+                Ok(n)
+            }
+        }
+        let limit = MAX_BLOB_BYTES as u64;
+        let pulled = std::rc::Rc::new(std::cell::Cell::new(0));
+        let err = read_preimage_from(
+            Outgrowing {
+                left: limit * 3,
+                pulled: pulled.clone(),
+            },
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CheckpointError::BlobTooLarge { .. }), "{err}");
+        assert_eq!(pulled.get(), limit + 1);
+
+        let untouched = std::rc::Rc::new(std::cell::Cell::new(0));
+        let err = read_preimage_from(
+            Outgrowing {
+                left: limit * 3,
+                pulled: untouched.clone(),
+            },
+            limit + 1,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, CheckpointError::BlobTooLarge { size } if size == MAX_BLOB_BYTES + 1)
+        );
+        assert_eq!(
+            untouched.get(),
+            0,
+            "an oversized file is refused before any read"
+        );
+
+        let exact = read_preimage_from(
+            Outgrowing {
+                left: limit,
+                pulled: std::rc::Rc::default(),
+            },
+            limit,
+        )
+        .unwrap();
+        assert_eq!(exact.len() as u64, limit);
+    }
+
+    /// Re-check item 14, the real entry point: `capture_file` of a file that
+    /// outgrows its declared size pulls at most one byte past the blob limit,
+    /// stores no blob and charges no task usage. An unbounded read in
+    /// `read_preimage` pulls all three limits' worth.
+    #[test]
+    fn audit_wp01_b006_capture_file_bounds_a_growing_preimage_and_stores_nothing() {
+        use crate::test_seam::{clear, install, Outgrowing};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("grows.bin"), b"small").unwrap();
+        let limit = MAX_BLOB_BYTES as u64;
+        let pulled = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let counter = pulled.clone();
+        install("checkpoint", move |_| {
+            Box::new(Outgrowing {
+                left: limit * 3,
+                pulled: counter.clone(),
+            })
+        });
+        let store = BlobStore::new();
+        let task_id = TaskId::new();
+        let err = store
+            .capture_file(task_id, dir.path(), "grows.bin")
+            .unwrap_err();
+        clear("checkpoint");
+        assert!(matches!(err, CheckpointError::BlobTooLarge { .. }), "{err}");
+        assert_eq!(pulled.get(), limit + 1);
+        assert_eq!(blob_files(&store), 0, "no blob was inserted");
+        assert_eq!(
+            store
+                .task_usage
+                .read()
+                .unwrap()
+                .get(&task_id)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "no task usage was charged"
         );
     }
 }

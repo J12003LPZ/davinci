@@ -278,6 +278,17 @@ impl SqliteSessionStore {
     }
 
     pub fn upsert_session(&self, session: &JsonlSession) -> Result<(), SessionError> {
+        // Validate the whole import before opening the transaction: a value
+        // beyond SQLite's signed range refuses the import with its field name
+        // instead of wrapping or leaving part of it behind.
+        let created_at = sqlite_i64(session.header.created_at, "created_at")?;
+        let mut entry_rows = Vec::with_capacity(session.entries.len());
+        for entry in &session.entries {
+            entry_rows.push((
+                sqlite_i64(entry.seq, "seq")?,
+                sqlite_i64(entry.timestamp, "timestamp")?,
+            ));
+        }
         transaction::atomic(&self.conn, || {
             self.conn
                 .execute(
@@ -289,7 +300,7 @@ impl SqliteSessionStore {
                     metadata = excluded.metadata",
                     params![
                         session.header.id,
-                        session.header.created_at as i64,
+                        created_at,
                         session.header.cwd,
                         session.header.parent_session_id,
                         session
@@ -300,8 +311,8 @@ impl SqliteSessionStore {
                     ],
                 )
                 .map_err(|err| SessionError::storage(format!("Unable to upsert session: {err}")))?;
-            for entry in &session.entries {
-                self.insert_entry_row(&session.header.id, entry)?;
+            for (entry, (seq, timestamp)) in session.entries.iter().zip(entry_rows) {
+                self.insert_entry_row_at(&session.header.id, entry, seq, timestamp)?;
             }
             self.rebuild_branch_cache(&session.header.id)?;
             Ok(())
@@ -315,7 +326,7 @@ impl SqliteSessionStore {
                 &self.conn,
                 session_id,
                 &entry.id,
-                entry.seq as i64,
+                sqlite_i64(entry.seq, "seq")?,
                 &entry.entry_type,
                 entry.custom_type.as_deref(),
                 entry.parent_id.as_deref(),
@@ -446,7 +457,7 @@ impl SqliteSessionStore {
                         entry.id,
                         entry.parent_id,
                         entry.entry_type,
-                        entry.timestamp as i64,
+                        sqlite_i64(entry.timestamp, "timestamp")?,
                         payload
                     ],
                 )
@@ -486,6 +497,21 @@ impl SqliteSessionStore {
     }
 
     fn insert_entry_row(&self, session_id: &str, entry: &SessionEntry) -> Result<(), SessionError> {
+        self.insert_entry_row_at(
+            session_id,
+            entry,
+            sqlite_i64(entry.seq, "seq")?,
+            sqlite_i64(entry.timestamp, "timestamp")?,
+        )
+    }
+
+    fn insert_entry_row_at(
+        &self,
+        session_id: &str,
+        entry: &SessionEntry,
+        seq: i64,
+        timestamp: i64,
+    ) -> Result<(), SessionError> {
         let payload = serde_json::to_string(entry)
             .map_err(|err| SessionError::storage(format!("Unable to encode entry: {err}")))?;
         self.conn
@@ -500,11 +526,11 @@ impl SqliteSessionStore {
                     payload = excluded.payload",
                 params![
                     session_id,
-                    entry.seq as i64,
+                    seq,
                     entry.id,
                     entry.parent_id,
                     entry.entry_type,
-                    entry.timestamp as i64,
+                    timestamp,
                     payload
                 ],
             )
@@ -745,7 +771,7 @@ impl SqliteSessionStore {
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                         params![
                             session_id,
-                            record.seq as i64,
+                            sqlite_i64(record.seq, "seq")?,
                             record.id,
                             record.lane.clone().unwrap_or_default(),
                             record.extra.get("runId").and_then(Value::as_str),
@@ -755,7 +781,7 @@ impl SqliteSessionStore {
                                 .get("intent")
                                 .and_then(|value| value.get("kind"))
                                 .and_then(Value::as_str),
-                            record.timestamp as i64,
+                            sqlite_i64(record.timestamp, "timestamp")?,
                             payload
                         ],
                     )
@@ -775,7 +801,7 @@ impl SqliteSessionStore {
                     self.conn
                     .execute(
                         "INSERT INTO lane_moves (session_id, seq, lane, leaf_id) VALUES (?1, ?2, ?3, ?4)",
-                        params![session_id, *seq as i64, lane, leaf_id],
+                        params![session_id, sqlite_i64(*seq, "seq")?, lane, leaf_id],
                     )
                     .map_err(|err| SessionError::storage(format!("Unable to insert lane move: {err}")))?;
                 }
@@ -783,7 +809,7 @@ impl SqliteSessionStore {
                     self.conn
                     .execute(
                         "INSERT INTO facts (session_id, seq, kind, key, value) VALUES (?1, ?2, 'name', NULL, ?3)",
-                        params![session_id, *seq as i64, name],
+                        params![session_id, sqlite_i64(*seq, "seq")?, name],
                     )
                     .map_err(|err| SessionError::storage(format!("Unable to insert name fact: {err}")))?;
                 }
@@ -795,15 +821,22 @@ impl SqliteSessionStore {
                     self.conn
                     .execute(
                         "INSERT INTO facts (session_id, seq, kind, key, value) VALUES (?1, ?2, 'label', ?3, ?4)",
-                        params![session_id, *seq as i64, target_id, label],
+                        params![session_id, sqlite_i64(*seq, "seq")?, target_id, label],
                     )
                     .map_err(|err| SessionError::storage(format!("Unable to insert label fact: {err}")))?;
                 }
             }
+            let next_seq = sqlite_i64(item.seq(), "sequence")?
+                .checked_add(1)
+                .ok_or_else(|| {
+                    SessionError::storage(
+                        "sequence value exceeds SQLite's signed 64-bit range when incremented",
+                    )
+                })?;
             self.conn
                 .execute(
                     "UPDATE session_sequences SET next_seq = ?1 WHERE session_id = ?2",
-                    params![item.seq() as i64 + 1, session_id],
+                    params![next_seq, session_id],
                 )
                 .map_err(|err| {
                     SessionError::storage(format!("Unable to update sequence: {err}"))
@@ -819,7 +852,7 @@ impl SqliteSessionStore {
                     "UPDATE sessions SET parent_session_id = ?1, created_at = ?2 WHERE id = ?3",
                     params![
                         session.parent_session_id,
-                        session.created_at as i64,
+                        sqlite_i64(session.created_at, "created_at")?,
                         session.id
                     ],
                 )
@@ -839,7 +872,7 @@ impl SqliteSessionStore {
                 })?
                 .unwrap_or(1);
             for item in session.get_log(&davinci_session::LogOptions::default())? {
-                if item.seq() as i64 >= next {
+                if sqlite_i64(item.seq(), "seq")? >= next {
                     self.persist_log_item(&session.id, &item)?;
                 }
             }
@@ -1073,6 +1106,17 @@ pub fn now_ms_i64() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Convert a session's unsigned field to SQLite's signed storage, refusing
+/// instead of wrapping. JSONL keeps its u64 contract; only this store is
+/// limited to i64.
+fn sqlite_i64(value: u64, field: &str) -> Result<i64, SessionError> {
+    i64::try_from(value).map_err(|_| {
+        SessionError::storage(format!(
+            "{field} value {value} exceeds SQLite's signed 64-bit range"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -1660,5 +1704,49 @@ mod tests {
         assert!(store.search("xx9").unwrap().is_empty());
         // Three or more characters still use the index.
         assert_eq!(store.search("marker").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn audit_wp04_b041_unsigned_values_refuse_instead_of_wrapping() {
+        let dir = tempdir().unwrap();
+        let store = SqliteSessionStore::open(&dir.path().join("range.db")).unwrap();
+        let mut good = JsonlSession::create(dir.path(), "/work", Some("good")).unwrap();
+        good.append_entry(SessionEntry::message("user", serde_json::json!("kept")))
+            .unwrap();
+        good.header.created_at = i64::MAX as u64;
+        store.import_jsonl(&good).unwrap();
+        let stored: i64 = store
+            .conn
+            .query_row(
+                "SELECT created_at FROM sessions WHERE id = ?1",
+                [&good.header.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, i64::MAX);
+
+        let mut bad_time = JsonlSession::create(dir.path(), "/work", Some("bad")).unwrap();
+        bad_time.header.created_at = i64::MAX as u64 + 1;
+        let error = store.import_jsonl(&bad_time).unwrap_err();
+        assert!(error.message.contains("created_at"), "{error}");
+
+        let mut bad_seq = JsonlSession::create(dir.path(), "/work", Some("seq")).unwrap();
+        bad_seq
+            .append_entry(SessionEntry::message("user", serde_json::json!("x")))
+            .unwrap();
+        bad_seq.entries[0].seq = u64::MAX;
+        let error = store.import_jsonl(&bad_seq).unwrap_err();
+        assert!(error.message.contains("seq"), "{error}");
+
+        let sessions: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        let entries: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sessions, 1);
+        assert_eq!(entries, 1);
     }
 }

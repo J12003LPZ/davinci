@@ -367,14 +367,20 @@ impl PersistentJsSession {
             });
         }
         let module_name = module.display().to_string();
-        let (tx, lines) = std::sync::mpsc::channel();
+        let (tx, lines) = std::sync::mpsc::sync_channel(MAX_PERSISTENT_QUEUED_MESSAGES);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
+            let mut line = Vec::new();
             loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line) {
+                line.clear();
+                match davinci_sys::fs::read_line_bounded(
+                    &mut reader,
+                    &mut line,
+                    MAX_PERSISTENT_LINE_BYTES,
+                ) {
                     Ok(0) => break,
                     Ok(_) => {
+                        let line = String::from_utf8_lossy(&line).into_owned();
                         if !line.trim_start().starts_with('{') {
                             if davinci_ai::trace::enabled() {
                                 davinci_ai::trace::log(&format!(
@@ -384,12 +390,14 @@ impl PersistentJsSession {
                             }
                             continue;
                         }
-                        if tx.send(Ok(line)).is_err() {
-                            break;
+                        match tx.try_send(Ok(line)) {
+                            Ok(()) => {}
+                            Err(std::sync::mpsc::TrySendError::Full(_)) => break,
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
                         }
                     }
                     Err(err) => {
-                        let _ = tx.send(Err(err));
+                        let _ = tx.try_send(Err(err));
                         break;
                     }
                 }
@@ -521,6 +529,10 @@ pub fn stop_persistent_js_extension() {
 /// already speaks line-delimited `{op, payload}` in persistent mode, and the
 /// TS reference keeps extensions loaded for the whole session anyway.
 const MAX_PERSISTENT_JS_SESSIONS: usize = 8;
+/// One persistent protocol line and the pending-reply queue are bounded so a
+/// runaway extension cannot grow memory without limit.
+const MAX_PERSISTENT_LINE_BYTES: usize = 1024 * 1024;
+const MAX_PERSISTENT_QUEUED_MESSAGES: usize = 64;
 
 #[derive(Default)]
 struct PersistentJsPool {
@@ -2786,5 +2798,95 @@ module.exports = (pi) => {
                 && call["success"] == false
                 && call["error"] == "Theme not found: light"
         }));
+    }
+
+    /// Runs the extension runner directly, bypassing `NODE_LOCK`, so several
+    /// node processes can start at once the way separate davinci processes do.
+    fn spawn_runner(module: &Path, tmp: &Path, probe: &Path) -> std::process::Output {
+        let mut child = Command::new(find_node().unwrap())
+            .arg(runner_path().unwrap())
+            .arg(module)
+            .arg("load")
+            .env("TMPDIR", tmp)
+            .env("TEMP", tmp)
+            .env("TMP", tmp)
+            .env("VIRTUAL_PROBE", probe)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"{}").unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    const VIRTUAL_PROBE_EXTENSION: &str = r#"
+const tuiModule = require("@earendil-works/pi-tui");
+require("fs").writeFileSync(process.env.VIRTUAL_PROBE, require.resolve("@earendil-works/pi-tui"));
+module.exports = () => { new tuiModule.TUI(); };
+"#;
+
+    #[test]
+    fn parallel_runners_always_see_complete_virtual_modules() {
+        if find_node().is_none() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let module = dir.path().join("index.js");
+        std::fs::write(&module, VIRTUAL_PROBE_EXTENSION).unwrap();
+        // Share one tmp dir across every runner: this is the layout that raced.
+        let tmp = dir.path().join("tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        for round in 0..4 {
+            let handles: Vec<_> = (0..16)
+                .map(|n| {
+                    let (module, tmp) = (module.clone(), tmp.clone());
+                    let probe = dir.path().join(format!("probe-{round}-{n}"));
+                    std::thread::spawn(move || {
+                        let out = spawn_runner(&module, &tmp, &probe);
+                        String::from_utf8_lossy(&out.stdout).into_owned()
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let stdout = handle.join().unwrap();
+                let parsed: Value = serde_json::from_str(stdout.trim())
+                    .unwrap_or_else(|err| panic!("bad runner output {stdout:?}: {err}"));
+                assert_eq!(parsed["ok"], true, "{stdout}");
+            }
+        }
+    }
+
+    #[test]
+    fn runners_use_private_virtual_dirs_removed_on_exit() {
+        if find_node().is_none() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let module = dir.path().join("index.js");
+        std::fs::write(&module, VIRTUAL_PROBE_EXTENSION).unwrap();
+        let tmp = dir.path().join("tmp");
+        let planted_dir = tmp.join("pi-virtual-modules");
+        std::fs::create_dir_all(&planted_dir).unwrap();
+        std::fs::write(
+            planted_dir.join("_earendil-works_pi-tui.js"),
+            "throw new Error('planted module loaded');",
+        )
+        .unwrap();
+        let mut resolved = Vec::new();
+        for n in 0..2 {
+            let probe = dir.path().join(format!("probe-{n}"));
+            let out = spawn_runner(&module, &tmp, &probe);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains("\"ok\":true"), "{stdout}");
+            resolved.push(PathBuf::from(std::fs::read_to_string(&probe).unwrap()));
+        }
+        let parents: Vec<_> = resolved.iter().map(|path| path.parent().unwrap()).collect();
+        assert_ne!(parents[0], parents[1], "runners shared a virtual directory");
+        for parent in parents {
+            assert!(parent.starts_with(&tmp), "{parent:?}");
+            assert_ne!(parent, planted_dir);
+            assert!(!parent.exists(), "{parent:?} left behind after exit");
+        }
     }
 }

@@ -1,0 +1,3691 @@
+{
+  "corpora": [
+    {
+      "corpus": "verified-core",
+      "invalid_scenarios": 0,
+      "scenarios": [
+        {
+          "findings": [],
+          "meaningful_verification_commands": 1,
+          "scenario_id": "verified-range",
+          "validity": "verified",
+          "verification_commands": 1
+        },
+        {
+          "findings": [],
+          "meaningful_verification_commands": 1,
+          "scenario_id": "verified-slice",
+          "validity": "verified",
+          "verification_commands": 1
+        },
+        {
+          "findings": [],
+          "meaningful_verification_commands": 1,
+          "scenario_id": "verified-parser",
+          "validity": "verified",
+          "verification_commands": 1
+        },
+        {
+          "findings": [],
+          "meaningful_verification_commands": 1,
+          "scenario_id": "verified-dedupe",
+          "validity": "verified",
+          "verification_commands": 1
+        },
+        {
+          "findings": [],
+          "meaningful_verification_commands": 1,
+          "scenario_id": "verified-errors",
+          "validity": "verified",
+          "verification_commands": 1
+        },
+        {
+          "findings": [],
+          "meaningful_verification_commands": 1,
+          "scenario_id": "verified-path",
+          "validity": "verified",
+          "verification_commands": 1
+        }
+      ],
+      "structural_only_scenarios": 0,
+      "success_scored_scenarios": 6,
+      "total_scenarios": 6,
+      "verified_scenarios": 6
+    },
+    {
+      "corpus": "core-200",
+      "invalid_scenarios": 90,
+      "scenarios": [
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/config.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/config.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-001",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/constants.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/constants.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-002",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'multi-crate' does not contain 'crates/core/src/log.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'multi-crate' does not contain 'crates/core/src/log.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-003",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/grammar.pest'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/grammar.pest'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-004",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/limiter.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/limiter.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-005",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'tests/common.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'tests/common.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-006",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'sample-workspace' does not contain 'config.toml'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'sample-workspace' does not contain 'config.toml'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-007",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/task_worker.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/task_worker.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-008",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/auth.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/auth.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-009",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/large_dispatch.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/large_dispatch.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-010",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/store.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/store.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-011",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'cli-project' does not contain 'src/cli.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'cli-project' does not contain 'src/cli.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-012",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/lib.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/lib.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-013",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'sample-workspace' does not contain 'src/server.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'sample-workspace' does not contain 'src/server.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-014",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/client.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/client.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-015",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/error.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/error.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-016",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'sample-workspace' does not contain 'src/plugins.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'sample-workspace' does not contain 'src/plugins.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-017",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/models.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/models.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-018",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/macros.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/macros.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-019",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'migrations/003_add_index.sql'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'migrations/003_add_index.sql'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-020",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'Cargo.toml'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'Cargo.toml'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-021",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'tests/fixtures/sample.json'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'tests/fixtures/sample.json'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-022",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'Cargo.toml'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'Cargo.toml'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-023",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'multi-crate' does not contain 'crates/proto/Cargo.toml'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'multi-crate' does not contain 'crates/proto/Cargo.toml'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-024",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'benches/parse.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'benches/parse.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "explore-025",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/utils.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/utils.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-001",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/user.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/user.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-002",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/hash.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/hash.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-003",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/matrix.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/matrix.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-004",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/buffer.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/buffer.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-005",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/form.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/form.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-006",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/watch_win.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/watch_win.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-007",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/b64.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/b64.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-008",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/worker.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/worker.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-009",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/parser.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/parser.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-010",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'cli-project' does not contain 'win_script.ps1'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'cli-project' does not contain 'win_script.ps1'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-011",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'cli-project' does not contain 'src/args.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'cli-project' does not contain 'src/args.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-012",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/net.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/net.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-013",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/conn.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/conn.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-014",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/sort.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/sort.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-015",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/event.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/event.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-016",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/test_runner.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/test_runner.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-017",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/version.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/version.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-018",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'multi-crate' does not contain 'crates/client/src/lib.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'multi-crate' does not contain 'crates/client/src/lib.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-019",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'sample-workspace' does not contain 'config.yaml'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'sample-workspace' does not contain 'config.yaml'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-020",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/cache.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/cache.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-021",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'tests/calc_test.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'tests/calc_test.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-022",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/transform.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/transform.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-023",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/path_util.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/path_util.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-024",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/gen.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/gen.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "scope-025",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'test' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-001",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'build' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-002",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'test' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-003",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'test' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-004",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'build' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-005",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'build' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-006",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'test' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-007",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'test' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-008",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'test' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-009",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'test' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-010",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'build' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-011",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'lint' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-012",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'test' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-013",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'lint' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-014",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'test' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-015",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'test' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-016",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'test' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-017",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'lint' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-018",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'test' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-019",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'test' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-020",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'build' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-021",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'build' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-022",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'build' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-023",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'test' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-024",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            },
+            {
+              "blocking": false,
+              "code": "verification_kind_without_oracle",
+              "detail": "requirement expects 'test' verification but no meaningful command provides it"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "verify-025",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-001",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-002",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-003",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-004",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-005",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-006",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-007",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-008",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-009",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-010",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-011",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-012",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-013",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-014",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-015",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-016",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-017",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-018",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-019",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-020",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-021",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-022",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-023",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-024",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "tool-025",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-001",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-002",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-003",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-004",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-005",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-006",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-007",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-008",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-009",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-010",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-011",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-012",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-013",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-014",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-015",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-016",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-017",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-018",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-019",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "collab-020",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-001",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-002",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-003",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-004",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-005",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-006",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-007",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-008",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-009",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-010",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-011",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-012",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-013",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-014",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-015",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-016",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-017",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-018",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-019",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "plan-020",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-001",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-002",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-003",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-004",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-005",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-006",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-007",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-008",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-009",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-010",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-011",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-012",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-013",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-014",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-015",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-016",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-017",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-018",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-019",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "security-020",
+          "validity": "structural_only",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Button.tsx'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Button.tsx'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-001",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Navbar.tsx'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Navbar.tsx'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-002",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Modal.tsx'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Modal.tsx'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-003",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Table.tsx'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Table.tsx'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-004",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/CardGrid.tsx'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/CardGrid.tsx'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-005",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/theme.css'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/theme.css'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-006",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Input.tsx'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Input.tsx'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-007",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Toast.tsx'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Toast.tsx'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-008",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/MetricCard.tsx'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/MetricCard.tsx'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-009",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Tabs.tsx'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Tabs.tsx'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-010",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/userReducer.ts'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/userReducer.ts'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-011",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/useFetch.ts'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/useFetch.ts'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-012",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/storage.ts'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/storage.ts'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-013",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/routes.ts'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/routes.ts'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-014",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/ws.ts'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/ws.ts'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-015",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Button.tsx'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Button.tsx'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-016",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Layout.tsx'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Layout.tsx'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-017",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Modal.tsx'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Modal.tsx'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-018",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Chart.tsx'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/Chart.tsx'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-019",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/styles.css'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'frontend-app' does not contain 'src/styles.css'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "frontend-020",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/date.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/date.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-001",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/validator.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/validator.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-002",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'tests/data.json'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'tests/data.json'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-003",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/fmt.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/fmt.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-004",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/strategy.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/strategy.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-005",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/parse_num.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/parse_num.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-006",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/timeout.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/timeout.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-007",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/list.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/list.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-008",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/email.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/email.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-009",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/search.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/search.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-010",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/math_util.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/math_util.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-011",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/batch.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/batch.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-012",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'sample-workspace' does not contain 'src/state.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'sample-workspace' does not contain 'src/state.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-013",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/user_svc.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/user_svc.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-014",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/err_msg.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/err_msg.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-015",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/op.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/op.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-016",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'cli-project' does not contain 'src/output.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'cli-project' does not contain 'src/output.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-017",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/parse_err.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/parse_err.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-018",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/callback.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'src/callback.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-019",
+          "validity": "invalid",
+          "verification_commands": 0
+        },
+        {
+          "findings": [
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'tests/repro_test.rs'"
+            },
+            {
+              "blocking": true,
+              "code": "missing_referenced_file",
+              "detail": "fixture 'core-repo' does not contain 'tests/repro_test.rs'"
+            },
+            {
+              "blocking": false,
+              "code": "missing_verification_command",
+              "detail": "scenario has no verification commands"
+            }
+          ],
+          "meaningful_verification_commands": 0,
+          "scenario_id": "anti-overeng-020",
+          "validity": "invalid",
+          "verification_commands": 0
+        }
+      ],
+      "structural_only_scenarios": 110,
+      "success_scored_scenarios": 0,
+      "total_scenarios": 200,
+      "verified_scenarios": 0
+    }
+  ]
+}

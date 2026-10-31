@@ -848,7 +848,7 @@ mod git_store_tests {
         // Records stay usable: discovery and rollback still find them.
         assert_eq!(
             manager.verification_candidates().unwrap(),
-            [preview.id.clone()]
+            std::slice::from_ref(&preview.id)
         );
         manager.rollback(&preview.id, &|_| Ok(()), None).unwrap();
         assert!(!root.join("source.txt").exists());
@@ -963,7 +963,7 @@ mod discovery_tests {
         manager.apply(&preview.id, &|_| Ok(()), None).unwrap();
         assert_eq!(
             manager.verification_candidates().unwrap(),
-            [preview.id.clone()]
+            std::slice::from_ref(&preview.id)
         );
         for boundary in ["same-session", "foreign-session", "task", "parent", "graph"] {
             let mut resumed = owner.clone();

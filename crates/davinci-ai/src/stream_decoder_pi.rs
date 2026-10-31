@@ -402,4 +402,39 @@ mod tests {
             Some(crate::stream_decoder::TRUNCATED_STREAM)
         );
     }
+
+    /// Object-valued tool arguments arrive as event JSON, not as a string buffer.
+    /// Their numbers are normalized when the frame is read, so an exact integral
+    /// decimal reaches the tool as that integer and a rounded fraction does not.
+    #[test]
+    fn audit_wp02_b023_object_arguments_in_a_frame_keep_integers_exact() {
+        use davinci_protocol::json_number::as_u64_exact;
+        let sse = concat!(
+            "data: {\"type\":\"toolcall_start\",\"contentIndex\":0,\"id\":\"c1\",\"toolName\":\"task\"}
+
+",
+            "data: {\"type\":\"toolcall_end\",\"contentIndex\":0,\"toolCall\":{\"type\":\"toolCall\",\"id\":\"c1\",\"name\":\"task\",",
+            "\"arguments\":{\"a\":1.0,\"b\":1e0,\"c\":9007199254740993.0,\"d\":18446744073709551615,",
+            "\"e\":18446744073709551615.0,\"f\":1.0000000000000001,\"g\":18446744073709551616.0}}}
+
+",
+        );
+        let mut decoder = PiMessagesDecoder::new(&model());
+        let mut out = Vec::new();
+        for frame in crate::stream_decoder::frames_of(sse) {
+            decoder.feed(&frame.data, &mut out);
+        }
+        let message = decoder.finish(&mut out);
+        let Some(ContentBlock::ToolCall { arguments, .. }) = message.content.first() else {
+            panic!("no tool call: {:?}", message.content);
+        };
+        let read = |key: &str| as_u64_exact(&arguments[key]);
+        assert_eq!(read("a"), Some(1));
+        assert_eq!(read("b"), Some(1));
+        assert_eq!(read("c"), Some(9_007_199_254_740_993));
+        assert_eq!(read("d"), Some(u64::MAX));
+        assert_eq!(read("e"), Some(u64::MAX));
+        assert_eq!(read("f"), None);
+        assert_eq!(read("g"), None);
+    }
 }

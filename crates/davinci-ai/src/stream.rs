@@ -46,6 +46,9 @@ pub struct StreamOptions {
     /// `response_format`; other providers get no wire change and rely on the
     /// caller's validation.
     pub output_schema: Option<Value>,
+    /// Receives the `Retry-After` the server sent with the request's final
+    /// failure, as a typed delay, for a caller that runs its own retries.
+    pub retry_after_sink: Option<crate::RetryAfterSink>,
 }
 
 /// The schema name the constrained-output wire formats carry. Codex exec
@@ -396,7 +399,9 @@ pub fn parse_sse_block(block: &str) -> Option<Value> {
     if data.is_empty() || data == "[DONE]" {
         return None;
     }
-    serde_json::from_str(&data).ok()
+    // Exact integral decimals (`1.0`, `1e0`) become integers here, before any
+    // object-valued tool argument is built into a `Value`.
+    davinci_protocol::json_number::parse_exact(&data).ok()
 }
 
 /// Replay a recorded SSE corpus through the decoder its frames call for.
@@ -559,16 +564,9 @@ fn read_provider_stream(
     if read_error.is_some() && frames > 0 && (framer.saw_done() || decoder.is_done()) {
         read_error = None;
     }
-    if !aborted && read_error.is_none() && !decoder.is_done() {
-        if let Some(frame) = framer.flush() {
-            frames += 1;
-            raw.clear();
-            if keep_raw_events {
-                raw_events.push(frame.data.clone());
-            }
-            feed(&frame.data, decoder, &mut events, on_event);
-        }
-    }
+    // EOF does not dispatch an unfinished event: only a real blank line ends
+    // an SSE event. A stream cut before its terminator is handled below as a
+    // missing terminal response.
 
     if !aborted {
         // A frame that failed to parse may have carried content or tool-call
@@ -844,7 +842,10 @@ pub fn live_complete_with(
         options.abort_signal.as_ref(),
         |ms| std::thread::sleep(Duration::from_millis(ms)),
     )
-    .map_err(|err| err.message)?;
+    .map_err(|err| {
+        crate::provider_retry::note_server_retry_delay(options.retry_after_sink.as_ref(), &err);
+        err.message
+    })?;
     let message = parse_provider_response(model, &text);
     observation.finish(
         if message.stop_reason == Some(StopReason::Error) {
@@ -1194,6 +1195,7 @@ fn live_complete_streaming_with_sink_envelope_inner(
     )
     .map_err(|err| {
         crate::trace::log(&format!("sse request failed: {}", err.message));
+        crate::provider_retry::note_server_retry_delay(options.retry_after_sink.as_ref(), &err);
         err.message
     })?;
     crate::trace::log(&format!("sse status {}", response.status()));
@@ -3288,7 +3290,7 @@ fn response_hit_token_limit(value: &Value) -> bool {
 }
 
 pub(crate) fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
-    let value: Value = match serde_json::from_str(raw) {
+    let value: Value = match davinci_protocol::json_number::parse_exact(raw) {
         Ok(value) => value,
         Err(_) if raw.lines().any(|line| line.starts_with("data:")) => {
             return fixture_complete(model, &[], raw);
@@ -5292,6 +5294,131 @@ mod tests {
         );
     }
 
+    /// With provider retries enabled, a 429 asking for more than the cap makes
+    /// one request, and the sink (filled by the adapter itself, not by the test)
+    /// tells the caller's retry loop to stop. The message still reads like a
+    /// rate limit, which is what that loop would otherwise retry.
+    #[test]
+    fn audit_wp02_b033_an_over_cap_retry_after_stops_the_callers_loop_non_streaming() {
+        over_cap_retry_after_fixture(false);
+    }
+
+    #[test]
+    fn audit_wp02_b033_an_over_cap_retry_after_stops_the_callers_loop_streaming() {
+        over_cap_retry_after_fixture(true);
+    }
+
+    fn over_cap_retry_after_fixture(streaming: bool) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        use crate::auth::ResolvedAuth;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let hits = Arc::new(AtomicU32::new(0));
+        let server_hits = hits.clone();
+        let server = std::thread::spawn(move || {
+            // Serve until nothing else connects for a moment: a retry would.
+            let mut idle = 0;
+            while idle < 40 {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(_) => {
+                        idle += 1;
+                        std::thread::sleep(Duration::from_millis(25));
+                        continue;
+                    }
+                };
+                idle = 0;
+                stream.set_nonblocking(false).unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                let header_end = loop {
+                    let n = match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break request.len(),
+                        Ok(n) => n,
+                    };
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let content_length = String::from_utf8_lossy(&request[..header_end])
+                    .to_ascii_lowercase()
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                server_hits.fetch_add(1, Ordering::SeqCst);
+                let body = r#"{"error":"rate limited"}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 120\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api.contains("openai"))
+            .expect("openai");
+        model.base_url = Some(format!("http://{addr}"));
+        let auth = ResolvedAuth {
+            api_key: Some("test".into()),
+            headers: Default::default(),
+            source: "test".into(),
+        };
+        let sink = crate::RetryAfterSink::default();
+        let options = StreamOptions {
+            max_retries: Some(3),
+            max_retry_delay_ms: Some(60_000),
+            retry_after_sink: Some(sink.clone()),
+            ..StreamOptions::default()
+        };
+        let messages = [ChatMessage::text("user", "hi")];
+        let error = if streaming {
+            live_complete_streaming_with_sink_envelope(
+                &model,
+                &messages,
+                &auth,
+                None,
+                &[],
+                &options,
+                &mut |_| {},
+            )
+            .map(|_| ())
+            .unwrap_err()
+        } else {
+            live_complete_with(&model, &messages, &auth, None, &[], &options)
+                .map(|_| ())
+                .unwrap_err()
+        };
+        server.join().unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the refused delay must not be retried: {error}"
+        );
+        assert!(
+            error.contains("Server requested 120s retry delay (max: 60s)"),
+            "{error}"
+        );
+        // The message alone would be retried by the caller's loop...
+        assert!(crate::is_retryable_error_text(&error), "{error}");
+        // ...so the typed advice is what stops it.
+        assert_eq!(sink.take_advice(), Some(crate::RetryAdvice::Stop(120_000)));
+    }
+
     #[test]
     fn anthropic_body_places_cache_control_breakpoints() {
         let anthropic = load_builtin_models()
@@ -6139,6 +6266,74 @@ mod tests {
         );
         assert!(!request.lines().next().unwrap_or_default().contains("key="));
         assert!(!events.is_empty());
+    }
+
+    /// Object-valued tool arguments in a provider body (OpenAI-compatible,
+    /// Anthropic `input`, Google `args`) and in an SSE event keep exact integral
+    /// decimals as integers; a rounded fraction stays refused by the consumer.
+    #[test]
+    fn audit_wp02_b023_object_arguments_in_provider_bodies_keep_integers_exact() {
+        use davinci_protocol::json_number::as_u64_exact;
+        let model = |api: &str| {
+            load_builtin_models()
+                .into_iter()
+                .find(|m| m.api == api)
+                .unwrap_or_else(|| panic!("no {api} model"))
+        };
+        let args = r#"{"a":1.0,"b":1e0,"c":9007199254740993.0,"d":18446744073709551615,"e":18446744073709551615.0,"f":1.0000000000000001,"g":18446744073709551616.0}"#;
+        let tool_arguments = |api: &str, body: String| {
+            let message = parse_provider_response(&model(api), &body);
+            message
+                .content
+                .into_iter()
+                .find_map(|block| match block {
+                    ContentBlock::ToolCall { arguments, .. } => Some(arguments),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{api}: no tool call"))
+        };
+        let bodies = [
+            (
+                "openai-completions",
+                format!(
+                    r#"{{"choices":[{{"message":{{"tool_calls":[{{"id":"c","function":{{"name":"task","arguments":{args}}}}}]}}}}]}}"#
+                ),
+            ),
+            (
+                "anthropic-messages",
+                format!(
+                    r#"{{"content":[{{"type":"tool_use","id":"c","name":"task","input":{args}}}]}}"#
+                ),
+            ),
+            (
+                "google-generative-ai",
+                format!(
+                    r#"{{"candidates":[{{"content":{{"parts":[{{"functionCall":{{"name":"task","args":{args}}}}}]}}}}]}}"#
+                ),
+            ),
+        ];
+        let check = |origin: &str, arguments: &Value| {
+            let read = |key: &str| as_u64_exact(&arguments[key]);
+            assert_eq!(read("a"), Some(1), "{origin}");
+            assert_eq!(read("b"), Some(1), "{origin}");
+            assert_eq!(read("c"), Some(9_007_199_254_740_993), "{origin}");
+            assert_eq!(read("d"), Some(u64::MAX), "{origin}");
+            assert_eq!(read("e"), Some(u64::MAX), "{origin}");
+            assert_eq!(read("f"), None, "{origin}");
+            assert_eq!(read("g"), None, "{origin}");
+        };
+        for (api, body) in bodies {
+            check(api, &tool_arguments(api, body));
+        }
+        // The SSE frame reader used by the streaming paths.
+        let event = parse_sse_block(&format!(
+            r#"data: {{"candidates":[{{"content":{{"parts":[{{"functionCall":{{"name":"task","args":{args}}}}}]}}}}]}}"#
+        ))
+        .expect("event");
+        check(
+            "sse",
+            &event["candidates"][0]["content"]["parts"][0]["functionCall"]["args"],
+        );
     }
 
     #[test]

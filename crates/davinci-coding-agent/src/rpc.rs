@@ -302,6 +302,14 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 .as_deref()
                 .map(davinci_agent::parse_rpc_images)
                 .unwrap_or_default();
+            if command
+                .message
+                .as_deref()
+                .is_none_or(|text| text.trim().is_empty())
+                && images.is_empty()
+            {
+                return fail(id, &kind, "prompt text is required".into());
+            }
             if runtime.agent.is_compacting {
                 return fail(id, &kind, COMPACTION_PROMPT_ERROR.to_string());
             }
@@ -347,6 +355,14 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 .as_deref()
                 .map(davinci_agent::parse_rpc_images)
                 .unwrap_or_default();
+            if command
+                .message
+                .as_deref()
+                .is_none_or(|text| text.trim().is_empty())
+                && images.is_empty()
+            {
+                return fail(id, &kind, "steer text is required".into());
+            }
             if let Some(message) = &command.message {
                 let text = davinci_agent::expand_user_text(
                     message,
@@ -364,6 +380,14 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 .as_deref()
                 .map(davinci_agent::parse_rpc_images)
                 .unwrap_or_default();
+            if command
+                .message
+                .as_deref()
+                .is_none_or(|text| text.trim().is_empty())
+                && images.is_empty()
+            {
+                return fail(id, &kind, "follow-up text is required".into());
+            }
             if let Some(message) = &command.message {
                 let text = davinci_agent::expand_user_text(
                     message,
@@ -509,13 +533,14 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
             }
             let exclude = command.exclude_from_context.unwrap_or(false);
             let bash_command = command.command.unwrap_or_default();
-            match davinci_agent::execute_tool(
+            match davinci_agent::execute_tool_with(
                 &runtime.cwd,
                 "bash",
                 &serde_json::json!({
                     "command": bash_command,
                     "excludeFromContext": exclude
                 }),
+                &runtime.agent.tool_context,
             ) {
                 Ok(result) => {
                     let bash_result = serde_json::json!({
@@ -1571,7 +1596,7 @@ mod tests {
             let id = SessionStartPlugin::session_id(&runtime.agent);
             assert_eq!(
                 SessionStartPlugin::context_session_ids(&runtime.agent),
-                [id.clone()]
+                std::slice::from_ref(&id)
             );
             id
         };

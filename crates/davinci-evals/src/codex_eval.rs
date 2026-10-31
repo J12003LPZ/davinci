@@ -496,8 +496,12 @@ mod tests {
             &evidence,
         );
         let tasks = vec![task.clone()];
-        assert!(evaluate_verified_report(1, &tasks, &[pair.clone()]).meets_release_gate);
-        assert!(!evaluate_verified_report(0, &tasks, &[pair.clone()]).meets_release_gate);
+        assert!(
+            evaluate_verified_report(1, &tasks, std::slice::from_ref(&pair)).meets_release_gate
+        );
+        assert!(
+            !evaluate_verified_report(0, &tasks, std::slice::from_ref(&pair)).meets_release_gate
+        );
         assert!(!evaluate_verified_report(1, &tasks, &[]).meets_release_gate);
         assert!(
             !evaluate_verified_report(1, &tasks, &[pair.clone(), pair.clone()]).meets_release_gate
@@ -505,7 +509,8 @@ mod tests {
         let mut changed_manifest = tasks.clone();
         changed_manifest[0].verification_command = Some("different-oracle".into());
         assert!(
-            !evaluate_verified_report(1, &changed_manifest, &[pair.clone()]).meets_release_gate
+            !evaluate_verified_report(1, &changed_manifest, std::slice::from_ref(&pair))
+                .meets_release_gate
         );
         let mut failed_oracle = evidence.clone();
         failed_oracle.exit_code = Some(1);

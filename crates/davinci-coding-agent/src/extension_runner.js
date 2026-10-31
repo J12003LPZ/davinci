@@ -37,8 +37,14 @@ const VIRTUAL_SPECIFIERS = [
 ];
 
 const VIRTUAL_FILES = {};
-const virtualRoot = path.join(os.tmpdir(), "pi-virtual-modules");
-fs.mkdirSync(virtualRoot, { recursive: true });
+// Private per-process directory (mode 0700): a shared fixed path let parallel
+// runners observe each other's truncated files and let other users plant modules.
+const virtualRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-virtual-"));
+process.on("exit", () => {
+	try {
+		fs.rmSync(virtualRoot, { recursive: true, force: true });
+	} catch (_error) {}
+});
 
 const TUI_VIRTUAL = `
 class Container {

@@ -493,7 +493,7 @@ fn conversation_body(model: &Model, height: usize) -> (Vec<Line<'static>>, Optio
         let cc = model.theme.cc();
         let fresh = model.transcript.len().saturating_sub(scroll.entries);
         let below = format!(
-            "  ↓ Jump to bottom · {}{offset} {} below · click, End or pgdn",
+            "  ↓ Jump to bottom · {}{offset} {} below · click, Ctrl+End or pgdn",
             match fresh {
                 0 => String::new(),
                 1 => "1 new message · ".to_owned(),
@@ -1210,6 +1210,21 @@ fn handle_history_search_key(model: &mut Model, key: KeyEvent) -> Flow {
     Flow::Continue
 }
 
+/// Whether this key event is the permission-mode chord and may act on the
+/// agent screen. A run in progress does not matter: the idle path acts on the
+/// agent directly, the mid-turn path queues the change for the worker.
+/// `data` is the key's terminal byte sequence.
+pub fn permission_cycle_chord(model: &Model, key: KeyEvent, data: &str) -> bool {
+    let plain_tab_modifiers = !matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+        || (key.modifiers - KeyModifiers::SHIFT).is_empty()
+        || (key.code == KeyCode::Tab && key.modifiers == KeyModifiers::CONTROL);
+    model.keybindings.matches(data, "app.permissions.cycle")
+        && key.kind == KeyEventKind::Press
+        && model.screen == Screen::Agent
+        && !model.codex_open()
+        && plain_tab_modifiers
+}
+
 pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     if key.kind == KeyEventKind::Release {
         return Flow::Continue;
@@ -1315,15 +1330,7 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
         // Active surfaces get first refusal above. Autocomplete may decline
         // this chord without losing its suggestions or changing the draft.
         if model.keybindings.matches(data, "app.permissions.cycle") {
-            let plain_tab_modifiers = !matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
-                || (key.modifiers - KeyModifiers::SHIFT).is_empty()
-                || (key.code == KeyCode::Tab && key.modifiers == KeyModifiers::CONTROL);
-            return if key.kind == KeyEventKind::Press
-                && !model.running
-                && model.screen == Screen::Agent
-                && !model.codex_open()
-                && plain_tab_modifiers
-            {
+            return if permission_cycle_chord(model, key, data) {
                 Flow::CyclePermissionMode
             } else {
                 Flow::Continue
@@ -3007,7 +3014,7 @@ mod tests {
         );
         assert_eq!(m.composer, "keep this café 🦀 draft");
         m.running = true;
-        assert_eq!(handle_key(&mut m, key), Flow::Continue);
+        assert_eq!(handle_key(&mut m, key), Flow::CyclePermissionMode);
         m.running = false;
         for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
             let mut repeated = key;
@@ -3046,12 +3053,12 @@ mod tests {
     }
 
     #[test]
-    fn shift_tab_does_not_escalate_running_modal_or_repeated_input() {
+    fn shift_tab_does_not_escalate_modal_or_repeated_input() {
         use crossterm::event::KeyEventKind;
         let mut m = model(120, 30);
         let mut key = KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT);
         m.running = true;
-        assert_eq!(handle_key(&mut m, key), Flow::Continue);
+        assert_eq!(handle_key(&mut m, key), Flow::CyclePermissionMode);
         m.running = false;
         for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
             key.kind = kind;
@@ -4526,15 +4533,17 @@ mod section_input_regressions {
     }
 
     #[test]
-    fn f11_running_turn_blocks_mode_cycling() {
+    fn f11_running_turn_cycles_mode() {
         let mut m = model("1a");
         m.screen = Screen::Agent;
         m.running = true;
         m.permission_mode = "ask".into();
 
         let flow = press_mods(&mut m, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(flow, Flow::CyclePermissionMode);
+        // A plain tab still completes rather than cycling mid-turn.
+        let flow = press(&mut m, KeyCode::Tab);
         assert_ne!(flow, Flow::CyclePermissionMode);
-        assert_eq!(m.permission_mode, "ask");
     }
 
     #[test]
@@ -5244,9 +5253,14 @@ mod working_line_spacing_tests {
             .iter()
             .position(|row| row.contains("◆ context"))
             .expect("context bar");
-        assert!(bar > working + 1, "working {working}, bar {bar}");
+        assert!(bar > working + 2, "working {working}, bar {bar}");
         assert!(
-            rows[working + 1..bar]
+            rows[working + 1].contains("Tip: "),
+            "{:?}",
+            &rows[working..=bar]
+        );
+        assert!(
+            rows[working + 2..bar]
                 .iter()
                 .all(|row| row.trim().is_empty()),
             "{:?}",
@@ -5360,7 +5374,8 @@ mod scroll_to_entry_tests {
                 row: targets[usize::from(row)].rows.start,
                 modifiers: KeyModifiers::NONE,
             };
-            assert!(super::super::runtime::route_click_target(m, event));
+            // Placed, and left to selection so a drag can copy the draft.
+            assert!(!super::super::runtime::route_click_target(m, event));
         };
         // Two cells of prompt, then "hello".
         click(&mut m, 0, 2 + 5);
@@ -5379,6 +5394,42 @@ mod scroll_to_entry_tests {
         assert_eq!(
             m.composer.editor().cursor,
             m.composer.editor().get_text().len()
+        );
+    }
+
+    #[test]
+    fn dragging_over_the_composer_selects_the_draft_for_copying() {
+        use crate::davinci::selection::Selector;
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut m = chat(24, 6);
+        m.composer.set_text("copy this draft");
+        let frame = compose_frame(&m, m.height);
+        let row = frame
+            .targets
+            .iter()
+            .find(|hit| matches!(hit.target, Target::ComposerRow(_)))
+            .expect("the composer is a target")
+            .rows
+            .start;
+        let rendered = rows(&m);
+        let mut selector = Selector::default();
+        let at = |kind, column| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let now = std::time::Instant::now();
+        let down = at(MouseEventKind::Down(MouseButton::Left), 2);
+        assert!(!super::super::runtime::route_click_target(&mut m, down));
+        assert_eq!(selector.mouse(&mut m, &rendered, down, now), None);
+        let end = 2 + "copy this draft".len() as u16 - 1;
+        let drag = at(MouseEventKind::Drag(MouseButton::Left), end);
+        selector.mouse(&mut m, &rendered, drag, now);
+        let up = at(MouseEventKind::Up(MouseButton::Left), end);
+        assert_eq!(
+            selector.mouse(&mut m, &rendered, up, now).as_deref(),
+            Some("copy this draft")
         );
     }
 

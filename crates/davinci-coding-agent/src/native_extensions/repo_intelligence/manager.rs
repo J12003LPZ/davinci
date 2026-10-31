@@ -125,7 +125,7 @@ impl RepoIntelligence {
 
     /// A deleted source is a valid impact input, but linked/outside ancestors are not.
     pub fn validate_changed_path(&self, raw: &str) -> Result<String, String> {
-        if raw.len() > 4096 {
+        if raw.chars().count() > 4096 {
             return Err("invalid_path: path length".into());
         }
         let relative = scanner::validate_relative(raw)?;

@@ -10,6 +10,9 @@ pub mod host_operation;
 mod permission_state;
 pub mod process_manager;
 pub mod subagent_progress;
+pub mod subagent_receipt;
+#[cfg(test)]
+mod test_seam;
 pub use permission_state::PermissionState;
 mod batch;
 mod branch;
@@ -66,7 +69,8 @@ pub use branch::{
 pub use compaction::{
     branch_summary_context_message, build_history_prompt, calculate_context_tokens,
     compact_messages, compact_messages_with, compact_messages_with_options,
-    compact_messages_with_summary, compaction_context_message, compaction_threshold,
+    compact_messages_with_summary, compact_messages_within, compaction_context_message,
+    compaction_context_message_carrying, compaction_summary_meta, compaction_threshold,
     compute_file_lists, convert_to_llm, env_summarizer, estimate_context_tokens, estimate_tokens,
     extract_file_ops, find_cut_point, format_file_operations, generate_summary_with_usage,
     get_summarization_failure, serialize_conversation, should_compact, CompactionDetails,
@@ -121,6 +125,10 @@ pub use subagent::{
     WorkerAccess, DEFAULT_SUBAGENT_TOOLS, MAX_TASK_CONCURRENCY, PLAN_MODE_APPENDIX,
     PLAN_MODE_DENIAL,
 };
+pub use subagent_receipt::{
+    publish as publish_subagent_receipt, receipt_for_agent, receipt_slot, ReceiptStatus,
+    SubagentReceiptSlot, VerificationReceipt, WorkspaceSnapshot, RECEIPT_SCHEMA_VERSION,
+};
 pub use templates::{
     discover_prompt_templates, expand_prompt_template, parse_command_args, parse_frontmatter,
     strip_frontmatter, substitute_args, PromptTemplate,
@@ -151,6 +159,9 @@ pub const PROMPT_SESSION_ENTRY_TYPE: &str = "prompt_session";
 /// Code on every error that reports a lost session write.
 pub const PERSISTENCE_FAILURE: &str = "PERSISTENCE_FAILURE";
 const MUTATION_VERIFICATION_ENTRY_TYPE: &str = "mutation_verification";
+/// Terminal verification status for a turn. Kept separate from the mutation
+/// state so the honest end state survives even after later edits.
+const COMPLETION_STATUS_ENTRY_TYPE: &str = "completion_status";
 /// Written before a host-driven tool effect and closed by the matching
 /// `mutation_effect_resolved` once its mutation state is durable. A pending
 /// marker with no resolution means the process died inside the effect.
@@ -401,6 +412,87 @@ pub enum CompletionEvidence {
     NotRequired,
 }
 
+/// Terminal, user-visible completion status for a turn.
+///
+/// `CompletionEvidence` remains the internal gate signal. This type is the
+/// honest end state: it distinguishes a stale/incomplete attempt from an
+/// environment where verification was never observed at all, and it is what a
+/// host must report instead of accepting a model's claim of success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionStatus {
+    /// A passing check covers the latest mutation generation.
+    Verified,
+    /// A passing check covers only part of the changed paths.
+    Partial,
+    /// Changes exist and verification is stale or incomplete.
+    Unverified,
+    /// The latest verification attempt failed.
+    VerificationFailed,
+    /// No verification was ever observed for the current changes.
+    VerificationUnavailable,
+    /// The turn made no repository changes.
+    NoChanges,
+}
+
+impl CompletionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Partial => "partial",
+            Self::Unverified => "unverified",
+            Self::VerificationFailed => "verification_failed",
+            Self::VerificationUnavailable => "verification_unavailable",
+            Self::NoChanges => "no_changes",
+        }
+    }
+
+    pub fn is_verified(&self) -> bool {
+        matches!(self, Self::Verified)
+    }
+
+    /// Derive the terminal status without changing the existing gate signal.
+    ///
+    /// `CompletionEvidence::Unverified` becomes `VerificationUnavailable` only
+    /// when the session never observed any verification call at all. A stale
+    /// success (verification ran, then another edit landed) stays `Unverified`,
+    /// which is the more useful distinction for operators.
+    pub fn from_evidence(evidence: CompletionEvidence, state: &MutationVerificationState) -> Self {
+        match evidence {
+            CompletionEvidence::Verified => Self::Verified,
+            CompletionEvidence::Partial => Self::Partial,
+            CompletionEvidence::VerificationFailed => Self::VerificationFailed,
+            CompletionEvidence::NotRequired => Self::NoChanges,
+            CompletionEvidence::Unverified => {
+                if state.latest_evidence.is_none() && state.last_verification.is_none() {
+                    Self::VerificationUnavailable
+                } else {
+                    Self::Unverified
+                }
+            }
+        }
+    }
+}
+
+/// Durable record of the terminal completion status for one turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionStatusRecord {
+    pub status: CompletionStatus,
+    pub evidence: CompletionEvidence,
+    pub mutation_generation: u64,
+    pub verified_generation: Option<u64>,
+    pub recorded_at_ms: u64,
+}
+
+impl CompletionStatusRecord {
+    fn same_terminal_state(&self, other: &Self) -> bool {
+        self.status == other.status
+            && self.evidence == other.evidence
+            && self.mutation_generation == other.mutation_generation
+            && self.verified_generation == other.verified_generation
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ToolOperationOrigin {
     ProviderCall,
@@ -522,6 +614,22 @@ pub(crate) struct HybridCompactionStats {
     pub context_tokens_after: u64,
 }
 
+/// Stand-ins the retry tests inject: the clock the run deadline is read from
+/// and the pool a request queues in.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct TestHooks {
+    pub(crate) clock: Option<std::sync::Arc<dyn Fn() -> u64 + Send + Sync>>,
+    pub(crate) capacity: Option<std::sync::Arc<runtime::capacity::RequestCapacity>>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for TestHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestHooks")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub(crate) codemode: Option<codemode::CodeModeBinding>,
@@ -556,6 +664,12 @@ pub struct Agent {
     pub auto_retry: bool,
     pub retry_attempts: u32,
     pub retry_base_delay_ms: u64,
+    /// Where the provider call leaves the server's `Retry-After` for the
+    /// request that just failed (see [`Agent::retry_after_sink`]).
+    retry_after_sink: davinci_ai::RetryAfterSink,
+    /// Test clock and capacity pool for the retry deadline checks.
+    #[cfg(test)]
+    pub(crate) test_hooks: TestHooks,
     /// Maximum provider model turns in one run; `Some(0)` disables the limit.
     pub max_model_turns: Option<u32>,
     pub provider_timeout_ms: Option<u64>,
@@ -579,6 +693,9 @@ pub struct Agent {
     /// disk, so edits and nested files are kept current (false under
     /// `--no-context-files`, and for files a caller assigned by hand).
     pub instruction_files_enabled: bool,
+    /// Why the mandatory instruction files cannot be admitted (over a size
+    /// limit, hard-linked); the turn is refused while it is set.
+    pub(crate) instruction_error: Option<String>,
     pub(crate) context_file_stamps: std::collections::HashMap<PathBuf, context::FileStamp>,
     /// Where an `AGENTS.md` could sit from the repository root to `cwd`, set
     /// at load, so one created mid-session is noticed.
@@ -612,6 +729,10 @@ pub struct Agent {
     pub agent_profile_models: Option<AgentProfileModels>,
     /// Typed trusted-host responder; takes precedence over the legacy approver.
     pub approval_responder: Option<approval::ApprovalResponder>,
+    /// A mode the host asked for while a turn owns the agent. The host holds a
+    /// clone of this slot; the turn loop applies it through
+    /// `set_permission_mode` before dispatching the next batch of tool calls.
+    pub pending_permission_mode: Arc<Mutex<Option<PermissionMode>>>,
     /// The responder is an unattended policy, not a person. A denial it
     /// returns tells the model the run cannot ask, not that a user declined.
     pub headless_approval: bool,
@@ -659,6 +780,16 @@ pub struct Agent {
     /// about the new limits, and a new summarizer deserves its own attempt. A
     /// change of Context VM mode clears it in [`Agent::set_context_vm_mode`].
     hybrid_fold_backoff_settings: Option<HybridBackoffScope>,
+    /// Context size and limits at the last automatic compaction that was
+    /// refused with `CONTEXT_ADMISSION_FAILED` while the request still fit the
+    /// window. The history is unchanged by a refusal, so the turn loop waits
+    /// for the context to grow by `keep_recent_tokens` (or for a different
+    /// window, settings or summarizer) before paying for another attempt.
+    refused_auto_compaction: Option<(u64, HybridBackoffScope)>,
+    /// Refusal notices no subscriber has seen: a run that fails returns an
+    /// error and drops its buffered events. Replayed into the next run's
+    /// events, cleared when a run returns them.
+    undelivered_notices: Vec<AgentEvent>,
     /// Summarizer requests the last hybrid fold sent (0 when it sent none).
     hybrid_last_fold_requests: u64,
     observation_root_id: String,
@@ -673,6 +804,9 @@ pub struct Agent {
     pub(crate) pending_tool_operations:
         Arc<Mutex<std::collections::HashMap<String, PendingToolOperation>>>,
     pub(crate) operation_presentations: Arc<Mutex<std::collections::HashMap<String, ToolResult>>>,
+    /// Permission revision each compatibility-route call was authorized under,
+    /// checked again right before its adapter runs.
+    pub(crate) prepared_permission_revisions: Arc<Mutex<std::collections::HashMap<String, u64>>>,
     /// Tool-call ids whose results are pruned from the provider view. Only
     /// grows; the session file keeps every body.
     pruned_tool_results: std::collections::HashSet<String>,
@@ -693,13 +827,15 @@ pub struct Agent {
     runtime_environment: Option<prompt::environment::EnvironmentSnapshot>,
     environment_key: Option<prompt::environment::EnvironmentKey>,
     environment_capture: prompt::environment::EnvironmentCapture,
-    last_verification_notice: Option<(u64, CompletionEvidence)>,
+    last_verification_notice: Option<(u64, CompletionStatus)>,
     /// Typed lifecycle evidence for the currently prepared real user turn.
     capability_run_state: Arc<Mutex<prompt::CapabilityRunState>>,
     /// Mutation generations and verification evidence for the current run.
     mutation_verification: Arc<Mutex<MutationVerificationState>>,
     /// Last state written to the session, so unchanged state is not rewritten.
     persisted_mutation_verification: Option<MutationVerificationState>,
+    /// Last terminal completion status written to the session.
+    persisted_completion_status: Option<CompletionStatusRecord>,
     persisted_tool_exposure: Option<std::collections::BTreeSet<String>>,
     completion_state: Arc<Mutex<completion::CompletionState>>,
     /// Bounded request suffix; never session/WAL history or compaction input.
@@ -806,6 +942,9 @@ impl Agent {
             auto_retry: true,
             retry_attempts: 3,
             retry_base_delay_ms: 2_000,
+            retry_after_sink: davinci_ai::RetryAfterSink::default(),
+            #[cfg(test)]
+            test_hooks: TestHooks::default(),
             max_model_turns: Some(200),
             provider_timeout_ms: None,
             provider_max_retries: None,
@@ -824,6 +963,7 @@ impl Agent {
             templates: Vec::new(),
             context_files: Vec::new(),
             instruction_files_enabled: false,
+            instruction_error: None,
             context_file_stamps: std::collections::HashMap::new(),
             instruction_chain: Vec::new(),
             session: None,
@@ -848,6 +988,7 @@ impl Agent {
             permissions: Arc::new(PermissionState::new(PermissionPolicy::default())),
             approver: None,
             approval_responder: None,
+            pending_permission_mode: Arc::new(Mutex::new(None)),
             headless_approval: false,
             output_schema: None,
             approval_registry: Arc::new(approval::ApprovalRegistry::default()),
@@ -870,6 +1011,8 @@ impl Agent {
             hybrid_compaction_stats: HybridCompactionStats::default(),
             hybrid_fold_backoff: None,
             hybrid_fold_backoff_settings: None,
+            refused_auto_compaction: None,
+            undelivered_notices: Vec::new(),
             hybrid_last_fold_requests: 0,
             observation_root_id: uuid::Uuid::new_v4().to_string(),
             root_budget: None,
@@ -879,6 +1022,7 @@ impl Agent {
             tool_ledger: Arc::new(std::sync::Mutex::new(ToolCallLedger::default())),
             pending_tool_operations: Arc::new(Mutex::new(std::collections::HashMap::new())),
             operation_presentations: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            prepared_permission_revisions: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pruned_tool_results: std::collections::HashSet::new(),
             pruned_evidence: std::collections::HashMap::new(),
             base_system_prompt: system_prompt,
@@ -897,6 +1041,7 @@ impl Agent {
             capability_run_state: Arc::new(Mutex::new(prompt::CapabilityRunState::default())),
             mutation_verification: Arc::new(Mutex::new(MutationVerificationState::default())),
             persisted_mutation_verification: None,
+            persisted_completion_status: None,
             persisted_tool_exposure: None,
             completion_state: Arc::new(Mutex::new(completion::CompletionState::default())),
             completion_context: Vec::new(),
@@ -1690,7 +1835,10 @@ impl Agent {
     pub(crate) fn restore_branch_state(&mut self) {
         self.hybrid_fold_backoff = None;
         self.hybrid_fold_backoff_settings = None;
+        self.refused_auto_compaction = None;
+        self.undelivered_notices.clear();
         self.restore_mutation_verification();
+        self.restore_completion_status();
         self.restore_tool_exposure();
     }
 
@@ -1783,6 +1931,84 @@ impl Agent {
         }
     }
 
+    /// The honest terminal status for the latest changes.
+    pub fn completion_status(&self) -> CompletionStatus {
+        let evidence = self.completion_evidence();
+        let state = self.mutation_verification_state();
+        CompletionStatus::from_evidence(evidence, &state)
+    }
+
+    /// The record that a host or resumed session can inspect.
+    pub fn completion_status_record(&self) -> CompletionStatusRecord {
+        let evidence = self.completion_evidence();
+        let state = self.mutation_verification_state();
+        CompletionStatusRecord {
+            status: CompletionStatus::from_evidence(evidence, &state),
+            evidence,
+            mutation_generation: state.mutation_generation,
+            verified_generation: state.verified_generation,
+            recorded_at_ms: davinci_session::now_ms(),
+        }
+    }
+
+    /// Last terminal status persisted on the current branch, if any.
+    pub fn last_recorded_completion_status(&self) -> Option<&CompletionStatusRecord> {
+        self.persisted_completion_status.as_ref()
+    }
+
+    /// Record the terminal completion status on the session. The write happens
+    /// at the turn boundary, so a model claim cannot create a verified status
+    /// on its own. Re-recording the same generation and status is a no-op.
+    pub(crate) fn record_terminal_completion_status(&mut self) {
+        // A terminal status is only meaningful if the mutation state it
+        // describes is already durable on the same branch.
+        self.persist_mutation_verification();
+        let record = self.completion_status_record();
+        if self
+            .persisted_completion_status
+            .as_ref()
+            .is_some_and(|previous| previous.same_terminal_state(&record))
+        {
+            return;
+        }
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let Ok(data) = serde_json::to_value(&record) else {
+            return;
+        };
+        let mut extra = serde_json::Map::new();
+        extra.insert("data".into(), data);
+        let appended = session.append_entry(davinci_session::SessionEntry {
+            id: String::new(),
+            entry_type: "custom".into(),
+            parent_id: None,
+            seq: 0,
+            timestamp: 0,
+            message: None,
+            custom_type: Some(COMPLETION_STATUS_ENTRY_TYPE.into()),
+            extra,
+        });
+        if appended.is_ok() {
+            self.persisted_completion_status = Some(record);
+        }
+    }
+
+    fn restore_completion_status(&mut self) {
+        let saved = self.session.as_ref().and_then(|session| {
+            davinci_session::branch_entries(&session.entries, session.leaf_id.as_deref())
+                .into_iter()
+                .rev()
+                .find(|entry| {
+                    entry.entry_type == "custom"
+                        && entry.custom_type.as_deref() == Some(COMPLETION_STATUS_ENTRY_TYPE)
+                })
+                .and_then(|entry| entry.extra.get("data").cloned())
+        });
+        self.persisted_completion_status =
+            saved.and_then(|data| serde_json::from_value::<CompletionStatusRecord>(data).ok());
+    }
+
     /// Background shells can change source after returning a job handle. Only
     /// the host-owned job state closes this interval; reading output is no pass.
     pub(crate) fn refresh_background_shell_mutations(&self) -> bool {
@@ -1808,6 +2034,13 @@ impl Agent {
             self.record_successful_mutation();
         }
         running
+    }
+
+    /// Hand this to the provider call (`StreamOptions::retry_after_sink`) so
+    /// the server's `Retry-After` on a failed request reaches the retry loop
+    /// as a number, not as text inside the error message.
+    pub fn retry_after_sink(&self) -> davinci_ai::RetryAfterSink {
+        self.retry_after_sink.clone()
     }
 
     /// Compatibility path for mutation sources that cannot yet provide a path.
@@ -2276,6 +2509,18 @@ impl Agent {
         self.reset_system_prompt_to_base();
     }
 
+    /// Apply the mode a host queued while a turn was running, through the same
+    /// entry point as an idle change. Returns the mode applied, if any.
+    pub fn apply_pending_permission_mode(&mut self) -> Option<PermissionMode> {
+        let mode = self
+            .pending_permission_mode
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take()?;
+        self.set_permission_mode(mode);
+        Some(mode)
+    }
+
     pub fn cycle_permission_mode(&mut self) -> PermissionMode {
         let mode = self.permission_mode().next();
         self.set_permission_mode(mode);
@@ -2446,7 +2691,8 @@ impl Agent {
             .map(|ledger| ledger.recent_tool_names(10))
             .unwrap_or_default();
 
-        let has_uncommitted_changes = runtime::has_uncommitted_changes(&self.cwd);
+        let has_uncommitted_changes =
+            runtime::has_uncommitted_changes(&self.cwd).map_err(|error| error.to_string())?;
         let router_input = prompt::CapabilityRouterInput::new(user_text)
             .with_previous_request(previous_user_request)
             .with_recent_tools(&recent_tools)
@@ -3443,13 +3689,21 @@ impl Agent {
     }
 
     /// Remember what the provider reported for the request that produced
-    /// `reply`, now at the end of `messages`. Missing usage records nothing.
+    /// `reply`, now at the end of `messages`. Missing usage, or a usage whose
+    /// input, output or cached-read count the provider did not report (a
+    /// placeholder zero, not a measurement), records nothing and clears any
+    /// earlier observation, so the full-context estimate is used instead. An
+    /// unreported cache-write count stays a plain zero: most providers never
+    /// send one, and requiring it would drop calibration for all of them.
     pub(crate) fn note_provider_context(
         &mut self,
         usage: Option<&davinci_protocol::Usage>,
         reply: &ChatMessage,
     ) {
         let tokens = usage.map_or(0, |usage| {
+            if usage.input_unreported || usage.output_unreported || usage.cache_read_unreported {
+                return 0;
+            }
             usage
                 .input
                 .saturating_add(usage.cache_read)
@@ -3696,7 +3950,7 @@ impl Agent {
                 entries.push(ContextManifestEntry::new(
                     format!("message_{i}"),
                     "history",
-                    ProvenanceKind::ToolEvidence,
+                    history_provenance(msg),
                     format!("message::{}", msg.role),
                     ContextManifestEntry::hash_content(&content_str),
                     tokens,
@@ -4586,9 +4840,13 @@ impl Agent {
             );
         }
         for skill in &self.skills {
-            account.add(
+            // Accounting needs a size, not the text: a skill's body is read
+            // only when it is selected or invoked.
+            let size = skill.size_hint();
+            account.add_unloaded(
                 format!("skill::{}", skill.name),
-                skill.body.clone(),
+                format!("skill-file:{}:{size}", skill.path.display()),
+                size,
                 true,
                 ContextPriority::Deferred,
             );
@@ -4881,6 +5139,8 @@ impl Agent {
             before_tokens,
             after_tokens,
         });
+        // The history the refusal described is gone.
+        self.refused_auto_compaction = None;
         Ok(root)
     }
 
@@ -5192,6 +5452,29 @@ impl Agent {
         }
     }
 
+    /// Whether the turn loop should skip automatic compaction at `tokens`
+    /// because an identical attempt was refused and the context has not grown
+    /// enough since. Never defers a context that no longer fits the window:
+    /// that case blocks the request and is retried every turn.
+    pub(crate) fn auto_compaction_refusal_defers(&mut self, tokens: u64) -> bool {
+        let Some((refused_at, scope)) = &self.refused_auto_compaction else {
+            return false;
+        };
+        let unchanged = *scope == self.hybrid_backoff_scope()
+            && tokens >= *refused_at
+            && tokens < refused_at.saturating_add(self.compaction.keep_recent_tokens)
+            && !(self.context_window > 0 && tokens >= self.context_window);
+        if !unchanged {
+            self.refused_auto_compaction = None;
+        }
+        unchanged
+    }
+
+    /// Remember a refused automatic attempt at `tokens`; see [`Self::auto_compaction_refusal_defers`].
+    pub(crate) fn arm_auto_compaction_refusal(&mut self, tokens: u64) {
+        self.refused_auto_compaction = Some((tokens, self.hybrid_backoff_scope()));
+    }
+
     fn clear_hybrid_backoff(&mut self) {
         self.hybrid_fold_backoff = None;
         self.hybrid_fold_backoff_settings = None;
@@ -5339,11 +5622,8 @@ impl Agent {
                     .rev()
                     .find(|entry| entry.entry_type == "compaction")
                     .and_then(|entry| {
-                        entry
-                            .extra
-                            .get("summary")
-                            .and_then(|value| value.as_str())
-                            .map(str::to_string)
+                        let text = entry.extra.get("summary")?.as_str()?.to_string();
+                        Some((text, compaction_entry_meta(entry)))
                     })
             });
             let provider = self.provider.clone();
@@ -5364,13 +5644,19 @@ impl Agent {
                 .with_input_budget(budget)
             });
             let observations = self.provider_observation_scope("compaction");
-            let result = compact_messages_with_options(
+            // The user requirements a summary carries are never truncated, so
+            // the replacement is admitted against the context that is left.
+            let max_tokens = (window > 0).then(|| self.hybrid_replacement_budget(true));
+            let result = crate::compaction::compact_messages_within(
                 &self.messages,
                 custom_instructions,
                 self.compaction.keep_recent_tokens,
                 self.compaction.reserve_tokens,
-                previous_summary.as_deref(),
+                previous_summary
+                    .as_ref()
+                    .map(|(text, meta)| crate::compaction::PreviousSummary { text, meta }),
                 bound.as_ref(),
+                max_tokens,
             );
             self.finish_auxiliary_observations(
                 observations,
@@ -5383,6 +5669,10 @@ impl Agent {
             result
         };
         let result = self.commit_compaction(result);
+        if result.compacted {
+            // The history the refusal described is gone.
+            self.refused_auto_compaction = None;
+        }
         if self.context_vm_mode() == ContextVmMode::Hybrid {
             self.note_hybrid_outcome(skipped_before, &result, trigger_tokens, recovery);
         }
@@ -5415,6 +5705,18 @@ impl Agent {
                 serde_json::to_value(&result.details).unwrap_or_default(),
             );
             extra.insert("fromHook".into(), serde_json::json!(false));
+            if let Some(meta) = result.messages.first().and_then(compaction_summary_meta) {
+                extra.insert(
+                    COMPACTION_CARRIED_KEY.into(),
+                    serde_json::json!(meta.carried_user_requirements),
+                );
+                if let Some(legacy) = meta.carried_legacy_summary {
+                    extra.insert(
+                        COMPACTION_CARRIED_LEGACY_KEY.into(),
+                        serde_json::json!(legacy),
+                    );
+                }
+            }
             if let Some(usage) = &result.usage {
                 extra.insert(
                     "usage".into(),
@@ -5498,6 +5800,9 @@ impl Agent {
     /// Activate durable task state before replacing the active session.
     /// Reloading the live source preserves its writer lease and worker handles.
     pub fn load_from_session(&mut self, mut session: JsonlSession) -> Result<(), String> {
+        // Admission comes first: a message that cannot be read must stop the
+        // load, not silently vanish from the context the model is given.
+        validate_session_messages(&session)?;
         let session_budget = self.restore_root_budget(&session)?;
         let repair_checkpoint = Self::restore_repair_checkpoint(&session)?;
         let source = std::fs::canonicalize(&session.path).map_err(|error| {
@@ -5739,6 +6044,10 @@ impl Agent {
         let (collected, _) =
             collect_entries_for_branch_summary(&session.entries, old_leaf.as_deref(), target_id);
         let (new_leaf, editor_text) = navigation_target(&target);
+        // The branch about to become active must read back whole. A message
+        // that would silently drop out of its context stops the move here,
+        // before the leaf, the summary entry or the agent's messages change.
+        validate_branch_messages(session, new_leaf.as_deref())?;
         let mut summary_text = None;
         if summarize && !collected.is_empty() {
             let provider = self.provider.clone();
@@ -6068,11 +6377,111 @@ pub(crate) fn is_legacy_verification_notice(message: &ChatMessage) -> bool {
     message.extra.contains_key("davinciVerificationStatus")
 }
 
+/// `extra` key of a `compaction` session entry holding the user requirements
+/// its summary carries. The summary text only displays them.
+const COMPACTION_CARRIED_KEY: &str = "carriedUserRequirements";
+/// `extra` key holding a legacy summary's text, carried apart from the
+/// requirements because the model wrote it.
+const COMPACTION_CARRIED_LEGACY_KEY: &str = "carriedLegacySummary";
+
+/// The requirements a `compaction` entry records. An entry saved before the
+/// metadata existed, or whose list does not parse, is `legacy`: its list is
+/// unknown, not empty, and its summary text is the only record.
+fn compaction_entry_meta(entry: &SessionEntry) -> crate::compaction::CompactionSummaryMeta {
+    let carried: Option<Vec<String>> = entry
+        .extra
+        .get(COMPACTION_CARRIED_KEY)
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    crate::compaction::CompactionSummaryMeta {
+        legacy: carried.is_none(),
+        carried_user_requirements: carried.unwrap_or_default(),
+        carried_legacy_summary: entry
+            .extra
+            .get(COMPACTION_CARRIED_LEGACY_KEY)
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    }
+}
+
+/// Manifest provenance of one history message, from the same role and origin
+/// rules the Context VM applies to its events: a real user message is a user
+/// decision, assistant text is inference, and only tool results are tool
+/// evidence. A message with no visible content carries no authority.
+fn history_provenance(message: &ChatMessage) -> runtime::context_manifest::ProvenanceKind {
+    use runtime::context_manifest::ProvenanceKind;
+    runtime::context_vm::events_from_messages(std::slice::from_ref(message))
+        .first()
+        .map_or_else(
+            || match message.role.as_str() {
+                "toolResult" | "tool_result" => ProvenanceKind::ToolEvidence,
+                _ => ProvenanceKind::AgentInference,
+            },
+            |event| event.provenance_kind,
+        )
+}
+
+/// Every message-bearing entry must deserialize, on every branch and before any
+/// compaction. `entry_to_chat` drops what it cannot read, which is right for
+/// non-message entry types but would hide a damaged or hostile message from the
+/// model's context the moment its branch became active or its history became
+/// visible again. Entry types that carry no message (custom state, labels,
+/// plans) are not checked.
+fn validate_session_messages(session: &JsonlSession) -> Result<(), String> {
+    session.entries.iter().try_for_each(validate_entry_message)
+}
+
+/// The context `leaf` would give the model, if every message-bearing entry on
+/// its path is readable. Nothing is changed; callers use it to refuse a
+/// navigation before moving.
+fn validate_branch_messages(session: &JsonlSession, leaf: Option<&str>) -> Result<(), String> {
+    davinci_session::build_context_entries(&session.entries, leaf)
+        .into_iter()
+        .try_for_each(validate_entry_message)
+}
+
+fn validate_entry_message(entry: &SessionEntry) -> Result<(), String> {
+    let malformed = |detail: String| {
+        format!(
+            "session entry {} (seq {}, type {}) has malformed message content: {detail}",
+            entry.id, entry.seq, entry.entry_type
+        )
+    };
+    match entry.entry_type.as_str() {
+        "message" => {
+            let message = entry
+                .message
+                .as_ref()
+                .ok_or_else(|| malformed("no message".into()))?;
+            serde_json::from_value::<ChatMessage>(message.clone())
+                .map_err(|error| malformed(error.to_string()))?;
+        }
+        "custom_message" => match entry.extra.get("content").or(entry.message.as_ref()) {
+            None | Some(Value::String(_)) => {}
+            Some(content @ Value::Array(_)) => {
+                serde_json::from_value::<Vec<MessageContent>>(content.clone())
+                    .map_err(|error| malformed(error.to_string()))?;
+            }
+            Some(_) => return Err(malformed("content is not text or a list".into())),
+        },
+        // Summaries stand in for the history they replaced.
+        "compaction" | "branch_summary" => {
+            if entry.extra.get("summary").and_then(Value::as_str).is_none() {
+                return Err(malformed("summary is missing or not text".into()));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub(crate) fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
     match entry.entry_type.as_str() {
         "compaction" => {
             let summary = entry.extra.get("summary")?.as_str()?;
-            Some(compaction_context_message(summary))
+            Some(crate::compaction::compaction_context_message_with_meta(
+                summary,
+                &compaction_entry_meta(entry),
+            ))
         }
         "branch_summary" => {
             let summary = entry.extra.get("summary")?.as_str()?;
@@ -6355,6 +6764,9 @@ pub fn capability_toolbox_ablation() -> Result<(bool, bool, u64, u64), String> {
 
 #[cfg(test)]
 mod worker_session_tests;
+
+#[cfg(test)]
+mod completion_status_tests;
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

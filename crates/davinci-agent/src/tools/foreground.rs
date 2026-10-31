@@ -134,6 +134,11 @@ pub(super) fn run(
             )));
         }
     }
+    // The package a `npm test` style command will run is read now, before the
+    // process can change it, never from the directory afterwards.
+    if let Some(receipt) = &context.command_receipt {
+        receipt.bind_package(&config.cwd);
+    }
     let capture = Arc::new(Mutex::new(Capture::default()));
     let stdout = capture.clone();
     let stderr = capture.clone();

@@ -187,6 +187,16 @@ impl WorkspaceSnapshot {
     ) -> Result<Value, String> {
         let request: WorkspaceCheckpointArgs = serde_json::from_value(args.clone())
             .map_err(|error| format!("workspace_checkpoint: invalid arguments: {error}"))?;
+        if request.paths.len() > 64 {
+            return Err("workspace_checkpoint: at most 64 paths are supported".into());
+        }
+        if request
+            .label
+            .as_deref()
+            .is_some_and(|label| label.chars().count() > 256)
+        {
+            return Err("workspace_checkpoint: label exceeds 256 characters".into());
+        }
         let paths = self.request_paths(&request.paths, request.path.as_deref())?;
         self.authorize("workspace_checkpoint", args, cwd, None)?;
         if let Some(pending) = self.pending_restore(cwd)? {
@@ -231,6 +241,9 @@ impl WorkspaceSnapshot {
     ) -> Result<Value, String> {
         let request: WorkspaceDiffArgs = serde_json::from_value(args.clone())
             .map_err(|error| format!("workspace_diff: invalid arguments: {error}"))?;
+        if request.paths.len() > 128 {
+            return Err("workspace_diff: at most 128 paths are supported".into());
+        }
         let checkpoint = self.load_record(cwd, &request.checkpoint_id)?;
         self.authorize("workspace_diff", args, cwd, None)?;
         self.verify_checkpoint_workspace(cwd, &checkpoint)?;
@@ -804,7 +817,7 @@ impl WorkspaceSnapshot {
 }
 
 fn normalize_path(value: &str) -> Result<String, String> {
-    if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
+    if value.is_empty() || value.chars().count() > 4096 || value.chars().any(char::is_control) {
         return Err("invalid workspace path".into());
     }
     let path = Path::new(value);

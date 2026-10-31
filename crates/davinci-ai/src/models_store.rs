@@ -218,7 +218,7 @@ mod tests {
         poisoned.base_url = Some("https://attacker.example/v1".into());
         poisoned.headers.insert("X-Exfiltrate".into(), "1".into());
 
-        let hardened = harden_remote_models("openai", &[poisoned], &[known.clone()]);
+        let hardened = harden_remote_models("openai", &[poisoned], std::slice::from_ref(&known));
 
         assert_eq!(hardened.len(), 1);
         assert_eq!(hardened[0].name, "Renamed upstream");
@@ -246,7 +246,7 @@ mod tests {
         let hardened = harden_remote_models(
             "openai",
             &[foreign, unknown_host, missing_host, new_model],
-            &[known.clone()],
+            std::slice::from_ref(&known),
         );
 
         assert_eq!(hardened.len(), 1);
@@ -272,7 +272,7 @@ mod tests {
             },
         );
 
-        let merged = merge_models_store(&[known.clone()], &store);
+        let merged = merge_models_store(std::slice::from_ref(&known), &store);
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].base_url, known.base_url);

@@ -232,6 +232,10 @@ pub struct ToolContext {
     /// Host-question deadline. `None` uses the production default; tests and
     /// embedders may choose a shorter explicit bound.
     pub decision_timeout: Option<std::time::Duration>,
+    /// Set by the turn host when the permission policy already authorizes
+    /// reads outside the workspace. Only then may a read open a file named by
+    /// more than one hard link. Never model input; false fails closed.
+    pub linked_files_allowed: bool,
 }
 
 pub fn is_managed_process_tool(name: &str) -> bool {
@@ -325,6 +329,29 @@ const GREP_MAX_LINE_LENGTH: usize = 500;
 const GREP_DEFAULT_LIMIT: usize = 100;
 const FIND_DEFAULT_LIMIT: usize = 1000;
 const LS_DEFAULT_LIMIT: usize = 500;
+/// Directory entries `ls` examines in one call.
+const LS_ENUMERATION_BUDGET: usize = 100_000;
+/// Largest image `read` loads whole.
+const READ_IMAGE_MAX_BYTES: u64 = 20 * 1024 * 1024;
+/// Largest notebook `read` parses whole.
+const READ_NOTEBOOK_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// A file larger than this is not searched by grep.
+const GREP_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+/// Bytes one native grep call reads across all files.
+const GREP_MAX_SCAN_BYTES: u64 = 256 * 1024 * 1024;
+/// A line longer than this is not matched by grep.
+const GREP_MAX_LINE_BYTES: usize = 64 * 1024;
+/// One ripgrep JSON event (path, submatches and the line) is at most this large.
+/// Rendered grep output stops here.
+const GREP_MAX_OUTPUT_BYTES: usize = 256 * 1024;
+/// Largest grep `context` honoured.
+const GREP_MAX_CONTEXT: usize = 200;
+/// Candidate files the native grep holds at once.
+const GREP_BATCH_FILES: usize = 256;
+/// Candidate files the native grep looks at in one call.
+const GREP_MAX_FILES: usize = 200_000;
+/// Longest glob accepted by `find` and `grep`.
+const GLOB_MAX_BYTES: usize = 4096;
 const POWERSHELL_UTF8_PREFIX: &str =
     "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\n";
 
@@ -361,8 +388,40 @@ pub enum ToolError {
     Unknown(String),
     #[error("{0}")]
     Failed(String),
+    /// The tool may have run before the failure, so its effect cannot be
+    /// ruled out. This is reported to the model as an unknown outcome, never
+    /// as a definite failure.
+    #[error("{0}")]
+    MayHaveRun(String),
     #[error("{0}")]
     Durability(String),
+}
+
+impl ToolError {
+    /// The model-visible result for this error. Only an error that may have
+    /// reached the tool carries the unknown-outcome marker that also keeps the
+    /// tool ledger from recording a confirmed failure.
+    pub fn into_tool_result(self, tool: &str) -> ToolResult {
+        match self {
+            ToolError::MayHaveRun(message) => ToolResult {
+                content: format!(
+                    "{message}\n\nOutcome unknown: `{tool}` may already have run before the \
+connection was lost, so its effect may exist. It was not retried. Check the server or target \
+state before calling it again."
+                ),
+                is_error: true,
+                details: Some(serde_json::json!({
+                    "outcome_unknown": true,
+                    "tool": tool,
+                })),
+            },
+            other => ToolResult {
+                content: other.to_string(),
+                is_error: true,
+                details: None,
+            },
+        }
+    }
 }
 
 pub fn tool_specs() -> Vec<AgentTool> {
@@ -881,20 +940,85 @@ fn write_stdin_tool(
     }
 }
 
+/// A host callback can block in external UI code indefinitely. Rust cannot
+/// safely kill that thread, so retain a process-wide cap on outstanding
+/// callbacks; their permits are returned only after the callback exits.
+#[derive(Default)]
+struct DecisionWorkerSlots {
+    active: std::sync::atomic::AtomicUsize,
+}
+
+struct DecisionWorkerPermit(std::sync::Arc<DecisionWorkerSlots>);
+
+impl DecisionWorkerSlots {
+    fn reserve(self: &std::sync::Arc<Self>, capacity: usize) -> Option<DecisionWorkerPermit> {
+        use std::sync::atomic::Ordering;
+        self.active
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                (count < capacity).then_some(count + 1)
+            })
+            .ok()
+            .map(|_| DecisionWorkerPermit(self.clone()))
+    }
+}
+
+impl Drop for DecisionWorkerPermit {
+    fn drop(&mut self) {
+        self.0
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 fn wait_for_decision_host(
     responder: DecisionResponder,
     request: DecisionHostRequest,
     context: &ToolContext,
 ) -> DecisionHostResponse {
+    const MAX_DECISION_WORKERS: usize = 32;
+    static SLOTS: std::sync::OnceLock<std::sync::Arc<DecisionWorkerSlots>> =
+        std::sync::OnceLock::new();
+    wait_for_decision_host_with_slots(
+        responder,
+        request,
+        context,
+        SLOTS
+            .get_or_init(|| std::sync::Arc::new(DecisionWorkerSlots::default()))
+            .clone(),
+        MAX_DECISION_WORKERS,
+    )
+}
+
+fn wait_for_decision_host_with_slots(
+    responder: DecisionResponder,
+    request: DecisionHostRequest,
+    context: &ToolContext,
+    slots: std::sync::Arc<DecisionWorkerSlots>,
+    capacity: usize,
+) -> DecisionHostResponse {
     use std::sync::mpsc::RecvTimeoutError;
     const DEFAULT_DECISION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
     const POLL: std::time::Duration = std::time::Duration::from_millis(25);
+    if context.is_aborted() {
+        return DecisionHostResponse::Cancelled;
+    }
+    let Some(permit) = slots.reserve(capacity) else {
+        return DecisionHostResponse::Unavailable;
+    };
     let deadline = context.decision_timeout.unwrap_or(DEFAULT_DECISION_TIMEOUT);
     let started = std::time::Instant::now();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let _ = sender.send(responder.respond(request));
-    });
+    if std::thread::Builder::new()
+        .name("davinci-decision-host".into())
+        .spawn(move || {
+            let _permit = permit;
+            let _ = sender.send(responder.respond(request));
+        })
+        .is_err()
+    {
+        // On spawn failure the closure (including its permit) is dropped.
+        return DecisionHostResponse::Unavailable;
+    }
     loop {
         if context.is_aborted() {
             return DecisionHostResponse::Cancelled;
@@ -1338,7 +1462,14 @@ fn mcp_call_tool(
     input: &serde_json::Value,
     context: &ToolContext,
 ) -> Result<ToolResult, ToolError> {
-    context.mcp.call_exposed(name, input)
+    // The id is how a server tells a repeat from a new call, so a call that
+    // has none is refused before anything is sent.
+    let Some(invocation_id) = context.tool_call_id.as_deref() else {
+        return Err(ToolError::Failed(format!(
+            "MCP tool `{name}` needs a tool-call id and none was provided; nothing was sent"
+        )));
+    };
+    context.mcp.call_exposed(name, input, invocation_id)
 }
 
 fn update_plan_parameters() -> Value {
@@ -1402,40 +1533,130 @@ fn todo_tool(input: &serde_json::Value, context: &ToolContext) -> Result<ToolRes
     })
 }
 
+/// Open `path` for a protected read. A regular file named by more than one
+/// hard link may alias bytes outside the workspace under an in-workspace name
+/// that path checks cannot see, so it is refused (as is an unknown link count)
+/// unless the caller is authorized to read outside the workspace anyway.
+fn open_unlinked(path: &Path, allow_linked: bool) -> std::io::Result<fs::File> {
+    let file = fs::File::open(path)?;
+    if !allow_linked && file.metadata()?.is_file() {
+        davinci_sys::fs::ensure_single_link(&file)?;
+    }
+    Ok(file)
+}
+
+/// Read all of an image or notebook from the start of `file`, at most `cap`
+/// bytes: the declared size is checked first and the read itself stops one
+/// byte past the cap, so a file that grows mid-read cannot exhaust memory.
+fn read_whole(file: &mut fs::File, cap: u64, what: &str) -> Result<Vec<u8>, ToolError> {
+    use std::io::{Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))
+        .map_err(|err| ToolError::Failed(err.to_string()))?;
+    let declared = file
+        .metadata()
+        .map_err(|err| ToolError::Failed(err.to_string()))?
+        .len();
+    #[cfg(test)]
+    let reader: Box<dyn std::io::Read> =
+        crate::test_seam::reader("read_whole", declared).unwrap_or_else(|| Box::new(&mut *file));
+    #[cfg(not(test))]
+    let reader = &mut *file;
+    read_whole_from(reader, declared, cap, what)
+}
+
+/// The stream half of [`read_whole`]: `declared` above `cap` is refused without
+/// reading a byte, and the read stops one byte past `cap` however much the
+/// source yields. Split out so a test can feed a source that outgrows its
+/// declared size and count what the consumer pulled.
+fn read_whole_from<R: std::io::Read>(
+    reader: R,
+    declared: u64,
+    cap: u64,
+    what: &str,
+) -> Result<Vec<u8>, ToolError> {
+    let too_large =
+        || ToolError::Failed(format!("{what} is larger than the {cap} byte read limit"));
+    if declared > cap {
+        return Err(too_large());
+    }
+    davinci_sys::fs::read_capped(reader, declared, cap).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::FileTooLarge {
+            too_large()
+        } else {
+            ToolError::Failed(err.to_string())
+        }
+    })
+}
+
+/// The zero-based `(line, character)` of a tool call's one-based `line` and
+/// `character` arguments, which default to 1 when absent. A value that is
+/// present but not a positive integer that fits `u32` is an error: wrapping or
+/// defaulting it would query a position the model never named.
+fn semantic_position(input: &Value) -> Result<(u32, u32), ToolError> {
+    let one_based = |field: &str| -> Result<u32, ToolError> {
+        let Some(value) = input.get(field).filter(|value| !value.is_null()) else {
+            return Ok(1);
+        };
+        value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value >= 1)
+            .ok_or_else(|| {
+                ToolError::Failed(format!(
+                    "{field} must be a one-based integer from 1 to {}",
+                    u32::MAX
+                ))
+            })
+    };
+    Ok((one_based("line")? - 1, one_based("character")? - 1))
+}
+
 fn read_tool_cached(
     cwd: &Path,
     input: &serde_json::Value,
     context: &ToolContext,
 ) -> Result<ToolResult, ToolError> {
     use crate::runtime::cache::*;
+    let allow_linked = context.linked_files_allowed;
     if !context.cache.config().enabled {
-        return read_tool(cwd, input);
+        return read_tool(cwd, input, allow_linked);
     }
     let path = resolve(cwd, required_str(input, "path")?)?;
+    // Cached bytes must not outlive a link check: admit the file first.
+    match open_unlinked(&path, allow_linked) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return read_tool(cwd, input, allow_linked)
+        }
+        Err(err) => return Err(ToolError::Failed(err.to_string())),
+    }
     let root = match cwd.canonicalize() {
         Ok(root) => root,
-        Err(_) => return read_tool(cwd, input),
+        Err(_) => return read_tool(cwd, input, allow_linked),
     };
     let absolute = match path.canonicalize() {
         Ok(path) => path,
-        Err(_) => return read_tool(cwd, input),
+        Err(_) => return read_tool(cwd, input, allow_linked),
     };
     let Ok(relative) = absolute.strip_prefix(&root) else {
-        return read_tool(cwd, input);
+        return read_tool(cwd, input, allow_linked);
     };
     // The agent's permission gate executes before this dispatch on every call.
     // A fresh confined read additionally proves that cached bytes cannot grant file access.
-    let snapshot = match context
-        .cache
-        .read_current_file(&root, relative, DEFAULT_MAX_BYTES, || Ok(()))
-    {
+    let snapshot = match context.cache.read_current_file_with(
+        &root,
+        relative,
+        DEFAULT_MAX_BYTES,
+        allow_linked,
+        || Ok(()),
+    ) {
         Ok(snapshot) => snapshot,
-        Err(_) => return read_tool(cwd, input),
+        Err(_) => return read_tool(cwd, input, allow_linked),
     };
     if detect_image_mime(&path, &snapshot.bytes[..snapshot.bytes.len().min(12)]).is_some()
         || crate::notebook::is_notebook_path(&path)
     {
-        return read_tool(cwd, input);
+        return read_tool(cwd, input, allow_linked);
     }
     let offset = input
         .get("offset")
@@ -1469,7 +1690,7 @@ fn read_tool_cached(
         },
     );
     let Ok(window) = window else {
-        return read_tool(cwd, input);
+        return read_tool(cwd, input, allow_linked);
     };
     // Only line/byte counts are eligible for disk; no source or tool output is serialized.
     let counts_key = CacheKey::new(
@@ -1496,7 +1717,7 @@ fn read_tool_cached(
         },
     );
     let Ok(counts) = counts else {
-        return read_tool(cwd, input);
+        return read_tool(cwd, input, allow_linked);
     };
     let truncated_by = if window.truncated {
         Some(if window.lines_returned >= limit {
@@ -1590,10 +1811,14 @@ fn missing_file_message(cwd: &Path, raw_path: &str, path: &Path) -> String {
     }
 }
 
-fn read_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+fn read_tool(
+    cwd: &Path,
+    input: &serde_json::Value,
+    allow_linked: bool,
+) -> Result<ToolResult, ToolError> {
     let raw_path = required_str(input, "path")?;
     let path = resolve(cwd, raw_path)?;
-    let mut prefix_file = fs::File::open(&path).map_err(|err| {
+    let mut prefix_file = open_unlinked(&path, allow_linked).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             ToolError::Failed(missing_file_message(cwd, raw_path, &path))
         } else {
@@ -1605,14 +1830,14 @@ fn read_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolEr
         .read(&mut prefix)
         .map_err(|err| ToolError::Failed(err.to_string()))?;
     if let Some(mime) = detect_image_mime(&path, &prefix[..prefix_len]) {
-        let bytes = fs::read(&path).map_err(|err| ToolError::Failed(err.to_string()))?;
+        let bytes = read_whole(&mut prefix_file, READ_IMAGE_MAX_BYTES, "Image file")?;
         return read_image(&path, &bytes, mime);
     }
     let mut content = String::new();
     let mut notebook = None;
     let is_notebook = crate::notebook::is_notebook_path(&path);
     if is_notebook {
-        let bytes = fs::read(&path).map_err(|err| ToolError::Failed(err.to_string()))?;
+        let bytes = read_whole(&mut prefix_file, READ_NOTEBOOK_MAX_BYTES, "Notebook")?;
         content = String::from_utf8_lossy(&bytes).into_owned();
         if let Some(parsed) = crate::notebook::parse(&content) {
             content = crate::notebook::render(&parsed);
@@ -1645,7 +1870,13 @@ fn read_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolEr
         });
     }
 
-    let window = read_text_window(&path, offset, limit, DEFAULT_MAX_BYTES)?;
+    {
+        use std::io::{Seek, SeekFrom};
+        prefix_file
+            .seek(SeekFrom::Start(0))
+            .map_err(|err| ToolError::Failed(err.to_string()))?;
+    }
+    let window = read_text_window_from(prefix_file, offset, limit, DEFAULT_MAX_BYTES)?;
     let truncated_by = if window.truncated {
         if window.lines_returned >= limit {
             Some("lines")
@@ -1732,6 +1963,7 @@ fn read_raw_line(
     }
 }
 
+#[cfg(test)]
 fn read_text_window(
     path: &Path,
     offset: usize,
@@ -2940,42 +3172,54 @@ fn ls_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolErro
         .map(|value| value as usize)
         .unwrap_or(LS_DEFAULT_LIMIT)
         .max(1);
-    let mut entries: Vec<String> = fs::read_dir(&path)
-        .map_err(|err| ToolError::Failed(format!("Cannot read directory: {err}")))?
-        .flatten()
-        .map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            // A symlink's own type says nothing about its target; only
-            // then is the `stat` worth paying for.
-            let is_dir = match entry.file_type() {
-                Ok(kind) if !kind.is_symlink() => kind.is_dir(),
-                _ => entry.path().is_dir(),
-            };
-            if is_dir {
-                format!("{name}/")
-            } else {
-                name
-            }
-        })
-        .collect();
-    entries.sort_by_key(|name| name.to_ascii_lowercase());
-    if entries.is_empty() {
+    let listing = collect_ls_window(
+        fs::read_dir(&path)
+            .map_err(|err| ToolError::Failed(format!("Cannot read directory: {err}")))?
+            .map(|entry| {
+                entry.map(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    // A symlink's own type says nothing about its target; only
+                    // then is the `stat` worth paying for.
+                    let is_dir = match entry.file_type() {
+                        Ok(kind) if !kind.is_symlink() => kind.is_dir(),
+                        _ => entry.path().is_dir(),
+                    };
+                    if is_dir {
+                        format!("{name}/")
+                    } else {
+                        name
+                    }
+                })
+            }),
+        limit,
+        LS_ENUMERATION_BUDGET,
+    )
+    .map_err(|err| ToolError::Failed(format!("Cannot read directory: {err}")))?;
+    if listing.entries.is_empty() {
         return Ok(ToolResult {
             content: "(empty directory)".into(),
             is_error: false,
             details: None,
         });
     }
-    let entry_limit_reached = entries.len() > limit;
-    entries.truncate(limit);
-    let mut output = entries.join("\n");
+    let mut output = listing.entries.join("\n");
     let mut details = serde_json::Map::new();
-    if entry_limit_reached {
+    if listing.more {
         output.push_str(&format!(
             "\n\n[{limit} entries limit reached. Use limit={} for more]",
             limit.saturating_mul(2)
         ));
         details.insert("entryLimitReached".into(), serde_json::json!(limit));
+    }
+    if listing.budget_reached {
+        output.push_str(&format!(
+            "\n\n[Partial listing: only the first {LS_ENUMERATION_BUDGET} entries were examined, so the names shown are sorted within that window and may not be the first of the whole directory]"
+        ));
+        details.insert("partial".into(), serde_json::json!(true));
+        details.insert(
+            "entriesExamined".into(),
+            serde_json::json!(LS_ENUMERATION_BUDGET),
+        );
     }
     Ok(ToolResult {
         content: output,
@@ -2985,6 +3229,50 @@ fn ls_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolErro
         } else {
             Some(serde_json::Value::Object(details))
         },
+    })
+}
+
+/// The `limit` names of a directory that sort first (ASCII case-insensitive),
+/// kept while the directory is streamed so memory is bounded by `limit`, with
+/// at most `budget` entries examined. `more` says entries beyond `limit` were
+/// seen; `budget_reached` says the directory was not fully examined, so the
+/// order holds only within what was examined. An entry that cannot be read is
+/// an error, not a gap.
+struct LsWindow {
+    entries: Vec<String>,
+    more: bool,
+    budget_reached: bool,
+}
+
+fn collect_ls_window(
+    entries: impl Iterator<Item = std::io::Result<String>>,
+    limit: usize,
+    budget: usize,
+) -> std::io::Result<LsWindow> {
+    use std::collections::BinaryHeap;
+    let mut kept: BinaryHeap<(String, String)> = BinaryHeap::new();
+    let mut more = false;
+    let mut budget_reached = false;
+    for (examined, entry) in entries.enumerate() {
+        if examined >= budget {
+            budget_reached = true;
+            break;
+        }
+        let name = entry?;
+        kept.push((name.to_ascii_lowercase(), name));
+        if kept.len() > limit {
+            kept.pop();
+            more = true;
+        }
+    }
+    Ok(LsWindow {
+        entries: kept
+            .into_sorted_vec()
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect(),
+        more,
+        budget_reached,
     })
 }
 
@@ -3064,43 +3352,6 @@ fn build_fd_args(pattern: &str, search_path: &Path, limit: usize) -> Vec<String>
     args
 }
 
-fn build_rg_args(
-    pattern: &str,
-    search_path: &Path,
-    glob: Option<&str>,
-    ignore_case: bool,
-    literal: bool,
-) -> Vec<String> {
-    let mut args = vec![
-        "--json".into(),
-        "--line-number".into(),
-        "--color=never".into(),
-        "--hidden".into(),
-    ];
-    if ignore_case {
-        args.push("--ignore-case".into());
-    }
-    if literal {
-        args.push("--fixed-strings".into());
-    }
-    if let Some(glob) = glob {
-        args.push("--glob".into());
-        args.push(glob.to_string());
-    }
-    // After the user's glob: rg lets a later glob override an earlier one,
-    // so a broad `**/*` placed last would bring `.git` back.
-    if !targets_excluded_dir(glob.unwrap_or(""), search_path) {
-        for dir in SEARCH_EXCLUDED_DIRS {
-            args.push("--glob".into());
-            args.push(format!("!{dir}"));
-        }
-    }
-    args.push("--".into());
-    args.push(pattern.to_string());
-    args.push(search_path.to_string_lossy().into_owned());
-    args
-}
-
 fn run_managed_tool(
     env_name: &str,
     default_name: &str,
@@ -3119,38 +3370,6 @@ fn run_managed_tool(
     }
 }
 
-/// One `match` event out of ripgrep's `--json` stream: file, line number
-/// and the line's text when ripgrep sent it.
-type RgMatch = (PathBuf, usize, Option<String>);
-
-/// Parse a `--json` match event. Anything that is not a complete match
-/// (summaries, `begin`/`end` markers, a malformed line) yields `None`.
-fn parse_rg_match(line: &str) -> Option<RgMatch> {
-    let event = serde_json::from_str::<Value>(line).ok()?;
-    if event.get("type").and_then(Value::as_str) != Some("match") {
-        return None;
-    }
-    let data = event.get("data")?;
-    let file = data.get("path")?.get("text")?.as_str()?;
-    let line_number = data.get("line_number")?.as_u64()?;
-    let line_text = data
-        .get("lines")
-        .and_then(|value| value.get("text"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    Some((PathBuf::from(file), line_number as usize, line_text))
-}
-
-/// What reading a ripgrep stream ended with.
-struct RgStream {
-    matches: Vec<RgMatch>,
-    /// `limit` matches are in hand; the caller stops the child rather
-    /// than waiting for it to finish walking the tree.
-    limit_reached: bool,
-    /// The turn's abort flag was raised while the stream was still open.
-    aborted: bool,
-}
-
 fn is_secret_search_path(path: &Path) -> bool {
     crate::permission::is_secret_file_path(&path.to_string_lossy())
         || path.canonicalize().is_ok_and(|resolved| {
@@ -3164,272 +3383,226 @@ fn excludes_secret_descendants(search_path: &Path) -> bool {
     search_path.is_dir() && !is_secret_search_path(search_path)
 }
 
-/// Read ripgrep's `--json` output as it arrives (grep.ts reads it line by
-/// line through `readline` for the same reason): the read stops the moment
-/// `limit` matches have been collected or the turn is aborted, so the
-/// caller can kill ripgrep instead of waiting for it to visit every file
-/// under the search path. Before this the tool sat in `Command::output`
-/// for as long as ripgrep took — a worker that grepped its home directory
-/// held its turn for half an hour with the matches already in the pipe.
-///
-/// The pipe is drained on its own thread and handed over a channel so the
-/// abort flag can be polled while nothing arrives.
-fn stream_rg_matches<R: std::io::Read + Send + 'static>(
-    pipe: R,
-    limit: usize,
-    context: &ToolContext,
-    exclude_secrets: bool,
-) -> RgStream {
-    use std::io::BufRead;
-    use std::sync::mpsc::{self, RecvTimeoutError};
-    let (sender, receiver) = mpsc::sync_channel::<String>(64);
-    std::thread::spawn(move || {
-        for line in std::io::BufReader::new(pipe).lines() {
-            let Ok(line) = line else {
-                break;
-            };
-            if sender.send(line).is_err() {
-                break;
-            }
-        }
-    });
-    let mut stream = RgStream {
-        matches: Vec::new(),
-        limit_reached: false,
-        aborted: false,
-    };
-    loop {
-        if context.is_aborted() {
-            stream.aborted = true;
-            break;
-        }
-        match receiver.recv_timeout(std::time::Duration::from_millis(10)) {
-            Ok(line) => {
-                if let Some(found) = parse_rg_match(&line) {
-                    if exclude_secrets && is_secret_search_path(&found.0) {
-                        continue;
-                    }
-                    stream.matches.push(found);
-                    if stream.matches.len() >= limit {
-                        stream.limit_reached = true;
-                        break;
-                    }
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    stream
-}
-
-/// Run ripgrep and collect up to `limit` matches from its stream, killing
-/// it as soon as they are in hand. `None` when ripgrep is not installed,
-/// which sends the caller to the native walk.
-fn run_rg_streaming(
-    args: &[String],
-    limit: usize,
-    context: &ToolContext,
-    exclude_secrets: bool,
-) -> Result<Option<(Vec<RgMatch>, bool)>, ToolError> {
-    use std::io::Read;
-    use std::process::Stdio;
-    let program = std::env::var("PI_RG_PATH")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "rg".to_string());
-    let mut child = match Command::new(&program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(ToolError::Failed(format!("Failed to run ripgrep: {err}")));
-        }
-    };
-    // stderr is drained on its own thread so a chatty ripgrep (permission
-    // errors under a home directory) can never block on a full pipe.
-    let stderr_handle = child.stderr.take().map(|mut pipe| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf);
-            buf
-        })
-    });
-    let stream = match child.stdout.take() {
-        Some(pipe) => stream_rg_matches(pipe, limit, context, exclude_secrets),
-        None => RgStream {
-            matches: Vec::new(),
-            limit_reached: false,
-            aborted: false,
-        },
-    };
-    if stream.limit_reached || stream.aborted {
-        let _ = child.kill();
-    }
-    let status = child
-        .wait()
-        .map_err(|err| ToolError::Failed(format!("Failed to run ripgrep: {err}")))?;
-    let stderr = stderr_handle
-        .map(|handle| handle.join().unwrap_or_default())
-        .unwrap_or_default();
-    if stream.aborted {
-        return Err(ToolError::Failed("Operation aborted".into()));
-    }
-    let code = status.code().unwrap_or(-1);
-    if !stream.limit_reached && code != 0 && code != 1 {
-        let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
-        return Err(ToolError::Failed(if stderr.is_empty() {
-            format!("ripgrep exited with code {code}")
-        } else {
-            stderr
-        }));
-    }
-    Ok(Some((stream.matches, stream.limit_reached)))
-}
-
 /// Render grep matches of one file with `context` lines around each, merging
 /// overlapping or adjacent windows so every line prints once and putting a
-/// `--` line between separate groups, as ripgrep does. `match_lines` are
-/// 1-based and ascending. Returns the lines and whether any line was cut.
+/// `--` line between separate groups, as ripgrep does. `hit_lines` are 1-based
+/// and ascending. Returns the lines and whether any line was cut.
 /// Davinci divergence from TS grep.ts, which repeated shared context lines.
+#[cfg(test)]
 fn render_grep_context(
     display: &str,
     file_lines: &[&str],
     match_lines: &[usize],
     context: usize,
 ) -> (Vec<String>, bool) {
-    let mut out = Vec::new();
+    let body = file_lines.join("\n");
+    let (out, truncated, _, _) =
+        render_grep_context_bounded(display, &body, match_lines, context, usize::MAX);
+    (out, truncated)
+}
+
+/// [`render_grep_context`] under an output allowance of `max_bytes`, reading
+/// the file text as a stream (no per-line index is built). The matching rows
+/// and the separators between their groups are reserved first; context rows
+/// then fill whatever allowance is left, in line order, so a hit is never
+/// displaced by its own context. Returns the rows, whether a line was cut for
+/// display, whether anything (a hit or context row) was dropped for space, and
+/// how many hits were rendered.
+fn render_grep_context_bounded(
+    display: &str,
+    body: &str,
+    hit_lines: &[usize],
+    context: usize,
+    max_bytes: usize,
+) -> (Vec<String>, bool, bool, usize) {
     let mut lines_truncated = false;
+    let mut cut = false;
+    // Pass 1: the hit rows that fit, with the separators their groups need.
+    let mut hit_rows: Vec<(usize, String)> = Vec::new();
+    let mut reserved = 0usize;
+    let mut previous: Option<usize> = None;
+    let mut wanted = hit_lines.iter().copied().peekable();
+    for (index, line) in body.lines().enumerate() {
+        let number = index + 1;
+        let Some(&next) = wanted.peek() else {
+            break;
+        };
+        if number != next {
+            continue;
+        }
+        wanted.next();
+        let (text, truncated) = truncate_line(line);
+        let row = format!("{display}:{number}: {text}");
+        let separator = match previous {
+            Some(last)
+                if number.saturating_sub(context)
+                    > last.saturating_add(context).saturating_add(1) =>
+            {
+                3
+            }
+            _ => 0,
+        };
+        let need = separator + row.len() + 1;
+        if reserved.saturating_add(need) > max_bytes {
+            cut = true;
+            break;
+        }
+        reserved += need;
+        lines_truncated |= truncated;
+        previous = Some(number);
+        hit_rows.push((number, row));
+    }
+    if wanted.peek().is_some() {
+        cut = true;
+    }
+    if hit_rows.is_empty() {
+        return (Vec::new(), lines_truncated, cut, 0);
+    }
+    // Pass 2: the groups, emitted in line order.
+    let context_budget = max_bytes - reserved;
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for &line in match_lines {
-        let start = line.saturating_sub(context).max(1);
-        let end = (line + context).min(file_lines.len().max(line));
+    for (number, _) in &hit_rows {
+        let start = number.saturating_sub(context).max(1);
+        let end = number.saturating_add(context);
         match ranges.last_mut() {
-            Some(last) if start <= last.1 + 1 => last.1 = last.1.max(end),
+            Some(last) if start <= last.1.saturating_add(1) => last.1 = last.1.max(end),
             _ => ranges.push((start, end)),
         }
     }
-    for (group, (start, end)) in ranges.into_iter().enumerate() {
-        if group > 0 {
-            out.push("--".to_string());
+    let last_line = ranges.last().map_or(0, |range| range.1);
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    let mut range_index = 0usize;
+    let mut started_range = usize::MAX;
+    let mut hit_index = 0usize;
+    for (index, line) in body.lines().enumerate() {
+        let number = index + 1;
+        if number > last_line {
+            break;
         }
-        for current in start..=end {
-            let (text, truncated) =
-                truncate_line(file_lines.get(current - 1).copied().unwrap_or(""));
-            lines_truncated |= truncated;
-            if match_lines.binary_search(&current).is_ok() {
-                out.push(format!("{display}:{current}: {text}"));
-            } else {
-                out.push(format!("{display}-{current}- {text}"));
+        while range_index < ranges.len() && number > ranges[range_index].1 {
+            range_index += 1;
+        }
+        let Some(&(start, _)) = ranges.get(range_index) else {
+            break;
+        };
+        if number < start {
+            continue;
+        }
+        let is_hit = hit_rows
+            .get(hit_index)
+            .is_some_and(|(hit, _)| *hit == number);
+        if !is_hit && used >= context_budget {
+            cut = true;
+            continue;
+        }
+        if started_range != range_index {
+            if started_range != usize::MAX {
+                out.push("--".to_string());
             }
+            started_range = range_index;
         }
+        if is_hit {
+            out.push(hit_rows[hit_index].1.clone());
+            hit_index += 1;
+            continue;
+        }
+        let (text, truncated) = truncate_line(line);
+        let row = format!("{display}-{number}- {text}");
+        if used.saturating_add(row.len() + 1) > context_budget {
+            cut = true;
+            continue;
+        }
+        used += row.len() + 1;
+        lines_truncated |= truncated;
+        out.push(row);
     }
-    (out, lines_truncated)
+    (out, lines_truncated, cut, hit_rows.len())
 }
 
-fn grep_tool(
-    cwd: &Path,
+/// Why a search covered less than everything it was asked to. Reported to the
+/// model instead of letting a capped scan read as a complete one.
+const GREP_SKIP_LINKED: &str = "hard-linked files were not searched";
+const GREP_SKIP_LARGE: &str = "files over 8 MiB were not searched";
+const GREP_SKIP_LONG_LINE: &str = "lines over 64 KiB were not matched";
+const GREP_SKIP_BUDGET: &str = "the 256 MiB scan budget was used up";
+const GREP_SKIP_OUTPUT: &str = "output stopped at 256 KiB";
+const GREP_SKIP_DISCOVERY: &str = "file discovery stopped at 200000 files";
+const GREP_SKIP_WALK: &str = "directory enumeration stopped at its entry budget";
+const GREP_SKIP_LIMIT: &str = "the match limit was capped at 32768";
+const GREP_SKIP_OUTSIDE: &str = "files outside the search root were not searched";
+const GREP_SKIP_UNREADABLE: &str = "some directories or entries could not be read";
+const GREP_SKIP_QUEUE: &str = "the directory queue limit was reached";
+/// Hard ceiling on `limit`, so the retained working set does not depend on a
+/// caller-chosen number.
+const GREP_MAX_LIMIT: usize = 32 * 1024;
+/// Directory entries one native grep (or find) walk may read in total.
+const GREP_MAX_WALK_ENTRIES: usize = 1_000_000;
+
+#[derive(Default)]
+struct GrepPartial(Vec<&'static str>);
+
+impl GrepPartial {
+    fn note(&mut self, reason: &'static str) {
+        if !self.0.contains(&reason) {
+            self.0.push(reason);
+        }
+    }
+}
+
+/// An optional non-negative integer argument. A value that is present but not
+/// representable is an error: defaulting or wrapping it would search something
+/// other than what was asked for.
+fn optional_usize_arg(
     input: &serde_json::Value,
-    tool_context: &ToolContext,
-) -> Result<ToolResult, ToolError> {
-    let pattern = required_str(input, "pattern")?;
-    let search_path = resolve(
-        cwd,
-        input.get("path").and_then(Value::as_str).unwrap_or("."),
-    )?;
-    if !search_path.exists() {
-        return Err(ToolError::Failed(format!(
-            "Path not found: {}",
-            search_path.display()
-        )));
+    field: &str,
+    default: usize,
+) -> Result<usize, ToolError> {
+    match input.get(field) {
+        None | Some(Value::Null) => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                ToolError::Failed(format!(
+                    "{field} must be a non-negative integer that fits in usize"
+                ))
+            }),
     }
-    if tool_context.is_aborted() {
-        return Err(ToolError::Failed("Operation aborted".into()));
+}
+
+/// Reject a glob argument before any file is looked at.
+fn check_glob_argument(glob: Option<&str>) -> Result<(), ToolError> {
+    match glob {
+        Some(glob) if glob.len() > GLOB_MAX_BYTES => Err(ToolError::Failed(format!(
+            "glob is longer than the {GLOB_MAX_BYTES} byte limit"
+        ))),
+        _ => Ok(()),
     }
-    let glob = input.get("glob").and_then(Value::as_str);
-    let ignore_case = input
-        .get("ignoreCase")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let literal = input
-        .get("literal")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let context = input.get("context").and_then(Value::as_u64).unwrap_or(0) as usize;
-    let limit = input
-        .get("limit")
-        .and_then(Value::as_u64)
-        .map(|value| value as usize)
-        .unwrap_or(GREP_DEFAULT_LIMIT)
-        .max(1);
-    let args = build_rg_args(pattern, &search_path, glob, ignore_case, literal);
-    let Some((raw_matches, match_limit_reached)) = run_rg_streaming(
-        &args,
-        limit,
-        tool_context,
-        excludes_secret_descendants(&search_path),
-    )?
-    else {
-        return grep_tool_native(cwd, input, tool_context);
-    };
-    let is_dir = search_path.is_dir();
-    if raw_matches.is_empty() {
-        return Ok(ToolResult {
-            content: "No matches found".into(),
-            is_error: false,
-            details: None,
-        });
+}
+
+/// Shape grep matches into the tool result: bound the output, and say so, in
+/// the result and its details, when the search or the output is partial.
+fn grep_result(
+    mut matches: Vec<String>,
+    limit: usize,
+    match_limit_reached: bool,
+    truncated_note: Option<String>,
+    mut partial: GrepPartial,
+    context_clamped: bool,
+) -> ToolResult {
+    let mut bytes = 0usize;
+    let keep = matches
+        .iter()
+        .take_while(|line| {
+            bytes = bytes.saturating_add(line.len() + 1);
+            bytes <= GREP_MAX_OUTPUT_BYTES
+        })
+        .count();
+    if keep < matches.len() {
+        matches.truncate(keep);
+        partial.note(GREP_SKIP_OUTPUT);
     }
-    let mut lines_truncated = false;
-    let mut matches = Vec::new();
-    if context > 0 {
-        // ripgrep reports a file's matches together and in line order, so
-        // each run of equal paths is one file: read it once, merge windows.
-        let mut index = 0;
-        while index < raw_matches.len() {
-            let file = raw_matches[index].0.clone();
-            let mut lines = Vec::new();
-            while index < raw_matches.len() && raw_matches[index].0 == file {
-                lines.push(raw_matches[index].1);
-                index += 1;
-            }
-            lines.sort_unstable();
-            lines.dedup();
-            let display = format_grep_path(&file, &search_path, is_dir);
-            let Ok(body) = fs::read_to_string(&file) else {
-                for line_number in lines {
-                    matches.push(format!("{display}:{line_number}: (unable to read file)"));
-                }
-                continue;
-            };
-            let normalized = body.replace("\r\n", "\n").replace('\r', "\n");
-            let file_lines: Vec<&str> = normalized.split('\n').collect();
-            let (rendered, truncated) = render_grep_context(&display, &file_lines, &lines, context);
-            lines_truncated |= truncated;
-            matches.extend(rendered);
-        }
-    }
-    if context == 0 {
-        for (file, line_number, line_text) in raw_matches {
-            let display = format_grep_path(&file, &search_path, is_dir);
-            let text = line_text
-                .as_deref()
-                .unwrap_or("")
-                .replace("\r\n", "\n")
-                .replace('\r', "")
-                .trim_end_matches('\n')
-                .to_string();
-            let (text, truncated) = truncate_line(&text);
-            lines_truncated |= truncated;
-            matches.push(format!("{display}:{line_number}: {text}"));
-        }
-    }
-    let mut output_text = matches.join("\n");
     let mut details = serde_json::Map::new();
     let mut notices = Vec::new();
     if match_limit_reached {
@@ -3439,26 +3612,38 @@ fn grep_tool(
         ));
         details.insert("matchLimitReached".into(), serde_json::json!(limit));
     }
-    if lines_truncated {
-        notices.push(format!(
-            "Some lines truncated to {GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines"
-        ));
+    if let Some(note) = truncated_note {
+        notices.push(note);
         details.insert("linesTruncated".into(), Value::Bool(true));
     }
-    if !notices.is_empty() {
-        output_text.push_str("\n\n[");
-        output_text.push_str(&notices.join(". "));
-        output_text.push(']');
+    if context_clamped {
+        notices.push(format!("context limited to {GREP_MAX_CONTEXT} lines"));
+        details.insert("contextLimit".into(), serde_json::json!(GREP_MAX_CONTEXT));
     }
-    Ok(ToolResult {
-        content: output_text,
+    if !partial.0.is_empty() {
+        notices.push(format!("partial results: {}", partial.0.join("; ")));
+        details.insert("partial".into(), Value::Bool(true));
+        details.insert("partialReasons".into(), serde_json::json!(partial.0));
+    }
+    let mut content = if matches.is_empty() {
+        "No matches found".to_string()
+    } else {
+        matches.join("\n")
+    };
+    if !notices.is_empty() {
+        content.push_str("\n\n[");
+        content.push_str(&notices.join(". "));
+        content.push(']');
+    }
+    ToolResult {
+        content,
         is_error: false,
         details: if details.is_empty() {
             None
         } else {
             Some(Value::Object(details))
         },
-    })
+    }
 }
 
 /// How many files the native grep scans at once. Reading is the cost, and
@@ -3512,59 +3697,382 @@ fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(BINARY_SNIFF_BYTES).any(|byte| *byte == 0)
 }
 
-/// A scanned file's rendered match lines and whether any line was cut.
-type ScannedFile = (Vec<String>, bool);
+/// Bytes one native grep call may still read, shared by its scan threads.
+struct ScanBudget(std::sync::atomic::AtomicU64);
 
-/// Scan one file for the native grep. Returns the rendered match lines (with
-/// context) and whether any line was cut, or `None` for a file that is not
-/// text.
+impl ScanBudget {
+    fn new(bytes: u64) -> Self {
+        Self(std::sync::atomic::AtomicU64::new(bytes))
+    }
+
+    /// Take `bytes` from the budget, or refuse and leave it unchanged.
+    fn reserve(&self, bytes: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut left = self.0.load(Relaxed);
+        loop {
+            if bytes > left {
+                return false;
+            }
+            match self
+                .0
+                .compare_exchange_weak(left, left - bytes, Relaxed, Relaxed)
+            {
+                Ok(_) => return true,
+                Err(now) => left = now,
+            }
+        }
+    }
+}
+
+/// What scanning one file found: rendered match lines, whether any line was
+/// cut for display, and what kept the scan from being complete.
+struct GrepScan {
+    lines: Vec<String>,
+    /// Lines that matched, which is what `limit` counts. `lines` also holds
+    /// context rows and group separators.
+    hits: usize,
+    truncated: bool,
+    skipped: Vec<&'static str>,
+}
+
+impl GrepScan {
+    fn skipped(reason: &'static str) -> Self {
+        Self {
+            lines: Vec::new(),
+            hits: 0,
+            truncated: false,
+            skipped: vec![reason],
+        }
+    }
+
+    /// Bytes the rows will take in the answer.
+    fn row_bytes(&self) -> usize {
+        self.lines.iter().map(|line| line.len() + 1).sum()
+    }
+}
+
+/// Counts live bytes allocated by threads that opted in, so a test can bound the
+/// peak memory of a scan instead of only its returned rows.
+#[cfg(test)]
+mod counting_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
+
+    thread_local! {
+        static TRACK: Cell<bool> = const { Cell::new(false) };
+    }
+    static LIVE: AtomicIsize = AtomicIsize::new(0);
+    static PEAK: AtomicIsize = AtomicIsize::new(0);
+
+    pub struct Counting;
+
+    fn tracking() -> bool {
+        TRACK.try_with(Cell::get).unwrap_or(false)
+    }
+
+    // SAFETY: every call forwards to the system allocator unchanged; the
+    // counters are atomics and the flag is a const-initialized thread local.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let pointer = System.alloc(layout);
+            if !pointer.is_null() && tracking() {
+                let live = LIVE.fetch_add(layout.size() as isize, Relaxed) + layout.size() as isize;
+                PEAK.fetch_max(live, Relaxed);
+            }
+            pointer
+        }
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            if tracking() {
+                LIVE.fetch_sub(layout.size() as isize, Relaxed);
+            }
+            System.dealloc(pointer, layout);
+        }
+    }
+
+    /// Run `f` with this thread's allocations counted.
+    pub fn tracked<T>(f: impl FnOnce() -> T) -> T {
+        TRACK.with(|flag| flag.set(true));
+        let result = f();
+        TRACK.with(|flag| flag.set(false));
+        result
+    }
+
+    pub fn reset() {
+        LIVE.store(0, Relaxed);
+        PEAK.store(0, Relaxed);
+    }
+
+    pub fn peak() -> usize {
+        PEAK.load(Relaxed).max(0) as usize
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static COUNTING_ALLOCATOR: counting_alloc::Counting = counting_alloc::Counting;
+
+#[cfg(test)]
+const UNRESTRICTED: GrepAccess<'static> = GrepAccess {
+    allow_linked: false,
+    root: None,
+};
+
+/// Where one native grep may read: the policy switch and, when outside reads
+/// are not authorized, the canonical search root every read handle must resolve
+/// under.
+#[derive(Clone, Copy)]
+struct GrepAccess<'a> {
+    allow_linked: bool,
+    root: Option<&'a Path>,
+}
+
+/// Scan one file for the native grep. The file is opened once, admitted on
+/// that handle (single link, resolving under the search root unless outside
+/// reads are authorized, within the per-file and aggregate byte budgets) and
+/// read at most to the per-file cap. `output_left` is what the answer still has
+/// room for: this file's rows are trimmed to it. Returns `None` for a file that
+/// is not text or cannot be read.
+#[allow(clippy::too_many_arguments)]
 fn grep_scan_file(
     file: &Path,
     matcher: &Matcher,
     context: usize,
     display: &str,
     remaining: usize,
-) -> Option<(Vec<String>, bool)> {
-    let bytes = fs::read(file).ok()?;
+    output_left: usize,
+    budget: &ScanBudget,
+    access: GrepAccess<'_>,
+) -> Option<GrepScan> {
+    #[cfg(test)]
+    GREP_TEST_BEFORE_OPEN.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(file);
+        }
+    });
+    let mut handle = match open_unlinked(file, access.allow_linked) {
+        Ok(handle) => handle,
+        Err(err) if davinci_sys::fs::is_hard_link_refusal(&err) => {
+            return Some(GrepScan::skipped(GREP_SKIP_LINKED));
+        }
+        Err(_) => return None,
+    };
+    // The check is on the handle that supplies the bytes: a symlink inside the
+    // tree, or a link or junction put in place after discovery, that leads out
+    // of the search root is refused and reported, not read.
+    if let Some(root) = access.root {
+        match davinci_sys::fs::final_path(&handle) {
+            Ok(real) if real.starts_with(root) => {}
+            _ => return Some(GrepScan::skipped(GREP_SKIP_OUTSIDE)),
+        }
+    }
+    let size = handle.metadata().ok()?.len();
+    if size > GREP_MAX_FILE_BYTES {
+        return Some(GrepScan::skipped(GREP_SKIP_LARGE));
+    }
+    if !budget.reserve(size) {
+        return Some(GrepScan::skipped(GREP_SKIP_BUDGET));
+    }
+    #[cfg(test)]
+    GREP_TEST_AFTER_RESERVE.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(file);
+        }
+    });
+    // Read no more than was charged: a file that grew after the size was
+    // taken is refused, so the bytes consumed never exceed the bytes reserved.
+    #[cfg(test)]
+    let reader: Box<dyn std::io::Read> =
+        crate::test_seam::reader("grep", size).unwrap_or_else(|| Box::new(&mut handle));
+    #[cfg(not(test))]
+    let reader = &mut handle;
+    let bytes = match davinci_sys::fs::read_capped(reader, size, size) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::FileTooLarge => {
+            return Some(GrepScan::skipped(GREP_SKIP_LARGE));
+        }
+        Err(_) => return None,
+    };
     if looks_binary(&bytes) {
         return None;
     }
     let body = String::from_utf8_lossy(&bytes);
-    let mut out = Vec::new();
-    let mut lines_truncated = false;
+    let mut scan = GrepScan {
+        lines: Vec::new(),
+        hits: 0,
+        truncated: false,
+        skipped: Vec::new(),
+    };
+    let is_match = |line: &str, scan: &mut GrepScan| {
+        if line.len() > GREP_MAX_LINE_BYTES {
+            if !scan.skipped.contains(&GREP_SKIP_LONG_LINE) {
+                scan.skipped.push(GREP_SKIP_LONG_LINE);
+            }
+            return false;
+        }
+        matcher.is_match(line)
+    };
     if context == 0 {
+        let mut used = 0usize;
         for (index, line) in body.lines().enumerate() {
-            if out.len() >= remaining {
+            if scan.hits >= remaining {
                 break;
             }
-            if matcher.is_match(line) {
+            if is_match(line, &mut scan) {
                 let (text, truncated) = truncate_line(line);
-                lines_truncated |= truncated;
-                out.push(format!("{display}:{}: {text}", index + 1));
+                let row = format!("{display}:{}: {text}", index + 1);
+                used = used.saturating_add(row.len() + 1);
+                if used > output_left.min(GREP_MAX_OUTPUT_BYTES) {
+                    scan.skipped.push(GREP_SKIP_OUTPUT);
+                    break;
+                }
+                scan.truncated |= truncated;
+                scan.hits += 1;
+                scan.lines.push(row);
             }
         }
-        return Some((out, lines_truncated));
+        return Some(scan);
     }
-    let file_lines: Vec<&str> = body.lines().collect();
+    // Matching streams over the text: only the hit line numbers are kept, never
+    // an index of every line.
     let mut match_lines = Vec::new();
-    for (index, line) in file_lines.iter().enumerate() {
-        if match_lines.len() >= remaining {
+    // A rendered hit takes at least four bytes of answer, so more hits than
+    // the output can hold are never collected.
+    let collect = remaining.min(GREP_MAX_OUTPUT_BYTES / 4);
+    for (index, line) in body.lines().enumerate() {
+        if match_lines.len() >= collect {
             break;
         }
-        if matcher.is_match(line) {
+        if is_match(line, &mut scan) {
             match_lines.push(index + 1);
         }
     }
-    let (rendered, truncated) = render_grep_context(display, &file_lines, &match_lines, context);
-    out.extend(rendered);
-    lines_truncated |= truncated;
-    Some((out, lines_truncated))
+    let (rendered, truncated, cut, rendered_hits) = render_grep_context_bounded(
+        display,
+        &body,
+        &match_lines,
+        context,
+        output_left.min(GREP_MAX_OUTPUT_BYTES),
+    );
+    scan.hits = rendered_hits;
+    scan.lines.extend(rendered);
+    scan.truncated |= truncated;
+    if cut {
+        scan.skipped.push(GREP_SKIP_OUTPUT);
+    }
+    Some(scan)
 }
 
-fn grep_tool_native(
+/// Scan one batch of candidate files, in parallel when the batch is big
+/// enough, returning one slot per file in batch order. The scan stops handing
+/// out files once `limit` match lines are in hand.
+fn scan_grep_batch(
+    files: &[PathBuf],
+    limit: usize,
+    output_left: usize,
+    scan: &(dyn Fn(&Path, usize, usize) -> Option<GrepScan> + Sync),
+) -> Vec<Option<GrepScan>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(test)]
+    GREP_TEST_MAX_BATCH.with(|max| max.set(max.get().max(files.len())));
+    if files.len() < GREP_PARALLEL_MIN_FILES {
+        let mut results: Vec<Option<GrepScan>> = Vec::with_capacity(files.len());
+        let (mut found, mut bytes) = (0, 0);
+        for file in files {
+            if found >= limit || bytes >= output_left {
+                results.push(None);
+                continue;
+            }
+            let result = scan(file, limit - found, output_left.saturating_sub(bytes));
+            found += result.as_ref().map_or(0, |result| result.hits);
+            bytes += result.as_ref().map_or(0, GrepScan::row_bytes);
+            results.push(result);
+        }
+        return results;
+    }
+    // Every thread pulls the next file index; results land in the file's slot
+    // so the merged order is the walk order, exactly as a sequential scan
+    // would have produced it. `found` and `bytes` let the pool stop early once
+    // the hit limit or the output budget is clearly reached.
+    let next = AtomicUsize::new(0);
+    let found = AtomicUsize::new(0);
+    let bytes = AtomicUsize::new(0);
+    let slots: Mutex<Vec<Option<GrepScan>>> = Mutex::new((0..files.len()).map(|_| None).collect());
+    let threads = GREP_SCAN_THREADS.min(files.len());
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                if index >= files.len()
+                    || found.load(Ordering::Relaxed) >= limit
+                    || bytes.load(Ordering::Relaxed) >= output_left
+                {
+                    break;
+                }
+                let remaining = limit.saturating_sub(found.load(Ordering::Relaxed)).max(1);
+                let room = output_left.saturating_sub(bytes.load(Ordering::Relaxed));
+                if let Some(result) = scan(&files[index], remaining, room) {
+                    found.fetch_add(result.hits, Ordering::Relaxed);
+                    bytes.fetch_add(result.row_bytes(), Ordering::Relaxed);
+                    slots.lock().unwrap_or_else(|err| err.into_inner())[index] = Some(result);
+                }
+            });
+        }
+    });
+    slots.into_inner().unwrap_or_else(|err| err.into_inner())
+}
+
+#[cfg(test)]
+type GrepReserveHook = Box<dyn Fn(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Largest candidate batch the native grep scanned on this thread.
+    static GREP_TEST_MAX_BATCH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Candidate files the native grep's walk handed over on this thread.
+    static GREP_TEST_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Runs after a file's size is charged and before it is read, so a test
+    /// can change the file in that window.
+    static GREP_TEST_AFTER_RESERVE: std::cell::RefCell<Option<GrepReserveHook>> =
+        const { std::cell::RefCell::new(None) };
+    /// Runs before a file is opened for scanning, so a test can swap it for a
+    /// link after discovery.
+    static GREP_TEST_BEFORE_OPEN: std::cell::RefCell<Option<GrepReserveHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Discovery limits of the native grep, injectable so a test can reach them
+/// without creating hundreds of thousands of files.
+struct GrepLimits {
+    batch_files: usize,
+    max_files: usize,
+    /// Directory entries the walk may read before it stops.
+    max_entries: usize,
+}
+
+const GREP_LIMITS: GrepLimits = GrepLimits {
+    batch_files: GREP_BATCH_FILES,
+    max_files: GREP_MAX_FILES,
+    max_entries: GREP_MAX_WALK_ENTRIES,
+};
+
+/// `grep` is always the native scanner. Every file is opened once, admitted on
+/// that handle (single link, byte budgets) and only then read; a path-based
+/// child process such as ripgrep reopens files itself and so cannot be held to
+/// that admission.
+fn grep_tool(
     cwd: &Path,
     input: &serde_json::Value,
     tool_context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    grep_native(cwd, input, tool_context, &GREP_LIMITS)
+}
+
+fn grep_native(
+    cwd: &Path,
+    input: &serde_json::Value,
+    tool_context: &ToolContext,
+    limits: &GrepLimits,
 ) -> Result<ToolResult, ToolError> {
     let pattern = required_str(input, "pattern")?;
     let search_path = resolve(
@@ -3578,6 +4086,7 @@ fn grep_tool_native(
         )));
     }
     let glob = input.get("glob").and_then(|v| v.as_str());
+    let glob = glob.map(compile_glob).transpose()?;
     let ignore_case = input
         .get("ignoreCase")
         .and_then(serde_json::Value::as_bool)
@@ -3586,133 +4095,164 @@ fn grep_tool_native(
         .get("literal")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let context = input
-        .get("context")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0) as usize;
-    let limit = input
+    let requested_context = optional_usize_arg(input, "context", 0)?;
+    let context = requested_context.min(GREP_MAX_CONTEXT);
+    let context_clamped = context != requested_context;
+    let requested_limit = input
         .get("limit")
         .and_then(serde_json::Value::as_u64)
-        .map(|value| value as usize)
+        .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
         .unwrap_or(GREP_DEFAULT_LIMIT)
         .max(1);
+    let limit = requested_limit.min(GREP_MAX_LIMIT);
     let is_dir = search_path.is_dir();
     let matcher = Matcher::new(pattern, ignore_case, literal);
-
-    // Walk first, scan after: the walk is cheap directory metadata, the
-    // scan is the file reads, and only the scan is worth spreading out.
-    let mut files: Vec<PathBuf> = Vec::new();
     let exclude_secrets = excludes_secret_descendants(&search_path);
+    let budget = ScanBudget::new(GREP_MAX_SCAN_BYTES);
+    // Without an outside-read grant every read handle must resolve under the
+    // search root as it was when the search began. A file given by name was
+    // authorized by name and is not confined.
+    let confine = if is_dir && !tool_context.linked_files_allowed {
+        Some(search_path.canonicalize().map_err(|error| {
+            ToolError::Failed(format!("cannot resolve {}: {error}", search_path.display()))
+        })?)
+    } else {
+        None
+    };
+    let access = GrepAccess {
+        allow_linked: tool_context.linked_files_allowed,
+        root: confine.as_deref(),
+    };
+
+    let mut matches: Vec<String> = Vec::new();
+    let mut lines_truncated = false;
+    let mut partial = GrepPartial::default();
+    if limit != requested_limit {
+        partial.note(GREP_SKIP_LIMIT);
+    }
+    let mut hits = 0usize;
+    let mut row_bytes = 0usize;
+    let mut batch: Vec<PathBuf> = Vec::with_capacity(limits.batch_files);
+    let mut discovered = 0usize;
+    let scan = |file: &Path, remaining: usize, output_left: usize| {
+        let display = format_grep_path(file, &search_path, is_dir);
+        grep_scan_file(
+            file,
+            &matcher,
+            context,
+            &display,
+            remaining,
+            output_left,
+            &budget,
+            access,
+        )
+    };
+    // Scan the batch and merge it in walk order. Returns whether the search is
+    // finished: the match limit is reached or a budget is gone.
+    let mut flush =
+        |batch: &mut Vec<PathBuf>, matches: &mut Vec<String>, partial: &mut GrepPartial| -> bool {
+            let scanned = scan_grep_batch(
+                batch,
+                limit.saturating_sub(hits),
+                GREP_MAX_OUTPUT_BYTES.saturating_sub(row_bytes),
+                &scan,
+            );
+            for (file, result) in batch.iter().zip(scanned) {
+                if hits >= limit || row_bytes >= GREP_MAX_OUTPUT_BYTES {
+                    break;
+                }
+                let Some(mut result) = result else {
+                    continue;
+                };
+                let room = GREP_MAX_OUTPUT_BYTES.saturating_sub(row_bytes);
+                if result.hits > limit - hits || result.row_bytes() > room {
+                    // A parallel scan did not know what its neighbours would find
+                    // or take; scan this file again for exactly what still fits,
+                    // so its contribution is trimmed rather than dropped.
+                    match scan(file, limit - hits, room) {
+                        Some(again) => result = again,
+                        None => continue,
+                    }
+                }
+                lines_truncated |= result.truncated;
+                for reason in &result.skipped {
+                    partial.note(reason);
+                }
+                row_bytes += result.row_bytes().min(room);
+                hits += result.hits;
+                matches.extend(result.lines);
+            }
+            batch.clear();
+            hits >= limit
+                || row_bytes >= GREP_MAX_OUTPUT_BYTES
+                || partial.0.contains(&GREP_SKIP_BUDGET)
+                || partial.0.contains(&GREP_SKIP_OUTPUT)
+        };
+
+    // Walk and scan in bounded batches: only `GREP_BATCH_FILES` candidate
+    // paths are held at once, and the walk stops as soon as the search is done.
+    let mut finished = false;
+    let mut walk = WalkBudget::new(limits.max_entries);
     walk_files(
         &search_path,
         &IgnoreRules::load(&search_path),
+        &mut walk,
         &mut |file| {
-            if glob.is_none_or(|glob| path_glob_match(glob, file, &search_path))
-                && !(exclude_secrets && is_secret_search_path(file))
-            {
-                files.push(file.to_path_buf());
-            }
             // A large tree is abandoned at the next file once the turn is
             // aborted, like the ripgrep path.
-            !tool_context.is_aborted()
+            if tool_context.is_aborted() {
+                return false;
+            }
+            if glob
+                .as_ref()
+                .is_none_or(|glob| path_glob_match(glob, file, &search_path))
+                && !(exclude_secrets && is_secret_search_path(file))
+            {
+                #[cfg(test)]
+                GREP_TEST_VISITED.with(|visited| visited.set(visited.get() + 1));
+                if discovered >= limits.max_files {
+                    partial.note(GREP_SKIP_DISCOVERY);
+                    return false;
+                }
+                discovered += 1;
+                batch.push(file.to_path_buf());
+                if batch.len() >= limits.batch_files {
+                    finished = flush(&mut batch, &mut matches, &mut partial);
+                    return !finished;
+                }
+            }
+            true
         },
     );
     if tool_context.is_aborted() {
         return Err(ToolError::Failed("Operation aborted".into()));
     }
-
-    let scan = |file: &Path, remaining: usize| {
-        let display = format_grep_path(file, &search_path, is_dir);
-        grep_scan_file(file, &matcher, context, &display, remaining)
-    };
-    let mut matches: Vec<String> = Vec::new();
-    let mut lines_truncated = false;
-    if files.len() < GREP_PARALLEL_MIN_FILES {
-        for file in &files {
-            if matches.len() >= limit {
-                break;
-            }
-            if let Some((lines, truncated)) = scan(file, limit - matches.len()) {
-                lines_truncated |= truncated;
-                matches.extend(lines);
-            }
-        }
-    } else {
-        // Every thread pulls the next file index; results land in the
-        // file's slot so the merged order is the walk order, exactly as
-        // the sequential scan would have produced it. `found` lets the
-        // pool stop early once the limit is clearly reached.
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let next = AtomicUsize::new(0);
-        let found = AtomicUsize::new(0);
-        let slots: Mutex<Vec<Option<ScannedFile>>> =
-            Mutex::new((0..files.len()).map(|_| None).collect());
-        let threads = GREP_SCAN_THREADS.min(files.len());
-        std::thread::scope(|scope| {
-            for _ in 0..threads {
-                scope.spawn(|| loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    if index >= files.len() || found.load(Ordering::Relaxed) >= limit {
-                        break;
-                    }
-                    if let Some(result) = scan(&files[index], limit) {
-                        found.fetch_add(result.0.len(), Ordering::Relaxed);
-                        slots.lock().unwrap_or_else(|err| err.into_inner())[index] = Some(result);
-                    }
-                });
-            }
-        });
-        for slot in slots.into_inner().unwrap_or_else(|err| err.into_inner()) {
-            if matches.len() >= limit {
-                break;
-            }
-            if let Some((lines, truncated)) = slot {
-                lines_truncated |= truncated;
-                matches.extend(lines);
-            }
-        }
+    if walk.exhausted {
+        partial.note(GREP_SKIP_WALK);
     }
-    if matches.is_empty() {
-        return Ok(ToolResult {
-            content: "No matches found".into(),
-            is_error: false,
-            details: None,
-        });
+    if walk.incomplete {
+        partial.note(GREP_SKIP_UNREADABLE);
     }
-    let match_limit_reached = matches.len() >= limit;
-    matches.truncate(limit);
-    let mut output = matches.join("\n");
-    let mut details = serde_json::Map::new();
-    let mut notices = Vec::new();
-    if match_limit_reached {
-        notices.push(format!(
-            "{limit} matches limit reached. Use limit={} for more, or refine pattern",
-            limit.saturating_mul(2)
-        ));
-        details.insert("matchLimitReached".into(), serde_json::json!(limit));
+    if walk.queue_full {
+        partial.note(GREP_SKIP_QUEUE);
     }
-    if lines_truncated {
-        notices.push("some lines truncated".into());
-        details.insert("linesTruncated".into(), serde_json::json!(true));
+    if !finished && !batch.is_empty() {
+        flush(&mut batch, &mut matches, &mut partial);
     }
-    if !notices.is_empty() {
-        output.push_str("\n\n[");
-        output.push_str(&notices.join(". "));
-        output.push(']');
-    }
-    Ok(ToolResult {
-        content: output,
-        is_error: false,
-        details: if details.is_empty() {
-            None
-        } else {
-            Some(serde_json::Value::Object(details))
-        },
-    })
+    let match_limit_reached = hits >= limit;
+    Ok(grep_result(
+        matches,
+        limit,
+        match_limit_reached,
+        lines_truncated.then(|| "some lines truncated".to_string()),
+        partial,
+        context_clamped,
+    ))
 }
 
 fn find_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
     let pattern = required_str(input, "pattern")?;
+    check_glob_argument(Some(pattern))?;
     let search_path = resolve(
         cwd,
         input.get("path").and_then(Value::as_str).unwrap_or("."),
@@ -3793,31 +4333,46 @@ fn find_tool_native(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult,
         .map(|value| value as usize)
         .unwrap_or(FIND_DEFAULT_LIMIT)
         .max(1);
+    let glob = compile_glob(pattern)?;
     let mut hits = Vec::new();
+    let mut walk = WalkBudget::new(GREP_MAX_WALK_ENTRIES);
     walk_files(
         &search_path,
         &IgnoreRules::load(&search_path),
+        &mut walk,
         &mut |file| {
             if hits.len() >= limit {
                 return false;
             }
-            if path_glob_match(pattern, file, &search_path) {
+            if path_glob_match(&glob, file, &search_path) {
                 hits.push(relativize_find_result_path(file, &search_path));
             }
             true
         },
     );
+    let walk_notice = walk_partial_notice(&walk);
     if hits.is_empty() {
         return Ok(ToolResult {
-            content: "No files found matching pattern".into(),
+            content: match &walk_notice {
+                Some(notice) => format!("No files found matching pattern\n\n[{notice}]"),
+                None => "No files found matching pattern".into(),
+            },
             is_error: false,
-            details: None,
+            details: walk_notice
+                .map(|notice| serde_json::json!({"partial": true, "reason": notice})),
         });
     }
     let result_limit_reached = hits.len() >= limit;
     hits.truncate(limit);
     let mut output = hits.join("\n");
+    if let Some(notice) = &walk_notice {
+        output.push_str(&format!("\n\n[{notice}]"));
+    }
     let mut details = serde_json::Map::new();
+    if let Some(notice) = walk_notice {
+        details.insert("partial".into(), Value::Bool(true));
+        details.insert("reason".into(), Value::String(notice));
+    }
     if result_limit_reached {
         output.push_str(&format!("\n\n[{limit} results limit reached]"));
         details.insert("resultLimitReached".into(), serde_json::json!(limit));
@@ -3889,11 +4444,43 @@ pub fn resolve_for_mutation(cwd: &Path, raw_path: &str) -> Result<PathBuf, ToolE
     Ok(path)
 }
 
+/// One ignore rule: its text, and the glob it compiles to. A rule that does
+/// not compile (too long, malformed) matches nothing.
+struct IgnorePattern {
+    text: String,
+    glob: Option<CompiledGlob>,
+}
+
+impl IgnorePattern {
+    fn new(text: String) -> Self {
+        let glob = (text.len() <= GLOB_MAX_BYTES)
+            .then(|| glob_matcher(&text).ok())
+            .flatten();
+        Self { text, glob }
+    }
+
+    fn is_match(&self, name: &str) -> bool {
+        self.glob.as_ref().is_some_and(|glob| glob.is_match(name))
+    }
+}
+
+/// Split ignore rules into those without a `/` (matched against an entry's
+/// own name) and those with one (matched against the whole path).
+fn split_ignore_patterns(patterns: Vec<String>) -> (Vec<IgnorePattern>, Vec<IgnorePattern>) {
+    let (path_patterns, name_patterns): (Vec<String>, Vec<String>) = patterns
+        .into_iter()
+        .partition(|pattern| pattern.contains('/'));
+    (
+        path_patterns.into_iter().map(IgnorePattern::new).collect(),
+        name_patterns.into_iter().map(IgnorePattern::new).collect(),
+    )
+}
+
 struct IgnoreRules {
     /// Rules without a `/`: matched against an entry's own name.
-    name_patterns: Vec<String>,
+    name_patterns: Vec<IgnorePattern>,
     /// Rules with a `/`: matched against the whole path.
-    path_patterns: Vec<String>,
+    path_patterns: Vec<IgnorePattern>,
 }
 
 impl IgnoreRules {
@@ -3935,9 +4522,7 @@ impl IgnoreRules {
             }
             let parent = current.parent();
             if current.join(".git").exists() || parent.is_none() {
-                let (path_patterns, name_patterns) = patterns
-                    .into_iter()
-                    .partition(|pattern| pattern.contains('/'));
+                let (path_patterns, name_patterns) = split_ignore_patterns(patterns);
                 return Some(Self {
                     name_patterns,
                     path_patterns,
@@ -3974,9 +4559,7 @@ impl IgnoreRules {
                 None => break,
             }
         }
-        let (path_patterns, name_patterns): (Vec<String>, Vec<String>) = patterns
-            .into_iter()
-            .partition(|pattern| pattern.contains('/'));
+        let (path_patterns, name_patterns) = split_ignore_patterns(patterns);
         Self {
             name_patterns,
             path_patterns,
@@ -3995,7 +4578,7 @@ impl IgnoreRules {
                 if self
                     .name_patterns
                     .iter()
-                    .any(|pattern| glob_match(pattern, &name))
+                    .any(|pattern| pattern.is_match(&name))
                 {
                     return true;
                 }
@@ -4007,51 +4590,154 @@ impl IgnoreRules {
         let posix = path.to_string_lossy().replace('\\', "/");
         self.path_patterns
             .iter()
-            .any(|pattern| glob_match(pattern, &posix) || posix.ends_with(pattern))
+            .any(|pattern| pattern.is_match(&posix) || posix.ends_with(&pattern.text))
     }
 }
 
-/// Depth-first walk in a stable order (entries sorted by name, so results
-/// do not depend on the file system's iteration order). The entry's own
-/// file type is used — `read_dir` already knows it — instead of a `stat`
-/// per path, and symlinked directories are not followed.
-fn walk_files(root: &Path, ignore: &IgnoreRules, visit: &mut dyn FnMut(&Path) -> bool) {
+/// Directory entries a walk may still read. Every raw result the file system
+/// hands back counts, whether a glob or an ignore rule later drops it, and
+/// empty directories included, so neither a flat directory of millions of files
+/// nor a deep tree of empty directories can make the walk hold unbounded state.
+struct WalkBudget {
+    left: usize,
+    /// The entry budget ran out.
+    exhausted: bool,
+    /// A directory or an entry could not be read, so coverage is partial.
+    incomplete: bool,
+    /// Directories were dropped because their queued paths hit the byte limit.
+    queue_full: bool,
+}
+
+impl WalkBudget {
+    fn new(entries: usize) -> Self {
+        Self {
+            left: entries,
+            exhausted: false,
+            incomplete: false,
+            queue_full: false,
+        }
+    }
+}
+
+/// Entries pulled from a directory and sorted together. A directory of at most
+/// this many entries is visited in name order; a larger one is visited window
+/// by window, each window sorted, so its first window is available (and a
+/// search that ends early stops) without reading the rest.
+const WALK_WINDOW: usize = 4096;
+/// Bytes of directory paths a walk may hold queued at once.
+const WALK_MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
+
+/// Why a walk covered less than everything, for tools that have no richer
+/// partial-result channel.
+fn walk_partial_notice(walk: &WalkBudget) -> Option<String> {
+    let mut reasons = Vec::new();
+    if walk.exhausted {
+        reasons.push(GREP_SKIP_WALK);
+    }
+    if walk.incomplete {
+        reasons.push(GREP_SKIP_UNREADABLE);
+    }
+    if walk.queue_full {
+        reasons.push(GREP_SKIP_QUEUE);
+    }
+    (!reasons.is_empty()).then(|| format!("partial results: {}", reasons.join("; ")))
+}
+
+/// Depth-first walk (entries in name order within each window of
+/// [`WALK_WINDOW`], so results do not depend on the file system's iteration
+/// order for any directory that fits one window). The entry's own file type is
+/// used — `read_dir` already knows it — instead of a `stat` per path, and
+/// symlinked directories are not followed. Entries are pulled a window at a
+/// time and at most `budget.left` are ever pulled in total; once the budget is
+/// gone the current window is finished, the walk stops and `budget.exhausted`
+/// is set. A directory or entry that cannot be read sets `budget.incomplete`.
+fn walk_files(
+    root: &Path,
+    ignore: &IgnoreRules,
+    budget: &mut WalkBudget,
+    visit: &mut dyn FnMut(&Path) -> bool,
+) {
     if root.is_file() {
         let _ = visit(root);
         return;
     }
     let mut stack = vec![root.to_path_buf()];
+    let mut queued_bytes = root.as_os_str().len();
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        let mut entries: Vec<fs::DirEntry> = entries.flatten().collect();
-        entries.sort_by_key(|entry| entry.file_name());
-        // Directories are pushed in reverse so the stack pops them in name
-        // order.
-        let mut dirs = Vec::new();
-        for entry in entries {
-            let path = entry.path();
-            if ignore.ignored(&path) {
+        queued_bytes = queued_bytes.saturating_sub(dir.as_os_str().len());
+        let mut entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => {
+                budget.incomplete = true;
                 continue;
             }
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                dirs.push(path);
-            } else if file_type.is_file() {
-                if !visit(&path) {
-                    return;
+        };
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        loop {
+            let take = WALK_WINDOW.min(budget.left.saturating_add(1));
+            let mut window: Vec<fs::DirEntry> = Vec::new();
+            let mut pulled = 0usize;
+            let mut last_was_entry = false;
+            for item in entries.by_ref().take(take) {
+                pulled += 1;
+                match item {
+                    Ok(entry) => {
+                        window.push(entry);
+                        last_was_entry = true;
+                    }
+                    Err(_) => {
+                        budget.incomplete = true;
+                        last_was_entry = false;
+                    }
                 }
-            } else if file_type.is_symlink() {
-                // A link to a file is searched like the file; a link to a
-                // directory is not followed (cycles).
-                if path.is_file() && !visit(&path) {
-                    return;
+            }
+            if pulled == 0 {
+                break;
+            }
+            if pulled > budget.left {
+                // The extra item only proved there was more than the budget.
+                if last_was_entry {
+                    window.pop();
                 }
+                budget.left = 0;
+                budget.exhausted = true;
+            } else {
+                budget.left -= pulled;
+            }
+            window.sort_by_key(|entry| entry.file_name());
+            for entry in window {
+                let path = entry.path();
+                if ignore.ignored(&path) {
+                    continue;
+                }
+                let Ok(file_type) = entry.file_type() else {
+                    budget.incomplete = true;
+                    continue;
+                };
+                if file_type.is_dir() {
+                    if queued_bytes.saturating_add(path.as_os_str().len()) > WALK_MAX_QUEUED_BYTES {
+                        budget.queue_full = true;
+                    } else {
+                        queued_bytes += path.as_os_str().len();
+                        dirs.push(path);
+                    }
+                } else if file_type.is_file() {
+                    if !visit(&path) {
+                        return;
+                    }
+                } else if file_type.is_symlink() {
+                    // A link to a file is searched like the file (the reader
+                    // confines it); a link to a directory is not followed.
+                    if path.is_file() && !visit(&path) {
+                        return;
+                    }
+                }
+            }
+            if budget.exhausted {
+                return;
             }
         }
+        // Directories are pushed in reverse so the stack pops them in order.
         stack.extend(dirs.into_iter().rev());
     }
 }
@@ -4181,7 +4867,94 @@ pub(crate) fn truncate_read(
     (output, details)
 }
 
-fn path_glob_match(pattern: &str, file: &Path, search_path: &Path) -> bool {
+/// A `find`/`grep` glob compiled once per call. `*` and `?` match any
+/// character, `/` included; `**/` matches any number of directories; `[`, `]`,
+/// `{` and `}` are ordinary characters. Matching is done by an automaton
+/// (`globset`, or `regex` when the pattern has a `?`), so no pattern can
+/// recurse deeper than its input.
+enum CompiledGlob {
+    Any,
+    Set(globset::GlobMatcher),
+    /// Patterns with a `?`. `globset` compiles `?` to a single byte, which
+    /// would split a multi-byte character; this keeps it one Unicode scalar.
+    Scalar(regex::Regex),
+}
+
+impl CompiledGlob {
+    fn is_match(&self, name: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Set(matcher) => matcher.is_match(name.replace('\\', "/")),
+            Self::Scalar(regex) => regex.is_match(&name.replace('\\', "/")),
+        }
+    }
+}
+
+/// Translate the glob grammar above into an anchored regex with `?` as one
+/// scalar value. `**/` at the start or after a `/` is zero or more directories.
+fn scalar_glob_regex(pattern: &str) -> Result<regex::Regex, String> {
+    let chars: Vec<char> = pattern.replace('\\', "/").chars().collect();
+    let mut out = String::from("(?s)^");
+    let mut index = 0;
+    while index < chars.len() {
+        let at_segment_start = index == 0 || chars[index - 1] == '/';
+        if at_segment_start && chars[index..].starts_with(&['*', '*', '/']) {
+            out.push_str("(?:.*/)?");
+            index += 3;
+            continue;
+        }
+        match chars[index] {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            c => out.push_str(&regex::escape(&c.to_string())),
+        }
+        index += 1;
+    }
+    out.push('$');
+    regex::RegexBuilder::new(&out)
+        .size_limit(16 << 20)
+        .build()
+        .map_err(|err| err.to_string())
+}
+
+fn glob_matcher(pattern: &str) -> Result<CompiledGlob, String> {
+    if matches!(pattern, "*" | "**" | "**/*") {
+        return Ok(CompiledGlob::Any);
+    }
+    if pattern.contains('?') {
+        return scalar_glob_regex(pattern).map(CompiledGlob::Scalar);
+    }
+    let mut literal = String::with_capacity(pattern.len());
+    for c in pattern.replace('\\', "/").chars() {
+        match c {
+            '[' => literal.push_str("[[]"),
+            ']' => literal.push_str("[]]"),
+            '{' => literal.push_str("[{]"),
+            '}' => literal.push_str("[}]"),
+            c => literal.push(c),
+        }
+    }
+    let glob = globset::GlobBuilder::new(&literal)
+        .literal_separator(false)
+        .backslash_escape(false)
+        .build()
+        .map_err(|err| err.to_string())?;
+    Ok(CompiledGlob::Set(glob.compile_matcher()))
+}
+
+/// Compile a glob taken from tool arguments, refusing an oversized or
+/// malformed one before any file is looked at.
+fn compile_glob(pattern: &str) -> Result<CompiledGlob, ToolError> {
+    if pattern.len() > GLOB_MAX_BYTES {
+        return Err(ToolError::Failed(format!(
+            "glob is longer than the {GLOB_MAX_BYTES} byte limit"
+        )));
+    }
+    glob_matcher(pattern)
+        .map_err(|err| ToolError::Failed(format!("Unsupported glob '{pattern}': {err}")))
+}
+
+fn path_glob_match(glob: &CompiledGlob, file: &Path, search_path: &Path) -> bool {
     let relative = file
         .strip_prefix(search_path)
         .map(|path| path.to_string_lossy().replace('\\', "/"))
@@ -4190,52 +4963,12 @@ fn path_glob_match(pattern: &str, file: &Path, search_path: &Path) -> bool {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    glob_match(pattern, &relative) || glob_match(pattern, &name)
+    glob.is_match(&relative) || glob.is_match(&name)
 }
 
+#[cfg(test)]
 fn glob_match(pattern: &str, name: &str) -> bool {
-    if pattern == "*" || pattern == "**" || pattern == "**/*" {
-        return true;
-    }
-    let pattern = pattern.replace('\\', "/");
-    let name = name.replace('\\', "/");
-    // match_glob_chars already implements **/ as zero-or-more path
-    // components. Recursing here for every leading **/ reintroduced an
-    // exponential search for patterns such as **/**/**/....
-    match_glob_chars(&pattern, &name)
-}
-
-fn match_glob_chars(pattern: &str, name: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let n: Vec<char> = name.chars().collect();
-    // memo[i * (n.len() + 1) + j]: does p[i..] match n[j..]? Each cell is
-    // computed once, so matching takes O(|p| * |n|) work regardless of stars.
-    let mut memo = vec![None; (p.len() + 1) * (n.len() + 1)];
-    fn rec(p: &[char], n: &[char], i: usize, j: usize, memo: &mut [Option<bool>]) -> bool {
-        let key = i * (n.len() + 1) + j;
-        if let Some(known) = memo[key] {
-            return known;
-        }
-        let result = match (p.get(i), n.get(j)) {
-            (None, None) => true,
-            (Some('*'), _) if p.get(i + 1) == Some(&'*') => {
-                let slash = p.get(i + 2) == Some(&'/');
-                let rest = if slash { i + 3 } else { i + 2 };
-                rec(p, n, rest, j, memo)
-                    || (j < n.len() && rec(p, n, i, j + 1, memo))
-                    || (slash && n.get(j) == Some(&'/') && rec(p, n, i + 3, j + 1, memo))
-            }
-            (Some('*'), _) => {
-                rec(p, n, i + 1, j, memo) || (j < n.len() && rec(p, n, i, j + 1, memo))
-            }
-            (Some('?'), Some(_)) => rec(p, n, i + 1, j + 1, memo),
-            (Some(a), Some(b)) if a == b => rec(p, n, i + 1, j + 1, memo),
-            _ => false,
-        };
-        memo[key] = Some(result);
-        result
-    }
-    rec(&p, &n, 0, 0, &mut memo)
+    glob_matcher(pattern).is_ok_and(|glob| glob.is_match(name))
 }
 
 fn code_definition_tool(
@@ -4248,8 +4981,7 @@ fn code_definition_tool(
     }
     let raw_path = required_str(input, "path")?;
     let path = resolve(cwd, raw_path)?;
-    let line = input.get("line").and_then(Value::as_u64).unwrap_or(1) as u32;
-    let character = input.get("character").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let (line, character) = semantic_position(input)?;
     let symbol = input.get("symbol").and_then(Value::as_str);
 
     if let Some(semantic) = &context.semantic {
@@ -4261,10 +4993,7 @@ fn code_definition_tool(
             crate::semantic::SemanticQuery::Definition {
                 cwd,
                 path: raw_path,
-                position: crate::semantic::Position {
-                    line: line.saturating_sub(1),
-                    character: character.saturating_sub(1),
-                },
+                position: crate::semantic::Position { line, character },
             },
             &request_context,
         ) {
@@ -4286,9 +5015,14 @@ fn code_definition_tool(
                 .into(),
         )
     })?;
-    let res =
-        crate::semantic::text_fallback_definition(cwd, sym, Some(&path), context.abort.as_deref())
-            .map_err(ToolError::Failed)?;
+    let res = crate::semantic::text_fallback_definition_authorized(
+        cwd,
+        sym,
+        Some(&path),
+        context.abort.as_deref(),
+        context.linked_files_allowed,
+    )
+    .map_err(ToolError::Failed)?;
     let content = serde_json::to_string_pretty(&res).unwrap_or_default();
     Ok(ToolResult {
         content,
@@ -4307,8 +5041,7 @@ fn code_references_tool(
     }
     let raw_path = required_str(input, "path")?;
     let path = resolve(cwd, raw_path)?;
-    let line = input.get("line").and_then(Value::as_u64).unwrap_or(1) as u32;
-    let character = input.get("character").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let (line, character) = semantic_position(input)?;
     let symbol = input.get("symbol").and_then(Value::as_str);
     let include_decl = input
         .get("includeDeclaration")
@@ -4324,10 +5057,7 @@ fn code_references_tool(
             crate::semantic::SemanticQuery::References {
                 cwd,
                 path: raw_path,
-                position: crate::semantic::Position {
-                    line: line.saturating_sub(1),
-                    character: character.saturating_sub(1),
-                },
+                position: crate::semantic::Position { line, character },
                 include_declaration: include_decl,
             },
             &request_context,
@@ -4350,9 +5080,14 @@ fn code_references_tool(
                 .into(),
         )
     })?;
-    let res =
-        crate::semantic::text_fallback_references(cwd, sym, Some(&path), context.abort.as_deref())
-            .map_err(ToolError::Failed)?;
+    let res = crate::semantic::text_fallback_references_authorized(
+        cwd,
+        sym,
+        Some(&path),
+        context.abort.as_deref(),
+        context.linked_files_allowed,
+    )
+    .map_err(ToolError::Failed)?;
     let content = serde_json::to_string_pretty(&res).unwrap_or_default();
     Ok(ToolResult {
         content,
@@ -4396,7 +5131,12 @@ fn code_outline_tool(
         }
     }
 
-    let res = crate::semantic::text_fallback_outline(cwd, raw_path).map_err(ToolError::Failed)?;
+    let res = crate::semantic::text_fallback_outline_authorized(
+        cwd,
+        raw_path,
+        context.linked_files_allowed,
+    )
+    .map_err(ToolError::Failed)?;
     let content = serde_json::to_string_pretty(&res).unwrap_or_default();
     Ok(ToolResult {
         content,
@@ -4460,8 +5200,7 @@ fn code_call_hierarchy_tool(
     }
     let raw_path = required_str(input, "path")?;
     let _path = resolve(cwd, raw_path)?;
-    let line = input.get("line").and_then(Value::as_u64).unwrap_or(1) as u32;
-    let character = input.get("character").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let (line, character) = semantic_position(input)?;
     let direction = input
         .get("direction")
         .and_then(Value::as_str)
@@ -4469,13 +5208,7 @@ fn code_call_hierarchy_tool(
     let incoming = direction != "outgoing";
 
     if let Some(semantic) = &context.semantic {
-        match semantic.call_hierarchy(
-            cwd,
-            raw_path,
-            line.saturating_sub(1),
-            character.saturating_sub(1),
-            incoming,
-        ) {
+        match semantic.call_hierarchy(cwd, raw_path, line, character, incoming) {
             Ok(res) => {
                 let content = serde_json::to_string_pretty(&res).unwrap_or_default();
                 return Ok(ToolResult {
@@ -4503,18 +5236,11 @@ fn code_rename_preview_tool(
     }
     let raw_path = required_str(input, "path")?;
     let _path = resolve(cwd, raw_path)?;
-    let line = input.get("line").and_then(Value::as_u64).unwrap_or(1) as u32;
-    let character = input.get("character").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let (line, character) = semantic_position(input)?;
     let new_name = required_str(input, "newName")?;
 
     if let Some(semantic) = &context.semantic {
-        match semantic.rename_preview(
-            cwd,
-            raw_path,
-            line.saturating_sub(1),
-            character.saturating_sub(1),
-            new_name,
-        ) {
+        match semantic.rename_preview(cwd, raw_path, line, character, new_name) {
             Ok(preview) => {
                 let content = serde_json::to_string_pretty(&preview).unwrap_or_default();
                 return Ok(ToolResult {
@@ -4532,6 +5258,29 @@ fn code_rename_preview_tool(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_error_that_may_have_reached_the_tool_is_reported_as_unknown() {
+        let result = super::ToolError::MayHaveRun("mcp transport failed".into())
+            .into_tool_result("mcp__lost__effect");
+        assert!(result.is_error);
+        assert!(result.content.contains("mcp transport failed"));
+        assert!(
+            result.content.contains("Outcome unknown"),
+            "{}",
+            result.content
+        );
+        assert!(result.content.contains("not retried"), "{}", result.content);
+        let details = result.details.expect("details");
+        assert_eq!(details["outcome_unknown"], true);
+        assert_eq!(details["tool"], "mcp__lost__effect");
+
+        // A definite failure stays a plain failure: no unknown-outcome text.
+        let failed = super::ToolError::Failed("permission denied".into()).into_tool_result("read");
+        assert!(failed.is_error);
+        assert_eq!(failed.content, "permission denied");
+        assert!(failed.details.is_none());
+    }
+
     #[test]
     fn exit_status_line_names_every_failed_exit_and_leaves_success_alone() {
         assert_eq!(super::exit_status_line(Some(0), false), None);
@@ -4624,7 +5373,7 @@ mod tests {
     fn pathological_glob_finishes_quickly() {
         let name = "a".repeat(40);
         let started = std::time::Instant::now();
-        assert!(!match_glob_chars("*a*a*a*a*a*a*a*a*a*b", &name));
+        assert!(!glob_match("*a*a*a*a*a*a*a*a*a*b", &name));
         assert!(started.elapsed() < std::time::Duration::from_millis(100));
     }
 
@@ -4648,11 +5397,7 @@ mod tests {
             ("**", "anything/at/all", true),
             ("a*b", "a/x/b", true),
         ] {
-            assert_eq!(
-                match_glob_chars(pattern, name),
-                expected,
-                "{pattern} {name}"
-            );
+            assert_eq!(glob_match(pattern, name), expected, "{pattern} {name}");
         }
     }
 
@@ -5145,6 +5890,60 @@ mod tests {
     }
 
     #[test]
+    fn timed_out_decision_hosts_cannot_spawn_unbounded_waiters() {
+        let slots = std::sync::Arc::new(DecisionWorkerSlots::default());
+        let (release, rx) = std::sync::mpsc::channel::<()>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let blocked = DecisionResponder::new(move |_| {
+            let _ = rx.lock().unwrap().recv();
+            DecisionHostResponse::Unavailable
+        });
+        let request = DecisionHostRequest {
+            questions: Vec::new(),
+        };
+        let context = ToolContext {
+            decision_timeout: Some(std::time::Duration::from_millis(25)),
+            ..ToolContext::default()
+        };
+
+        let first = wait_for_decision_host_with_slots(
+            blocked.clone(),
+            request.clone(),
+            &context,
+            slots.clone(),
+            1,
+        );
+        assert_eq!(first, DecisionHostResponse::Timeout);
+        assert_eq!(slots.active.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let second =
+            wait_for_decision_host_with_slots(blocked, request.clone(), &context, slots.clone(), 1);
+        assert_eq!(second, DecisionHostResponse::Unavailable);
+        assert_eq!(slots.active.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while slots.active.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "decision slot was not reclaimed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_in_worker = called.clone();
+        let ready = DecisionResponder::new(move |_| {
+            called_in_worker.store(true, std::sync::atomic::Ordering::SeqCst);
+            DecisionHostResponse::Unavailable
+        });
+        assert_eq!(
+            wait_for_decision_host_with_slots(ready, request, &context, slots, 1),
+            DecisionHostResponse::Unavailable
+        );
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
     fn f02_host_answer_uses_authenticated_reply_and_never_changes_files() {
         let (dir, context, question) = f02_question_fixture();
         let source_before = fs::read(dir.path().join("src.rs")).unwrap();
@@ -5542,106 +6341,22 @@ mod tests {
             fs::write(dir.path().join(name), "needle PRIVATE_FIXTURE\n").unwrap();
         }
         fs::write(dir.path().join("public.txt"), "needle PUBLIC_FIXTURE\n").unwrap();
-        for native in [false, true] {
-            for glob in ["**/*", ".env", "**/.env*", "[.]env", "*.pem"] {
-                let input =
-                    serde_json::json!({"pattern":"needle", "path":".", "glob":glob, "context":1});
-                let result = if native {
-                    grep_tool_native(dir.path(), &input, &ToolContext::default())
-                } else {
-                    grep_tool(dir.path(), &input, &ToolContext::default())
-                }
-                .unwrap();
-                assert!(
-                    !result.content.contains("PRIVATE_FIXTURE"),
-                    "credential exposed for glob {glob}, native={native}"
-                );
-                if glob == "**/*" {
-                    assert!(result.content.contains("PUBLIC_FIXTURE"));
-                }
-            }
-            // The caller's permission gate still authorizes an explicit secret path.
-            let input = serde_json::json!({"pattern":"needle", "path":".env"});
-            let explicit = if native {
-                grep_tool_native(dir.path(), &input, &ToolContext::default())
-            } else {
-                grep_tool(dir.path(), &input, &ToolContext::default())
-            }
-            .unwrap();
-            assert!(explicit.content.contains("PRIVATE_FIXTURE"));
-        }
-    }
-
-    /// A ripgrep stdout that never ends: one match event per read, forever.
-    struct EndlessRg(usize);
-
-    impl std::io::Read for EndlessRg {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            self.0 += 1;
-            let line = format!(
-                "{{\"type\":\"match\",\"data\":{{\"path\":{{\"text\":\"f{}.rs\"}},\"line_number\":{},\"lines\":{{\"text\":\"needle\\n\"}}}}}}\n",
-                self.0, self.0
+        for glob in ["**/*", ".env", "**/.env*", "[.]env", "*.pem"] {
+            let input =
+                serde_json::json!({"pattern":"needle", "path":".", "glob":glob, "context":1});
+            let result = grep_tool(dir.path(), &input, &ToolContext::default()).unwrap();
+            assert!(
+                !result.content.contains("PRIVATE_FIXTURE"),
+                "credential exposed for glob {glob}"
             );
-            let bytes = line.as_bytes();
-            let n = bytes.len().min(buf.len());
-            buf[..n].copy_from_slice(&bytes[..n]);
-            Ok(n)
-        }
-    }
-
-    /// A ripgrep stdout that produces nothing and never closes, like a
-    /// walk over a huge tree that has found nothing yet.
-    struct SilentRg {
-        receiver: std::sync::mpsc::Receiver<u8>,
-        /// Held so the receiver blocks instead of seeing a closed channel.
-        _sender: std::sync::mpsc::Sender<u8>,
-    }
-
-    impl std::io::Read for SilentRg {
-        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-            let _ = self.receiver.recv();
-            Ok(0)
-        }
-    }
-
-    #[test]
-    fn grep_stops_reading_ripgrep_at_the_match_limit() {
-        let stream = stream_rg_matches(EndlessRg(0), 5, &ToolContext::default(), false);
-        assert_eq!(stream.matches.len(), 5);
-        assert!(stream.limit_reached);
-        assert!(!stream.aborted);
-        assert_eq!(stream.matches[4].0, PathBuf::from("f5.rs"));
-        assert_eq!(stream.matches[4].1, 5);
-    }
-
-    #[test]
-    fn grep_stops_reading_ripgrep_when_the_turn_is_aborted() {
-        let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let context = ToolContext {
-            abort: Some(abort.clone()),
-            ..ToolContext::default()
-        };
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn({
-            let abort = abort.clone();
-            move || {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                abort.store(true, std::sync::atomic::Ordering::SeqCst);
+            if glob == "**/*" {
+                assert!(result.content.contains("PUBLIC_FIXTURE"));
             }
-        });
-        let started = std::time::Instant::now();
-        let stream = stream_rg_matches(
-            SilentRg {
-                receiver,
-                _sender: sender,
-            },
-            5,
-            &context,
-            false,
-        );
-        assert!(stream.aborted);
-        assert!(stream.matches.is_empty());
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        }
+        // The caller's permission gate still authorizes an explicit secret path.
+        let input = serde_json::json!({"pattern":"needle", "path":".env"});
+        let explicit = grep_tool(dir.path(), &input, &ToolContext::default()).unwrap();
+        assert!(explicit.content.contains("PRIVATE_FIXTURE"));
     }
 
     #[test]
@@ -5775,27 +6490,6 @@ mod tests {
                 dir.path().to_string_lossy().as_ref(),
             ]
         );
-        let rg = build_rg_args("Needle", dir.path(), Some("*.rs"), true, true);
-        assert_eq!(
-            rg,
-            vec![
-                "--json",
-                "--line-number",
-                "--color=never",
-                "--hidden",
-                "--ignore-case",
-                "--fixed-strings",
-                "--glob",
-                "*.rs",
-                "--glob",
-                "!.git",
-                "--glob",
-                "!node_modules",
-                "--",
-                "Needle",
-                dir.path().to_string_lossy().as_ref(),
-            ]
-        );
     }
 
     #[test]
@@ -5877,15 +6571,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let fd = build_fd_args(".git/hooks/*", dir.path(), 10);
         assert!(!fd.iter().any(|arg| arg == "--exclude"));
-        let rg = build_rg_args("x", &dir.path().join(".git"), None, false, false);
-        assert!(!rg.iter().any(|arg| arg == "!.git"));
-        let rg = build_rg_args("x", dir.path(), Some("node_modules/**"), false, false);
-        assert!(!rg.iter().any(|arg| arg == "!node_modules"));
-        // A broad user glob must not re-include .git: the negation comes last.
-        let rg = build_rg_args("x", dir.path(), Some("**/*"), false, false);
-        let user = rg.iter().position(|arg| arg == "**/*").unwrap();
-        let negated = rg.iter().position(|arg| arg == "!.git").unwrap();
-        assert!(negated > user, "{rg:?}");
         // A file that merely starts with ".git" is not a request for .git.
         let fd = build_fd_args(".gitignore", dir.path(), 10);
         assert!(fd.iter().any(|arg| arg == ".git"));
@@ -5925,7 +6610,7 @@ mod tests {
             "one\nneedle\nthree\nneedle\nfive\n",
         )
         .unwrap();
-        let out = grep_tool_native(
+        let out = grep_tool(
             dir.path(),
             &serde_json::json!({"pattern": "needle", "context": 1}),
             &ToolContext::default(),
@@ -6314,10 +6999,6 @@ mod bounded_discovery_regressions {
             "node_module?/pkg/*.js",
         ] {
             assert!(targets_excluded_dir(pattern, Path::new(".")), "{pattern}");
-            let args = build_rg_args("needle", Path::new("."), Some(pattern), false, false);
-            assert!(!args
-                .iter()
-                .any(|arg| arg == "!node_modules" || arg == "!.git"));
         }
         assert!(!targets_excluded_dir("**/*", Path::new(".")));
         assert!(!targets_excluded_dir("!**/.git*/**", Path::new(".")));
@@ -6340,5 +7021,1578 @@ mod bounded_discovery_regressions {
         }));
         assert_eq!(visited, 0);
         assert!(walk_workspace_files(root.path(), 20, &mut |_| true));
+    }
+
+    // ---- WP01: agent filesystem isolation and bounded scans ----
+
+    /// A workspace holding `plain.txt` and `alias.txt`, where `alias.txt` is a
+    /// second hard link to a canary that lives outside the workspace.
+    fn wp01_linked_workspace() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let canary = outside.path().join("canary.txt");
+        fs::write(&canary, "needle outside secret\n").unwrap();
+        fs::hard_link(&canary, workspace.path().join("alias.txt")).unwrap();
+        fs::write(workspace.path().join("plain.txt"), "needle inside\n").unwrap();
+        (workspace, outside, canary)
+    }
+
+    #[test]
+    fn audit_wp01_b001_a_hard_link_to_an_outside_file_is_not_read_or_searched() {
+        let (workspace, _outside, canary) = wp01_linked_workspace();
+        let cwd = workspace.path();
+
+        let read = execute_tool(cwd, "read", &serde_json::json!({"path": "alias.txt"}));
+        let message = match read {
+            Err(ToolError::Failed(message)) => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert!(message.contains("hard link"), "{message}");
+        let plain = execute_tool(cwd, "read", &serde_json::json!({"path": "plain.txt"})).unwrap();
+        assert!(plain.content.contains("needle inside"));
+
+        // Native grep and ripgrep both leave the alias out and say so.
+        let input = serde_json::json!({"pattern": "needle"});
+        let native = grep_tool(cwd, &input, &ToolContext::default()).unwrap();
+        let routed = grep_tool(cwd, &input, &ToolContext::default()).unwrap();
+        for result in [native, routed] {
+            assert!(result.content.contains("plain.txt:1"), "{}", result.content);
+            assert!(
+                !result.content.contains("outside secret"),
+                "{}",
+                result.content
+            );
+            assert!(!result.content.contains("alias.txt"), "{}", result.content);
+            let details = result.details.expect("a skipped file is reported");
+            assert_eq!(details["partial"], true);
+            assert!(details["partialReasons"]
+                .to_string()
+                .contains("hard-linked"));
+        }
+        assert_eq!(
+            fs::read_to_string(&canary).unwrap(),
+            "needle outside secret\n"
+        );
+    }
+
+    #[test]
+    fn audit_wp01_b001_permission_denies_a_hard_linked_read_before_the_tool_runs() {
+        use crate::permission::{PermissionMode, PermissionPolicy, PermissionVerdict};
+        let (workspace, _outside, _canary) = wp01_linked_workspace();
+        let mut policy = PermissionPolicy::new(PermissionMode::Auto);
+        // The refusal applies while outside reads are not authorized.
+        policy.set_read_outside_root_policy(crate::permission::ReadOutsideRootPolicy::Ask);
+        for tool in ["read", "grep"] {
+            let args = serde_json::json!({"path": "alias.txt", "pattern": "needle"});
+            let verdict = policy.decide("call", tool, &args, workspace.path());
+            assert!(
+                matches!(&verdict, PermissionVerdict::Deny { reason } if reason.contains("hard link")),
+                "{tool}: {verdict:?}"
+            );
+        }
+        let plain = serde_json::json!({"path": "plain.txt"});
+        let verdict = policy.decide("call", "read", &plain, workspace.path());
+        assert!(
+            !matches!(verdict, PermissionVerdict::Deny { .. }),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn audit_wp01_b004_oversized_image_and_notebook_are_refused_before_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("big.png");
+        let mut file = fs::File::create(&png).unwrap();
+        std::io::Write::write_all(&mut file, &[0x89, b'P', b'N', b'G']).unwrap();
+        file.set_len(READ_IMAGE_MAX_BYTES + 1).unwrap();
+        let notebook = dir.path().join("big.ipynb");
+        fs::File::create(&notebook)
+            .unwrap()
+            .set_len(READ_NOTEBOOK_MAX_BYTES + 1)
+            .unwrap();
+        for name in ["big.png", "big.ipynb"] {
+            let error = execute_tool(dir.path(), "read", &serde_json::json!({"path": name}))
+                .expect_err(name);
+            assert!(error.to_string().contains("larger than"), "{name}: {error}");
+        }
+
+        // A file that grows while it is read still stops at the cap plus one byte.
+        struct Growing(u64);
+        impl Read for Growing {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0 += buf.len() as u64;
+                buf.fill(b' ');
+                Ok(buf.len())
+            }
+        }
+        let mut growing = Growing(0);
+        let error = davinci_sys::fs::read_capped(&mut growing, 0, READ_NOTEBOOK_MAX_BYTES)
+            .expect_err("growing input");
+        assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+        assert_eq!(growing.0, READ_NOTEBOOK_MAX_BYTES + 1);
+
+        // Ordinary small files still read.
+        let mut small_png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        small_png.extend_from_slice(&[0; 16]);
+        fs::write(dir.path().join("small.png"), small_png).unwrap();
+        let image = execute_tool(
+            dir.path(),
+            "read",
+            &serde_json::json!({"path": "small.png"}),
+        )
+        .unwrap();
+        assert!(!image.is_error, "{}", image.content);
+        fs::write(
+            dir.path().join("small.ipynb"),
+            r#"{"cells":[{"cell_type":"markdown","source":["hello"],"metadata":{}}],"metadata":{},"nbformat":4,"nbformat_minor":5}"#,
+        )
+        .unwrap();
+        let notebook = execute_tool(
+            dir.path(),
+            "read",
+            &serde_json::json!({"path": "small.ipynb"}),
+        )
+        .unwrap();
+        assert!(notebook.content.contains("hello"), "{}", notebook.content);
+    }
+
+    fn partial_reasons(result: &ToolResult) -> String {
+        result
+            .details
+            .as_ref()
+            .and_then(|details| details.get("partialReasons"))
+            .map(Value::to_string)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn audit_wp01_b005_grep_budgets_hold_on_the_native_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // Over the per-file cap, a matching file: never read into memory.
+        let mut huge = vec![b'a'; GREP_MAX_FILE_BYTES as usize + 1];
+        huge.extend_from_slice(b"\nneedle in a huge file\n");
+        fs::write(dir.path().join("huge.txt"), huge).unwrap();
+        // One line over the line cap beside an ordinary matching line.
+        let mut long = format!("needle {}", "x".repeat(GREP_MAX_LINE_BYTES * 2));
+        long.push_str("\nneedle ordinary\n");
+        fs::write(dir.path().join("long.txt"), long).unwrap();
+        // Many matching lines: the rendered output stops at its cap.
+        let many: String = (0..2000)
+            .map(|_| format!("needle {}\n", "y".repeat(400)))
+            .collect();
+        fs::write(dir.path().join("many.txt"), many).unwrap();
+
+        let input = serde_json::json!({"pattern": "needle", "limit": 10_000});
+        let native = grep_tool(dir.path(), &input, &ToolContext::default()).unwrap();
+        let routed = grep_tool(dir.path(), &input, &ToolContext::default()).unwrap();
+        for (path, result) in [("native", native), ("routed", routed)] {
+            let reasons = partial_reasons(&result);
+            assert!(reasons.contains("8 MiB"), "{path}: {reasons}");
+            assert!(reasons.contains("64 KiB"), "{path}: {reasons}");
+            assert!(reasons.contains("256 KiB"), "{path}: {reasons}");
+            assert!(
+                result.content.len() < GREP_MAX_OUTPUT_BYTES + 4096,
+                "{path}: {} bytes",
+                result.content.len()
+            );
+            assert!(
+                result.content.contains("long.txt:2: needle ordinary"),
+                "{path}"
+            );
+            assert!(!result.content.contains("huge file"), "{path}");
+        }
+    }
+
+    #[test]
+    fn audit_wp01_b005_aggregate_scan_budget_stops_further_reads() {
+        let budget = ScanBudget::new(100);
+        assert!(budget.reserve(60));
+        assert!(!budget.reserve(60), "the budget is shared, not per file");
+        assert!(budget.reserve(40));
+        assert!(!budget.reserve(1));
+    }
+
+    #[test]
+    fn audit_wp01_b005_context_at_file_boundaries_is_correct() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "needle\nb\nc\nd\nneedle\n").unwrap();
+        let result = grep_tool(
+            dir.path(),
+            &serde_json::json!({"pattern": "needle", "context": 1}),
+            &ToolContext::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            result.content,
+            "a.txt:1: needle\na.txt-2- b\n--\na.txt-4- d\na.txt:5: needle"
+        );
+    }
+
+    #[test]
+    fn audit_wp01_b014_ls_returns_at_most_the_limit_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..30 {
+            fs::write(dir.path().join(format!("f{index:02}")), "").unwrap();
+        }
+        let result = execute_tool(dir.path(), "ls", &serde_json::json!({"limit": 5})).unwrap();
+        let names: Vec<&str> = result
+            .content
+            .lines()
+            .take_while(|line| !line.is_empty())
+            .collect();
+        assert_eq!(names, ["f00", "f01", "f02", "f03", "f04"]);
+        assert!(result.content.contains("5 entries limit reached"));
+        assert_eq!(result.details.unwrap()["entryLimitReached"], 5);
+    }
+
+    #[test]
+    fn audit_wp01_b014_ls_window_is_bounded_and_enumeration_errors_are_visible() {
+        let names = |count: usize| {
+            (0..count)
+                .rev()
+                .map(|index| Ok(format!("n{index:03}")))
+                .collect::<Vec<std::io::Result<String>>>()
+                .into_iter()
+        };
+        let window = collect_ls_window(names(50), 4, 1000).unwrap();
+        assert_eq!(window.entries, ["n000", "n001", "n002", "n003"]);
+        assert!(window.more && !window.budget_reached);
+
+        // Past the enumeration budget the listing is explicitly partial.
+        let window = collect_ls_window(names(50), 4, 10).unwrap();
+        assert_eq!(window.entries.len(), 4);
+        assert!(window.budget_reached);
+
+        let failing = vec![
+            Ok("a".to_string()),
+            Err(std::io::Error::other("injected enumeration failure")),
+        ];
+        let error = collect_ls_window(failing.into_iter(), 4, 1000)
+            .err()
+            .expect("error");
+        assert!(error.to_string().contains("injected enumeration failure"));
+    }
+
+    #[test]
+    fn audit_wp01_b015_native_grep_holds_one_batch_and_stops_early() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..60 {
+            fs::write(
+                dir.path().join(format!("f{index:03}.txt")),
+                if index == 0 { "needle\n" } else { "hay\n" },
+            )
+            .unwrap();
+        }
+        GREP_TEST_MAX_BATCH.with(|max| max.set(0));
+        GREP_TEST_VISITED.with(|visited| visited.set(0));
+        let limits = GrepLimits {
+            batch_files: 8,
+            max_files: 1000,
+            max_entries: 1_000_000,
+        };
+        let result = grep_native(
+            dir.path(),
+            &serde_json::json!({"pattern": "needle", "limit": 1}),
+            &ToolContext::default(),
+            &limits,
+        )
+        .unwrap();
+        assert!(result.content.contains("f000.txt:1: needle"));
+        assert_eq!(result.details.unwrap()["matchLimitReached"], 1);
+        assert_eq!(GREP_TEST_MAX_BATCH.with(|max| max.get()), 8);
+        assert_eq!(
+            GREP_TEST_VISITED.with(|visited| visited.get()),
+            8,
+            "the walk stopped after the first batch held the match"
+        );
+
+        // Discovery that runs out of budget says the coverage is partial.
+        let limits = GrepLimits {
+            batch_files: 8,
+            max_files: 20,
+            max_entries: 1_000_000,
+        };
+        let result = grep_native(
+            dir.path(),
+            &serde_json::json!({"pattern": "absent"}),
+            &ToolContext::default(),
+            &limits,
+        )
+        .unwrap();
+        assert!(
+            partial_reasons(&result).contains("file discovery"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn audit_wp01_b018_semantic_positions_are_checked_not_wrapped() {
+        let position = |input: serde_json::Value| semantic_position(&input);
+        assert_eq!(position(serde_json::json!({})).unwrap(), (0, 0));
+        assert_eq!(position(serde_json::json!({"line": null})).unwrap(), (0, 0));
+        assert_eq!(
+            position(serde_json::json!({"line": 1, "character": 7})).unwrap(),
+            (0, 6)
+        );
+        assert_eq!(
+            position(serde_json::json!({"line": u32::MAX})).unwrap().0,
+            u32::MAX - 1
+        );
+        for bad in [
+            serde_json::json!({"line": 0}),
+            serde_json::json!({"character": 0}),
+            serde_json::json!({"line": 4_294_967_296_u64}),
+            serde_json::json!({"line": 4_294_967_297_u64}),
+            serde_json::json!({"character": 4_294_967_297_u64}),
+            serde_json::json!({"line": -1}),
+            serde_json::json!({"line": "3"}),
+            serde_json::json!({"line": 1.5}),
+        ] {
+            assert!(position(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct SpySemantic(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl SpySemantic {
+        fn hit<T>(&self) -> Result<T, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("spy".into())
+        }
+    }
+
+    impl crate::semantic::SemanticService for SpySemantic {
+        fn is_server_available(&self, _: &str, _: &Path) -> bool {
+            true
+        }
+        fn capabilities(&self, _: &str, _: &Path) -> crate::semantic::SemanticCapabilities {
+            Default::default()
+        }
+        fn definition(
+            &self,
+            _: &Path,
+            _: &str,
+            _: u32,
+            _: u32,
+        ) -> Result<crate::semantic::SemanticResult, String> {
+            self.hit()
+        }
+        fn references(
+            &self,
+            _: &Path,
+            _: &str,
+            _: u32,
+            _: u32,
+            _: bool,
+        ) -> Result<crate::semantic::SemanticResult, String> {
+            self.hit()
+        }
+        fn outline(&self, _: &Path, _: &str) -> Result<crate::semantic::SemanticResult, String> {
+            self.hit()
+        }
+        fn diagnostics(
+            &self,
+            _: &Path,
+            _: &str,
+        ) -> Result<crate::semantic::SemanticResult, String> {
+            self.hit()
+        }
+        fn call_hierarchy(
+            &self,
+            _: &Path,
+            _: &str,
+            _: u32,
+            _: u32,
+            _: bool,
+        ) -> Result<crate::semantic::SemanticResult, String> {
+            self.hit()
+        }
+        fn rename_preview(
+            &self,
+            _: &Path,
+            _: &str,
+            _: u32,
+            _: u32,
+            _: &str,
+        ) -> Result<crate::semantic::RenamePreview, String> {
+            self.hit()
+        }
+    }
+
+    #[test]
+    fn audit_wp01_b018_an_oversized_position_never_reaches_the_language_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let context = ToolContext {
+            semantic: Some(Arc::new(SpySemantic(calls.clone()))),
+            ..ToolContext::default()
+        };
+        for tool in [
+            "code_definition",
+            "code_references",
+            "code_call_hierarchy",
+            "code_rename_preview",
+        ] {
+            for field in ["line", "character"] {
+                let mut input = serde_json::json!({"path": "a.rs", "newName": "b"});
+                input[field] = serde_json::json!(4_294_967_297_u64);
+                let error = execute_tool_with(dir.path(), tool, &input, &context)
+                    .expect_err("oversized position");
+                assert!(
+                    error.to_string().contains("one-based"),
+                    "{tool}.{field}: {error}"
+                );
+            }
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // The documented defaults and the u32 boundary reach the server.
+        let boundary = serde_json::json!({"path": "a.rs", "line": u32::MAX, "character": 1});
+        let _ = execute_tool_with(dir.path(), "code_definition", &boundary, &context);
+        let _ = execute_tool_with(
+            dir.path(),
+            "code_definition",
+            &serde_json::json!({"path": "a.rs"}),
+            &context,
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn audit_wp01_b019_huge_grep_context_cannot_panic_or_lose_a_match() {
+        let lines = ["a", "b", "c", "d", "e"];
+        for context in [usize::MAX, usize::MAX / 2, 1 << 40, 5, 4] {
+            let (out, _) = render_grep_context("f", &lines, &[3], context);
+            assert!(
+                out.contains(&"f:3: c".to_string()),
+                "context {context}: {out:?}"
+            );
+            assert!(out.len() <= lines.len(), "context {context}: {out:?}");
+        }
+        // A match line near usize::MAX must not wrap its window end.
+        let (out, _) = render_grep_context("f", &lines, &[2, usize::MAX - 1], usize::MAX);
+        assert!(out.contains(&"f:2: b".to_string()), "{out:?}");
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f.txt"), "a\nb\nneedle\nd\ne\n").unwrap();
+        for context in [
+            serde_json::json!(u64::MAX),
+            serde_json::json!(usize::MAX as u64),
+        ] {
+            let input = serde_json::json!({"pattern": "needle", "context": context});
+            let result = grep_tool(dir.path(), &input, &ToolContext::default()).unwrap();
+            assert!(
+                result.content.contains("f.txt:3: needle"),
+                "{}",
+                result.content
+            );
+            assert!(result.content.contains("f.txt-1- a"), "{}", result.content);
+            assert!(
+                result.content.contains("context limited"),
+                "{}",
+                result.content
+            );
+        }
+        let negative = serde_json::json!({"pattern": "needle", "context": -1});
+        assert!(grep_tool(dir.path(), &negative, &ToolContext::default()).is_err());
+    }
+
+    #[test]
+    fn audit_wp01_b020_globs_are_bounded_and_keep_their_syntax() {
+        // Over the byte limit: refused before anything is scanned.
+        let long = "a".repeat(GLOB_MAX_BYTES + 1);
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+        let by_grep = serde_json::json!({"pattern": "needle", "glob": long});
+        assert!(grep_tool(dir.path(), &by_grep, &ToolContext::default()).is_err());
+        assert!(grep_tool(dir.path(), &by_grep, &ToolContext::default()).is_err());
+        let by_find = serde_json::json!({"pattern": long});
+        assert!(find_tool_native(dir.path(), &by_find).is_err());
+        assert!(find_tool(dir.path(), &by_find).is_err());
+
+        // A legal, adversarial glob cannot recurse: it is compiled, not walked.
+        let adversarial = format!("{}b", "a*".repeat(GLOB_MAX_BYTES / 2 - 1));
+        let glob = compile_glob(&adversarial).expect("legal glob");
+        assert!(!glob.is_match(&"a".repeat(5000)));
+        let deep = format!("{}x", "**/".repeat(1000));
+        if let Ok(glob) = compile_glob(&deep) {
+            assert!(glob.is_match("x"));
+        }
+
+        // Supported syntax is unchanged.
+        for (pattern, name, expected) in [
+            ("*.rs", "src/lib.rs", true),
+            ("src/**/*.rs", "src/a/b/c.rs", true),
+            ("src/**/*.rs", "src/c.rs", true),
+            ("?.md", "a.md", true),
+            ("?.md", "ab.md", false),
+            ("a/b", "a/b", true),
+            ("a*b", "a/x/b", true),
+            ("[id].tsx", "[id].tsx", true),
+            ("[id].tsx", "i.tsx", false),
+            ("{a,b}.rs", "{a,b}.rs", true),
+            ("{a,b}.rs", "a.rs", false),
+        ] {
+            assert_eq!(glob_match(pattern, name), expected, "{pattern} {name}");
+        }
+        // `**` inside a name behaves as it always did: any characters.
+        assert!(glob_match("a**b", "axxb"));
+        assert!(glob_match("a**b", "a/x/b"));
+    }
+}
+
+#[cfg(test)]
+mod audit_wp01_review_regressions {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn limits(batch_files: usize, max_entries: usize) -> GrepLimits {
+        GrepLimits {
+            batch_files,
+            max_files: 1_000_000,
+            max_entries,
+        }
+    }
+
+    fn grep(dir: &Path, input: serde_json::Value, limits: &GrepLimits) -> ToolResult {
+        grep_native(dir, &input, &ToolContext::default(), limits).unwrap()
+    }
+
+    /// Finding 13: `limit` counts matching lines, not rendered context rows.
+    #[test]
+    fn audit_wp01_b019_context_rows_never_displace_the_matching_row() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("f.txt"), "a\nb\nneedle\nd\ne\n").unwrap();
+        for context in [
+            serde_json::json!(u64::MAX),
+            serde_json::json!(2),
+            serde_json::json!(18),
+        ] {
+            let result = grep(
+                dir.path(),
+                serde_json::json!({"pattern": "needle", "context": context, "limit": 1}),
+                &GREP_LIMITS,
+            );
+            assert!(
+                result.content.contains("f.txt:3: needle"),
+                "{}",
+                result.content
+            );
+            assert!(
+                result.content.contains("f.txt-1- a"),
+                "context rows are kept"
+            );
+            assert_eq!(result.details.unwrap()["matchLimitReached"], 1);
+        }
+        // Two files, limit 1: the second file's hit is not rendered.
+        fs::write(dir.path().join("g.txt"), "needle\n").unwrap();
+        let result = grep(
+            dir.path(),
+            serde_json::json!({"pattern": "needle", "context": 1, "limit": 1}),
+            &GREP_LIMITS,
+        );
+        assert!(result.content.contains("f.txt:3: needle"));
+        assert!(!result.content.contains("g.txt"), "{}", result.content);
+    }
+
+    /// Finding 13, parallel scan: 40 files cross the pool threshold; the exact
+    /// limit is still honoured in walk order.
+    #[test]
+    fn audit_wp01_b019_a_parallel_scan_keeps_the_exact_limit() {
+        let dir = tempdir().unwrap();
+        for index in 0..40 {
+            fs::write(
+                dir.path().join(format!("f{index:02}.txt")),
+                "needle\nneedle\nneedle\n",
+            )
+            .unwrap();
+        }
+        let result = grep(
+            dir.path(),
+            serde_json::json!({"pattern": "needle", "limit": 7}),
+            &GREP_LIMITS,
+        );
+        let rows: Vec<_> = result
+            .content
+            .lines()
+            .filter(|l| l.contains(": needle"))
+            .collect();
+        assert_eq!(rows.len(), 7, "{}", result.content);
+        assert!(rows[0].starts_with("f00.txt:1:") && rows[6].starts_with("f02.txt:1:"));
+    }
+
+    /// Finding 7: bytes read never exceed bytes charged. A file that grows
+    /// after its size was taken is refused, and its new text is never seen.
+    #[test]
+    fn audit_wp01_b005_a_file_that_grows_after_its_size_is_charged_is_not_read() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("grow.txt");
+        fs::write(&target, "hay\n").unwrap();
+        GREP_TEST_AFTER_RESERVE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|file: &Path| {
+                let mut handle = fs::OpenOptions::new().append(true).open(file).unwrap();
+                std::io::Write::write_all(
+                    &mut handle,
+                    b"needle appended after the size was taken\n",
+                )
+                .unwrap();
+            }));
+        });
+        let result = grep(
+            dir.path(),
+            serde_json::json!({"pattern": "needle"}),
+            &GREP_LIMITS,
+        );
+        GREP_TEST_AFTER_RESERVE.with(|hook| *hook.borrow_mut() = None);
+        assert!(!result.content.contains("appended"), "{}", result.content);
+        assert_eq!(result.details.as_ref().unwrap()["partial"], true);
+        assert!(
+            result.content.contains(GREP_SKIP_LARGE),
+            "{}",
+            result.content
+        );
+    }
+
+    /// Finding 7 (aggregate): many small files, each charged for what it holds,
+    /// stop once the shared budget is gone.
+    #[test]
+    fn audit_wp01_b005_the_shared_budget_is_charged_per_file_read() {
+        let budget = ScanBudget::new(25);
+        let dir = tempdir().unwrap();
+        let matcher = Matcher::new("x", false, true);
+        let mut reasons = Vec::new();
+        for index in 0..4 {
+            let file = dir.path().join(format!("{index}.txt"));
+            fs::write(&file, "x".repeat(10)).unwrap();
+            let scan = grep_scan_file(
+                &file,
+                &matcher,
+                0,
+                "f",
+                5,
+                usize::MAX,
+                &budget,
+                UNRESTRICTED,
+            )
+            .unwrap();
+            reasons.push((scan.hits, scan.skipped.clone()));
+        }
+        assert_eq!(reasons[0].0, 1);
+        assert_eq!(reasons[1].0, 1);
+        assert_eq!(reasons[2].1, vec![GREP_SKIP_BUDGET]);
+        assert_eq!(reasons[3].1, vec![GREP_SKIP_BUDGET]);
+    }
+
+    /// Finding 8: the rows one file retains stop at the output budget however
+    /// many matches were asked for, with and without context.
+    #[test]
+    fn audit_wp01_b005_retained_output_is_bounded_whatever_limit_asks_for() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("many.txt");
+        fs::write(&file, "needle\n".repeat(1_000_000)).unwrap();
+        assert!(fs::metadata(&file).unwrap().len() <= GREP_MAX_FILE_BYTES);
+        let matcher = Matcher::new("needle", false, true);
+        for context in [0, 2] {
+            let budget = ScanBudget::new(GREP_MAX_SCAN_BYTES);
+            let scan = grep_scan_file(
+                &file,
+                &matcher,
+                context,
+                "many.txt",
+                usize::MAX,
+                usize::MAX,
+                &budget,
+                UNRESTRICTED,
+            )
+            .unwrap();
+            assert!(
+                scan.row_bytes() <= GREP_MAX_OUTPUT_BYTES,
+                "context {context}: {}",
+                scan.row_bytes()
+            );
+            assert!(scan.skipped.contains(&GREP_SKIP_OUTPUT));
+            assert!(scan.hits < 1_000_000);
+        }
+        // End to end, an absurd limit is capped and says so.
+        let result = grep(
+            dir.path(),
+            serde_json::json!({"pattern": "needle", "limit": u64::MAX}),
+            &GREP_LIMITS,
+        );
+        assert!(
+            result.content.len() < GREP_MAX_OUTPUT_BYTES + 4096,
+            "{}",
+            result.content.len()
+        );
+        let reasons = result.details.unwrap()["partialReasons"].to_string();
+        assert!(
+            reasons.contains("capped at 32768") && reasons.contains("256 KiB"),
+            "{reasons}"
+        );
+    }
+
+    /// Finding 9: every directory entry is counted, with or without a glob
+    /// match and for empty directories, and reading stops at the budget.
+    #[test]
+    fn audit_wp01_b015_the_walk_stops_at_its_entry_budget() {
+        let flat = tempdir().unwrap();
+        for index in 0..60 {
+            fs::write(flat.path().join(format!("f{index:02}.txt")), "hay\n").unwrap();
+        }
+        let mut visited = 0;
+        let mut budget = WalkBudget::new(10);
+        walk_files(
+            flat.path(),
+            &IgnoreRules::load(flat.path()),
+            &mut budget,
+            &mut |_| {
+                visited += 1;
+                true
+            },
+        );
+        assert_eq!(visited, 10, "no more entries are visited than were allowed");
+        assert!(budget.exhausted && budget.left == 0);
+
+        // Through the tool: a glob that matches nothing still hits the budget.
+        let result = grep(
+            flat.path(),
+            serde_json::json!({"pattern": "needle", "glob": "*.zzz"}),
+            &limits(8, 10),
+        );
+        assert!(
+            result.content.contains(GREP_SKIP_WALK),
+            "{}",
+            result.content
+        );
+
+        // A tree of empty directories never produces a file, yet is bounded.
+        let empty = tempdir().unwrap();
+        let mut path = empty.path().to_path_buf();
+        for depth in 0..40 {
+            path = path.join(format!("d{depth}"));
+            fs::create_dir(&path).unwrap();
+        }
+        let result = grep(
+            empty.path(),
+            serde_json::json!({"pattern": "needle"}),
+            &limits(8, 12),
+        );
+        assert!(
+            result.content.contains(GREP_SKIP_WALK),
+            "{}",
+            result.content
+        );
+        // A complete walk under the budget stays unmarked.
+        let result = grep(
+            flat.path(),
+            serde_json::json!({"pattern": "needle"}),
+            &limits(8, 1000),
+        );
+        assert!(
+            !result.content.contains(GREP_SKIP_WALK),
+            "{}",
+            result.content
+        );
+    }
+
+    /// Finding 12: `?` is one Unicode scalar, as it was before globset.
+    #[test]
+    fn audit_wp01_b020_question_mark_matches_one_scalar_not_one_byte() {
+        for (pattern, name, expected) in [
+            ("?.rs", "a.rs", true),
+            ("?.rs", "\u{e9}.rs", true),
+            ("?.rs", "\u{1F600}.rs", true),
+            ("??.rs", "\u{e9}.rs", false),
+            ("??.rs", "\u{e9}\u{1F600}.rs", true),
+            ("a?c", "a/c", true),
+            ("**/?.rs", "\u{e9}.rs", true),
+            ("**/?.rs", "dir/sub/\u{e9}.rs", true),
+            ("src/**/x.rs", "src/x.rs", true),
+            ("src/**/x.rs", "src/a/b/x.rs", true),
+            ("src/**", "src/a/b", true),
+            ("sr?/*.rs", "src/\u{e9}.rs", true),
+            ("[a]?.rs", "[a]\u{e9}.rs", true),
+            ("a.b?", "axb\u{e9}", false),
+            ("a.b?", "a.b\u{e9}", true),
+        ] {
+            assert_eq!(glob_match(pattern, name), expected, "{pattern} vs {name}");
+        }
+        assert!(glob_matcher(&"?".repeat(GLOB_MAX_BYTES)).is_ok());
+    }
+
+    #[test]
+    fn audit_wp01_b020_unicode_names_work_in_find_grep_and_ignore_rules() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("\u{e9}.rs"), "needle\n").unwrap();
+        fs::write(dir.path().join("ab.rs"), "needle\n").unwrap();
+        fs::write(dir.path().join("\u{e9}.log"), "needle\n").unwrap();
+        fs::write(dir.path().join(".gitignore"), "?.log\n").unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        let found = find_tool_native(dir.path(), &serde_json::json!({"pattern": "?.rs"})).unwrap();
+        assert!(
+            found.content.contains("\u{e9}.rs") && !found.content.contains("ab.rs"),
+            "{}",
+            found.content
+        );
+        let grepped = grep(
+            dir.path(),
+            serde_json::json!({"pattern": "needle", "glob": "?.rs"}),
+            &GREP_LIMITS,
+        );
+        assert!(grepped.content.contains("\u{e9}.rs") && !grepped.content.contains("ab.rs"));
+        // The ignore rule `?.log` hides the one-scalar name `\u{e9}.log`.
+        assert!(!grepped.content.contains(".log"));
+        let all = grep(
+            dir.path(),
+            serde_json::json!({"pattern": "needle"}),
+            &GREP_LIMITS,
+        );
+        assert!(!all.content.contains(".log"), "{}", all.content);
+    }
+
+    /// Finding 15: `grep` no longer has a ripgrep route that could silently
+    /// fall back, so a configured ripgrep is never started.
+    #[test]
+    fn audit_wp01_b001_grep_never_starts_ripgrep() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("f.txt"), "needle\n").unwrap();
+        // A directory is not an executable: the old route failed with
+        // "Failed to run ripgrep" when it tried to spawn it.
+        let previous = std::env::var_os("PI_RG_PATH");
+        std::env::set_var("PI_RG_PATH", dir.path());
+        let result = grep_tool(
+            dir.path(),
+            &serde_json::json!({"pattern": "needle"}),
+            &ToolContext::default(),
+        );
+        match previous {
+            Some(value) => std::env::set_var("PI_RG_PATH", value),
+            None => std::env::remove_var("PI_RG_PATH"),
+        }
+        assert!(result.unwrap().content.contains("f.txt:1: needle"));
+    }
+
+    fn linked_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let canary = outside.path().join("canary.txt");
+        fs::write(&canary, "needle outside secret\n").unwrap();
+        fs::hard_link(&canary, workspace.path().join("alias.txt")).unwrap();
+        (workspace, outside, canary)
+    }
+
+    /// Finding 4: the cache reader enforces the link policy on the handle that
+    /// supplies its bytes. Called directly, with no earlier admission by the
+    /// tool, it refuses a linked file before one source byte is counted.
+    #[test]
+    fn audit_wp01_b001_the_cache_reader_refuses_a_linked_file_on_its_own_handle() {
+        use crate::runtime::cache::{read_current_file, CacheRuntime};
+        let (workspace, _outside, canary) = linked_fixture();
+        fs::write(workspace.path().join("plain.txt"), "fine\n").unwrap();
+        let relative = Path::new("alias.txt");
+        assert!(read_current_file(workspace.path(), relative, 1024, || Ok(())).is_err());
+        let cache = CacheRuntime::default();
+        assert!(cache
+            .read_current_file(workspace.path(), relative, 1024, || Ok(()))
+            .is_err());
+        let counted = cache
+            .stats()
+            .namespaces
+            .get(&crate::runtime::cache::CacheNamespace::File)
+            .map_or(0, |stats| stats.source_bytes_read);
+        assert_eq!(counted, 0, "no outside byte was admitted");
+        // The same cache still serves an ordinary file.
+        cache
+            .read_current_file(workspace.path(), Path::new("plain.txt"), 1024, || Ok(()))
+            .unwrap();
+        // An authorized caller may read the linked file through the cache.
+        let snapshot = cache
+            .read_current_file_with(workspace.path(), relative, 1024, true, || Ok(()))
+            .unwrap();
+        assert_eq!(snapshot.bytes, fs::read(&canary).unwrap());
+    }
+
+    /// Finding 6, tools: one hard-linked file, restricted then outside-authorized.
+    #[test]
+    fn audit_wp01_b001_an_outside_read_grant_lets_read_grep_and_outline_follow_a_link() {
+        let (workspace, _outside, _canary) = linked_fixture();
+        let cwd = workspace.path();
+        let restricted = ToolContext::default();
+        let authorized = ToolContext {
+            linked_files_allowed: true,
+            ..ToolContext::default()
+        };
+        for (tool, input) in [
+            ("read", serde_json::json!({"path": "alias.txt"})),
+            (
+                "grep",
+                serde_json::json!({"pattern": "needle", "path": "alias.txt"}),
+            ),
+        ] {
+            let denied = execute_tool_with(cwd, tool, &input, &restricted);
+            let text = match &denied {
+                Ok(result) => result.content.clone(),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                !text.contains("outside secret"),
+                "{tool} restricted: {text}"
+            );
+            let allowed = execute_tool_with(cwd, tool, &input, &authorized).unwrap();
+            assert!(
+                allowed.content.contains("outside secret") || allowed.content.contains("needle"),
+                "{tool}: {}",
+                allowed.content
+            );
+        }
+    }
+
+    /// Finding 6, policy: the grant is read from the permission policy, and
+    /// the deny that applies without it disappears with it.
+    #[test]
+    fn audit_wp01_b001_the_link_refusal_follows_the_outside_read_policy() {
+        use crate::permission::{
+            PermissionMode, PermissionPolicy, PermissionVerdict, ReadOutsideRootPolicy,
+        };
+        let (workspace, _outside, _canary) = linked_fixture();
+        let cwd = workspace.path();
+        let args = serde_json::json!({"path": "alias.txt"});
+        let mut policy = PermissionPolicy::new(PermissionMode::Auto);
+        policy.set_worktree_boundary(cwd, None);
+        for restricted in [ReadOutsideRootPolicy::Ask, ReadOutsideRootPolicy::Deny] {
+            policy.set_read_outside_root_policy(restricted);
+            assert!(!policy.linked_files_allowed());
+            let verdict = policy.decide("call", "read", &args, cwd);
+            assert!(
+                matches!(&verdict, PermissionVerdict::Deny { reason } if reason.contains("hard link")),
+                "{restricted:?}: {verdict:?}"
+            );
+        }
+        policy.set_read_outside_root_policy(ReadOutsideRootPolicy::Allow);
+        assert!(policy.linked_files_allowed());
+        let verdict = policy.decide("call", "read", &args, cwd);
+        assert!(
+            !matches!(&verdict, PermissionVerdict::Deny { reason } if reason.contains("hard link")),
+            "{verdict:?}"
+        );
+    }
+
+    /// A source that yields `total` bytes whatever its declared size was, and
+    /// counts how many the consumer pulled.
+    struct Outgrowing {
+        left: u64,
+        pulled: std::rc::Rc<std::cell::Cell<u64>>,
+    }
+
+    impl std::io::Read for Outgrowing {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = (buf.len() as u64).min(self.left) as usize;
+            buf[..n].fill(b'x');
+            self.left -= n as u64;
+            self.pulled.set(self.pulled.get() + n as u64);
+            Ok(n)
+        }
+    }
+
+    /// Review finding 14: the image and notebook reader is bounded at its own
+    /// call, not only in the shared helper. A source that outgrows its declared
+    /// size stops at `cap + 1` bytes, and an oversized declaration reads none.
+    /// Swapping the bounded read for `read_to_end` pulls all `3 * cap` bytes.
+    #[test]
+    fn audit_wp01_b004_the_whole_file_reader_stops_a_source_that_outgrows_its_size() {
+        let cap = 64 * 1024u64;
+        let pulled = std::rc::Rc::new(std::cell::Cell::new(0));
+        let grown = Outgrowing {
+            left: cap * 3,
+            pulled: pulled.clone(),
+        };
+        let error = read_whole_from(grown, 0, cap, "Image file").unwrap_err();
+        assert!(error.to_string().contains("larger than"), "{error}");
+        assert_eq!(pulled.get(), cap + 1);
+
+        let untouched = std::rc::Rc::new(std::cell::Cell::new(0));
+        let declared_big = Outgrowing {
+            left: cap * 3,
+            pulled: untouched.clone(),
+        };
+        assert!(read_whole_from(declared_big, cap + 1, cap, "Image file").is_err());
+        assert_eq!(untouched.get(), 0, "an oversized declaration reads nothing");
+
+        let exact = std::rc::Rc::new(std::cell::Cell::new(0));
+        let ok = read_whole_from(
+            Outgrowing {
+                left: cap,
+                pulled: exact.clone(),
+            },
+            cap,
+            cap,
+            "Image file",
+        )
+        .unwrap();
+        assert_eq!(ok.len() as u64, cap);
+    }
+
+    /// The same through the real `read` tool: an image over the limit is
+    /// refused from its size alone.
+    #[test]
+    fn audit_wp01_b004_read_refuses_an_oversized_image_without_decoding_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("big.png");
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        bytes.resize(READ_IMAGE_MAX_BYTES as usize + 1, 0);
+        fs::write(&path, bytes).unwrap();
+        let error = execute_tool_with(
+            dir.path(),
+            "read",
+            &serde_json::json!({"path": "big.png"}),
+            &ToolContext::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("larger than"), "{error}");
+    }
+
+    /// Planner security fix: a read grant never widens to a write. With outside
+    /// reads allowed, writing or editing an in-workspace hard link of an outside
+    /// file is refused and the outside bytes are unchanged, with and without a
+    /// runtime (checkpoint store); a single-link file still edits.
+    #[test]
+    fn audit_wp01_b001_linked_target_write_refused_even_with_read_grant() {
+        use crate::runtime::{
+            bus::RuntimeBus,
+            ids::{AgentId, RunId},
+            RuntimeHandle,
+        };
+        let runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+        let contexts = [
+            (
+                "no runtime",
+                ToolContext {
+                    linked_files_allowed: true,
+                    ..ToolContext::default()
+                },
+            ),
+            (
+                "runtime",
+                ToolContext {
+                    linked_files_allowed: true,
+                    runtime: Some(runtime.clone()),
+                    ..ToolContext::default()
+                },
+            ),
+        ];
+        for (label, context) in &contexts {
+            let (workspace, _outside, canary) = linked_fixture();
+            let cwd = workspace.path();
+            fs::write(
+                cwd.join("plain.txt"),
+                "needle plain
+",
+            )
+            .unwrap();
+            let before = fs::read(&canary).unwrap();
+
+            let write = execute_tool_with(
+                cwd,
+                "write",
+                &serde_json::json!({"path": "alias.txt", "content": "overwritten
+"}),
+                context,
+            );
+            assert!(
+                write.is_err(),
+                "{label}: write through a link must be refused"
+            );
+            let edit = execute_tool_with(
+                cwd,
+                "edit",
+                &serde_json::json!({"path": "alias.txt", "oldText": "needle", "newText": "pwned"}),
+                context,
+            );
+            assert!(
+                edit.is_err(),
+                "{label}: edit through a link must be refused"
+            );
+            assert!(
+                write.unwrap_err().to_string().contains("hard link"),
+                "{label}: the refusal names the cause"
+            );
+            assert_eq!(
+                fs::read(&canary).unwrap(),
+                before,
+                "{label}: the outside file changed"
+            );
+            assert_eq!(fs::read(cwd.join("alias.txt")).unwrap(), before);
+
+            // The checkpoint taken before any edit refuses the same target.
+            assert!(runtime
+                .blob_store
+                .capture_file(crate::runtime::ids::TaskId::new(), cwd, "alias.txt")
+                .is_err());
+
+            // A single-link file still edits normally.
+            execute_tool_with(
+                cwd,
+                "edit",
+                &serde_json::json!({"path": "plain.txt", "oldText": "plain", "newText": "edited"}),
+                context,
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read_to_string(cwd.join("plain.txt")).unwrap(),
+                "needle edited
+"
+            );
+        }
+    }
+
+    fn link_directory(link: &Path, target: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .is_ok_and(|out| out.status.success())
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+    }
+
+    fn link_file(link: &Path, target: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+    }
+
+    fn unauthorized() -> ToolContext {
+        ToolContext::default()
+    }
+
+    fn authorized() -> ToolContext {
+        ToolContext {
+            linked_files_allowed: true,
+            ..ToolContext::default()
+        }
+    }
+
+    fn run_grep(dir: &Path, context: &ToolContext, input: serde_json::Value) -> ToolResult {
+        grep_native(dir, &input, context, &GREP_LIMITS).unwrap()
+    }
+
+    /// Re-check N1: a symlink to an outside file, inside the tree, is not read
+    /// under the restricted (Ask/Deny) policy and is under the outside grant.
+    #[test]
+    fn audit_wp01_n1_grep_does_not_follow_a_file_symlink_out_of_the_search_root() {
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let canary = outside.path().join("canary.txt");
+        fs::write(&canary, "needle outside secret\n").unwrap();
+        fs::write(workspace.path().join("plain.txt"), "needle inside\n").unwrap();
+        if !link_file(&workspace.path().join("alias.txt"), &canary) {
+            eprintln!("file symlinks are unavailable here: static symlink case not executed");
+            return;
+        }
+        let input = serde_json::json!({"pattern": "needle", "path": "."});
+        let restricted = run_grep(workspace.path(), &unauthorized(), input.clone());
+        assert!(
+            restricted.content.contains("needle inside"),
+            "{}",
+            restricted.content
+        );
+        assert!(
+            !restricted.content.contains("outside secret"),
+            "{}",
+            restricted.content
+        );
+        assert!(restricted.details.unwrap()["partialReasons"]
+            .to_string()
+            .contains("outside the search root"));
+        let allowed = run_grep(workspace.path(), &authorized(), input);
+        assert!(
+            allowed.content.contains("outside secret"),
+            "{}",
+            allowed.content
+        );
+    }
+
+    /// Re-check N1, without needing link privileges: the confinement is judged
+    /// on the opened handle, so a file whose handle resolves outside the root is
+    /// refused and reported, and read once the root is lifted.
+    #[test]
+    fn audit_wp01_n1_a_handle_resolving_outside_the_root_is_refused() {
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let canary = outside.path().join("canary.txt");
+        fs::write(
+            &canary,
+            "needle outside secret
+",
+        )
+        .unwrap();
+        let root = workspace.path().canonicalize().unwrap();
+        let matcher = Matcher::new("needle", false, true);
+        let budget = ScanBudget::new(GREP_MAX_SCAN_BYTES);
+        let scan = |root: Option<&Path>| {
+            grep_scan_file(
+                &canary,
+                &matcher,
+                0,
+                "canary.txt",
+                10,
+                usize::MAX,
+                &budget,
+                GrepAccess {
+                    allow_linked: false,
+                    root,
+                },
+            )
+            .unwrap()
+        };
+        let refused = scan(Some(&root));
+        assert_eq!(refused.hits, 0);
+        assert!(refused.skipped.contains(&GREP_SKIP_OUTSIDE));
+        assert_eq!(scan(None).hits, 1);
+    }
+
+    /// Re-check N1, synchronized: the directory is swapped for a junction or
+    /// link to outside after discovery and before the file is opened.
+    #[test]
+    fn audit_wp01_n1_a_link_swapped_in_after_discovery_is_refused_on_the_read_handle() {
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("a.txt"), "needle outside secret\n").unwrap();
+        fs::create_dir(workspace.path().join("sub")).unwrap();
+        fs::write(
+            workspace.path().join("sub").join("a.txt"),
+            "needle inside\n",
+        )
+        .unwrap();
+        let swapped = std::cell::Cell::new(false);
+        let root = workspace.path().to_path_buf();
+        let target = outside.path().to_path_buf();
+        GREP_TEST_BEFORE_OPEN.with(|hook| {
+            let (root, target) = (root.clone(), target.clone());
+            let swapped = std::rc::Rc::new(swapped);
+            let flag = swapped.clone();
+            *hook.borrow_mut() = Some(Box::new(move |_| {
+                if flag.get() {
+                    return;
+                }
+                flag.set(true);
+                fs::remove_dir_all(root.join("sub")).unwrap();
+                if !link_directory(&root.join("sub"), &target) {
+                    // Links unavailable: put the directory back, nothing to test.
+                    fs::create_dir(root.join("sub")).unwrap();
+                    fs::write(root.join("sub").join("a.txt"), "needle inside\n").unwrap();
+                }
+            }));
+        });
+        let restricted = run_grep(
+            workspace.path(),
+            &unauthorized(),
+            serde_json::json!({"pattern": "needle", "path": "."}),
+        );
+        GREP_TEST_BEFORE_OPEN.with(|hook| *hook.borrow_mut() = None);
+        assert!(
+            !restricted.content.contains("outside secret"),
+            "{}",
+            restricted.content
+        );
+    }
+
+    /// Re-check item 13: a hit survives however much context precedes it.
+    #[test]
+    fn audit_wp01_b019_a_hit_is_reserved_before_its_context() {
+        let dir = tempdir().unwrap();
+        let wide = "\u{1F600}".repeat(500);
+        let mut text = String::new();
+        for _ in 0..200 {
+            text.push_str(&wide);
+            text.push('\n');
+        }
+        text.push_str("needle\n");
+        fs::write(dir.path().join("big.txt"), text).unwrap();
+        let result = run_grep(
+            dir.path(),
+            &unauthorized(),
+            serde_json::json!({"pattern": "needle", "context": 200, "limit": 1}),
+        );
+        assert!(
+            result.content.contains("big.txt:201: needle"),
+            "{}",
+            &result.content[..200.min(result.content.len())]
+        );
+        assert!(result.content.len() <= GREP_MAX_OUTPUT_BYTES + 512);
+    }
+
+    /// Re-check item 13, global allowance: a file whose output no longer fits
+    /// is trimmed to the room left, and its hit survives.
+    #[test]
+    fn audit_wp01_b019_a_nearly_full_answer_still_keeps_the_next_files_hit() {
+        let dir = tempdir().unwrap();
+        let filler = "x".repeat(480);
+        let first: String = (0..470).map(|_| format!("needle {filler}\n")).collect();
+        fs::write(dir.path().join("a.txt"), first).unwrap();
+        let mut second = String::new();
+        for _ in 0..60 {
+            second.push_str(&"y".repeat(480));
+            second.push('\n');
+        }
+        second.push_str("needle second file\n");
+        for _ in 0..60 {
+            second.push_str(&"z".repeat(480));
+            second.push('\n');
+        }
+        fs::write(dir.path().join("b.txt"), second).unwrap();
+        let result = run_grep(
+            dir.path(),
+            &unauthorized(),
+            serde_json::json!({"pattern": "needle", "context": 60, "limit": 100000}),
+        );
+        assert!(
+            result.content.contains("b.txt:61: needle second file"),
+            "the second file's hit was dropped"
+        );
+        assert!(
+            result.content.contains("output stopped"),
+            "partial output is reported"
+        );
+    }
+
+    /// Re-check item 8: scanning a file of newlines builds no per-line index.
+    /// Peak allocation on the scanning thread stays near the file's own size;
+    /// the old whole-file line index added 16 bytes for each of its 8M lines.
+    #[test]
+    fn audit_wp01_b005_a_no_match_scan_of_short_lines_retains_no_line_index() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("newlines.txt");
+        fs::write(&file, vec![b'\n'; GREP_MAX_FILE_BYTES as usize]).unwrap();
+        let matcher = Matcher::new("zzz", false, true);
+        let budget = ScanBudget::new(GREP_MAX_SCAN_BYTES);
+        counting_alloc::reset();
+        let scan = counting_alloc::tracked(|| {
+            grep_scan_file(
+                &file,
+                &matcher,
+                5,
+                "n",
+                usize::MAX,
+                usize::MAX,
+                &budget,
+                UNRESTRICTED,
+            )
+        })
+        .unwrap();
+        let peak = counting_alloc::peak();
+        assert_eq!(scan.hits, 0);
+        assert!(
+            peak < 3 * GREP_MAX_FILE_BYTES as usize,
+            "peak {peak} bytes: far more than the file, so a per-line index is back"
+        );
+    }
+
+    /// The same through the worker pool: eight workers, each scanning short-line
+    /// files, together stay near eight files' bytes.
+    #[test]
+    fn audit_wp01_b005_pooled_workers_retain_no_line_index() {
+        let dir = tempdir().unwrap();
+        let mut files = Vec::new();
+        for index in 0..40 {
+            let file = dir.path().join(format!("{index}.txt"));
+            fs::write(&file, vec![b'\n'; 2 << 20]).unwrap();
+            files.push(file);
+        }
+        let matcher = Matcher::new("zzz", false, true);
+        let budget = ScanBudget::new(GREP_MAX_SCAN_BYTES);
+        counting_alloc::reset();
+        let scan = |file: &Path, remaining: usize, left: usize| {
+            counting_alloc::tracked(|| {
+                grep_scan_file(
+                    file,
+                    &matcher,
+                    5,
+                    "n",
+                    remaining,
+                    left,
+                    &budget,
+                    UNRESTRICTED,
+                )
+            })
+        };
+        let results = scan_grep_batch(&files, 100, GREP_MAX_OUTPUT_BYTES, &scan);
+        let peak = counting_alloc::peak();
+        assert_eq!(results.len(), 40);
+        // Eight workers x 2 MiB of file bytes, plus slack; the old index added
+        // 32 MiB per worker.
+        assert!(peak < 40 << 20, "peak {peak} bytes across the pool");
+    }
+
+    /// Re-check item 9: a search that ends early pulls a window, not the whole
+    /// directory.
+    #[test]
+    fn audit_wp01_b015_an_early_stop_pulls_one_window_not_the_directory() {
+        let dir = tempdir().unwrap();
+        for index in 0..(WALK_WINDOW * 2 + 100) {
+            fs::write(dir.path().join(format!("f{index:05}.txt")), "x").unwrap();
+        }
+        let mut budget = WalkBudget::new(1_000_000);
+        let mut visited = 0usize;
+        walk_files(
+            dir.path(),
+            &IgnoreRules::load(dir.path()),
+            &mut budget,
+            &mut |_| {
+                visited += 1;
+                false
+            },
+        );
+        assert_eq!(visited, 1);
+        let pulled = 1_000_000 - budget.left;
+        assert!(
+            pulled <= WALK_WINDOW,
+            "pulled {pulled} entries before the first visit"
+        );
+        assert!(!budget.exhausted);
+    }
+
+    /// Re-check item 9: a directory that cannot be read is reported, not
+    /// skipped silently into a complete-looking answer.
+    #[test]
+    fn audit_wp01_b015_an_unreadable_directory_makes_the_walk_partial() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub").join("b.txt"), "needle\n").unwrap();
+        let root = dir.path().to_path_buf();
+        let mut budget = WalkBudget::new(1_000);
+        walk_files(
+            dir.path(),
+            &IgnoreRules::load(dir.path()),
+            &mut budget,
+            &mut |file| {
+                // The queued directory disappears after being discovered.
+                if file.ends_with("a.txt") {
+                    fs::remove_dir_all(root.join("sub")).unwrap();
+                }
+                true
+            },
+        );
+        assert!(budget.incomplete);
+
+        // And through grep: the answer says it is partial.
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub").join("b.txt"), "needle\n").unwrap();
+        GREP_TEST_BEFORE_OPEN.with(|hook| {
+            let root = dir.path().to_path_buf();
+            *hook.borrow_mut() = Some(Box::new(move |file| {
+                if file.ends_with("a.txt") {
+                    let _ = fs::remove_dir_all(root.join("sub"));
+                }
+            }));
+        });
+        // One-file batches scan `a.txt` while the walk is still running.
+        let result = grep_native(
+            dir.path(),
+            &serde_json::json!({"pattern": "needle", "path": "."}),
+            &unauthorized(),
+            &limits(1, 1_000_000),
+        )
+        .unwrap();
+        GREP_TEST_BEFORE_OPEN.with(|hook| *hook.borrow_mut() = None);
+        assert!(
+            result.content.contains("could not be read"),
+            "{}",
+            result.content
+        );
+    }
+
+    /// Re-check item 14, grep consumer: a file that grows after its last
+    /// metadata check is cut off one byte past the size that was charged, and
+    /// reports it. An unbounded read in `grep_scan_file` pulls all of it.
+    #[test]
+    fn audit_wp01_b005_grep_stops_a_file_that_outgrows_its_charged_size() {
+        use crate::test_seam::{clear, install, Outgrowing};
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("grows.txt");
+        fs::write(&file, "needle\n").unwrap();
+        let pulled = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let counter = pulled.clone();
+        install("grep", move |_| {
+            Box::new(Outgrowing {
+                left: 1 << 20,
+                pulled: counter.clone(),
+            })
+        });
+        let matcher = Matcher::new("needle", false, true);
+        let budget = ScanBudget::new(GREP_MAX_SCAN_BYTES);
+        let scan = grep_scan_file(
+            &file,
+            &matcher,
+            0,
+            "grows.txt",
+            10,
+            usize::MAX,
+            &budget,
+            UNRESTRICTED,
+        )
+        .unwrap();
+        clear("grep");
+        // Charged: the 7 declared bytes. Consumed: those plus one probe byte.
+        assert_eq!(
+            pulled.get(),
+            8,
+            "the read must stop one byte past the charged size"
+        );
+        assert!(scan.skipped.contains(&GREP_SKIP_LARGE));
+        assert_eq!(scan.hits, 0);
+    }
+
+    /// Re-check item 14, image and notebook entry points of the real `read`
+    /// tool: a file that outgrows its size is cut off at the limit plus one.
+    #[test]
+    fn audit_wp01_b004_read_stops_an_image_or_notebook_that_outgrows_its_size() {
+        use crate::test_seam::{clear, install, Outgrowing};
+        let dir = tempdir().unwrap();
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(&[0; 16]);
+        fs::write(dir.path().join("pic.png"), &png).unwrap();
+        fs::write(dir.path().join("nb.ipynb"), "{\"cells\": []}").unwrap();
+        for (name, cap) in [
+            ("pic.png", READ_IMAGE_MAX_BYTES),
+            ("nb.ipynb", READ_NOTEBOOK_MAX_BYTES),
+        ] {
+            let pulled = std::rc::Rc::new(std::cell::Cell::new(0u64));
+            let counter = pulled.clone();
+            install("read_whole", move |_| {
+                Box::new(Outgrowing {
+                    left: cap * 2,
+                    pulled: counter.clone(),
+                })
+            });
+            let result = execute_tool_with(
+                dir.path(),
+                "read",
+                &serde_json::json!({"path": name}),
+                &ToolContext::default(),
+            );
+            clear("read_whole");
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("larger than"), "{name}: {error}");
+            assert_eq!(
+                pulled.get(),
+                cap + 1,
+                "{name}: the read must stop one byte past the limit"
+            );
+        }
     }
 }

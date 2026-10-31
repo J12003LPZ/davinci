@@ -9,6 +9,7 @@ pub mod executor;
 pub mod gate;
 pub mod json_events;
 pub mod mutation;
+pub mod oracle;
 pub mod process;
 pub mod qdrant_projection;
 pub mod runner;
@@ -16,6 +17,7 @@ pub mod scenario;
 pub mod scorer;
 pub mod statistics;
 pub mod trace;
+pub mod validity;
 pub mod verification;
 
 pub use artifacts::{persist_eval_run, ArtifactHashes, ArtifactRoot, EvalRunManifest};
@@ -36,6 +38,10 @@ pub use executor::{
 pub use gate::{evaluate_gate, GateResult, RegressionBudget};
 pub use json_events::trace_from_json_lines;
 pub use mutation::{audit_dead_prompt_modules, evaluate_ablation, AblationResult, DeadPromptAudit};
+pub use oracle::{
+    default_solution_root, directory_digest, evaluate_scenario, evaluate_scenario_in, OraclePhase,
+    OracleReport, OracleVerdict, SolutionVariant,
+};
 pub use process::{run_davinci_process, DavinciProcessConfig, DavinciProcessRun};
 pub use runner::{
     aggregate_scenario_results, aggregate_suite_scores, classify_failure_signal,
@@ -46,9 +52,9 @@ pub use runner::{
 };
 pub use scenario::{
     load_core_200_corpus, load_debugging_hard_corpus, load_long_horizon_corpus,
-    load_regression_corpus, load_regression_suite, BehaviorCategory, BehaviorLimits,
-    BehaviorRequirement, BehaviorScenario, BehaviorTurn, MultiTurnBehaviorScenario, RegressionCase,
-    RegressionOwner, VerificationCommand,
+    load_regression_corpus, load_regression_suite, load_verified_core_corpus, BehaviorCategory,
+    BehaviorLimits, BehaviorRequirement, BehaviorScenario, BehaviorTurn, MultiTurnBehaviorScenario,
+    RegressionCase, RegressionOwner, VerificationCommand,
 };
 pub use scorer::{score_trace, ScoreCard};
 pub use statistics::{
@@ -60,6 +66,10 @@ pub use statistics::{
 pub use trace::{
     classify_shell_command, detect_verification_claims, BehaviorEvent, BehaviorStats,
     BehaviorTrace, FileDiff, VerificationEvent,
+};
+pub use validity::{
+    classify_scenario, default_fixture_root, is_meaningful_oracle, CorpusValidityReport,
+    ScenarioValidity, ScenarioValidityReport, ValidityFinding, ValidityFindingCode,
 };
 pub use verification::{
     run_verification_command, run_verification_commands, validate_fixture_command,

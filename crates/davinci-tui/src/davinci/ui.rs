@@ -578,8 +578,11 @@ pub fn tool_line(
 
 /// Presentation names only. The runtime's tool names and arguments stay intact.
 fn tool_caption<'a>(instrument: &'a str, target: &'a str) -> (&'a str, &'a str) {
-    if instrument == "manus" {
-        return ("Shell", target);
+    if instrument == super::model::POWERSHELL_INSTRUMENT {
+        return ("PowerShell", target);
+    }
+    if instrument == super::model::SHELL_INSTRUMENT {
+        return ("Bash", target);
     }
     if let Some((verb, argument)) = target.split_once(' ') {
         let name = match verb {
@@ -1194,7 +1197,7 @@ mod tests {
             false,
         );
         let drawn = text_of(&line);
-        assert_eq!(drawn, "● Shell(cargo check -p davinci-agent)");
+        assert_eq!(drawn, "● Bash(cargo check -p davinci-agent)");
         assert_eq!(line.spans.iter().filter(|s| is_strong(s)).count(), 1);
     }
 
@@ -1212,7 +1215,7 @@ mod tests {
             false,
         ));
         assert!(!drawn.contains("manus"), "got {drawn:?}");
-        assert!(drawn.starts_with("● Shell(cargo check"), "got {drawn:?}");
+        assert!(drawn.starts_with("● Bash(cargo check"), "got {drawn:?}");
         assert!(UnicodeWidthStr::width(drawn.as_str()) <= 34);
     }
 
@@ -1258,7 +1261,7 @@ mod tests {
         );
         assert_eq!(failed.spans[3].style.fg, Some(th.text));
         assert_eq!(failed.spans[0].style.fg, Some(th.cc().error));
-        assert!(text_of(&failed).starts_with("● Shell("));
+        assert!(text_of(&failed).starts_with("● Bash("));
     }
 
     #[test]

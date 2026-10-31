@@ -274,6 +274,12 @@ fn encode_value(
             if !n.is_finite() {
                 return Err(CborError::new("CBOR numbers must be finite"));
             }
+            // The decoder rejects whole-number floats past the safe range.
+            if n.fract() == 0.0 && n.abs() > 9007199254740991.0 {
+                return Err(CborError::new(
+                    "CBOR integers must be safe JavaScript integers",
+                ));
+            }
             writer.write_float64(*n)
         }
         CborValue::Text(text) => encode_text(writer, text, options),
@@ -306,6 +312,13 @@ fn encode_value(
                     "CBOR map length exceeds configured limit of {}",
                     options.max_container_length
                 )));
+            }
+            // The decoder rejects duplicate keys, so never emit them.
+            let mut keys = std::collections::HashSet::with_capacity(map.len());
+            for (key, _) in map {
+                if !keys.insert(key.as_str()) {
+                    return Err(CborError::new("CBOR map contains a duplicate key"));
+                }
             }
             write_argument(writer, 5, map.len() as u64)?;
             for (key, value) in map {
@@ -637,6 +650,40 @@ mod tests {
         ];
         let encoded = encode_cbor(&CborValue::Map(map.clone()), None).unwrap();
         assert_eq!(decode_cbor(&encoded, None).unwrap(), CborValue::Map(map));
+    }
+
+    #[test]
+    fn audit_wp03_b036_encoder_never_emits_what_the_decoder_rejects() {
+        // Duplicate keys, at the top level and nested in an array.
+        let duplicate = vec![
+            ("a".to_string(), CborValue::Null),
+            ("a".to_string(), CborValue::Bool(true)),
+        ];
+        let error = encode_cbor(&CborValue::Map(duplicate.clone()), None).unwrap_err();
+        assert_eq!(error.to_string(), "CBOR map contains a duplicate key");
+        assert!(encode_cbor(&CborValue::Array(vec![CborValue::Map(duplicate)]), None).is_err());
+
+        // A whole-number float past the safe range is a map value the decoder
+        // refuses.
+        let unsafe_float = CborValue::Map(vec![("n".to_string(), CborValue::Float(1e300))]);
+        assert!(encode_cbor(&unsafe_float, None).is_err());
+
+        // Everything accepted decodes back to the same value.
+        let accepted = CborValue::Map(vec![
+            ("b".to_string(), CborValue::Float(1.5)),
+            (
+                "a".to_string(),
+                CborValue::Map(vec![
+                    ("b".to_string(), CborValue::Integer(-3)),
+                    (
+                        "a".to_string(),
+                        CborValue::Array(vec![CborValue::Float(1e15)]),
+                    ),
+                ]),
+            ),
+        ]);
+        let encoded = encode_cbor(&accepted, None).unwrap();
+        assert_eq!(decode_cbor(&encoded, None).unwrap(), accepted);
     }
 
     #[test]

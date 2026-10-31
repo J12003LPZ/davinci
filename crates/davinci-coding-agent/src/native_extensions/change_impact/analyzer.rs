@@ -90,7 +90,11 @@ impl<'a> ChangeImpactAnalyzer<'a> {
         // 3. Resolve explicitly provided symbols
         if let Some(explicit_symbols) = symbols {
             for s in explicit_symbols {
-                target_symbols.insert(s.trim().to_string());
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return Err("empty symbol not allowed".into());
+                }
+                target_symbols.insert(trimmed.to_string());
             }
         }
 
@@ -262,18 +266,7 @@ impl<'a> ChangeImpactAnalyzer<'a> {
     }
 
     fn normalize_path(&self, raw: &str) -> Result<String, String> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return Err("empty path not allowed".into());
-        }
-        if trimmed.contains('\0') {
-            return Err("null bytes not allowed in path".into());
-        }
-        let normalized = trimmed.replace('\\', "/");
-        if normalized.starts_with('/') || normalized.contains("../") || normalized == ".." {
-            return Err(format!("path traversal rejected: {raw}"));
-        }
-        Ok(normalized)
+        normalize_workspace_relative(raw)
     }
 
     fn resolve_transaction(
@@ -654,6 +647,7 @@ impl<'a> ChangeImpactAnalyzer<'a> {
         use crate::native_extensions::git_intelligence::runner;
         let mut files = BTreeSet::new();
         for args in [
+            &["diff", "-z", "--name-only", "--cached"][..],
             &["diff", "-z", "--name-only", "HEAD"][..],
             &["ls-files", "-z", "--others", "--exclude-standard"][..],
         ] {
@@ -1224,4 +1218,66 @@ fn render_command(command: &Value) -> Option<String> {
             .collect::<Vec<_>>()
             .join(" "),
     )
+}
+
+fn normalize_workspace_relative(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("empty path not allowed".into());
+    }
+    if trimmed.contains('\0') {
+        return Err("null bytes not allowed in path".into());
+    }
+    let normalized = trimmed.replace('\\', "/");
+    if normalized.starts_with('/')
+        || normalized
+            .as_bytes()
+            .get(1)
+            .is_some_and(|byte| *byte == b':')
+        || normalized.contains("../")
+        || normalized == ".."
+    {
+        return Err(format!("path traversal rejected: {raw}"));
+    }
+    let mut parts = Vec::new();
+    for part in normalized.split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => return Err(format!("path traversal rejected: {raw}")),
+            part => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        return Err("empty path not allowed".into());
+    }
+    Ok(parts.join("/"))
+}
+
+#[cfg(test)]
+mod audit_wp13_tests {
+    use super::normalize_workspace_relative;
+
+    #[test]
+    fn audit_wp13_b123_b125_b126_paths_are_workspace_relative() {
+        for bad in [
+            "C:\\x",
+            "C:x",
+            "\\\\server\\share",
+            "//server/share",
+            "\\\\?\\C:\\x",
+            "/rooted",
+            "../x",
+            "a/../../x",
+        ] {
+            assert!(normalize_workspace_relative(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            normalize_workspace_relative("./src//a.rs").unwrap(),
+            "src/a.rs"
+        );
+        assert_eq!(
+            normalize_workspace_relative("src\\a.rs").unwrap(),
+            "src/a.rs"
+        );
+    }
 }

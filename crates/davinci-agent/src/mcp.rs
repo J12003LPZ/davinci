@@ -33,7 +33,66 @@ pub struct McpServerRow {
 /// server never holds up a call to another (or the registry itself). The
 /// scheduler runs read-only MCP tools in the parallel lane; this is what
 /// lets them actually overlap.
-type SharedClient = Arc<Mutex<davinci_mcp::Client>>;
+type SharedClient = Arc<ClientSlot>;
+
+/// A client plus whether the registry has since dropped it. Callers clone the
+/// handle before taking the client lock, so one that waited behind a failing
+/// call must see the flag when it gets the lock: sending on an evicted client
+/// would run a new call on a server the registry already gave up on.
+///
+/// `evicted` is only ever written while the client mutex is held, and a request
+/// checks it in the same lock hold that sends. A caller therefore either sends
+/// before the eviction or is refused after it; there is no gap between.
+struct ClientSlot {
+    client: Mutex<davinci_mcp::Client>,
+    evicted: AtomicBool,
+}
+
+impl ClientSlot {
+    fn new(client: davinci_mcp::Client) -> SharedClient {
+        Arc::new(Self {
+            client: Mutex::new(client),
+            evicted: AtomicBool::new(false),
+        })
+    }
+
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, davinci_mcp::Client>> {
+        self.client.lock()
+    }
+
+    fn is_evicted(&self) -> bool {
+        self.evicted.load(Ordering::SeqCst)
+    }
+
+    /// Flag the slot after the registry dropped it. Waits for any request in
+    /// flight, so call it with no registry lock held.
+    fn mark_evicted(&self) {
+        let _client = self.lock().unwrap_or_else(|err| err.into_inner());
+        self.evicted.store(true, Ordering::SeqCst);
+    }
+
+    /// Run one request, unless the slot was evicted while the caller waited.
+    /// Nothing is sent in that case, so the refusal is a definite failure. A
+    /// transport or protocol failure ends the connection, and the flag is set
+    /// before the lock is released so the next waiter cannot slip in.
+    fn send<T>(
+        &self,
+        server: &str,
+        request: impl FnOnce(&mut davinci_mcp::Client) -> davinci_mcp::Result<T>,
+    ) -> Result<davinci_mcp::Result<T>, ToolError> {
+        let mut client = self.lock().unwrap_or_else(|err| err.into_inner());
+        if self.is_evicted() {
+            return Err(ToolError::Failed(format!(
+                "MCP server `{server}` was disconnected before this call was sent"
+            )));
+        }
+        let result = request(&mut client);
+        if matches!(&result, Err(err) if !err.is_rpc()) {
+            self.evicted.store(true, Ordering::SeqCst);
+        }
+        Ok(result)
+    }
+}
 
 #[derive(Default)]
 struct Inner {
@@ -47,6 +106,11 @@ struct Inner {
     /// Project servers stopped on purpose; a background connect that finishes
     /// later must not bring them back.
     blocked: BTreeSet<String>,
+    /// Original user/project-authorized HTTP endpoints only. Local stdio and
+    /// sandboxed services require their own supervisor restart policy.
+    remote_configs: BTreeMap<String, (davinci_mcp::ServerConfig, PathBuf)>,
+    /// At most one reconnect worker may own a server at a time.
+    reconnecting: BTreeSet<String>,
 }
 
 /// Connected MCP servers, shared with the tool thread and the shell.
@@ -54,7 +118,23 @@ struct Inner {
 pub struct McpRegistry {
     inner: Arc<Mutex<Inner>>,
     progress: Arc<Progress>,
+    /// Test seam: runs after a failing call released its client lock and
+    /// before the registry entry is removed, the window a racing call needs.
+    #[cfg(test)]
+    failure_hook: Arc<Mutex<Option<FailureHook>>>,
+    /// Test seam: runs after a retiring slot was flagged and before its
+    /// registry entry is removed or replaced, the window a stale caller needs.
+    #[cfg(test)]
+    retire_hook: Arc<Mutex<Option<FailureHook>>>,
+    /// Test seam: runs on the reconnect worker after it published a
+    /// replacement and dropped the registry lock, the window in which a call
+    /// on that replacement can fail.
+    #[cfg(test)]
+    published_hook: Arc<Mutex<Option<FailureHook>>>,
 }
+
+#[cfg(test)]
+type FailureHook = Arc<dyn Fn() + Send + Sync>;
 
 /// Where a background connect stands: still running, or finished and not yet
 /// reported to the shell.
@@ -95,7 +175,7 @@ impl McpRegistry {
         )>,
     ) -> Self {
         let registry = Self::default();
-        registry.note_project_servers(config);
+        registry.note_project_servers(config, cwd);
         registry.adopt(Self::connect_parts(config, cwd, executor));
         registry
     }
@@ -116,7 +196,7 @@ impl McpRegistry {
         if config.mcp_servers.is_empty() {
             return registry;
         }
-        registry.note_project_servers(config);
+        registry.note_project_servers(config, cwd);
         registry.progress.running.store(true, Ordering::SeqCst);
         let worker = registry.clone();
         let config = config.clone();
@@ -181,24 +261,32 @@ impl McpRegistry {
         })
     }
 
+    /// Publish connected parts. A slot being replaced is retired first (see
+    /// [`ClientSlot::mark_evicted`]), so a caller still holding the old handle
+    /// is refused before the new one is visible. Retiring waits for requests in
+    /// flight, so it runs with no registry lock held; the loop repeats if
+    /// another thread published a live slot in the meantime.
     fn adopt(&self, parts: Vec<Inner>) {
-        let mut inner = self.lock();
-        for part in parts {
-            let blocked = |name: &String| inner.blocked.contains(name);
-            if part.clients.keys().any(blocked)
-                || part
-                    .rows
-                    .iter()
-                    .any(|row| inner.blocked.contains(&row.name))
-            {
-                continue;
+        loop {
+            let mut inner = self.lock();
+            let live: Vec<SharedClient> = parts
+                .iter()
+                .filter(|part| !inner.blocks(part))
+                .flat_map(|part| part.clients.keys())
+                .filter_map(|name| inner.clients.get(name))
+                .filter(|slot| !slot.is_evicted())
+                .cloned()
+                .collect();
+            if live.is_empty() {
+                inner.publish(parts);
+                return;
             }
-            inner.clients.extend(part.clients);
-            inner.routes.extend(part.routes);
-            inner
-                .trusted_read_only_servers
-                .extend(part.trusted_read_only_servers);
-            inner.rows.extend(part.rows);
+            drop(inner);
+            for slot in &live {
+                slot.mark_evicted();
+            }
+            #[cfg(test)]
+            self.run_retire_hook();
         }
     }
 
@@ -206,11 +294,60 @@ impl McpRegistry {
         self.inner.lock().unwrap_or_else(|err| err.into_inner())
     }
 
-    fn note_project_servers(&self, config: &davinci_mcp::ConfigFile) {
+    #[cfg(test)]
+    fn run_retire_hook(&self) {
+        let hook = self
+            .retire_hook
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn run_published_hook(&self) {
+        let hook = self
+            .published_hook
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn run_failure_hook(&self) {
+        let hook = self
+            .failure_hook
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn note_project_servers(&self, config: &davinci_mcp::ConfigFile, cwd: &Path) {
         let mut inner = self.lock();
         for (name, server) in &config.mcp_servers {
             if server.project_origin {
                 inner.project.insert(name.clone());
+            }
+            // Only an explicitly remote HTTP endpoint is eligible for this
+            // retry path. Never restart a local command outside its sandbox.
+            if server.url.is_some()
+                && !server.disabled
+                && matches!(
+                    server.execution_policy(),
+                    Ok(davinci_mcp::McpExecutionPolicy::Remote)
+                )
+            {
+                inner
+                    .remote_configs
+                    .insert(name.clone(), (server.clone(), cwd.to_path_buf()));
             }
         }
     }
@@ -221,19 +358,33 @@ impl McpRegistry {
     /// name. Used when trust in the project is withdrawn. Returns how many
     /// connected servers were stopped.
     pub fn disconnect_project(&self) -> usize {
+        let (names, stopped): (Vec<String>, Vec<SharedClient>) = {
+            let mut inner = self.lock();
+            let names: Vec<String> = inner.project.iter().cloned().collect();
+            inner.blocked.extend(names.iter().cloned());
+            let stopped = names
+                .iter()
+                .filter_map(|name| inner.clients.get(name).cloned())
+                .collect();
+            (names, stopped)
+        };
+        // Flag first, with no registry lock held (this waits for any request
+        // in flight), remove second: a caller that cloned the handle in
+        // between is refused by the flag. The names are blocked, so nothing
+        // replaces these entries meanwhile.
+        for slot in &stopped {
+            slot.mark_evicted();
+        }
+        #[cfg(test)]
+        self.run_retire_hook();
         let mut inner = self.lock();
-        let names: Vec<String> = inner.project.iter().cloned().collect();
-        let mut stopped = 0;
         for name in &names {
-            inner.blocked.insert(name.clone());
-            if inner.clients.remove(name).is_some() {
-                stopped += 1;
-            }
+            inner.clients.remove(name);
             inner.routes.retain(|_, (server, _)| server != name);
             inner.trusted_read_only_servers.remove(name);
             inner.rows.retain(|row| &row.name != name);
         }
-        stopped
+        stopped.len()
     }
 
     /// Kill every stdio server this process spawned, for an exit that runs
@@ -395,11 +546,24 @@ impl McpRegistry {
         self.lock().routes.get(exposed).cloned()
     }
 
-    pub fn call_exposed(&self, exposed: &str, arguments: &Value) -> Result<ToolResult, ToolError> {
+    /// `invocation_id` is the tool-call id of this logical call; it always
+    /// rides in the request's `_meta` so a server can tell a repeat from a new
+    /// call.
+    pub fn call_exposed(
+        &self,
+        exposed: &str,
+        arguments: &Value,
+        invocation_id: &str,
+    ) -> Result<ToolResult, ToolError> {
         let Some((server, tool)) = self.resolve_tool(exposed) else {
             return Err(ToolError::Unknown(exposed.to_string()));
         };
-        self.call(&server, &tool, arguments)
+        let result = self.call_full(&server, &tool, arguments, invocation_id)?;
+        Ok(ToolResult {
+            content: result.text(),
+            is_error: result.is_error.unwrap_or(false),
+            details: None,
+        })
     }
 
     /// The server's own handle, fetched under the registry lock and used
@@ -412,13 +576,163 @@ impl McpRegistry {
             .ok_or_else(|| ToolError::Failed(format!("no MCP server named `{server}`")))
     }
 
+    /// HTTP 4xx errors are generally configuration, authorization, or input
+    /// problems, not dropped transport connections. Only timeout/rate-limit
+    /// statuses in that range are eligible for transient reconnection.
+    ///
+    /// This decides only whether the connection is worth repairing for future
+    /// calls. Whether the failed call may run again is a separate question,
+    /// answered by [`davinci_mcp::Error::may_have_run`]: an ambiguous call is
+    /// never replayed, whatever this returns. `underlying` sees through an
+    /// ambiguous call outcome to the status or transport failure behind it.
+    fn should_reconnect(error: &davinci_mcp::Error) -> bool {
+        match error.underlying() {
+            davinci_mcp::Error::Rpc { .. } => false,
+            davinci_mcp::Error::Transport(message) => {
+                let status = message
+                    .strip_prefix("mcp http ")
+                    .and_then(|tail| tail.split(|ch: char| !ch.is_ascii_digit()).next())
+                    .and_then(|digits| digits.parse::<u16>().ok());
+                !matches!(status, Some(400..=499) if status != Some(408) && status != Some(429))
+            }
+            davinci_mcp::Error::Protocol(_)
+            | davinci_mcp::Error::Io(_)
+            | davinci_mcp::Error::Ambiguous { .. }
+            | davinci_mcp::Error::NotDelivered(_) => true,
+        }
+    }
+
+    /// Handle an error only if it belongs to this exact server connection.
+    /// An older, still-in-flight call must never evict a replacement
+    /// connection, nor start a reconnect for one.
+    fn failed_client(
+        &self,
+        server: &str,
+        slot: &SharedClient,
+        err: davinci_mcp::Error,
+    ) -> Result<ToolResult, ToolError> {
+        let reconnect = Self::should_reconnect(&err);
+        let (result, current) = {
+            let mut inner = self.lock();
+            let current = inner
+                .clients
+                .get(server)
+                .is_some_and(|current| Arc::ptr_eq(current, slot));
+            (inner.failed(server, slot, err), current)
+        };
+        if reconnect && current {
+            self.schedule_remote_reconnect(server);
+        }
+        result
+    }
+
+    /// Repair the transport for future calls only. The call that lost its
+    /// response may have mutated remote state and is NEVER replayed.
+    fn schedule_remote_reconnect(&self, server: &str) {
+        let reconnect = {
+            let mut inner = self.lock();
+            if inner.blocked.contains(server) || inner.reconnecting.contains(server) {
+                return;
+            }
+            let Some(config) = inner.remote_configs.get(server).cloned() else {
+                return;
+            };
+            inner.reconnecting.insert(server.to_string());
+            if let Some(row) = inner.rows.iter_mut().find(|row| row.name == server) {
+                row.status = "reconnecting".into();
+            }
+            config
+        };
+
+        let worker = self.clone();
+        let name = server.to_string();
+        std::thread::spawn(move || {
+            let (config, cwd) = reconnect;
+            let mut last_error = String::from("MCP reconnect failed");
+            // Set when the publish released this worker's ownership under the
+            // same lock. From then on a newer worker may own the server, so
+            // this one must not touch `reconnecting` or the row again.
+            let mut released = false;
+            for attempt in 0..3 {
+                if attempt > 0 {
+                    std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 1)));
+                }
+                if worker.lock().blocked.contains(&name) {
+                    break;
+                }
+                let mut part = Inner::default();
+                part.connect_one(&name, &config, &cwd, None);
+                let connected = part.clients.contains_key(&name);
+                if connected {
+                    loop {
+                        let mut inner = worker.lock();
+                        // A project trust revocation during handshake wins.
+                        if inner.blocked.contains(&name) {
+                            break;
+                        }
+                        // Retire a live slot before its replacement is
+                        // visible (see `adopt`), with no registry lock held.
+                        let live = inner
+                            .clients
+                            .get(&name)
+                            .filter(|slot| !slot.is_evicted())
+                            .cloned();
+                        if let Some(slot) = live {
+                            drop(inner);
+                            slot.mark_evicted();
+                            continue;
+                        }
+                        inner.clients.remove(&name);
+                        inner.routes.retain(|_, (owner, _)| owner != &name);
+                        inner.trusted_read_only_servers.remove(&name);
+                        inner.rows.retain(|row| row.name != name);
+                        inner.clients.extend(part.clients);
+                        inner.routes.extend(part.routes);
+                        inner
+                            .trusted_read_only_servers
+                            .extend(part.trusted_read_only_servers);
+                        inner.rows.extend(part.rows);
+                        // Publishing and giving up ownership are one step: a
+                        // failure on the replacement that lands after the lock
+                        // drops must be able to schedule a fresh worker.
+                        inner.reconnecting.remove(&name);
+                        released = true;
+                        drop(inner);
+                        #[cfg(test)]
+                        worker.run_published_hook();
+                        break;
+                    }
+                    break;
+                }
+                if let Some(error) = part.rows.first().and_then(|row| row.error.as_ref()) {
+                    last_error = error.clone();
+                }
+            }
+
+            if !released {
+                let mut inner = worker.lock();
+                inner.reconnecting.remove(&name);
+                if let Some(row) = inner.rows.iter_mut().find(|row| row.name == name) {
+                    if row.status == "reconnecting" {
+                        row.status = "error".into();
+                        row.error = Some(last_error);
+                    }
+                }
+            }
+            // The host must rebuild the model-visible MCP tool surface after
+            // recovery; a reconnect never grants permissions by itself.
+            worker.progress.unreported.store(true, Ordering::SeqCst);
+        });
+    }
+
     pub fn call(
         &self,
         server: &str,
         tool: &str,
         arguments: &Value,
+        invocation_id: &str,
     ) -> Result<ToolResult, ToolError> {
-        let result = self.call_full(server, tool, arguments)?;
+        let result = self.call_full(server, tool, arguments, invocation_id)?;
         Ok(ToolResult {
             content: result.text(),
             is_error: result.is_error.unwrap_or(false),
@@ -434,19 +748,34 @@ impl McpRegistry {
         server: &str,
         tool: &str,
         arguments: &Value,
+        invocation_id: &str,
     ) -> Result<davinci_mcp::CallToolResult, ToolError> {
-        let client = self.client(server)?;
-        let result = client
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .call_tool(tool, arguments.clone());
+        let slot = self.client(server)?;
+        self.call_on(server, &slot, tool, arguments, invocation_id)
+    }
+
+    /// The call itself, on a handle fetched earlier. Split out so the window
+    /// between fetching a handle and locking it can be tested.
+    fn call_on(
+        &self,
+        server: &str,
+        slot: &SharedClient,
+        tool: &str,
+        arguments: &Value,
+        invocation_id: &str,
+    ) -> Result<davinci_mcp::CallToolResult, ToolError> {
+        let result = slot.send(server, |client| {
+            client.call_tool_with_invocation(tool, arguments.clone(), Some(invocation_id))
+        })?;
         match result {
             Ok(result) => Ok(result),
             Err(err) => {
                 // Preserve the direct path's distinction: an RPC error is a
                 // failed tool answer; transport/protocol failure drops the
                 // server and remains an error, not an empty structured value.
-                let result = self.lock().failed(server, err)?;
+                #[cfg(test)]
+                self.run_failure_hook();
+                let result = self.failed_client(server, slot, err)?;
                 Ok(davinci_mcp::CallToolResult {
                     content: vec![davinci_mcp::ContentBlock {
                         kind: "text".into(),
@@ -463,18 +792,25 @@ impl McpRegistry {
     }
 
     pub fn read(&self, server: &str, uri: &str) -> Result<ToolResult, ToolError> {
-        let client = self.client(server)?;
-        let result = client
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .read_resource(uri);
+        let slot = self.client(server)?;
+        self.read_on(server, &slot, uri)
+    }
+
+    /// The resource read itself, on a handle fetched earlier.
+    fn read_on(
+        &self,
+        server: &str,
+        slot: &SharedClient,
+        uri: &str,
+    ) -> Result<ToolResult, ToolError> {
+        let result = slot.send(server, |client| client.read_resource(uri))?;
         match result {
             Ok(text) => Ok(ToolResult {
                 content: text,
                 is_error: false,
                 details: None,
             }),
-            Err(err) => self.lock().failed(server, err),
+            Err(err) => self.failed_client(server, slot, err),
         }
     }
 }
@@ -484,7 +820,12 @@ impl Inner {
     /// `is_error` on the result, server kept. Anything else (closed pipe,
     /// timeout, decode) means the server is gone: it is dropped and its row
     /// turns into an error.
-    fn failed(&mut self, server: &str, err: davinci_mcp::Error) -> Result<ToolResult, ToolError> {
+    fn failed(
+        &mut self,
+        server: &str,
+        slot: &SharedClient,
+        err: davinci_mcp::Error,
+    ) -> Result<ToolResult, ToolError> {
         if err.is_rpc() {
             return Ok(ToolResult {
                 content: err.to_string(),
@@ -492,7 +833,19 @@ impl Inner {
                 details: None,
             });
         }
-        self.drop_server(server, err.to_string());
+        // Only drop the server this call used: a newer connection under the
+        // same name is not the one that failed. The slot is already flagged
+        // (see `ClientSlot::send`), so its flag says nothing about this.
+        if self
+            .clients
+            .get(server)
+            .is_some_and(|current| Arc::ptr_eq(current, slot))
+        {
+            self.drop_server(server, err.to_string());
+        }
+        if err.may_have_run() {
+            return Err(ToolError::MayHaveRun(err.to_string()));
+        }
         Err(ToolError::Failed(err.to_string()))
     }
 
@@ -551,6 +904,20 @@ impl Inner {
             });
             return;
         }
+        let call_timeout = match server.call_timeout() {
+            Ok(timeout) => timeout,
+            Err(err) => {
+                self.rows.push(McpServerRow {
+                    name: name.to_string(),
+                    transport: transport_label.into(),
+                    status: "error".into(),
+                    tools: 0,
+                    error: Some(err.to_string()),
+                    skipped: Vec::new(),
+                });
+                return;
+            }
+        };
         if policy == davinci_mcp::McpExecutionPolicy::Sandboxed {
             let Some((host, sandbox)) = executor else {
                 self.rows.push(McpServerRow {
@@ -568,7 +935,11 @@ impl Inner {
             };
             let client = sandboxed::SupervisedMcpTransport::spawn(host, server, cwd, sandbox)
                 .and_then(|transport| {
-                    davinci_mcp::Client::connect_transport(name, Box::new(transport))
+                    davinci_mcp::Client::connect_transport_with_timeout(
+                        name,
+                        Box::new(transport),
+                        call_timeout,
+                    )
                 });
             self.finish_connection(name, server, "sandboxed-stdio", client);
             return;
@@ -587,7 +958,7 @@ impl Inner {
                 return;
             }
         };
-        let client = davinci_mcp::Client::connect(name, transport, cwd);
+        let client = davinci_mcp::Client::connect_with_timeout(name, transport, cwd, call_timeout);
         self.finish_connection(name, server, transport_label, client);
     }
 
@@ -612,7 +983,7 @@ impl Inner {
                     self.trusted_read_only_servers.insert(name.to_string());
                 }
                 self.clients
-                    .insert(name.to_string(), Arc::new(Mutex::new(client)));
+                    .insert(name.to_string(), ClientSlot::new(client));
                 self.rows.push(McpServerRow {
                     name: name.to_string(),
                     transport: transport_label.into(),
@@ -633,6 +1004,27 @@ impl Inner {
         }
     }
 
+    /// Whether a stopped project server's name forbids publishing `part`.
+    fn blocks(&self, part: &Inner) -> bool {
+        part.clients.keys().any(|name| self.blocked.contains(name))
+            || part.rows.iter().any(|row| self.blocked.contains(&row.name))
+    }
+
+    fn publish(&mut self, parts: Vec<Inner>) {
+        for part in parts {
+            if self.blocks(&part) {
+                continue;
+            }
+            self.clients.extend(part.clients);
+            self.routes.extend(part.routes);
+            self.trusted_read_only_servers
+                .extend(part.trusted_read_only_servers);
+            self.rows.extend(part.rows);
+        }
+    }
+
+    /// Only reached for a slot `ClientSlot::send` already flagged under the
+    /// client lock, so removing the entry cannot expose an unflagged slot.
     fn drop_server(&mut self, name: &str, error: String) {
         self.clients.remove(name);
         self.routes.retain(|_, (server, _)| server != name);
@@ -641,6 +1033,110 @@ impl Inner {
             row.status = "error".into();
             row.tools = 0;
             row.error = Some(error);
+        }
+    }
+}
+
+#[cfg(test)]
+impl McpRegistry {
+    /// A registry holding one connected server over `transport`, for tests.
+    pub(crate) fn with_test_transport(
+        name: &str,
+        transport: Box<dyn davinci_mcp::RpcTransport>,
+    ) -> Self {
+        let client = davinci_mcp::Client::connect_transport(name, transport).unwrap();
+        let registry = Self::default();
+        {
+            let mut inner = registry.lock();
+            for tool in &client.tools {
+                inner.routes.insert(
+                    client.agent_tool_name(&tool.name),
+                    (name.to_string(), tool.name.clone()),
+                );
+            }
+            inner.rows.push(McpServerRow {
+                name: name.to_string(),
+                transport: "test".into(),
+                status: "connected".into(),
+                tools: client.tools.len(),
+                error: None,
+                skipped: Vec::new(),
+            });
+            inner
+                .clients
+                .insert(name.to_string(), ClientSlot::new(client));
+        }
+        registry
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    /// Serves one non-read-only tool, `effect`, and records the params of every
+    /// `tools/call`. `lose_reply` makes each call fail after the (pretend)
+    /// effect, the way a dropped connection does.
+    pub(crate) struct RecordingTransport {
+        pub(crate) calls: Arc<Mutex<Vec<Value>>>,
+        pub(crate) lose_reply: bool,
+    }
+
+    /// Like `RecordingTransport` with `lose_reply`, but every `tools/call`
+    /// fails with a transport error carrying `message`.
+    pub(crate) struct FailingCallTransport {
+        pub(crate) calls: Arc<Mutex<Vec<Value>>>,
+        pub(crate) message: String,
+    }
+
+    impl davinci_mcp::RpcTransport for FailingCallTransport {
+        fn call(&mut self, method: &str, params: Value) -> davinci_mcp::Result<Value> {
+            match method {
+                "initialize" => Ok(json!({
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {"tools": {}}
+                })),
+                "tools/list" => Ok(json!({
+                    "tools": [{"name": "ping", "inputSchema": {"type": "object"}}]
+                })),
+                "tools/call" => {
+                    self.calls.lock().unwrap().push(params);
+                    Err(davinci_mcp::Error::Transport(self.message.clone()))
+                }
+                other => Err(davinci_mcp::Error::Protocol(format!("unexpected {other}"))),
+            }
+        }
+
+        fn notify(&mut self, _: &str, _: Value) -> davinci_mcp::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl davinci_mcp::RpcTransport for RecordingTransport {
+        fn call(&mut self, method: &str, params: Value) -> davinci_mcp::Result<Value> {
+            match method {
+                "initialize" => Ok(json!({
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {"tools": {}}
+                })),
+                "tools/list" => Ok(json!({
+                    "tools": [{"name": "effect", "inputSchema": {"type": "object"}}]
+                })),
+                "tools/call" => {
+                    self.calls.lock().unwrap().push(params);
+                    if self.lose_reply {
+                        Err(davinci_mcp::Error::Transport("connection reset".into()))
+                    } else {
+                        Ok(json!({"content": [{"type": "text", "text": "done"}]}))
+                    }
+                }
+                other => Err(davinci_mcp::Error::Protocol(format!("unexpected {other}"))),
+            }
+        }
+
+        fn notify(&mut self, _: &str, _: Value) -> davinci_mcp::Result<()> {
+            Ok(())
         }
     }
 }
@@ -859,6 +1355,29 @@ mod tests {
     }
 
     #[test]
+    fn invalid_remote_mcp_call_timeout_fails_before_connecting() {
+        let (dir, _) = http_fixture(
+            r#"{
+                "initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
+                "tools/list":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]}
+            }"#,
+        );
+        let path = dir.path().join("mcp-fixture.json");
+        let config = davinci_mcp::parse_config(&format!(
+            r#"{{"mcpServers":{{"memory":{{"url":{},"callTimeoutSeconds":1801}}}}}}"#,
+            serde_json::to_string(&format!("fixture:{}", path.display())).unwrap()
+        ))
+        .unwrap();
+        let registry = McpRegistry::connect(&config, dir.path());
+        assert!(registry.tool_names().is_empty());
+        assert_eq!(registry.rows()[0].status, "error");
+        assert!(registry.rows()[0]
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("callTimeoutSeconds")));
+    }
+
+    #[test]
     fn a_fixture_server_becomes_one_agent_tool() {
         let (_dir, mut config) = http_fixture(
             r#"{
@@ -894,7 +1413,7 @@ mod tests {
         registry.register_with(&runtime_registry);
         assert!(runtime_registry.is_read_only("mcp__memory__echo"));
         let result = registry
-            .call("memory", "echo", &json!({"text": "hi"}))
+            .call("memory", "echo", &json!({"text": "hi"}), "call-1")
             .unwrap();
         assert_eq!(result.content, "hi");
         let read = registry.read("memory", "fixture://note").unwrap();
@@ -910,11 +1429,24 @@ mod tests {
         assert!(agent.tools.iter().any(|name| name == "mcp__memory__echo"));
         let specs = agent.builtin_and_mcp_specs();
         assert!(specs.iter().any(|tool| tool.name == "mcp__memory__echo"));
+        let mut context = agent.tool_context.clone();
+        let refused = crate::execute_tool_with(
+            Path::new("."),
+            "mcp__memory__echo",
+            &json!({"text": "hi"}),
+            &context,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&refused, ToolError::Failed(m) if m.contains("needs a tool-call id")),
+            "a call with no tool-call id must not be sent: {refused:?}"
+        );
+        context.tool_call_id = Some("call-1".into());
         let result = crate::execute_tool_with(
             Path::new("."),
             "mcp__memory__echo",
             &json!({"text": "hi"}),
-            &agent.tool_context,
+            &context,
         )
         .unwrap();
         assert_eq!(result.content, "hi");
@@ -952,7 +1484,10 @@ mod tests {
             Some(("memory".to_string(), long.clone()))
         );
         assert_eq!(
-            registry.call_exposed(&exposed, &json!({})).unwrap().content,
+            registry
+                .call_exposed(&exposed, &json!({}), "call-1")
+                .unwrap()
+                .content,
             "ok"
         );
     }
@@ -985,7 +1520,7 @@ mod tests {
         );
         let registry = McpRegistry::connect(&config, Path::new("."));
         let result = registry
-            .call("memory", "echo", &json!({}))
+            .call("memory", "echo", &json!({}), "call-1")
             .expect("an rpc error is a tool result, not a failure");
         assert!(result.is_error);
         assert_eq!(result.content, "mcp -32602: invalid params");
@@ -1063,6 +1598,655 @@ mod tests {
         let registry = McpRegistry::connect(&config, Path::new("."));
         assert!(registry.specs().is_empty());
         assert_eq!(registry.rows()[0].status, "disabled");
+    }
+
+    #[test]
+    fn remote_mcp_recovers_after_transport_failure_without_replaying_the_tool() {
+        let (dir, config) = http_fixture(
+            r#"{
+                "initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
+                "tools/list":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]}
+            }"#,
+        );
+        let registry = McpRegistry::connect(&config, dir.path());
+        assert_eq!(registry.rows()[0].status, "connected");
+
+        // The existing connection has snapshotted the broken response map.
+        // Only a NEW connection can see this repaired server. No tool call
+        // should be replayed automatically because the old call's effect may
+        // have been committed before the transport failed.
+        let fixture = dir.path().join("mcp-fixture.json");
+        std::fs::write(
+            &fixture,
+            r#"{
+                "initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
+                "tools/list":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]},
+                "tools/call":{"content":[{"type":"text","text":"recovered"}]}
+            }"#,
+        )
+        .unwrap();
+
+        let first = registry.call("memory", "ping", &json!({}), "call-1");
+        assert!(
+            first.is_err(),
+            "an unknown-effect call must not be replayed"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while !registry.take_ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "failed remote MCP connection was never re-established"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(registry.rows()[0].status, "connected");
+        assert_eq!(registry.tool_names(), ["mcp__memory__ping"]);
+        assert_eq!(
+            registry
+                .call("memory", "ping", &json!({}), "call-1")
+                .unwrap()
+                .content,
+            "recovered"
+        );
+    }
+
+    struct LostReply;
+
+    impl davinci_mcp::RpcTransport for LostReply {
+        fn call(&mut self, method: &str, _: Value) -> davinci_mcp::Result<Value> {
+            match method {
+                "initialize" => Ok(json!({
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {"tools": {}}
+                })),
+                "tools/list" => Ok(json!({
+                    "tools": [{"name": "effect", "inputSchema": {"type": "object"}}]
+                })),
+                "tools/call" => Err(davinci_mcp::Error::Transport(
+                    "the reply was lost after the effect".into(),
+                )),
+                other => Err(davinci_mcp::Error::Protocol(format!("unexpected {other}"))),
+            }
+        }
+
+        fn notify(&mut self, _: &str, _: Value) -> davinci_mcp::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_lost_mcp_reply_becomes_may_have_run_not_failed() {
+        let client = davinci_mcp::Client::connect_transport("lost", Box::new(LostReply)).unwrap();
+        let registry = McpRegistry::default();
+        {
+            let mut inner = registry.lock();
+            inner.clients.insert("lost".into(), ClientSlot::new(client));
+            inner
+                .routes
+                .insert("mcp__lost__effect".into(), ("lost".into(), "effect".into()));
+        }
+
+        let error = registry
+            .call_exposed("mcp__lost__effect", &json!({}), "call-1")
+            .unwrap_err();
+        match &error {
+            ToolError::MayHaveRun(message) => {
+                assert!(message.contains("reply was lost"), "{message}")
+            }
+            other => panic!("a lost reply must be an unknown outcome, got {other:?}"),
+        }
+
+        // The server and its route are still evicted: a later call cannot
+        // even resolve, let alone silently re-run the effect.
+        let later = registry
+            .call_exposed("mcp__lost__effect", &json!({}), "call-2")
+            .unwrap_err();
+        assert!(matches!(later, ToolError::Unknown(_)), "{later:?}");
+    }
+
+    fn recording_registry(lose_reply: bool) -> (McpRegistry, Arc<Mutex<Vec<Value>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let registry = McpRegistry::with_test_transport(
+            "rec",
+            Box::new(test_support::RecordingTransport {
+                calls: calls.clone(),
+                lose_reply,
+            }),
+        );
+        (registry, calls)
+    }
+
+    fn refused_before_sending(error: &ToolError) -> bool {
+        matches!(error, ToolError::Failed(m) if m.contains("before this call was sent"))
+    }
+
+    #[test]
+    fn g01_a_call_waiting_on_an_evicted_client_is_not_sent() {
+        let (registry, calls) = recording_registry(true);
+        // The second caller fetched its handle before the first call failed.
+        let waiting = registry.client("rec").unwrap();
+
+        let first = registry
+            .call_exposed("mcp__rec__effect", &json!({}), "call-1")
+            .unwrap_err();
+        assert!(matches!(first, ToolError::MayHaveRun(_)), "{first:?}");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+
+        let second = registry
+            .call_on("rec", &waiting, "effect", &json!({}), "call-2")
+            .unwrap_err();
+        assert!(refused_before_sending(&second), "{second:?}");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the evicted client must not reach the transport again"
+        );
+    }
+
+    #[test]
+    fn project_trust_revocation_prevents_remote_mcp_reconnection() {
+        let (dir, mut config) = http_fixture(
+            r#"{
+                "initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
+                "tools/list":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]}
+            }"#,
+        );
+        config.mcp_servers.get_mut("memory").unwrap().project_origin = true;
+        let registry = McpRegistry::connect(&config, dir.path());
+        assert!(registry
+            .call("memory", "ping", &json!({}), "call-1")
+            .is_err());
+        registry.disconnect_project();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while registry.lock().reconnecting.contains("memory") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reconnect never stopped"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(registry.rows().is_empty(), "revoked server was restored");
+        assert!(registry.tool_names().is_empty());
+        assert!(registry.resolve_tool("mcp__memory__ping").is_none());
+    }
+
+    #[test]
+    fn remote_mcp_does_not_reconnect_after_auth_or_bad_request_status() {
+        use davinci_mcp::Error;
+
+        for status in [400, 401, 403, 404, 422] {
+            let failure = Error::Transport(format!("mcp http {status}: denied"));
+            assert!(
+                !McpRegistry::should_reconnect(&failure),
+                "status {status} must not trigger a retry"
+            );
+        }
+        for status in [408, 429, 500, 502, 503] {
+            let failure = Error::Transport(format!("mcp http {status}"));
+            assert!(
+                McpRegistry::should_reconnect(&failure),
+                "status {status} should be treated as transient"
+            );
+        }
+        assert!(!McpRegistry::should_reconnect(&Error::Rpc {
+            code: -32602,
+            message: "bad parameters".into(),
+        }));
+    }
+
+    /// A remote-eligible server whose `tools/call` always fails with
+    /// `message`, plus the calls it received. The fixture behind the saved
+    /// config answers `ping` with "recovered", so a reconnect is observable.
+    fn failing_remote_registry(
+        message: &str,
+    ) -> (tempfile::TempDir, McpRegistry, Arc<Mutex<Vec<Value>>>) {
+        let (dir, config) = http_fixture(
+            r#"{
+                "initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
+                "tools/list":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]},
+                "tools/call":{"content":[{"type":"text","text":"recovered"}]}
+            }"#,
+        );
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let registry = McpRegistry::with_test_transport(
+            "memory",
+            Box::new(test_support::FailingCallTransport {
+                calls: calls.clone(),
+                message: message.into(),
+            }),
+        );
+        registry.note_project_servers(&config, dir.path());
+        (dir, registry, calls)
+    }
+
+    #[test]
+    fn an_ambiguous_call_keeps_its_cause_for_the_reconnect_decision() {
+        use davinci_mcp::Error;
+
+        for status in [400, 401, 403, 404, 422] {
+            let failure = Error::ambiguous_from(Error::Transport(format!("mcp http {status}")));
+            assert!(failure.may_have_run());
+            assert!(
+                !McpRegistry::should_reconnect(&failure),
+                "an ambiguous {status} must not trigger a retry"
+            );
+        }
+        for status in [408, 429, 500, 503] {
+            let failure = Error::ambiguous_from(Error::Transport(format!("mcp http {status}")));
+            assert!(McpRegistry::should_reconnect(&failure), "{status}");
+        }
+        assert!(McpRegistry::should_reconnect(&Error::ambiguous(
+            "the writer stopped before confirming the write"
+        )));
+        assert!(!McpRegistry::should_reconnect(&Error::ambiguous_from(
+            Error::Rpc {
+                code: -32602,
+                message: "bad".into()
+            }
+        )));
+    }
+
+    #[test]
+    fn a_call_rejected_with_401_is_ambiguous_but_never_reconnects() {
+        let (_dir, registry, calls) = failing_remote_registry("mcp http 401: denied");
+
+        let error = registry
+            .call("memory", "ping", &json!({}), "call-1")
+            .unwrap_err();
+        assert!(matches!(error, ToolError::MayHaveRun(_)), "{error:?}");
+        assert!(registry.lock().reconnecting.is_empty());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!registry.take_ready(), "a 401 must not start a reconnect");
+        assert_eq!(registry.rows()[0].status, "error");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    /// The connection is repaired for later calls, the failed call is not run
+    /// again, and the registry serves the next call from the new connection.
+    fn assert_reconnects_without_replaying(message: &str) {
+        let (_dir, registry, calls) = failing_remote_registry(message);
+
+        let error = registry
+            .call("memory", "ping", &json!({}), "call-1")
+            .unwrap_err();
+        assert!(matches!(error, ToolError::MayHaveRun(_)), "{error:?}");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while !registry.take_ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "`{message}` never reconnected"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(registry.rows()[0].status, "connected");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the ambiguous call was replayed on the old transport"
+        );
+        assert_eq!(
+            registry
+                .call("memory", "ping", &json!({}), "call-2")
+                .unwrap()
+                .content,
+            "recovered"
+        );
+    }
+
+    #[test]
+    fn a_call_rejected_with_429_reconnects_without_replaying_the_call() {
+        assert_reconnects_without_replaying("mcp http 429: slow down");
+    }
+
+    #[test]
+    fn a_timed_out_call_reconnects_without_replaying_the_call() {
+        assert_reconnects_without_replaying("mcp request timed out after 30s");
+    }
+
+    #[test]
+    fn rpc_tool_errors_keep_the_mcp_connection_and_do_not_schedule_reconnect() {
+        let (dir, config) = http_fixture(
+            r#"{
+                "initialize":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"f","version":"0"}},
+                "tools/list":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]},
+                "tools/call":{"$rpcError":{"code":-32602,"message":"bad args"}}
+            }"#,
+        );
+        let registry = McpRegistry::connect(&config, dir.path());
+        let result = registry
+            .call("memory", "ping", &json!({}), "call-1")
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("bad args"));
+        assert_eq!(registry.rows()[0].status, "connected");
+        assert!(registry.lock().reconnecting.is_empty());
+        assert!(!registry.take_ready());
+    }
+
+    /// A call on the replacement fails after the worker published it and
+    /// before the worker's own bookkeeping ends. The failure must still be
+    /// able to start recovery: the server may not be left with no client and
+    /// no worker.
+    #[test]
+    fn a_replacement_that_fails_right_after_publishing_still_gets_recovered() {
+        let (_dir, registry, calls) = failing_remote_registry("mcp http 503: down");
+        let fired = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let done_tx = Mutex::new(done_tx);
+        *registry.published_hook.lock().unwrap() = Some({
+            let registry = registry.clone();
+            Arc::new(move || {
+                // Only the first publication is failed; the recovery's own
+                // replacement is left alone.
+                if fired.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let replacement = registry.client("memory").expect("replacement is published");
+                let _ = registry.failed_client(
+                    "memory",
+                    &replacement,
+                    davinci_mcp::Error::ambiguous_from(davinci_mcp::Error::Transport(
+                        "mcp http 503: down".into(),
+                    )),
+                );
+                done_tx.lock().unwrap().send(()).unwrap();
+            })
+        });
+
+        let error = registry
+            .call("memory", "ping", &json!({}), "call-1")
+            .unwrap_err();
+        assert!(matches!(error, ToolError::MayHaveRun(_)), "{error:?}");
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the replacement was never published");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while registry.client("memory").is_err() {
+            assert!(
+                !registry.lock().reconnecting.is_empty(),
+                "no client and no reconnect worker: the server is lost for good"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "recovery never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(registry.lock().reconnecting.is_empty());
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the ambiguous call was replayed on the old transport"
+        );
+    }
+
+    #[test]
+    fn g01_a_call_arriving_after_a_failure_but_before_the_registry_evicts_is_not_sent() {
+        let (registry, calls) = recording_registry(true);
+        let waiting = registry.client("rec").unwrap();
+        // Park the failing call after it released the client lock and before it
+        // takes the registry lock: the window the old code left open.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        let parked = AtomicBool::new(false);
+        *registry.failure_hook.lock().unwrap() = Some(Arc::new(move || {
+            // Only the first failure parks, so a wrongly sent second call fails
+            // the assertions below instead of hanging the test.
+            if !parked.swap(true, Ordering::SeqCst) {
+                entered_tx.send(()).unwrap();
+                let _ = go_rx.lock().unwrap().recv();
+            }
+        }));
+        let first = {
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                registry.call_exposed("mcp__rec__effect", &json!({}), "call-1")
+            })
+        };
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the first call never failed");
+        assert!(
+            registry.client("rec").is_ok(),
+            "precondition: the registry still lists the failed client"
+        );
+
+        let second = registry
+            .call_on("rec", &waiting, "effect", &json!({}), "call-2")
+            .unwrap_err();
+        assert!(refused_before_sending(&second), "{second:?}");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the waiting call must not reach the dead transport"
+        );
+
+        go_tx.send(()).unwrap();
+        let first = first.join().unwrap().unwrap_err();
+        assert!(matches!(first, ToolError::MayHaveRun(_)), "{first:?}");
+        assert!(registry.client("rec").is_err(), "then the entry is removed");
+    }
+
+    /// A transport whose `tools/call` parks until released, so a test can hold
+    /// a request in flight while other threads act.
+    struct Gated {
+        entered: Mutex<std::sync::mpsc::Sender<()>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        sent: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl davinci_mcp::RpcTransport for Gated {
+        fn call(&mut self, method: &str, _: Value) -> davinci_mcp::Result<Value> {
+            match method {
+                "initialize" => Ok(json!({
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {"tools": {}}
+                })),
+                "tools/list" => Ok(json!({
+                    "tools": [{"name": "effect", "inputSchema": {"type": "object"}}]
+                })),
+                "tools/call" => {
+                    self.sent.fetch_add(1, Ordering::SeqCst);
+                    self.entered.lock().unwrap().send(()).unwrap();
+                    let _ = self.release.lock().unwrap().recv();
+                    Ok(json!({"content": [{"type": "text", "text": "done"}]}))
+                }
+                other => Err(davinci_mcp::Error::Protocol(format!("unexpected {other}"))),
+            }
+        }
+
+        fn notify(&mut self, _: &str, _: Value) -> davinci_mcp::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn g01_external_eviction_waits_for_the_in_flight_call_and_never_holds_the_registry_lock() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = McpRegistry::with_test_transport(
+            "rec",
+            Box::new(Gated {
+                entered: Mutex::new(entered_tx),
+                release: Mutex::new(release_rx),
+                sent: sent.clone(),
+            }),
+        );
+        registry.lock().project.insert("rec".into());
+        let waiting = registry.client("rec").unwrap();
+
+        let in_flight = {
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                registry.call_exposed("mcp__rec__effect", &json!({}), "call-1")
+            })
+        };
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the first call never reached the transport");
+
+        let disconnect = {
+            let registry = registry.clone();
+            std::thread::spawn(move || registry.disconnect_project())
+        };
+        // The flag is written first, under the client lock, so the disconnect
+        // waits for the in-flight call and the entry stays listed meanwhile.
+        // Reading the registry here proves its lock is not held while waiting.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(registry.rows().len(), 1);
+        assert!(registry.client("rec").is_ok());
+        assert!(!disconnect.is_finished());
+
+        release_tx.send(()).unwrap();
+        assert_eq!(in_flight.join().unwrap().unwrap().content, "done");
+        assert_eq!(disconnect.join().unwrap(), 1);
+        assert!(registry.client("rec").is_err());
+        assert!(registry.rows().is_empty());
+
+        let late = registry
+            .call_on("rec", &waiting, "effect", &json!({}), "call-2")
+            .unwrap_err();
+        assert!(refused_before_sending(&late), "{late:?}");
+        assert_eq!(sent.load(Ordering::SeqCst), 1, "the late call was not sent");
+    }
+
+    #[test]
+    fn g01_adopting_a_replacement_flags_the_replaced_connection() {
+        let (registry, calls) = recording_registry(false);
+        let replaced = registry.client("rec").unwrap();
+        let mut part = Inner::default();
+        let (fresh, _) = recording_registry(false);
+        part.clients
+            .insert("rec".into(), fresh.client("rec").unwrap());
+        registry.adopt(vec![part]);
+
+        let late = registry
+            .call_on("rec", &replaced, "effect", &json!({}), "call-1")
+            .unwrap_err();
+        assert!(refused_before_sending(&late), "{late:?}");
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// Run `retire` with the hook set to make a stale caller (holding `stale`)
+    /// try a call in the window after the old slot was flagged and before the
+    /// registry entry changes. Returns the stale call's outcome.
+    fn stale_call_during_retire(
+        registry: &McpRegistry,
+        stale: &SharedClient,
+        retire: impl FnOnce(),
+    ) -> ToolError {
+        let outcome = Arc::new(Mutex::new(None));
+        let hook_outcome = outcome.clone();
+        let hooked = registry.clone();
+        let stale = stale.clone();
+        *registry.retire_hook.lock().unwrap() = Some(Arc::new(move || {
+            assert!(
+                hooked.client("rec").is_ok(),
+                "precondition: the registry entry is still in place"
+            );
+            let result = hooked.call_on("rec", &stale, "effect", &json!({}), "stale-call");
+            *hook_outcome.lock().unwrap() = Some(result);
+        }));
+        retire();
+        let outcome = outcome.lock().unwrap().take();
+        outcome
+            .expect("the retire hook never ran")
+            .expect_err("the stale call must be refused")
+    }
+
+    #[test]
+    fn g01_a_stale_caller_cannot_send_while_a_project_disconnect_is_retiring_the_slot() {
+        let (registry, calls) = recording_registry(false);
+        registry.lock().project.insert("rec".into());
+        let stale = registry.client("rec").unwrap();
+
+        let error = stale_call_during_retire(&registry, &stale, || {
+            assert_eq!(registry.disconnect_project(), 1);
+        });
+        assert!(refused_before_sending(&error), "{error:?}");
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(registry.client("rec").is_err());
+    }
+
+    #[test]
+    fn g01_a_stale_caller_cannot_send_while_an_adopt_is_retiring_the_slot() {
+        let (registry, calls) = recording_registry(false);
+        let stale = registry.client("rec").unwrap();
+        let (fresh, fresh_calls) = recording_registry(false);
+        let mut part = Inner::default();
+        part.clients
+            .insert("rec".into(), fresh.client("rec").unwrap());
+
+        let error = stale_call_during_retire(&registry, &stale, || registry.adopt(vec![part]));
+        assert!(refused_before_sending(&error), "{error:?}");
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(fresh_calls.lock().unwrap().is_empty());
+        assert!(
+            Arc::ptr_eq(
+                &registry.client("rec").unwrap(),
+                &fresh.client("rec").unwrap()
+            ),
+            "the replacement is published afterwards"
+        );
+    }
+
+    #[test]
+    fn g01_a_resource_read_on_an_evicted_client_is_not_sent() {
+        let (registry, _calls) = recording_registry(false);
+        let slot = registry.client("rec").unwrap();
+        slot.mark_evicted();
+        // The recording transport fails any other method with "unexpected ...",
+        // so reaching it would show as that message instead of the refusal.
+        let error = registry
+            .read_on("rec", &slot, "fixture://note")
+            .unwrap_err();
+        assert!(refused_before_sending(&error), "{error:?}");
+    }
+
+    #[test]
+    fn g01_a_stale_failure_does_not_drop_a_newer_connection() {
+        let (registry, _calls) = recording_registry(true);
+        let stale = registry.client("rec").unwrap();
+        // A newer connection took the name; the stale slot is not yet flagged
+        // (the registry replaced it before the failing call reported back).
+        let (replacement, _) = recording_registry(false);
+        let fresh = replacement.client("rec").unwrap();
+        registry.lock().clients.insert("rec".into(), fresh.clone());
+
+        // The stale call fails on the wire, which runs `Inner::failed` with a
+        // slot that is no longer the registered one.
+        let error = registry
+            .call_on("rec", &stale, "effect", &json!({}), "call-1")
+            .unwrap_err();
+        assert!(matches!(error, ToolError::MayHaveRun(_)), "{error:?}");
+        assert!(
+            Arc::ptr_eq(&registry.client("rec").unwrap(), &fresh),
+            "the newer connection must survive"
+        );
+        assert!(registry.resolve_tool("mcp__rec__effect").is_some());
+        let rows = registry.rows();
+        assert_eq!(rows[0].status, "connected", "{rows:?}");
+        assert_eq!(rows[0].error, None);
+    }
+
+    #[test]
+    fn g12_the_tool_call_id_reaches_the_server_as_meta() {
+        let (registry, calls) = recording_registry(false);
+        registry
+            .call_exposed("mcp__rec__effect", &json!({"a": 1}), "call-77")
+            .unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls[0]["_meta"][davinci_mcp::INVOCATION_ID_META_KEY],
+            "call-77"
+        );
+        assert_eq!(calls[0]["arguments"], json!({"a": 1}));
     }
 }
 

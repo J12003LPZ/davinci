@@ -196,13 +196,18 @@ fn configure_workflow_runtime(
         let cwd = session
             .map(|s| std::path::PathBuf::from(&s.header.cwd))
             .or_else(|| std::env::current_dir().ok());
-        if let Some(root) = cwd.and_then(|cwd| davinci_agent::runtime::worktree::git_toplevel(&cwd))
-        {
+        let root = match cwd {
+            Some(cwd) if cwd.is_dir() => davinci_agent::runtime::worktree::git_toplevel(&cwd)
+                .map_err(|error| error.to_string())?,
+            _ => None,
+        };
+        if let Some(root) = root {
             let manager = davinci_agent::runtime::WorktreeManager::new(
                 root,
                 std::env::temp_dir().join("davinci").join("worktrees"),
             )
             .with_bus(runtime.bus.clone());
+            warn_about_orphans_once(&manager, |warning| eprintln!("Warning: {warning}"));
             runtime = runtime.with_worktree_manager(manager);
         }
     }
@@ -220,6 +225,49 @@ fn configure_workflow_runtime(
         ))
     });
     Ok(runtime.with_workflow_executor(executor))
+}
+
+/// Report managed worktree directories and branches that no lease owns, once
+/// per repository per process (this builder also runs for every child turn).
+/// Report only: an orphan may hold unmerged work, and the shared worktree root
+/// may belong to another running davinci, so nothing is ever deleted here.
+fn warn_about_orphans_once(
+    manager: &davinci_agent::runtime::WorktreeManager,
+    mut warn: impl FnMut(String),
+) {
+    static SCANNED: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+    {
+        let mut scanned = SCANNED.lock().unwrap_or_else(|e| e.into_inner());
+        if scanned.iter().any(|root| root == manager.repo_root()) {
+            return;
+        }
+        scanned.push(manager.repo_root().to_path_buf());
+    }
+    match manager.scan_orphans() {
+        Ok(orphans) if orphans.is_empty() => {}
+        Ok(orphans) => {
+            use davinci_agent::runtime::worktree::WorktreeOrphan;
+            let list: Vec<String> = orphans
+                .iter()
+                .map(|orphan| match orphan {
+                    WorktreeOrphan::Directory(path) => format!("directory {}", path.display()),
+                    WorktreeOrphan::Branch(branch) => format!("branch {branch}"),
+                    WorktreeOrphan::Registration(path) => {
+                        format!("git registration {}", path.display())
+                    }
+                })
+                .collect();
+            warn(format!(
+                "{} unleased agent worktree item(s), possibly from a crashed run or another \
+                 running davinci; nothing was deleted: {}",
+                list.len(),
+                list.join(", ")
+            ));
+        }
+        Err(error) => warn(format!(
+            "could not scan for orphaned agent worktrees: {error}"
+        )),
+    }
 }
 
 #[allow(unused_imports)]
@@ -253,19 +301,29 @@ impl HostBudgetEvidenceAdapter {
         }
     }
 
-    /// Evaluates a task completion incorporating budget reserves.
+    /// Evaluates a task completion incorporating budget reserves. Implementation
+    /// evidence is the host's own: the runtime's file effects for
+    /// `expected_attempt`, added to the supplied command receipts. A caller
+    /// cannot supply a mutation receipt of its own that the ledger does not back.
     pub fn evaluate_task(
         &self,
+        runtime: &davinci_agent::RuntimeHandle,
         task: &davinci_agent::runtime::tasks::TaskRecord,
         contract: Option<&davinci_agent::runtime::contracts::TaskContract>,
         receipts: &[davinci_agent::runtime::evidence_store::ExecutionReceipt],
         manifest: &davinci_agent::runtime::source_manifest::SourceManifest,
         expected_attempt: u32,
     ) -> davinci_agent::runtime::completion::CompletionEvaluation {
+        let mut all: Vec<_> = receipts
+            .iter()
+            .filter(|receipt| receipt.mutation.is_none())
+            .cloned()
+            .collect();
+        all.extend(runtime.mutation_receipts(task.id, expected_attempt));
         davinci_agent::runtime::completion::evaluate_task_completion_with_budget(
             task,
             contract,
-            receipts,
+            &all,
             manifest,
             expected_attempt,
             Some(&self.reservation),
@@ -697,6 +755,48 @@ impl GovernorHostAdapter {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn startup_scan_reports_orphans_once_and_deletes_nothing() {
+        let git = |cwd: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init"]);
+        git(repo.path(), &["config", "user.name", "t"]);
+        git(repo.path(), &["config", "user.email", "t@t"]);
+        std::fs::write(repo.path().join("a"), "a").unwrap();
+        git(repo.path(), &["add", "a"]);
+        git(repo.path(), &["commit", "-m", "init"]);
+        git(repo.path(), &["branch", "davinci/agent/crashed"]);
+        let root = tempfile::tempdir().unwrap();
+        let orphan_dir = root.path().join("wt-dead");
+        std::fs::create_dir_all(&orphan_dir).unwrap();
+        let manager = davinci_agent::runtime::WorktreeManager::new(repo.path(), root.path());
+
+        let mut warnings = Vec::new();
+        super::warn_about_orphans_once(&manager, |w| warnings.push(w));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("davinci/agent/crashed"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("wt-dead"), "{warnings:?}");
+        assert!(warnings[0].contains("nothing was deleted"), "{warnings:?}");
+        assert!(orphan_dir.exists(), "orphans are reported, never deleted");
+
+        super::warn_about_orphans_once(&manager, |w| warnings.push(w));
+        assert_eq!(
+            warnings.len(),
+            1,
+            "a repository is scanned once per process"
+        );
+    }
+
+    #[test]
     fn f03_host_imports_legacy_tasks_once_and_reconciles_orphans() {
         let dir = tempfile::tempdir().unwrap();
         let session = davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap();
@@ -891,6 +991,7 @@ mod tests {
         let admission = WorkerAdmission::new(Some(WorkerResourceConfig {
             memory_budget_bytes: 8,
             estimated_worker_bytes: 8,
+            ..Default::default()
         }))
         .unwrap();
         let lease = admission.acquire_worker(|| false).unwrap();
@@ -2085,5 +2186,51 @@ mod tests {
         // 30k spent + 15k verify + 5k handoff = 50k ceiling. Available for impl: 0 tokens!
         assert!(adapter.can_dispatch_implementation(0).is_ok());
         assert!(adapter.can_dispatch_implementation(100).is_err());
+    }
+
+    /// Host evaluation takes implementation evidence from the runtime's own file
+    /// effects for the attempt being evaluated. A mutation receipt supplied by the
+    /// caller, or one backed by an earlier attempt's write, proves nothing.
+    #[test]
+    fn audit_wp02_b025_host_evaluation_uses_the_runtime_file_effects() {
+        use davinci_agent::runtime::effects::{FileEffectKind, OwnedFileEffect};
+        use davinci_agent::runtime::evidence_store::ExecutionReceipt;
+        let root = tempfile::tempdir().unwrap();
+        let manifest =
+            davinci_agent::runtime::source_manifest::SourceManifestBuilder::new(root.path())
+                .build()
+                .unwrap();
+        let runtime = davinci_agent::RuntimeHandle::new(
+            davinci_agent::RunId::new(),
+            davinci_agent::AgentId::new(),
+            davinci_agent::RuntimeBus::new(),
+        );
+        let task = davinci_agent::runtime::TaskRecord::new(runtime.run_id, "implement");
+        let mut effect = OwnedFileEffect::new(
+            "op-1",
+            davinci_agent::AgentId::new(),
+            1,
+            "src/lib.rs",
+            FileEffectKind::Created,
+            task.id,
+        );
+        effect.after_blob = Some("after".into());
+        let adapter = HostBudgetEvidenceAdapter::default();
+        let evaluate = |receipts: &[ExecutionReceipt], attempt: u32| {
+            adapter
+                .evaluate_task(&runtime, &task, None, receipts, &manifest, attempt)
+                .allowed
+        };
+
+        // A receipt built by the caller from an effect the runtime never recorded.
+        let supplied =
+            ExecutionReceipt::from_file_effects("op-1", task.id, 0, &[effect.clone()]).unwrap();
+        assert!(!evaluate(&[supplied], 0));
+        assert!(!evaluate(&[], 0));
+
+        // The runtime recorded it, in attempt 0.
+        runtime.effect_ledger.write().unwrap().push(effect);
+        assert!(evaluate(&[], 0));
+        assert!(!evaluate(&[], 1), "attempt 0's write satisfied attempt 1");
     }
 }
