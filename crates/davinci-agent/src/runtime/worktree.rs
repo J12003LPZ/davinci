@@ -560,31 +560,47 @@ impl WorktreeManager {
         if current_head.is_empty() || current_head == lease.base_head {
             return Ok(UnsavedWork::None);
         }
-        let integrated = isolated_git_command_in(&self.repo_root)?
+        // Exit 1 is the answer "not an ancestor"; any other exit means git
+        // could not read the history, which is not the same as unmerged.
+        let ancestry = isolated_git_command_in(&self.repo_root)?
             .args(["merge-base", "--is-ancestor", current_head, "HEAD"])
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if integrated {
-            return Ok(UnsavedWork::None);
+            .map_err(|e| WorktreeError::GitError(format!("Failed to execute git: {e}")))?;
+        match ancestry.status.code() {
+            Some(0) => return Ok(UnsavedWork::None),
+            Some(1) => {}
+            code => {
+                return Err(WorktreeError::GitError(format!(
+                    "cannot check whether {current_head} is merged (status {code:?}): {}",
+                    String::from_utf8_lossy(&ancestry.stderr).trim()
+                )));
+            }
         }
         // Patch IDs used by `git cherry` ignore whitespace and merge-only
         // changes. Instead, compute the exact result of merging the worker
         // HEAD into the main checkout. Only a byte-identical tree proves that
-        // cleanup cannot discard committed work. A conflict or unsupported Git
-        // command is ambiguous and must preserve the worker worktree.
-        let merged_tree = match run_git(
-            &self.repo_root,
-            &[
+        // cleanup cannot discard committed work. Exit 1 is a genuine conflict,
+        // which is unmerged work; any other failure is unreadable state and
+        // must preserve the worker worktree.
+        let merge = isolated_git_command_in(&self.repo_root)?
+            .args([
                 "merge-tree",
                 "--write-tree",
                 "--no-messages",
                 "HEAD",
                 current_head,
-            ],
-        ) {
-            Ok(tree) => tree,
-            Err(_) => return Ok(UnsavedWork::Unmerged),
+            ])
+            .output()
+            .map_err(|e| WorktreeError::GitError(format!("Failed to execute git: {e}")))?;
+        let merged_tree = match merge.status.code() {
+            Some(0) => String::from_utf8_lossy(&merge.stdout).trim().to_string(),
+            Some(1) => return Ok(UnsavedWork::Unmerged),
+            code => {
+                return Err(WorktreeError::GitError(format!(
+                    "cannot merge {current_head} to inspect it (status {code:?}): {}",
+                    String::from_utf8_lossy(&merge.stderr).trim()
+                )));
+            }
         };
         let main_tree = run_git(&self.repo_root, &["rev-parse", "HEAD^{tree}"])?;
         Ok(if merged_tree == main_tree {
@@ -2047,6 +2063,81 @@ mod tests {
         ));
         assert!(branch_exists(repo_dir.path(), &lease.branch));
         assert_eq!(manager.get_lease(&lease.path), Some(lease.clone()));
+    }
+
+    /// With the checkout gone and the branch tip's commit object missing, the
+    /// ancestry and merge checks fail. That is unreadable state, not unmerged
+    /// work: the lease and branch stay, forced or not.
+    #[test]
+    fn an_unreadable_branch_tip_keeps_the_lease_even_when_forced() {
+        for force in [false, true] {
+            let repo_dir = init_temp_git_repo();
+            let wt_dir = tempdir().unwrap();
+            let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+            let lease = manager
+                .create_lease(RunId::new(), AgentId::new(), None)
+                .unwrap();
+            commit_unique_work_on_branch(&lease);
+            let tip = rev_parse(&lease.path, "HEAD");
+            std::fs::remove_dir_all(&lease.path).unwrap();
+            let object = repo_dir
+                .path()
+                .join(".git/objects")
+                .join(&tip[..2])
+                .join(&tip[2..]);
+            let mut mode = std::fs::metadata(&object).unwrap().permissions();
+            mode.set_readonly(false);
+            std::fs::set_permissions(&object, mode).unwrap();
+            std::fs::remove_file(&object).unwrap();
+
+            let err = manager.release_lease(&lease, force).unwrap_err();
+            assert!(
+                matches!(err, WorktreeError::GitError(_)),
+                "force={force}: {err:?}"
+            );
+            let reference = repo_dir.path().join(".git/refs/heads").join(&lease.branch);
+            assert_eq!(
+                std::fs::read_to_string(reference).unwrap().trim(),
+                tip,
+                "force={force}: the ref is untouched"
+            );
+            assert_eq!(manager.get_lease(&lease.path).as_ref(), Some(&lease));
+        }
+    }
+
+    /// A real merge conflict is still known unmerged work: preserved, and
+    /// only a forced release may discard it.
+    #[test]
+    fn a_merge_conflict_is_unmerged_work_that_only_force_discards() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        std::fs::write(
+            lease.path.join("README.md"),
+            "worker
+",
+        )
+        .unwrap();
+        git_in(&lease.path, &["config", "user.name", "w"]);
+        git_in(&lease.path, &["config", "user.email", "w@x"]);
+        git_in(&lease.path, &["commit", "-am", "worker edit"]);
+        std::fs::write(
+            repo_dir.path().join("README.md"),
+            "main
+",
+        )
+        .unwrap();
+        git_in(repo_dir.path(), &["commit", "-am", "main edit"]);
+
+        assert!(matches!(
+            manager.release_lease(&lease, false),
+            Err(WorktreeError::DirtyWorktreePreserved { .. })
+        ));
+        manager.release_lease(&lease, true).unwrap();
+        assert!(!branch_exists(repo_dir.path(), &lease.branch));
     }
 
     #[test]
