@@ -25,7 +25,11 @@ Units, so the columns are not misread:
 - **Project-instruction bytes, turn-context bytes** — raw text bytes of the
   `<project_context>` and `<turn_context>` blocks respectively (the two sub-strings the
   `WireManifest` does not split out). They are the content size, not the JSON-encoded size, so
-  they are not directly additive with the JSON-encoded columns.
+  they are not directly additive with the JSON-encoded columns. They are also **contained in**
+  other columns, not disjoint from them: the `<project_context>` block is a substring of the
+  `instructions` value, so its bytes are already inside `Instruction bytes`; the `<turn_context>`
+  block is the text of the turn-context message, so its bytes are already inside the
+  `conversation B` figure (section 2). Do not add either column to anything.
 
 ### Droid `not re-checked` — why
 
@@ -44,18 +48,35 @@ not a request capture, and no request is ever built without a live provider or t
 ## 2. DaVinci numbers (test output, `--nocapture`)
 
 ```
-configuration             tools    tool-schema B    instruction B    project-instruction B     turn-context B   conversation B          total B     structural B
-DaVinci Full                 40            25906             9747                     5650                426              588            36447               36
-DaVinci Lean                 16            12830             9747                     5650                426              588            23371               36
-DaVinci Full+Codemode        41            27444             9747                     5650               1176             1339            38736               36
+configuration             tools    tool-schema B    instruction B project-instr B (in instr)   turn-context B (in conv)   conversation B          total B     structural B
+DaVinci Full                 40            25906             9747                       5650                        426              588            36447               36
+DaVinci Lean                 16            12830             9747                       5650                        426              588            23371               36
+DaVinci Full+Codemode        41            27444             9747                       5650                       1176             1339            38736               36
+note: project-instr B is a raw-text substring contained in instruction B;
+note: turn-context B is raw text contained in conversation B. Do not add columns.
 ```
 
 `conversation B` (the `ConversationItem` segments — the user `hi` message plus the turn-context
 message wrapper) and `structural B` (the top-level JSON key/brace/comma bytes that no
-`WireManifest` segment carries) are printed as cross-checks, not as table columns. Every row
-passes the test's consistency assertions: the `tools` array length equals
-`provider_tool_specs().len()`, `ToolContract` and `TrustedInstructions` are non-empty, and the
-segment sum plus the structural bytes equals `request_bytes_before_compression` exactly.
+`WireManifest` segment carries) are printed as cross-checks, not as table columns. The
+`project-instr B` and `turn-context B` columns are raw text contained in `instruction B` and
+`conversation B` respectively, so none of the printed columns should be summed.
+
+What the test asserts for every row, and nothing beyond this:
+
+- the `tools` array length equals `provider_tool_specs().len()` and is non-zero;
+- `ToolContract` bytes equal the serialized `body["tools"]`; `TrustedInstructions` bytes equal the
+  serialized `instructions` (plus any `system` value and developer/system input items);
+  `ConversationItem` bytes equal the serialized remaining `input` items — each recomputed from the
+  body, not from the manifest;
+- the manifest's total segment bytes equal the independently computed tools + instructions +
+  conversation + remaining-config object + routing object bytes (dropping any one segment from the
+  manifest makes this fail; verified by skipping the first segment, which failed 36,270 vs 36,411);
+- the structural remainder (`total - sum(segments)`) is the same in all three configurations.
+
+These checks catch a dropped or mis-sized manifest segment, but they reuse the same top-level key
+grouping as `build_segments`, so they do not independently prove that the 36-byte structural
+remainder is the exact JSON punctuation; it is only shown to be constant across configurations.
 
 ## 3. Reproduction
 
@@ -99,6 +120,5 @@ every segment is counted". `build_segments` (`responses_request.rs:148`) places 
 *values* into segments but no segment carries the top-level JSON structure (key names, braces,
 commas), and it re-wraps the model-visible config and routing keys in their own objects. The sum
 is therefore the total **minus a small structural remainder** — 36 bytes for every configuration
-here. The test asserts the corrected identity
-`sum(segments) + structural_bytes == request_bytes_before_compression`, which catches a skipped
-segment just as the plan intended.
+here. The test therefore does not assert segment sum equals total; it asserts the checks listed in
+section 2.

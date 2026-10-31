@@ -267,6 +267,97 @@ fn measure(config: Config) -> Row {
         .sum();
     let structural_overhead = total_bytes - sum_segments;
 
+    // Independent recomputation straight from the body, not from the manifest.
+    let json_len = |value: &Value| serde_json::to_vec(value).unwrap().len();
+    let object = body.as_object().expect("body is an object");
+    let is_trusted_item = |item: &Value| {
+        matches!(
+            item.get("role").and_then(Value::as_str),
+            Some("developer" | "system")
+        )
+    };
+    let items: &[Value] = object
+        .get("input")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let expected_tools = object.get("tools").map(json_len).unwrap_or(0);
+    let expected_instructions = object.get("instructions").map(json_len).unwrap_or(0)
+        + object.get("system").map(json_len).unwrap_or(0)
+        + items
+            .iter()
+            .filter(|item| is_trusted_item(item))
+            .map(json_len)
+            .sum::<usize>();
+    let expected_conversation: usize = items
+        .iter()
+        .filter(|item| !is_trusted_item(item))
+        .map(json_len)
+        .sum();
+    // Remaining top-level keys are re-wrapped in one object per group.
+    let group = |keys: &[&str], invert: bool| {
+        let map: serde_json::Map<String, Value> = object
+            .iter()
+            .filter(|(key, _)| keys.contains(&key.as_str()) != invert)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        if map.is_empty() {
+            0
+        } else {
+            json_len(&Value::Object(map))
+        }
+    };
+    let routing_keys = [
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "prompt_cache_options",
+        "stream",
+        "store",
+    ];
+    let claimed_keys = [
+        "input",
+        "messages",
+        "tools",
+        "instructions",
+        "system",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "prompt_cache_options",
+        "stream",
+        "store",
+    ];
+    let expected_config = group(&claimed_keys, true);
+    let expected_routing = group(&routing_keys, false);
+
+    assert_eq!(
+        tool_schema_bytes,
+        expected_tools,
+        "{}: ToolContract bytes != serialized body[\"tools\"]",
+        config.name()
+    );
+    assert_eq!(
+        instruction_bytes,
+        expected_instructions,
+        "{}: TrustedInstructions bytes != serialized instructions (+ developer items)",
+        config.name()
+    );
+    assert_eq!(
+        conversation_bytes,
+        expected_conversation,
+        "{}: ConversationItem bytes != serialized non-developer input items",
+        config.name()
+    );
+    assert_eq!(
+        sum_segments,
+        expected_tools
+            + expected_instructions
+            + expected_conversation
+            + expected_config
+            + expected_routing,
+        "{}: manifest segments do not cover tools + instructions + input + config + routing",
+        config.name()
+    );
+
     // Internal consistency that catches a broken measurement.
     assert!(tool_count > 0, "{}: empty tool set", config.name());
     assert_eq!(
@@ -283,16 +374,6 @@ fn measure(config: Config) -> Row {
     assert!(
         instruction_bytes > 0,
         "{}: empty TrustedInstructions segment",
-        config.name()
-    );
-    assert!(
-        sum_segments < total_bytes,
-        "{}: segment sum {sum_segments} not < total {total_bytes} (expected top-level JSON structural overhead)",
-        config.name()
-    );
-    assert!(
-        structural_overhead > 0,
-        "{}: expected positive structural overhead, got 0",
         config.name()
     );
 
@@ -317,21 +398,29 @@ fn first_request_anatomy_table() {
         measure(Config::FullCodemode),
     ];
 
+    // The top-level key set is identical in all three configurations, so the
+    // structural remainder (key names, braces, commas) must be too.
+    assert!(
+        rows.iter()
+            .all(|row| row.structural_overhead == rows[0].structural_overhead),
+        "structural overhead differs across configurations"
+    );
+
     println!(
-        "{:<22} {:>8} {:>16} {:>16} {:>24} {:>18} {:>16} {:>16} {:>16}",
+        "{:<22} {:>8} {:>16} {:>16} {:>26} {:>26} {:>16} {:>16} {:>16}",
         "configuration",
         "tools",
         "tool-schema B",
         "instruction B",
-        "project-instruction B",
-        "turn-context B",
+        "project-instr B (in instr)",
+        "turn-context B (in conv)",
         "conversation B",
         "total B",
         "structural B"
     );
     for row in &rows {
         println!(
-            "{:<22} {:>8} {:>16} {:>16} {:>24} {:>18} {:>16} {:>16} {:>16}",
+            "{:<22} {:>8} {:>16} {:>16} {:>26} {:>26} {:>16} {:>16} {:>16}",
             row.name,
             row.tool_count,
             row.tool_schema_bytes,
@@ -343,4 +432,6 @@ fn first_request_anatomy_table() {
             row.structural_overhead
         );
     }
+    println!("note: project-instr B is a raw-text substring contained in instruction B;");
+    println!("note: turn-context B is raw text contained in conversation B. Do not add columns.");
 }
