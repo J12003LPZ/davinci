@@ -226,6 +226,14 @@ enum UnsavedWork {
     Unmerged,
 }
 
+/// What an inspection found, and the managed branch tip it was made against.
+struct Inspection {
+    work: UnsavedWork,
+    /// The branch tip at inspection time. Cleanup deletes the branch only if it
+    /// still points here, so a commit landing afterwards is never lost.
+    branch_tip: Option<String>,
+}
+
 /// Thread-safe manager for ephemeral git worktrees.
 #[derive(Clone)]
 pub struct WorktreeManager {
@@ -506,34 +514,40 @@ impl WorktreeManager {
     /// `git cherry` ignores whitespace and merge-only edits. A worker that
     /// still points to its original `base_head` has no new committed work.
     pub fn check_dirty(&self, lease: &WorktreeLease) -> Result<bool, WorktreeError> {
-        Ok(self.unsaved_work(lease)? != UnsavedWork::None)
+        Ok(self.unsaved_work(lease)?.work != UnsavedWork::None)
     }
 
     /// What removing the worktree would lose. Uncommitted files are never
     /// discarded by a release, forced or not; only committed work that is not
     /// integrated may be, and only when the caller forces.
-    fn unsaved_work(&self, lease: &WorktreeLease) -> Result<UnsavedWork, WorktreeError> {
-        if lease.path.exists() {
-            if !run_git(&lease.path, &["status", "--porcelain"])?.is_empty() {
-                return Ok(UnsavedWork::Uncommitted);
-            }
-            let current_head = run_git(&lease.path, &["rev-parse", "HEAD"])?;
-            let work = self.unintegrated_commit(lease, &current_head)?;
-            if work != UnsavedWork::None {
-                return Ok(work);
-            }
-        }
+    fn unsaved_work(&self, lease: &WorktreeLease) -> Result<Inspection, WorktreeError> {
         // The checkout can sit detached at `base_head` (or be gone) while the
         // managed branch still holds commits, and release deletes that branch.
-        // Its tip is checked on its own, directory or not.
-        if lease.branch.starts_with("davinci/agent/") && self.branch_exists(&lease.branch)? {
-            let tip = run_git(
-                &self.repo_root,
-                &["rev-parse", &format!("refs/heads/{}", lease.branch)],
-            )?;
-            return self.unintegrated_commit(lease, &tip);
+        // Its tip is read first and checked on its own, directory or not.
+        let branch_tip =
+            if lease.branch.starts_with("davinci/agent/") && self.branch_exists(&lease.branch)? {
+                Some(run_git(
+                    &self.repo_root,
+                    &["rev-parse", &format!("refs/heads/{}", lease.branch)],
+                )?)
+            } else {
+                None
+            };
+        let mut work = UnsavedWork::None;
+        if lease.path.exists() {
+            if !run_git(&lease.path, &["status", "--porcelain"])?.is_empty() {
+                return Ok(Inspection {
+                    work: UnsavedWork::Uncommitted,
+                    branch_tip,
+                });
+            }
+            let current_head = run_git(&lease.path, &["rev-parse", "HEAD"])?;
+            work = self.unintegrated_commit(lease, &current_head)?;
         }
-        Ok(UnsavedWork::None)
+        if let (UnsavedWork::None, Some(tip)) = (work, &branch_tip) {
+            work = self.unintegrated_commit(lease, tip)?;
+        }
+        Ok(Inspection { work, branch_tip })
     }
 
     /// Whether `commit` would be lost by cleanup: neither the lease's original
@@ -615,7 +629,8 @@ impl WorktreeManager {
             };
         }
         // Unreadable state preserves the worktree too, forced or not.
-        match self.unsaved_work(lease)? {
+        let inspection = self.unsaved_work(lease)?;
+        match inspection.work {
             UnsavedWork::None => {}
             UnsavedWork::Unmerged if force => {}
             UnsavedWork::Uncommitted | UnsavedWork::Unmerged => {
@@ -700,7 +715,15 @@ impl WorktreeManager {
                 Ok(false) => {}
                 Ok(true) if left_path.is_some() => left_branch = Some(lease.branch.clone()),
                 Ok(true) => {
-                    if let Err(error) = run_git(&self.repo_root, &["branch", "-D", &lease.branch]) {
+                    // Only the tip that was inspected may go, forced or not.
+                    let deleted = match inspection.branch_tip.as_deref() {
+                        Some(tip) => self.delete_branch_at(&lease.branch, tip),
+                        None => Err(WorktreeError::GitError(format!(
+                            "branch {} appeared after inspection",
+                            lease.branch
+                        ))),
+                    };
+                    if let Err(error) = deleted {
                         details.push(error.to_string());
                         left_branch = Some(lease.branch.clone());
                     }
@@ -808,6 +831,39 @@ impl WorktreeManager {
         }
         orphans.sort_by_key(|orphan| format!("{orphan:?}"));
         Ok(orphans)
+    }
+
+    /// Delete `refs/heads/<branch>` only if it still points at `tip`, in one
+    /// atomic ref update. `update-ref` has no checked-out guard like
+    /// `branch -D`, so a branch checked out in any worktree is refused here.
+    fn delete_branch_at(&self, branch: &str, tip: &str) -> Result<(), WorktreeError> {
+        let full = format!("refs/heads/{branch}");
+        let output = isolated_git_command_in(&self.repo_root)?
+            .args(["worktree", "list", "--porcelain", "-z"])
+            .output()
+            .map_err(|e| WorktreeError::GitError(format!("Failed to execute git: {e}")))?;
+        if !output.status.success() {
+            return Err(WorktreeError::GitError(format!(
+                "cannot list worktrees (status {:?}): {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let wanted = format!("branch {full}");
+        if output
+            .stdout
+            .split(|byte| *byte == 0)
+            .any(|field| field == wanted.as_bytes())
+        {
+            return Err(WorktreeError::GitError(format!(
+                "cannot delete branch {branch}: it is checked out in a worktree"
+            )));
+        }
+        run_git(
+            &self.repo_root,
+            &["update-ref", "--no-deref", "-d", &full, tip],
+        )
+        .map(|_| ())
     }
 
     /// `Ok(false)` only when git reports the ref missing (exit 1, no message).
@@ -1749,6 +1805,106 @@ mod tests {
         }
         assert!(late.exists(), "late work preserved");
         assert_eq!(manager.get_lease(&lease.path).as_ref(), Some(&lease));
+    }
+
+    /// A managed branch name that is a symbolic ref must lose only itself:
+    /// deleting through it would remove the branch it points at.
+    #[test]
+    fn a_symbolic_managed_branch_never_deletes_its_target() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        git_in(
+            repo_dir.path(),
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                lease.path.to_str().unwrap(),
+            ],
+        );
+        let main = run_git(repo_dir.path(), &["symbolic-ref", "HEAD"]).unwrap();
+        git_in(repo_dir.path(), &["branch", "-D", &lease.branch]);
+        git_in(
+            repo_dir.path(),
+            &[
+                "symbolic-ref",
+                &format!("refs/heads/{}", lease.branch),
+                &main,
+            ],
+        );
+
+        manager.release_lease(&lease, true).unwrap();
+        assert!(!branch_exists(repo_dir.path(), &lease.branch));
+        assert!(
+            branch_exists(repo_dir.path(), main.trim_start_matches("refs/heads/")),
+            "the symref's target survives"
+        );
+    }
+
+    fn rev_parse(repo: &Path, rev: &str) -> String {
+        let out = Command::new("git")
+            .current_dir(repo)
+            .args(["rev-parse", rev])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "rev-parse {rev}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The branch tip that passed inspection is the one cleanup may delete:
+    /// a commit landing on the branch after the check must keep the branch
+    /// and the lease, forced or not.
+    #[test]
+    fn a_branch_that_advances_after_inspection_is_not_deleted() {
+        for force in [false, true] {
+            let repo_dir = init_temp_git_repo();
+            let wt_dir = tempdir().unwrap();
+            let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+            let lease = manager
+                .create_lease(RunId::new(), AgentId::new(), None)
+                .unwrap();
+            let (repo, path, branch) = (
+                repo_dir.path().to_path_buf(),
+                lease.path.clone(),
+                lease.branch.clone(),
+            );
+            manager.set_before_remove_hook(move || {
+                // Same tree as HEAD, so the worktree stays clean and removable.
+                let out = Command::new("git")
+                    .current_dir(&path)
+                    .args(["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "late"])
+                    .output()
+                    .unwrap();
+                assert!(out.status.success());
+                let late = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                git_in(
+                    &repo,
+                    &["update-ref", &format!("refs/heads/{branch}"), &late],
+                );
+            });
+
+            let err = manager.release_lease(&lease, force).unwrap_err();
+            match &err {
+                WorktreeError::CleanupIncomplete { branch, detail, .. } => {
+                    assert_eq!(branch.as_deref(), Some(lease.branch.as_str()), "{err}");
+                    assert!(!detail.is_empty(), "the reason is reported");
+                }
+                other => panic!("force={force}: expected CleanupIncomplete, got {other:?}"),
+            }
+            assert!(
+                branch_exists(repo_dir.path(), &lease.branch),
+                "force={force}: the advanced branch survives"
+            );
+            assert_ne!(
+                rev_parse(repo_dir.path(), &format!("refs/heads/{}", lease.branch)),
+                lease.base_head
+            );
+            assert_eq!(manager.get_lease(&lease.path).as_ref(), Some(&lease));
+        }
     }
 
     #[test]
