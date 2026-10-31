@@ -1168,6 +1168,50 @@ impl Drop for GraphEnvGuard {
     }
 }
 
+/// Fail with the process snapshot and the tail of its output as soon as the
+/// fixture's HTTP server stops running, naming the step that preceded the
+/// check. "managed process is not running" at `browser_open` alone cannot tell
+/// an exit from a kill, or say which step ended the server.
+fn assert_server_alive(
+    manager: &ProcessManager,
+    root: &std::path::Path,
+    process_id: u64,
+    after_step: &str,
+) {
+    let status = manager
+        .execute(
+            root,
+            "process_status",
+            &json!({"id":process_id}),
+            None,
+            None,
+        )
+        .unwrap();
+    let details = status.details.unwrap();
+    if details["state"] == "running" {
+        return;
+    }
+    let output = manager
+        .execute(
+            root,
+            "process_output",
+            &json!({"id":process_id}),
+            None,
+            None,
+        )
+        .map(|result| result.content)
+        .unwrap_or_else(|error| format!("<output unavailable: {error}>"));
+    panic!(
+        "the fixture server stopped after step `{after_step}`: state={} exit_code={} error={} output_complete={} active_leases={}
+{output}",
+        details["state"],
+        details["exit_code"],
+        details["error"],
+        details["output_complete"],
+        details["active_leases"],
+    );
+}
+
 #[test]
 #[ignore = "requires explicitly configured trusted Node and Playwright installation"]
 #[allow(clippy::drop_non_drop)]
@@ -1358,8 +1402,13 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
         .local_addr()
         .unwrap()
         .port();
+    // The server must outlive every step of the test and say why if it does not:
+    // no self-closing timer (an idle server with no other handle makes node exit),
+    // a handler that cannot throw out of the process, and an exit line that
+    // `assert_server_alive` shows in its failure message. `process_stop` and the
+    // owner's drop end it.
     let script = format!(
-        "const http=require('node:http');const fs=require('node:fs');const server=http.createServer((req,res)=>{{if(req.url==='/broken-api'){{res.writeHead(500);res.end('planted failure');return;}}res.setHeader('content-type','text/html');res.end(fs.readFileSync('index.html'));}});server.listen({port},'127.0.0.1',()=>console.log('READY'));setTimeout(()=>server.close(),600000);"
+        "const http=require('node:http');const fs=require('node:fs');process.on('exit',c=>console.log('NODE_EXIT '+c));process.on('uncaughtException',e=>console.log('NODE_UNCAUGHT '+(e&&e.stack||e)));const server=http.createServer((req,res)=>{{try{{if(req.url==='/broken-api'){{res.writeHead(500);res.end('planted failure');return;}}res.setHeader('content-type','text/html');res.end(fs.readFileSync('index.html'));}}catch(e){{res.writeHead(500);res.end(String(e));}}}});server.on('error',e=>console.log('NODE_SERVER_ERROR '+e));server.listen({port},'127.0.0.1',()=>console.log('READY'));"
     );
 
     let mut dispatched = Vec::new();
@@ -1404,6 +1453,7 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
     let (_, output, error) =
         super::test_impact_integration_tests::call(&mut agent, "repo_map", json!({}));
     record("repo_map", error, cold.elapsed());
+    assert_server_alive(&manager, root.path(), process_id, "repo_map");
     assert!(!error, "{output}");
 
     let (_, _, error) = super::test_impact_integration_tests::call(
@@ -1412,24 +1462,28 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
         json!({"path":"src/login.ts"}),
     );
     record("lsp_document_symbols", error, Duration::from_millis(0));
+    assert_server_alive(&manager, root.path(), process_id, "lsp_document_symbols");
     let (_, _, error) = super::test_impact_integration_tests::call(
         &mut agent,
         "package_info",
         json!({"package":"login-app"}),
     );
     record("package_info", error, Duration::from_millis(0));
+    assert_server_alive(&manager, root.path(), process_id, "package_info");
     let (_, _, error) = super::test_impact_integration_tests::call(
         &mut agent,
         "git_blame_symbol",
         json!({"symbol":"loginButtonLabel","path":"src/login.ts"}),
     );
     record("git_blame_symbol", error, Duration::from_millis(0));
+    assert_server_alive(&manager, root.path(), process_id, "git_blame_symbol");
     let (_, _, error) = super::test_impact_integration_tests::call(
         &mut agent,
         "git_commit_context",
         json!({"commit":"HEAD"}),
     );
     record("git_commit_context", error, Duration::from_millis(0));
+    assert_server_alive(&manager, root.path(), process_id, "git_commit_context");
 
     let impact_cold = Instant::now();
     let (_, output, error) = super::test_impact_integration_tests::call(
@@ -1438,6 +1492,7 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
         json!({"files":["src/login.ts"]}),
     );
     record("impact_analyze", error, impact_cold.elapsed());
+    assert_server_alive(&manager, root.path(), process_id, "impact_analyze");
     assert!(!error, "{output}");
     let impact_warm = Instant::now();
     let (_, output, error) = super::test_impact_integration_tests::call(
@@ -1446,6 +1501,7 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
         json!({"files":["src/login.ts"]}),
     );
     record("impact_analyze_warm", error, impact_warm.elapsed());
+    assert_server_alive(&manager, root.path(), process_id, "impact_analyze_warm");
     assert!(!error, "{output}");
 
     let (_, _, error) = super::test_impact_integration_tests::call(
@@ -1454,24 +1510,28 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
         json!({"path":"src/login.ts"}),
     );
     record("test_plan", error, Duration::from_millis(0));
+    assert_server_alive(&manager, root.path(), process_id, "test_plan");
     let (_, _, error) = super::test_impact_integration_tests::call(
         &mut agent,
         "build_command",
         json!({"files":["src/login.ts"]}),
     );
     record("build_command", error, Duration::from_millis(0));
+    assert_server_alive(&manager, root.path(), process_id, "build_command");
     let (_, _, error) = super::test_impact_integration_tests::call(
         &mut agent,
         "bash",
         json!({"command":"node --test src/login.test.ts"}),
     );
     record("bash", error, Duration::from_millis(0));
+    assert_server_alive(&manager, root.path(), process_id, "bash");
     let (_, _, error) = super::test_impact_integration_tests::call(
         &mut agent,
         "lsp_diagnostics",
         json!({"path":"src/login.ts"}),
     );
     record("lsp_diagnostics", error, Duration::from_millis(0));
+    assert_server_alive(&manager, root.path(), process_id, "lsp_diagnostics");
 
     let checkpoint = Instant::now();
     let (checkpointed, output, error) = super::test_impact_integration_tests::call(
@@ -1480,6 +1540,7 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
         json!({"path":"src/login.ts","label":"login"}),
     );
     record("workspace_checkpoint", error, checkpoint.elapsed());
+    assert_server_alive(&manager, root.path(), process_id, "workspace_checkpoint");
     assert!(!error, "{output}");
     let checkpoint_id = snapshot_checkpoint_id(&checkpointed);
 
@@ -1493,6 +1554,7 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
         }),
     );
     record("edit", error, Duration::from_millis(0));
+    assert_server_alive(&manager, root.path(), process_id, "edit");
     assert!(!error, "{output}");
 
     let browser_start = Instant::now();
@@ -1719,6 +1781,7 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
         }),
     );
     graph_record("edit", error, Duration::from_millis(0));
+    assert_server_alive(&manager, root.path(), process_id, "graph edit");
     assert!(!error, "graph writer edit: {output}");
 
     let graph_browser = Instant::now();
