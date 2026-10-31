@@ -169,6 +169,46 @@ impl LoopSignal {
     }
 }
 
+/// Two loop signals are the same escalation when their stable identity matches.
+/// `OscillatingEdits` carries a `cycle_sequence` that rotates as the 3-wide
+/// sliding window advances (A->B->A vs B->A->B), so it is compared by `path`
+/// rather than the exact cycle; the other variants compare their stable fields.
+fn same_escalation(a: &LoopSignal, b: &LoopSignal) -> bool {
+    match (a, b) {
+        (
+            LoopSignal::RepeatedCommandWithoutNewOutput {
+                tool: tool_a,
+                command_or_input: command_a,
+                ..
+            },
+            LoopSignal::RepeatedCommandWithoutNewOutput {
+                tool: tool_b,
+                command_or_input: command_b,
+                ..
+            },
+        ) => tool_a == tool_b && command_a == command_b,
+        (
+            LoopSignal::RepeatedUnchangedReads { path: path_a, .. },
+            LoopSignal::RepeatedUnchangedReads { path: path_b, .. },
+        )
+        | (
+            LoopSignal::OscillatingEdits { path: path_a, .. },
+            LoopSignal::OscillatingEdits { path: path_b, .. },
+        ) => path_a == path_b,
+        (
+            LoopSignal::RepeatedTestFailureWithoutNewDiagnosis {
+                signature: signature_a,
+                ..
+            },
+            LoopSignal::RepeatedTestFailureWithoutNewDiagnosis {
+                signature: signature_b,
+                ..
+            },
+        ) => signature_a == signature_b,
+        _ => false,
+    }
+}
+
 /// Lifecycle state of the progress watchdog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum WatchdogState {
@@ -253,7 +293,11 @@ impl ProgressWatchdog {
                 // Every loop signal shares one escalation path: the first
                 // occurrence nudges for a bounded recovery attempt, a second
                 // occurrence equal to the stored escalation stops.
-                let occurrence = if self.last_escalation.as_ref() == Some(&signal) {
+                let occurrence = if self
+                    .last_escalation
+                    .as_ref()
+                    .map_or(false, |last| same_escalation(last, &signal))
+                {
                     REPEATED_SIGNAL_STOP_AT
                 } else {
                     REPEATED_SIGNAL_NUDGE_AT
@@ -820,6 +864,54 @@ mod tests {
         assert_eq!(*watchdog.state(), WatchdogState::Running);
 
         watchdog.pause(signal);
+        assert!(matches!(
+            watchdog.repair_action(),
+            RepairAction::Blocked(LoopSignal::OscillatingEdits { .. })
+        ));
+        assert_eq!(*watchdog.state(), WatchdogState::Stopped);
+    }
+
+    #[test]
+    fn oscillating_edits_observe_path_escalates_to_stop() {
+        let mut watchdog = ProgressWatchdog::new();
+
+        let observe_edit = |wd: &mut ProgressWatchdog, hash: &str| {
+            wd.observe(ProgressObservation {
+                tool_name: "edit".into(),
+                input_fingerprint: "edit src/lib.rs".into(),
+                output_digest: "ok".into(),
+                hypothesis_id: None,
+                hypothesis_evidence_refs: vec![],
+                target_path: Some("src/lib.rs".into()),
+                edit_content_hash: Some(hash.into()),
+                test_failure_signature: None,
+                is_pruning_recovery: false,
+                is_job_poll: false,
+                has_new_evidence: false,
+            })
+        };
+
+        assert_eq!(observe_edit(&mut watchdog, "hash_A"), None);
+        assert_eq!(observe_edit(&mut watchdog, "hash_B"), None);
+
+        // A -> B -> A: first oscillation signal.
+        assert!(matches!(
+            observe_edit(&mut watchdog, "hash_A"),
+            Some(LoopSignal::OscillatingEdits { path, .. }) if path == "src/lib.rs"
+        ));
+        assert!(matches!(
+            watchdog.repair_action(),
+            RepairAction::ChangeApproach(LoopSignal::OscillatingEdits { .. })
+        ));
+        assert_eq!(*watchdog.state(), WatchdogState::Running);
+
+        // A -> B -> A -> B: the continuing oscillation rotates the cycle
+        // sequence (B -> A -> B) but must compare equal and stop, not nudge
+        // again.
+        assert!(matches!(
+            observe_edit(&mut watchdog, "hash_B"),
+            Some(LoopSignal::OscillatingEdits { path, .. }) if path == "src/lib.rs"
+        ));
         assert!(matches!(
             watchdog.repair_action(),
             RepairAction::Blocked(LoopSignal::OscillatingEdits { .. })
