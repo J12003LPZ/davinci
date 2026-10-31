@@ -804,21 +804,37 @@ mod tests {
             directory: directory.path().to_path_buf(),
         };
         let abort = AtomicBool::new(false);
+        // Generous so a slow runner cannot expire it before the abort lands;
+        // the stalled child makes the cancel handshake spend what is left.
+        let timeout = Duration::from_secs(1);
         let started = Instant::now();
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                std::thread::sleep(Duration::from_millis(40));
+                // Abort only once the request is registered as pending, i.e.
+                // provably in flight, never after a guessed delay. Capped so a
+                // request that fails early cannot leave this thread spinning.
+                let give_up = Instant::now() + Duration::from_secs(10);
+                while bridge
+                    .state
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pending
+                    .is_empty()
+                    && Instant::now() < give_up
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 abort.store(true, Ordering::SeqCst);
             });
-            let result = bridge.request_with_abort(
-                json!({"op":"fixture"}),
-                Duration::from_millis(100),
-                Some(&abort),
-            );
+            let result = bridge.request_with_abort(json!({"op":"fixture"}), timeout, Some(&abort));
             assert_eq!(result, Err("browser cancellation unconfirmed".into()));
         });
+        // The handshake draws on the original budget: total stays near
+        // `timeout`, not timeout plus the 5s cancel ceiling. Slack is
+        // derived from the budget so it holds on slow runners.
         assert!(
-            started.elapsed() < Duration::from_millis(500),
+            started.elapsed() < timeout + Duration::from_secs(1),
             "{:?}",
             started.elapsed()
         );
