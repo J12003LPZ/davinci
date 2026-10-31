@@ -786,6 +786,10 @@ pub struct Agent {
     /// for the context to grow by `keep_recent_tokens` (or for a different
     /// window, settings or summarizer) before paying for another attempt.
     refused_auto_compaction: Option<(u64, HybridBackoffScope)>,
+    /// Refusal notices no subscriber has seen: a run that fails returns an
+    /// error and drops its buffered events. Replayed into the next run's
+    /// events, cleared when a run returns them.
+    undelivered_notices: Vec<AgentEvent>,
     /// Summarizer requests the last hybrid fold sent (0 when it sent none).
     hybrid_last_fold_requests: u64,
     observation_root_id: String,
@@ -1008,6 +1012,7 @@ impl Agent {
             hybrid_fold_backoff: None,
             hybrid_fold_backoff_settings: None,
             refused_auto_compaction: None,
+            undelivered_notices: Vec::new(),
             hybrid_last_fold_requests: 0,
             observation_root_id: uuid::Uuid::new_v4().to_string(),
             root_budget: None,
@@ -1831,6 +1836,7 @@ impl Agent {
         self.hybrid_fold_backoff = None;
         self.hybrid_fold_backoff_settings = None;
         self.refused_auto_compaction = None;
+        self.undelivered_notices.clear();
         self.restore_mutation_verification();
         self.restore_completion_status();
         self.restore_tool_exposure();

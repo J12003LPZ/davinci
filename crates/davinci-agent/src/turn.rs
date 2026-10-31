@@ -321,7 +321,10 @@ impl Agent {
                 }
                 result
             }
-            (Ok(_), Ok(())) => result,
+            (Ok(_), Ok(())) => {
+                self.undelivered_notices.clear();
+                result
+            }
         }
     }
 
@@ -663,6 +666,9 @@ Issue the call again if it is still needed.";
         let mut turns_this_run = 0_u32;
         let mut fast_downgrade_notified = false;
         self.push_event(&mut events, AgentEvent::AgentStart);
+        for notice in self.undelivered_notices.clone() {
+            self.push_event(&mut events, notice);
+        }
         self.push_event(&mut events, AgentEvent::TurnStart);
         self.push_event(
             &mut events,
@@ -916,16 +922,20 @@ Issue the call again if it is still needed.";
                         // history stays above the trigger. Say so once and do
                         // not pay for the same refusal on every tool round.
                         self.arm_auto_compaction_refusal(tokens);
-                        self.push_event(
-                            &mut events,
-                            AgentEvent::CompletionNotice {
-                                reason_code: "compaction.admission_refused".into(),
-                                text: format!(
-                                    "Automatic compaction was refused and the context is unchanged: {} Run /compact or start a new session.",
-                                    outcome.summary
-                                ),
-                            },
-                        );
+                        let notice = AgentEvent::CompletionNotice {
+                            reason_code: "compaction.admission_refused".into(),
+                            text: format!(
+                                "Automatic compaction was refused and the context is unchanged: {} Run /compact or start a new session.",
+                                outcome.summary
+                            ),
+                        };
+                        // The marker now suppresses the retry, so a buffered
+                        // caller must still get the notice if this run fails.
+                        // A sink hears it live and needs no replay.
+                        if self.event_sink.is_none() {
+                            self.undelivered_notices.push(notice.clone());
+                        }
+                        self.push_event(&mut events, notice);
                     }
                 }
             }

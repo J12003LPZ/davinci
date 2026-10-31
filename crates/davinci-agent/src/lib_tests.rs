@@ -6450,6 +6450,66 @@ fn a_turn_below_the_trigger_drops_a_stale_refusal_marker() {
     assert!(agent.refused_auto_compaction.is_none());
 }
 
+fn refusal_notices(events: &[AgentEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(event, AgentEvent::CompletionNotice { reason_code, .. }
+                if reason_code == "compaction.admission_refused")
+        })
+        .count()
+}
+
+/// The refusal marker suppresses the retry, so a buffered caller whose first
+/// run failed (and dropped its events with the error) must still receive the
+/// notice, exactly once, on the run that succeeds.
+#[test]
+fn a_refusal_notice_lost_to_a_failed_run_reaches_the_retry_once() {
+    let mut agent = agent_with_a_refused_auto_compaction();
+    let retry = agent.run_loop(scripted_tool_calls(vec![])).unwrap();
+    assert_eq!(refusal_notices(&retry), 1, "delivered on the retry");
+    agent.prompt("fourth request");
+    let next = agent.run_loop(scripted_tool_calls(vec![])).unwrap();
+    assert_eq!(refusal_notices(&next), 0, "not delivered twice");
+}
+
+/// A sink already received the notice live, so the retry must not repeat it.
+#[test]
+fn a_refusal_notice_already_sent_to_the_sink_is_not_replayed() {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let counted = std::sync::Arc::clone(&seen);
+    let mut agent = Agent::new("fixture");
+    agent.event_sink = Some(EventSink(std::sync::Arc::new(move |event| {
+        if matches!(event, AgentEvent::CompletionNotice { reason_code, .. }
+            if reason_code == "compaction.admission_refused")
+        {
+            *counted.lock().unwrap() += 1;
+        }
+    })));
+    agent.context_window = 10_000;
+    agent.compaction.enabled = true;
+    agent.compaction.reserve_tokens = 500;
+    agent.compaction.keep_recent_tokens = 6_000;
+    agent.summarizer = Some(Summarizer::new(|_| {
+        Ok(crate::compaction::SummarizeResponse {
+            text: "s".repeat(38_000),
+            usage: Some(Default::default()),
+            stop_reason: Some(davinci_ai::StopReason::Stop),
+            error_message: None,
+            has_tool_call: false,
+        })
+    }));
+    agent.prompt("first request");
+    agent.record_assistant(&"x".repeat(20_000));
+    agent.prompt("second request");
+    agent.record_assistant(&"y".repeat(13_000));
+    agent.prompt("third request");
+    let _ = agent.run_loop(|_| Err::<crate::CompleteOutput, String>("stop here".into()));
+    let retry = agent.run_loop(scripted_tool_calls(vec![])).unwrap();
+    assert_eq!(refusal_notices(&retry), 0);
+    assert_eq!(*seen.lock().unwrap(), 1, "the sink heard it once");
+}
+
 #[test]
 fn switching_the_tree_branch_restores_that_branchs_verification_and_exposure() {
     let dir = tempfile::tempdir().unwrap();
