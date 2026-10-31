@@ -6510,6 +6510,49 @@ fn a_refusal_notice_already_sent_to_the_sink_is_not_replayed() {
     assert_eq!(*seen.lock().unwrap(), 1, "the sink heard it once");
 }
 
+/// A buffered run lost its notice, then a live sink is attached for the
+/// retry. Replay hands the sink the notice; a retry that fails again must not
+/// leave it queued for the sink to hear a second time.
+#[test]
+fn a_replayed_refusal_notice_is_dropped_once_a_live_sink_has_it() {
+    let mut agent = agent_with_a_refused_auto_compaction();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let counted = std::sync::Arc::clone(&seen);
+    agent.event_sink = Some(EventSink(std::sync::Arc::new(move |event| {
+        if matches!(event, AgentEvent::CompletionNotice { reason_code, .. }
+            if reason_code == "compaction.admission_refused")
+        {
+            *counted.lock().unwrap() += 1;
+        }
+    })));
+    let _ = agent.run_loop(|_| Err::<crate::CompleteOutput, String>("stop again".into()));
+    assert_eq!(*seen.lock().unwrap(), 1, "replayed to the sink");
+    let retry = agent.run_loop(scripted_tool_calls(vec![])).unwrap();
+    assert_eq!(refusal_notices(&retry), 0);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        1,
+        "the sink heard it once, not twice"
+    );
+}
+
+/// With `keep_recent_tokens` 0 the refusal never defers, so every failed run
+/// refuses again. The queue holds one notice, not one per run.
+#[test]
+fn repeated_refusals_with_failing_runs_queue_one_notice() {
+    let mut agent = agent_with_a_refused_auto_compaction();
+    agent.compaction.keep_recent_tokens = 0;
+    for _ in 0..3 {
+        let _ = agent.run_loop(|_| Err::<crate::CompleteOutput, String>("stop again".into()));
+    }
+    assert_eq!(
+        agent.undelivered_notices.len(),
+        1,
+        "{:?}",
+        agent.undelivered_notices
+    );
+}
+
 #[test]
 fn switching_the_tree_branch_restores_that_branchs_verification_and_exposure() {
     let dir = tempfile::tempdir().unwrap();

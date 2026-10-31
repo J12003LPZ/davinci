@@ -666,7 +666,15 @@ Issue the call again if it is still needed.";
         let mut turns_this_run = 0_u32;
         let mut fast_downgrade_notified = false;
         self.push_event(&mut events, AgentEvent::AgentStart);
-        for notice in self.undelivered_notices.clone() {
+        // A live sink hears the replay, so nothing stays queued for it to hear
+        // again if this run fails; a buffered caller keeps them until a run
+        // returns them.
+        let replay = if self.event_sink.is_some() {
+            std::mem::take(&mut self.undelivered_notices)
+        } else {
+            self.undelivered_notices.clone()
+        };
+        for notice in replay {
             self.push_event(&mut events, notice);
         }
         self.push_event(&mut events, AgentEvent::TurnStart);
@@ -931,9 +939,11 @@ Issue the call again if it is still needed.";
                         };
                         // The marker now suppresses the retry, so a buffered
                         // caller must still get the notice if this run fails.
-                        // A sink hears it live and needs no replay.
+                        // A sink hears it live and needs no replay. The notice
+                        // is the same refusal each time, so the latest
+                        // replaces the queued one instead of piling up.
                         if self.event_sink.is_none() {
-                            self.undelivered_notices.push(notice.clone());
+                            self.undelivered_notices = vec![notice.clone()];
                         }
                         self.push_event(&mut events, notice);
                     }
