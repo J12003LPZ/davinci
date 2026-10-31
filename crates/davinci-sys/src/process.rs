@@ -958,6 +958,24 @@ mod tests {
             ])
             .args(args)
             .env("GIT_CONFIG_NOSYSTEM", "1");
+        // Tests edit this process's GIT_* variables; fixture setup must not
+        // inherit them (a `GIT_CONFIG=/dev/null` makes `git config` unwritable).
+        for name in [
+            "GIT_CONFIG",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+        ] {
+            command.env_remove(name);
+        }
         let output = command.output().expect("git is available");
         assert!(output.status.success(), "git {args:?}: {output:?}");
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
