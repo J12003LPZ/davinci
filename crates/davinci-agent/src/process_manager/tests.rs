@@ -782,7 +782,7 @@ fn a_dead_leased_process_reports_its_exit_and_last_output() {
             "process_start",
             &json!({
                 "executable": "node",
-                "argv": ["-e", "process.stdout.write('READY\\nNODE_EXIT 0\\n');setTimeout(()=>process.exit(0),50)"]
+                "argv": ["-e", "process.stdout.write('x'.repeat(10000)+'\\nREADY\\nNODE_EXIT 0\\n');setTimeout(()=>process.exit(0),50)"]
             }),
             None,
             None,

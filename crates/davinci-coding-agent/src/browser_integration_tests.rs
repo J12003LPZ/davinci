@@ -1191,11 +1191,27 @@ fn assert_server_alive(
     if details["state"] == "running" {
         return;
     }
+    // `process_output` pages forward from the earliest retained byte when no
+    // cursor is given, so a server that wrote more than one page of output would
+    // hide the very exit line this diagnostic exists to show. Read one byte to
+    // learn the total, then ask for the page that ends at the current tail.
+    let total = manager
+        .execute(
+            root,
+            "process_output",
+            &json!({"id":process_id,"limit":1}),
+            None,
+            None,
+        )
+        .ok()
+        .and_then(|result| result.details)
+        .and_then(|details| details["total_bytes"].as_u64())
+        .unwrap_or(0);
     let output = manager
         .execute(
             root,
             "process_output",
-            &json!({"id":process_id}),
+            &json!({"id":process_id,"cursor":total.saturating_sub(8192),"limit":8192}),
             None,
             None,
         )
@@ -1405,10 +1421,12 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
     // The server must outlive every step of the test and say why if it does not:
     // no self-closing timer (an idle server with no other handle makes node exit),
     // a handler that cannot throw out of the process, and an exit line that
-    // `assert_server_alive` shows in its failure message. `process_stop` and the
+    // `assert_server_alive` shows in its failure message. The exception hook is a
+    // monitor so an uncaught throw still crashes node instead of leaving a wedged
+    // server that the liveness check would call healthy. `process_stop` and the
     // owner's drop end it.
     let script = format!(
-        "const http=require('node:http');const fs=require('node:fs');process.on('exit',c=>console.log('NODE_EXIT '+c));process.on('uncaughtException',e=>console.log('NODE_UNCAUGHT '+(e&&e.stack||e)));const server=http.createServer((req,res)=>{{try{{if(req.url==='/broken-api'){{res.writeHead(500);res.end('planted failure');return;}}res.setHeader('content-type','text/html');res.end(fs.readFileSync('index.html'));}}catch(e){{res.writeHead(500);res.end(String(e));}}}});server.on('error',e=>console.log('NODE_SERVER_ERROR '+e));server.listen({port},'127.0.0.1',()=>console.log('READY'));"
+        "const http=require('node:http');const fs=require('node:fs');process.on('exit',c=>console.log('NODE_EXIT '+c));process.on('uncaughtExceptionMonitor',e=>console.log('NODE_UNCAUGHT '+(e&&e.stack||e)));const server=http.createServer((req,res)=>{{try{{if(req.url==='/broken-api'){{res.writeHead(500);res.end('planted failure');return;}}res.setHeader('content-type','text/html');res.end(fs.readFileSync('index.html'));}}catch(e){{res.writeHead(500);res.end(String(e));}}}});server.on('error',e=>console.log('NODE_SERVER_ERROR '+e));server.listen({port},'127.0.0.1',()=>console.log('READY'));"
     );
 
     let mut dispatched = Vec::new();
@@ -1557,6 +1575,7 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
     assert_server_alive(&manager, root.path(), process_id, "edit");
     assert!(!error, "{output}");
 
+    assert_server_alive(&manager, root.path(), process_id, "before browser_open");
     let browser_start = Instant::now();
     let (opened, output, error) = super::test_impact_integration_tests::call(
         &mut agent,
@@ -1748,6 +1767,8 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
         let started = Instant::now();
         let (_, output, error) = super::test_impact_integration_tests::call(&mut agent, name, args);
         graph_record(name, error, started.elapsed());
+        // Attribute an exit to the step that just ran, not to the later edit.
+        assert_server_alive(&manager, root.path(), process_id, name);
         if matches!(
             name,
             "repo_map"
@@ -1784,6 +1805,12 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
     assert_server_alive(&manager, root.path(), process_id, "graph edit");
     assert!(!error, "graph writer edit: {output}");
 
+    assert_server_alive(
+        &manager,
+        root.path(),
+        process_id,
+        "graph before browser_open",
+    );
     let graph_browser = Instant::now();
     let (graph_opened, output, error) = super::test_impact_integration_tests::call(
         &mut agent,
