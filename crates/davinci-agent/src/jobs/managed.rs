@@ -708,7 +708,7 @@ impl ManagedOwner {
     /// Host resource attachment requires this caller's active lease. Historical
     /// status access remains available after release through `snapshot`.
     pub fn active_snapshot(&self, id: u32) -> Result<ProcessSnapshot, String> {
-        let (_, record) = self.owned(id)?;
+        let (shared, record) = self.owned(id)?;
         if !record
             .owners
             .lock()
@@ -720,7 +720,7 @@ impl ManagedOwner {
         }
         let snapshot = self.snapshot(id)?;
         if snapshot.state != "running" {
-            return Err("managed process is not running".into());
+            return Err(not_running(&shared, &snapshot));
         }
         Ok(snapshot)
     }
@@ -819,7 +819,8 @@ impl ManagedOwner {
     ) -> Result<usize, String> {
         let snapshot = self.control_snapshot(id, expected_lifetime)?;
         if snapshot.state != "running" {
-            return Err("managed process is not running".into());
+            let (shared, _) = self.owned(id)?;
+            return Err(not_running(&shared, &snapshot));
         }
         self.write(id, bytes)
     }
@@ -877,6 +878,42 @@ impl ManagedOwner {
             .ok_or("process lifetime missing")?;
         Ok(supervisor.wait(timeout.saturating_sub(started.elapsed())))
     }
+}
+
+/// A caller asking for new work on a dead process needs the reason, not a
+/// verdict: "not running" cannot tell a server that exited on its own from one
+/// another owner stopped. The record already knows which; the output tail often
+/// carries the child's own last words (the p12 fixture prints `NODE_EXIT`).
+fn not_running(shared: &Shared, snapshot: &ProcessSnapshot) -> String {
+    let mut detail = format!("managed process is not running (state: {}", snapshot.state);
+    if let Some(code) = snapshot.exit_code {
+        detail.push_str(&format!(", exit code {code}"));
+    }
+    if let Some(error) = snapshot.error.as_deref().filter(|error| !error.is_empty()) {
+        detail.push_str(&format!(", error: {error}"));
+    }
+    if let Some(line) = last_output_line(shared) {
+        detail.push_str(&format!(", last output: {line}"));
+    }
+    detail.push(')');
+    detail
+}
+
+fn last_output_line(shared: &Shared) -> Option<String> {
+    let buffer = shared.output.lock().unwrap_or_else(|e| e.into_inner());
+    String::from_utf8_lossy(&buffer.bytes)
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| {
+            let mut chars = line.chars();
+            let mut bounded: String = chars.by_ref().take(200).collect();
+            if chars.next().is_some() {
+                bounded.push('…');
+            }
+            bounded
+        })
 }
 
 fn acquire(record: &Record, owner: Uuid) -> Result<(), String> {

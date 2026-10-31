@@ -767,6 +767,49 @@ fn browser_dev_server_rejects_evidence_after_authority_changes_during_callback()
     }
 }
 
+/// A leased process that exits on its own is not a lease problem: the record
+/// still holds this owner, so the only actionable fact is why the process is
+/// gone. The p12 fixture's old 60 s self-close produced exactly this state and
+/// reported only "managed process is not running".
+#[test]
+fn a_dead_leased_process_reports_its_exit_and_last_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = agent(directory.path(), PermissionMode::AlwaysApprove);
+    let manager = session.tool_context.processes.as_ref().unwrap();
+    let result = manager
+        .execute(
+            directory.path(),
+            "process_start",
+            &json!({
+                "executable": "node",
+                "argv": ["-e", "process.stdout.write('READY\\nNODE_EXIT 0\\n');setTimeout(()=>process.exit(0),50)"]
+            }),
+            None,
+            None,
+        )
+        .unwrap();
+    let id = result.details.unwrap()["process"]["id"].as_u64().unwrap() as u32;
+    wait_for(|| manager.owner.snapshot(id).unwrap().state == "exited");
+    let error = manager
+        .owner
+        .active_lease(id)
+        .expect_err("a process that exited cannot accept new work");
+    assert!(
+        error.starts_with("managed process is not running"),
+        "{error}"
+    );
+    assert!(error.contains("state: exited"), "{error}");
+    assert!(error.contains("exit code 0"), "{error}");
+    assert!(error.contains("last output: NODE_EXIT 0"), "{error}");
+    assert!(
+        manager
+            .owner
+            .write_with_lifetime(id, None, b"ping\n")
+            .is_err_and(|error| error.contains("last output: NODE_EXIT 0")),
+        "stdin to a dead process must name its exit too"
+    );
+}
+
 /// Bound for fixture processes (`node`, shells) to start, exit or react.
 /// Every wait returns as soon as its condition holds; the bound only has to
 /// outlast a loaded windows-latest runner, where even 30 s was not enough.
