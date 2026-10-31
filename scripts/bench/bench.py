@@ -13,6 +13,8 @@ Environment:
     BENCH_RUNS       results directory (default scripts/bench/runs)
     BENCH_DAVINCI    davinci executable (default: davinci on PATH)
     BENCH_CODEX      codex executable (default: codex on PATH)
+    BENCH_DROID      droid executable (default: droid on PATH)
+    BENCH_DROID_TOOL_EXECUTION_MODE  droid tool-execution mode (default script-only)
 
 This is a maintainer tool, never a test: it starts real harnesses and spends
 model usage on both the davinci and the Codex CLI accounts.
@@ -42,6 +44,7 @@ from codex_otel import Collector, request_metrics
 from private_suite import apply_hidden, argv, import_suite, load_frozen, run_check, GradingLifecycleError
 from readiness_metrics import report as readiness_report, load_prices
 import subscription_campaign
+from droid_usage import droid_usage_from_session, droid_request_count
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TASKS = os.path.join(HERE, "tasks")
@@ -50,6 +53,8 @@ MODEL = os.environ.get("BENCH_MODEL", "gpt-6-luna")
 EFFORT = os.environ.get("BENCH_EFFORT", "medium")
 SERVICE_TIER = os.environ.get("BENCH_SERVICE_TIER", "default")
 TIMEOUT = int(os.environ.get("BENCH_TIMEOUT", "900"))
+DROID_TOOL_EXECUTION_MODES = ("direct-only", "script-only")
+DROID_TOOL_EXECUTION_MODE = os.environ.get("BENCH_DROID_TOOL_EXECUTION_MODE", "script-only")
 IGNORED = ("__pycache__", ".pytest_cache", ".git/", ".pi/", ".davinci/", ".codex/",
            ".davinci-transactions/", ".serena/")
 WORKSPACE_CONTRACT = (
@@ -244,6 +249,66 @@ def codemode_arm(settings):
     return mode
 
 
+def droid_settings_path(workdir):
+    """Per-run Droid settings file, beside the workspace like other run artifacts.
+
+    The graded workspace itself must stay clean, so the file is a sibling of the
+    workspace directory (matching ``.stdout.jsonl`` / ``.stderr.txt``).
+    """
+    return str(workdir) + ".droid-settings.json"
+
+
+def droid_settings(workdir, mode=None):
+    """Write the per-process Droid settings file that forces the tool-execution mode.
+
+    Never touches the user's ``~/.factory/settings.json`` or any CLIProxyAPI
+    config. Returns ``(path, content_sha256)`` so the row records the exact
+    bytes the arm was launched with.
+    """
+    mode = DROID_TOOL_EXECUTION_MODE if mode is None else mode
+    if mode not in DROID_TOOL_EXECUTION_MODES:
+        raise ValueError("droid tool-execution mode must be direct-only or script-only")
+    content = {"toolExecutionMode": mode}
+    payload = json.dumps(content, sort_keys=True, separators=(",", ":")) + "\n"
+    path = droid_settings_path(workdir)
+    Path(path).write_text(payload, encoding="utf-8")
+    return path, hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def droid_usage_for_run(stats, workdir):
+    """Merge Droid usage from the run's session artifacts into a parsed row.
+
+    Droid records totals in ``~/.factory/sessions/<id>.settings.json``
+    (``tokenUsage``) and the request count in ``Streaming result`` log lines.
+    This harness reads them through explicit environment overrides
+    (``BENCH_DROID_SESSION_SETTINGS``, ``BENCH_DROID_LOG``,
+    ``BENCH_DROID_SESSION_ID``); automatic discovery of the session id from a
+    live run is not re-checked (the live Droid self-test is deferred by ledger
+    ruling R3). Missing artifacts leave the fields ``None`` (INCOMPLETE),
+    never zero.
+    """
+    usage = {"input": None, "cached": None, "output": None, "reasoning": None}
+    requests = None
+    settings_path = os.environ.get("BENCH_DROID_SESSION_SETTINGS")
+    if settings_path and os.path.isfile(settings_path):
+        usage = droid_usage_from_session(settings_path)
+    log_path = os.environ.get("BENCH_DROID_LOG")
+    session_id = os.environ.get("BENCH_DROID_SESSION_ID")
+    if log_path and session_id and os.path.isfile(log_path):
+        counted = droid_request_count(
+            Path(log_path).read_text(encoding="utf-8", errors="replace"), session_id)
+        if counted is not None:
+            requests = counted["requests"]
+    stats["input"] = usage["input"]
+    stats["cached"] = usage["cached"]
+    stats["output"] = usage["output"]
+    stats["reasoning_tokens"] = usage["reasoning"]
+    stats["requests"] = requests
+    stats["usage_available"] = all(
+        value is not None for value in (usage["input"], usage["cached"], usage["output"], requests))
+    return stats
+
+
 def command(harness, prompt, workdir, settings=None):
     if harness == "davinci":
         # The /config switch silently stays off under --no-session, so an "on"
@@ -258,6 +323,22 @@ def command(harness, prompt, workdir, settings=None):
             "--provider", "openai-codex", "--model", MODEL, "--thinking", EFFORT,
             *(["--append-system-prompt", steer] if steer else []),
             "--permission-mode", "always-approve", "-p", prompt,
+        ]
+    if harness == "droid":
+        # Flags verified in droid-1.1.0-identity.md §2. The tool-execution mode
+        # is forced through the hidden --tool-execution-mode flag (the verified
+        # mechanism) and mirrored in a per-process --settings file written under
+        # the run directory (never the user's ~\.factory\settings.json), whose
+        # path and content hash are recorded in the row for reproducibility.
+        mode = DROID_TOOL_EXECUTION_MODE
+        settings_path, _ = droid_settings(workdir, mode)
+        return [
+            os.environ.get("BENCH_DROID", "droid"), "exec",
+            "--model", MODEL, "--auto", EFFORT,
+            "--tool-execution-mode", mode,
+            "--output-format", "stream-json",
+            "--settings", settings_path,
+            "--cwd", workdir, prompt,
         ]
     # --ignore-user-config drops a user's service_tier = "fast" (priority
     # processing davinci does not use), a max effort and MCP servers; auth is kept.
@@ -339,6 +420,19 @@ def parse_stream(harness, stdout):
             ):
                 stats["tool_calls"] += 1
                 stats["tools"][item["type"]] = stats["tools"].get(item["type"], 0) + 1
+        elif harness == "droid":
+            # Droid `--output-format stream-json`. Usage comes from the session
+            # settings file and the `Streaming result` log lines (droid_usage),
+            # never from this stream, so input/cached/output/requests stay None.
+            # Tool calls are counted from `tool_call` events; assistant text and
+            # reasoning items carry other `type` values and are excluded. The
+            # exact event schema is not re-checked (the live Droid self-test is
+            # deferred by ledger ruling R3).
+            if event.get("type") == "tool_call":
+                name = event.get("name") or event.get("toolName")
+                if isinstance(name, str) and name:
+                    stats["tool_calls"] += 1
+                    stats["tools"][name] = stats["tools"].get(name, 0) + 1
         else:
             update = event.get("assistantMessageEvent") or {}
             update = update if isinstance(update, dict) else {}
@@ -636,6 +730,8 @@ def run_one(harness, tid, rep, campaign=None):
             cleanup_complete = False
             ok, passed, failed, tail = False, 0, 0, str(error)
     s = parse_stream(harness, stdout)
+    if harness == "droid":
+        droid_usage_for_run(s, workdir)
     if collector:
         s.update(request_metrics(collector.records, collector.spans, collector.errors))
         Path(workdir + ".otel.json").write_text(json.dumps({
@@ -688,6 +784,9 @@ def run_one(harness, tid, rep, campaign=None):
         for field in ("private_suite_digest", "price_table_hash"):
             if field in campaign:
                 result[field] = campaign[field]
+    if harness == "droid":
+        settings_path, settings_hash = droid_settings(workdir, DROID_TOOL_EXECUTION_MODE)
+        result["droid_settings"] = {"path": settings_path, "sha256": settings_hash}
     result["pass"] = task_success(result)
     with open(os.path.join(RUNS, "results.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps(result) + "\n")
@@ -985,8 +1084,7 @@ def gate():
     sys.exit(0)
 
 
-def main():
-    global TASKS
+def build_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["validate", "run", "report", "gate", "compare", "private-import"])
     ap.add_argument("--private-manifest", help="owner-authored source commits and human prompts for private-import")
@@ -994,7 +1092,7 @@ def main():
     ap.add_argument("--private-suite", help="frozen private fixture directory")
     ap.add_argument("--price-table", help="explicit USD model price table to freeze with a new campaign")
     ap.add_argument("--split", choices=["dev", "holdout"], help="explicit private split; holdout is never a tuning set")
-    ap.add_argument("--harness", nargs="+", choices=["davinci", "codex"], default=["davinci", "codex"])
+    ap.add_argument("--harness", nargs="+", choices=["davinci", "codex", "droid"], default=["davinci", "codex"])
     ap.add_argument("--tasks", nargs="+", default=["all"])
     ap.add_argument("--reps", type=int, default=1)
     ap.add_argument("--rep-start", type=int, default=0)
@@ -1013,6 +1111,12 @@ def main():
     ap.add_argument("--candidate")
     ap.add_argument("--base-ref", help="declared PR target ref used to verify the actual parent merge-base")
     ap.add_argument("--parent-for", help="candidate source SHA when running a parent control; requires --base-ref")
+    return ap
+
+
+def main():
+    global TASKS
+    ap = build_parser()
     args = ap.parse_args()
     if not 1 <= args.grading_timeout <= 3600:
         ap.error("grading-timeout must be between 1 and 3600 seconds")

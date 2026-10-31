@@ -259,6 +259,50 @@ before hidden tests are overlaid. Fixture validation uses separate
 paths and test output; keep them with the local campaign evidence and review
 them before sharing. A receipt does not establish independent grader isolation.
 
+## Droid arm
+
+A `droid` arm runs Droid 1.1.0 through the same harness, schedule and grading as
+DaVinci and Codex. Select it with `--harness davinci droid` (or
+`--harness davinci codex droid`); `BENCH_DROID` selects the executable (default
+`droid` on PATH). `BENCH_MODEL`, `BENCH_EFFORT` and `BENCH_SERVICE_TIER` are
+shared with the other arms exactly as they are today.
+
+The arm builds an argv list, never a shell string:
+
+```sh
+droid exec --model <BENCH_MODEL> --auto <BENCH_EFFORT> \
+  --tool-execution-mode <direct-only|script-only> \
+  --output-format stream-json --settings <workspace>.droid-settings.json \
+  --cwd <workspace> <prompt>
+```
+
+`--tool-execution-mode` is the hidden flag Droid 1.1.0 still accepts
+(`docs/perf/droid-gap/droid-1.1.0-identity.md` §2). The mode is selected by
+`BENCH_DROID_TOOL_EXECUTION_MODE` (default `script-only`; the other value is
+`direct-only`).
+
+**Settings file.** The mode is also forced through a per-process `--settings`
+file written beside the run directory (`<workspace>.droid-settings.json`),
+never the user's `~/.factory/settings.json` or any CLIProxyAPI config. Its path
+and content SHA-256 are recorded in the result row (`droid_settings.path`,
+`droid_settings.sha256`) so the arm is reproducible.
+
+**Usage.** Droid usage is read from its own artifacts, not the stream. Totals
+(`input`, `cached`, `output`, `reasoning`) come from the session settings file
+`~/.factory/sessions/<id>.settings.json` `tokenUsage`, where `input` is total
+input (`inputTokens + cacheReadInputTokens`) and `cached` is
+`cacheReadInputTokens` (`scripts/bench/droid_usage.py`). Request count comes
+from `Streaming result` log lines filtered by session id; each line's `count`
+is the uncached prompt size. The stream (`--output-format stream-json`)
+supplies tool-call counts only. Automatic discovery of the session id from a
+live run is not re-checked (the live Droid self-test is deferred); the harness
+reads `BENCH_DROID_SESSION_SETTINGS`, `BENCH_DROID_LOG` and
+`BENCH_DROID_SESSION_ID` when the operator supplies them.
+
+**INCOMPLETE rule.** Any absent usage field stays `None`, never zero, and the
+row is marked incomplete via `usage_available: false`. A Droid row cannot pass
+request-reduction or per-success cost rules on missing usage.
+
 ## Metric definitions and acceptance
 
 ### Codex subscription acceptance
