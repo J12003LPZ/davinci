@@ -1858,7 +1858,10 @@ mod tests {
         commit_unique_work_on_branch(&lease);
         git_in(&lease.path, &["checkout", "--detach", &lease.base_head]);
 
-        assert!(manager.is_dirty(&lease), "the branch tip holds unmerged work");
+        assert!(
+            manager.is_dirty(&lease),
+            "the branch tip holds unmerged work"
+        );
         assert!(matches!(
             manager.release_lease(&lease, false),
             Err(WorktreeError::DirtyWorktreePreserved { .. })
@@ -1878,7 +1881,10 @@ mod tests {
         commit_unique_work_on_branch(&lease);
         std::fs::remove_dir_all(&lease.path).unwrap();
 
-        assert!(manager.is_dirty(&lease), "the branch tip holds unmerged work");
+        assert!(
+            manager.is_dirty(&lease),
+            "the branch tip holds unmerged work"
+        );
         assert!(matches!(
             manager.release_lease(&lease, false),
             Err(WorktreeError::DirtyWorktreePreserved { .. })
