@@ -126,6 +126,11 @@ pub struct McpRegistry {
     /// registry entry is removed or replaced, the window a stale caller needs.
     #[cfg(test)]
     retire_hook: Arc<Mutex<Option<FailureHook>>>,
+    /// Test seam: runs on the reconnect worker after it published a
+    /// replacement and dropped the registry lock, the window in which a call
+    /// on that replacement can fail.
+    #[cfg(test)]
+    published_hook: Arc<Mutex<Option<FailureHook>>>,
 }
 
 #[cfg(test)]
@@ -293,6 +298,18 @@ impl McpRegistry {
     fn run_retire_hook(&self) {
         let hook = self
             .retire_hook
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn run_published_hook(&self) {
+        let hook = self
+            .published_hook
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .clone();
@@ -632,6 +649,10 @@ impl McpRegistry {
         std::thread::spawn(move || {
             let (config, cwd) = reconnect;
             let mut last_error = String::from("MCP reconnect failed");
+            // Set when the publish released this worker's ownership under the
+            // same lock. From then on a newer worker may own the server, so
+            // this one must not touch `reconnecting` or the row again.
+            let mut released = false;
             for attempt in 0..3 {
                 if attempt > 0 {
                     std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 1)));
@@ -671,6 +692,14 @@ impl McpRegistry {
                             .trusted_read_only_servers
                             .extend(part.trusted_read_only_servers);
                         inner.rows.extend(part.rows);
+                        // Publishing and giving up ownership are one step: a
+                        // failure on the replacement that lands after the lock
+                        // drops must be able to schedule a fresh worker.
+                        inner.reconnecting.remove(&name);
+                        released = true;
+                        drop(inner);
+                        #[cfg(test)]
+                        worker.run_published_hook();
                         break;
                     }
                     break;
@@ -680,7 +709,7 @@ impl McpRegistry {
                 }
             }
 
-            {
+            if !released {
                 let mut inner = worker.lock();
                 inner.reconnecting.remove(&name);
                 if let Some(row) = inner.rows.iter_mut().find(|row| row.name == name) {
@@ -1895,6 +1924,64 @@ mod tests {
         assert_eq!(registry.rows()[0].status, "connected");
         assert!(registry.lock().reconnecting.is_empty());
         assert!(!registry.take_ready());
+    }
+
+    /// A call on the replacement fails after the worker published it and
+    /// before the worker's own bookkeeping ends. The failure must still be
+    /// able to start recovery: the server may not be left with no client and
+    /// no worker.
+    #[test]
+    fn a_replacement_that_fails_right_after_publishing_still_gets_recovered() {
+        let (_dir, registry, calls) = failing_remote_registry("mcp http 503: down");
+        let fired = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let done_tx = Mutex::new(done_tx);
+        *registry.published_hook.lock().unwrap() = Some({
+            let registry = registry.clone();
+            Arc::new(move || {
+                // Only the first publication is failed; the recovery's own
+                // replacement is left alone.
+                if fired.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let replacement = registry.client("memory").expect("replacement is published");
+                let _ = registry.failed_client(
+                    "memory",
+                    &replacement,
+                    davinci_mcp::Error::ambiguous_from(davinci_mcp::Error::Transport(
+                        "mcp http 503: down".into(),
+                    )),
+                );
+                done_tx.lock().unwrap().send(()).unwrap();
+            })
+        });
+
+        let error = registry
+            .call("memory", "ping", &json!({}), "call-1")
+            .unwrap_err();
+        assert!(matches!(error, ToolError::MayHaveRun(_)), "{error:?}");
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the replacement was never published");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while registry.client("memory").is_err() {
+            assert!(
+                !registry.lock().reconnecting.is_empty(),
+                "no client and no reconnect worker: the server is lost for good"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "recovery never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(registry.lock().reconnecting.is_empty());
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the ambiguous call was replayed on the old transport"
+        );
     }
 
     #[test]
