@@ -122,6 +122,86 @@ class DroidUsageTests(unittest.TestCase):
         self.assertIsNone(result["uncached_input"])
 
 
+class DroidPerRunTests(unittest.TestCase):
+    def _home(self, tmp, sessions, log_lines=()):
+        home = Path(tmp)
+        for sid in sessions:
+            d = home / "sessions" / "proj"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"{sid}.settings.json").write_text(json.dumps({"tokenUsage": {
+                "inputTokens": 10, "cacheReadInputTokens": 5,
+                "outputTokens": 3, "reasoningTokens": 1}}))
+        (home / "logs").mkdir(exist_ok=True)
+        (home / "logs" / "droid-log-single.log").write_text("\n".join(log_lines))
+        return home
+
+    @staticmethod
+    def _line(sid, count):
+        return '[t] INFO: Streaming result | Context: {"sessionId":"%s","count":%d}' % (sid, count)
+
+    def test_one_new_session_yields_usage_and_metrics_for_campaign(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._home(tmp, ["old"], [self._line("old", 1)])
+            before = droid_usage.droid_session_files(home)
+            self._home(tmp, ["old", "new"], [self._line("old", 1), self._line("new", 7),
+                                             self._line("new", 9)])
+            stats = bench.droid_usage_for_run({}, "w", before, home)
+            self.assertEqual(stats["input"], 15)
+            self.assertEqual(stats["requests"], 2)
+            self.assertEqual(stats["logical_requests"], 2)
+            self.assertIsNone(stats["provider_attempts"])
+            self.assertTrue(stats["request_metrics_available"])
+            self.assertTrue(stats["request_metrics_complete"])
+            self.assertEqual(stats["droid_log_uncached_input"], 16)
+            self.assertIsNone(stats["droid_usage_error"])
+            self.assertTrue(stats["usage_available"])
+            # campaign.py reads logical_requests per success; a droid row carries it.
+            self.assertIn("logical_requests", campaign.PER_SUCCESS_FIELDS)
+            r = campaign_row("droid")
+            r["logical_requests"] = stats["logical_requests"]
+            self.assertIsNotNone(r["logical_requests"])
+
+    def test_zero_or_many_new_sessions_leave_usage_none_with_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._home(tmp, [])
+            stats = bench.droid_usage_for_run({}, "w", set(), home)
+            self.assertIsNone(stats["input"])
+            self.assertIsNone(stats["logical_requests"])
+            self.assertFalse(stats["request_metrics_available"])
+            self.assertFalse(stats["usage_available"])
+            self.assertIn("found 0", stats["droid_usage_error"])
+            self._home(tmp, ["a", "b"], [self._line("a", 1), self._line("b", 1)])
+            stats = bench.droid_usage_for_run({}, "w", set(), home)
+            self.assertIsNone(stats["input"])
+            self.assertIsNone(stats["requests"])
+            self.assertIn("found 2", stats["droid_usage_error"])
+
+    def test_session_id_match_is_exact(self):
+        log = "\n".join([self._line("S", 1), self._line("S2", 1), self._line("S2", 1)])
+        self.assertEqual(droid_usage.droid_request_count(log, "S")["requests"], 1)
+        self.assertEqual(droid_usage.droid_request_count(log, "S2")["requests"], 2)
+        bare = "Streaming result session S2 count=4\nStreaming result session S count=3"
+        self.assertEqual(droid_usage.droid_request_count(bare, "S")["requests"], 1)
+
+
+class DroidGateTests(unittest.TestCase):
+    def _gate_code(self, harnesses):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "campaign.json").write_text(json.dumps({"harnesses": harnesses}))
+            with (patch.object(bench, "RUNS", tmp), patch.object(bench, "load_rows", return_value=[]),
+                  patch.object(bench, "campaign_errors", return_value=[]),
+                  patch("builtins.print")):
+                with self.assertRaises(SystemExit) as raised:
+                    bench.gate()
+            return raised.exception.code
+
+    def test_gate_harness_sets(self):
+        for ok in (["davinci", "codex"], ["davinci", "droid"], ["davinci", "codex", "droid"]):
+            self.assertEqual(self._gate_code(ok), 0, ok)
+        for bad in (["codex", "droid"], ["davinci"], ["davinci", "bogus"]):
+            self.assertEqual(self._gate_code(bad), 1, bad)
+
+
 class DroidCampaignTests(unittest.TestCase):
     def test_three_harness_schedule_rotates_first_positions(self):
         tasks = ["t1-intervals", "t2-duration", "t3-lru"]

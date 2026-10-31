@@ -6,7 +6,29 @@ session id. Both functions take text/JSON, never a live process, so they are
 unit-testable offline.
 """
 import json
+import os
 import re
+from pathlib import Path
+
+
+def droid_home(home=None):
+    """Droid data root: ``home`` argument, else ``BENCH_DROID_HOME``, else ``~/.factory``."""
+    return Path(home or os.environ.get("BENCH_DROID_HOME") or Path.home() / ".factory")
+
+
+def droid_session_files(home=None):
+    """Set of ``*.settings.json`` paths under ``<home>/sessions`` (read-only listing)."""
+    root = droid_home(home) / "sessions"
+    return {str(path) for path in root.rglob("*.settings.json")} if root.is_dir() else set()
+
+
+def droid_log_text(home=None):
+    """Concatenated text of ``droid-log-single.log`` and its dated rotations."""
+    logs = droid_home(home) / "logs"
+    if not logs.is_dir():
+        return ""
+    return "\n".join(path.read_text(encoding="utf-8", errors="replace")
+                     for path in sorted(logs.glob("droid-log-single*.log*")) if path.is_file())
 
 
 def _non_negative_int(value):
@@ -55,6 +77,24 @@ def _count_from_line(line):
     return None
 
 
+def _line_has_session(line, session_id):
+    """Exact session match: the JSON context's ``sessionId`` when present,
+    otherwise the id as a whole token (not a prefix of a longer id)."""
+    found_context = False
+    for token in re.findall(r"\{[^{}]*\}", line):
+        try:
+            obj = json.loads(token)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and "sessionId" in obj:
+            found_context = True
+            if obj["sessionId"] == session_id:
+                return True
+    if found_context:
+        return False
+    return re.search(r"(?<![\w-])" + re.escape(session_id) + r"(?![\w-])", line) is not None
+
+
 def droid_request_count(log_text, session_id):
     """Count ``Streaming result`` lines for a session and sum their sizes.
 
@@ -65,7 +105,7 @@ def droid_request_count(log_text, session_id):
     """
     sizes = []
     for line in log_text.splitlines():
-        if "Streaming result" not in line or session_id not in line:
+        if "Streaming result" not in line or not _line_has_session(line, session_id):
             continue
         sizes.append(_count_from_line(line))
     if not sizes:

@@ -289,15 +289,25 @@ and content SHA-256 are recorded in the result row (`droid_settings.path`,
 
 **Usage.** Droid usage is read from its own artifacts, not the stream. Totals
 (`input`, `cached`, `output`, `reasoning`) come from the session settings file
-`~/.factory/sessions/<id>.settings.json` `tokenUsage`, where `input` is total
+`~/.factory/sessions/*/<id>.settings.json` `tokenUsage`, where `input` is total
 input (`inputTokens + cacheReadInputTokens`) and `cached` is
 `cacheReadInputTokens` (`scripts/bench/droid_usage.py`). Request count comes
-from `Streaming result` log lines filtered by session id; each line's `count`
-is the uncached prompt size. The stream (`--output-format stream-json`)
-supplies tool-call counts only. Automatic discovery of the session id from a
-live run is not re-checked (the live Droid self-test is deferred); the harness
-reads `BENCH_DROID_SESSION_SETTINGS`, `BENCH_DROID_LOG` and
-`BENCH_DROID_SESSION_ID` when the operator supplies them.
+from `Streaming result` log lines (`~/.factory/logs/droid-log-single.log` and its
+dated rotations) matching the session id exactly; one line is one request, and
+each line's `count` is the uncached prompt size (their sum is kept as
+`droid_log_uncached_input`, a cross-check only). The stream
+(`--output-format stream-json`) supplies tool-call counts only.
+
+The session is discovered per run: the harness snapshots the `*.settings.json`
+files under the sessions root right before the process starts and diffs after
+it. Exactly one new file gives the session id (its stem); zero or several leave
+the usage fields `None` and record the reason in `droid_usage_error`. The only
+override is `BENCH_DROID_HOME`, which names the Droid data root (default
+`~/.factory`, holding `sessions/` and `logs/`) and exists for tests. This rule
+is not re-checked against a live 1.1.0 run (ruling R3), and concurrent Droid
+runs on the machine make the diff ambiguous and the row INCOMPLETE. Droid
+exposes no retry visibility, so `logical_requests` equals `requests` and
+`provider_attempts` is `None`.
 
 **INCOMPLETE rule.** Any absent usage field stays `None`, never zero, and the
 row is marked incomplete via `usage_available: false`. A Droid row cannot pass

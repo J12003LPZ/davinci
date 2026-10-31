@@ -44,7 +44,8 @@ from codex_otel import Collector, request_metrics
 from private_suite import apply_hidden, argv, import_suite, load_frozen, run_check, GradingLifecycleError
 from readiness_metrics import report as readiness_report, load_prices
 import subscription_campaign
-from droid_usage import droid_usage_from_session, droid_request_count
+from droid_usage import (droid_usage_from_session, droid_request_count,
+                         droid_session_files, droid_log_text)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TASKS = os.path.join(HERE, "tasks")
@@ -275,35 +276,46 @@ def droid_settings(workdir, mode=None):
     return path, hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def droid_usage_for_run(stats, workdir):
-    """Merge Droid usage from the run's session artifacts into a parsed row.
+def droid_usage_for_run(stats, workdir, before=None, home=None):
+    """Merge Droid usage from this run's own session into a parsed row.
 
-    Droid records totals in ``~/.factory/sessions/<id>.settings.json``
-    (``tokenUsage``) and the request count in ``Streaming result`` log lines.
-    This harness reads them through explicit environment overrides
-    (``BENCH_DROID_SESSION_SETTINGS``, ``BENCH_DROID_LOG``,
-    ``BENCH_DROID_SESSION_ID``); automatic discovery of the session id from a
-    live run is not re-checked (the live Droid self-test is deferred by ledger
-    ruling R3). Missing artifacts leave the fields ``None`` (INCOMPLETE),
-    never zero.
+    ``before`` is the set of ``*.settings.json`` files under the Droid sessions
+    root snapshotted right before the process started
+    (``droid_session_files``). Exactly one new file means its stem is the
+    session id; zero or several new files leave every usage field ``None`` and
+    record ``droid_usage_error`` (never a guess; concurrent Droid runs make the
+    diff ambiguous). The request count is the number of ``Streaming result``
+    log lines for that session id. This discovery rule is not re-checked
+    against a live 1.1.0 run (ledger ruling R3).
     """
     usage = {"input": None, "cached": None, "output": None, "reasoning": None}
-    requests = None
-    settings_path = os.environ.get("BENCH_DROID_SESSION_SETTINGS")
-    if settings_path and os.path.isfile(settings_path):
-        usage = droid_usage_from_session(settings_path)
-    log_path = os.environ.get("BENCH_DROID_LOG")
-    session_id = os.environ.get("BENCH_DROID_SESSION_ID")
-    if log_path and session_id and os.path.isfile(log_path):
-        counted = droid_request_count(
-            Path(log_path).read_text(encoding="utf-8", errors="replace"), session_id)
-        if counted is not None:
-            requests = counted["requests"]
+    requests = uncached = error = None
+    new = droid_session_files(home) - (before or set())
+    if len(new) != 1:
+        error = f"expected exactly one new droid session settings file, found {len(new)}"
+    else:
+        settings_path = next(iter(new))
+        session_id = Path(settings_path).name[:-len(".settings.json")]
+        try:
+            usage = droid_usage_from_session(settings_path)
+        except (OSError, ValueError) as exc:
+            error = f"unreadable session settings: {type(exc).__name__}"
+        counted = droid_request_count(droid_log_text(home), session_id)
+        if counted is None:
+            error = error or "no Streaming result log lines for the session"
+        else:
+            requests, uncached = counted["requests"], counted["uncached_input"]
     stats["input"] = usage["input"]
     stats["cached"] = usage["cached"]
     stats["output"] = usage["output"]
     stats["reasoning_tokens"] = usage["reasoning"]
     stats["requests"] = requests
+    # Mirror the codex arm; Droid exposes no retry visibility, so attempts stay unknown.
+    stats["logical_requests"] = requests
+    stats["provider_attempts"] = None
+    stats["request_metrics_available"] = stats["request_metrics_complete"] = requests is not None
+    stats["droid_log_uncached_input"] = uncached
+    stats["droid_usage_error"] = error
     stats["usage_available"] = all(
         value is not None for value in (usage["input"], usage["cached"], usage["output"], requests))
     return stats
@@ -644,6 +656,7 @@ def run_one(harness, tid, rep, campaign=None):
     prepare(tid, workdir)
     env = (controlled_environment(os.environ, campaign["agent_dir"], subscription_only=bool(subscription))
            if campaign else dict(os.environ, PI_LEARNING_DISABLE_BACKGROUND="1", PYTHONUTF8="1"))
+    droid_before = None
     with Collector() if harness == "codex" else nullcontext() as collector:
         settings = campaign["identities"][harness].get("effective_settings") if campaign else None
         args = command(harness, WORKSPACE_CONTRACT + spec["prompt"], workdir, settings)
@@ -671,6 +684,8 @@ def run_one(harness, tid, rep, campaign=None):
             for value in collector.overrides():
                 args[-1:-1] = ["-c", value]
         timeout = min(TIMEOUT, subscription_campaign.remaining_seconds(subscription)) if subscription else TIMEOUT
+        if harness == "droid":
+            droid_before = droid_session_files()
         measured = execute(args, workdir, env, timeout)
     code, stdout, stderr = measured["exit"], measured["stdout"], measured["stderr"]
     stopped = ("cleanup_failed" if measured.get("cleanup_complete") is not True else None)
@@ -731,7 +746,7 @@ def run_one(harness, tid, rep, campaign=None):
             ok, passed, failed, tail = False, 0, 0, str(error)
     s = parse_stream(harness, stdout)
     if harness == "droid":
-        droid_usage_for_run(s, workdir)
+        droid_usage_for_run(s, workdir, droid_before)
     if collector:
         s.update(request_metrics(collector.records, collector.spans, collector.errors))
         Path(workdir + ".otel.json").write_text(json.dumps({
@@ -787,6 +802,8 @@ def run_one(harness, tid, rep, campaign=None):
     if harness == "droid":
         settings_path, settings_hash = droid_settings(workdir, DROID_TOOL_EXECUTION_MODE)
         result["droid_settings"] = {"path": settings_path, "sha256": settings_hash}
+        result["droid_log_uncached_input"] = s.get("droid_log_uncached_input")
+        result["droid_usage_error"] = s.get("droid_usage_error")
     result["pass"] = task_success(result)
     with open(os.path.join(RUNS, "results.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps(result) + "\n")
@@ -1074,8 +1091,9 @@ def gate():
     rows = load_rows()
     errors = campaign_errors(RUNS, rows)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if set(manifest.get("harnesses", [])) != {"davinci", "codex"}:
-        errors.append("paired screening requires both DaVinci and Codex")
+    harnesses = set(manifest.get("harnesses", []))
+    if "davinci" not in harnesses or not harnesses & {"codex", "droid"} or harnesses - {"davinci", "codex", "droid"}:
+        errors.append("paired screening requires DaVinci and at least one of Codex or Droid")
     if errors:
         print("FAIL campaign completeness: " + "; ".join(errors))
         sys.exit(1)
