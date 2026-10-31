@@ -162,7 +162,8 @@ nested_task_delegation_limits:
   {"max_depth":1,"max_active_descendants_per_root":8,"max_active_task_subagents_per_daemon":15}
 ```
 
-The snapshot file this run wrote has `fileSize 13461`, `fileMtime 2026-10-31T18:45:06.824Z`,
+The snapshot this run wrote records `fileSize 13461` (the source `feature-flags.json` cache
+size, not the snapshot's own size), `fileMtime 2026-10-31T18:45:06.824Z`,
 `lastStartupVersion 1.1.0`, 19 flags, 12 Script models.
 
 The 1.0.0 reference records the byte-for-byte identical allow-list, identical 19 flag values and
@@ -176,7 +177,7 @@ Labels: `same as 1.0.0` / `changed` / `not re-checked`.
 | # | Fact the plan relies on | Label | Evidence |
 |---|---|---|---|
 | 1 | `--tool-execution-mode` hidden flag exists | **same as 1.0.0** | accepted + validated: `--tool-execution-mode bogus` → `error: ... Expected direct-only or script-only`; `direct-only`/`script-only` run exit 0. Absent from help in both versions. |
-| 2 | `--auto` levels | **same as 1.0.0** | 1.1.0 help: `--auto <level>  Autonomy level: low|medium|high`; DEFAULT (no flag) = read-only (1.0.0 `autonomyLevel off` ≈ no-flag read-only). |
+| 2 | `--auto` levels | **same as 1.0.0** | 1.1.0 CLI flag accepts three values `low|medium|high`; the no-flag DEFAULT is read-only, which corresponds to the settings-enum value `off` (the settings `autonomyLevel` enum has four values `off|low|medium|high`). Same surface as 1.0.0. |
 | 3 | `--list-tools` availability | **same as 1.0.0** | present in help; exits before any model call; returns 30 tools for the GPT-family alias (1.0.0: 30 GPT / 31 Claude). |
 | 4 | Script-mode tool count / bytes (5 / 29,728 B) | **not re-checked** | needs the mock capture (ch. 19 §2.1); mock suite forbidden (R3 — binds 8317 where CLIProxyAPI runs). |
 | 5 | Direct-mode tool count / bytes (23 / 69,689 B) | **not re-checked** | needs the mock capture (ch. 19 §2.1); same R3 reason. |
@@ -186,7 +187,7 @@ Labels: `same as 1.0.0` / `changed` / `not re-checked`.
 | 9 | Script allow-list (12 models) | **same as 1.0.0** | `effective-config.js` 1.1.0 list is byte-identical to 1.0.0's (reference lines 5013–5024). |
 | 10 | Subagent limits (1 / 8 / 15) | **same as 1.0.0** | `nested_task_delegation_limits {max_depth:1, max_active_descendants_per_root:8, max_active_task_subagents_per_daemon:15}` identical (reference 5027–5031). |
 | 11 | Compaction flags | **same as 1.0.0** | `adaptive_compaction_prompt=true`, `mid_conversation_tool_changes=true`; all 19 flags identical to 1.0.0 snapshot (reference 4989–5008). |
-| 12 | Model alias resolution (`custom:Codex-via-ChatGPT-(gpt-6.1-sol)-0`) | **same as 1.0.0** | alias resolves to "Codex via ChatGPT (gpt-6.1-sol)"; `--list-tools` works; settings.json still maps `baseUrl http://localhost:8317/v1`, `provider openai`. |
+| 12 | Model alias resolution (`custom:Codex-via-ChatGPT-(gpt-6.1-sol)-0`) | **not re-checked** | Established this session: the CLI accepts the alias and maps it to the display name "Codex via ChatGPT (gpt-6.1-sol)"; `--list-tools` runs against it; settings.json still maps `baseUrl http://localhost:8317/v1`, `provider openai`. Not established: whether the alias resolves to the allow-list entry `gpt-6.1-sol` for Script mode — the 1.0.0 reference grades that Inferred/Unknown (`ya()` unresolved, reference line 3643), and `--list-tools` only prints the base catalog built *before* mode resolution (`jZ`), with `Script`/`WaitForScript` injected at session scope (reference line 3748; see §3). |
 | 13 | Proxy endpoint as part of the system under test | **changed** | endpoint URL config unchanged (`http://localhost:8317/v1`), but liveness changed: 1.0.0 `connection refused` (ch. 16 §2.1) → 1.1.0 **listening** (`Test-NetConnection 127.0.0.1:8317` → `TcpTestSucceeded=True`). |
 
 Additional identity deltas (not part of the 13 relied-on facts above, but recorded because
