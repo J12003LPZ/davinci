@@ -231,10 +231,10 @@ The bench-row fields the study reads, checked against `scripts/bench/bench.py`,
 | `exit`, `grader_pass`, `unrelated`, `cleanup_complete`, `transaction_leak`, `artifact_leak`, `pass` | pass definition (`campaign.task_success`) | set | set |
 | `stop_reason`, `inspection_error` | infrastructure-failure classification | set | set |
 | `wall_s` | `wall_ms` | set | set |
-| `input_tokens` | `input_total`, `input_uncached` | set | Droid `inputTokens + cacheReadInputTokens`, or `None` |
-| `cached_tokens` | `input_uncached` | set | Droid `cacheReadInputTokens`, or `None` |
+| `input_tokens` | `input_total`, `input_uncached` | set | Droid `inputTokens + cacheReadTokens`, or `None` |
+| `cached_tokens` | `input_uncached` | set | Droid `cacheReadTokens` (1.0.0 name `cacheReadInputTokens` accepted), or `None` |
 | `output_tokens` | `output_plus_reasoning` | set | Droid `outputTokens`, or `None` |
-| `reasoning_tokens` | `output_plus_reasoning` | set | Droid `reasoningTokens`, or `None` |
+| `reasoning_tokens` | `output_plus_reasoning` | set | Droid `thinkingTokens` (1.0.0 name `reasoningTokens` accepted), or `None` |
 | `reasoning_included_in_output` | `output_plus_reasoning` | `True` | `True` (hard-coded for every harness; see G3) |
 | `logical_requests` | `requests` | set | equal to `requests` (count of `Streaming result` lines) |
 | `requests` | cross-check of `logical_requests` | set | set |
@@ -267,8 +267,9 @@ parser; G3, G8 and G9 are procedural and unchanged. Nothing below has been run l
   source needs `pwsh` and the fixtures root; it fails loudly without them.
 - **G2. Resolved tool-execution mode: resolved in code.** Rows carry
   `droid_resolved_tool_execution_mode` (the session settings key `toolExecutionMode`, or `None`) and
-  `droid_mode_mismatch`. The key name comes from the 1.0.0 reference and is not re-checked for 1.1.0,
-  so a `None` here means "not recorded", not "default".
+  `droid_mode_mismatch`. A live 1.1.0 session file records the mode as `script_only` / `direct_only`;
+  the comparison normalises `_` and `-`, and the raw value is stored. A `None` means "not recorded",
+  not "default".
 - **G3. Reasoning accounting for Droid: procedural, unchanged.** Apply the smoke-row rule, then run
   the analysis with `--droid-reasoning-excluded` if it says Droid's output excludes reasoning.
 - **G4. Arm identity: resolved in code.** The harness names `droid-direct` and `droid-script` pin the
@@ -278,7 +279,9 @@ parser; G3, G8 and G9 are procedural and unchanged. Nothing below has been run l
 - **G5. Model and effort: resolved in code, with one limit that remains.** The Droid model is
   `BENCH_DROID_MODEL` (fallback `BENCH_MODEL`); `--auto` is autonomy from `BENCH_DROID_AUTO`
   (default `high`) and no longer takes `BENCH_EFFORT`. Rows record `droid_model`, `droid_auto` and
-  `droid_reasoning_effort: "not forced"`. **Remaining:** Droid 1.1.0 documents no reasoning-effort
+  `droid_reasoning_effort: "not forced"`, and the session file's own `reasoningEffort` and `model` are
+  recorded as `droid_session_reasoning_effort` and `droid_session_model`, so the effort Droid actually
+  used is observed even though it is not forced. **Remaining:** Droid 1.1.0 documents no reasoning-effort
   flag for `droid exec`, so "effort high" is not forced on the Droid model; it follows the proxy model
   configuration, which the bench must not write. The study therefore compares DaVinci at high effort
   against Droid at whatever effort that configuration gives, and the report must say so.

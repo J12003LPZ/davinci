@@ -308,8 +308,12 @@ and content SHA-256 are recorded in the result row (`droid_settings.path`,
 **Usage.** Droid usage is read from its own artifacts, not the stream. Totals
 (`input`, `cached`, `output`, `reasoning`) come from the session settings file
 `~/.factory/sessions/*/<id>.settings.json` `tokenUsage`, where `input` is total
-input (`inputTokens + cacheReadInputTokens`) and `cached` is
-`cacheReadInputTokens` (`scripts/bench/droid_usage.py`). Request count comes
+input (`inputTokens + cached`), `cached` is `cacheReadTokens`, `output` is
+`outputTokens` and `reasoning` is `thinkingTokens`; these are the names observed
+in a real 1.1.0 session file, and the 1.0.0 names (`cacheReadInputTokens`,
+`reasoningTokens`) are still accepted as a fallback
+(`scripts/bench/droid_usage.py`). A live 1.1.0 session confirmed that the log's
+summed `count` equals `inputTokens`, i.e. `count` is the uncached prompt size. Request count comes
 from `Streaming result` log lines (`~/.factory/logs/droid-log-single.log` and its
 dated rotations) matching the session id exactly; one line is one request, and
 each line's `count` is the uncached prompt size (their sum is kept as
@@ -328,11 +332,24 @@ exposes no retry visibility, so `logical_requests` equals `requests` and
 `provider_attempts` is `None`.
 
 **Resolved mode.** After the run, `toolExecutionMode` is read from the discovered
-session settings file into `droid_resolved_tool_execution_mode` (`None` when the
-key is absent). `droid_mode_mismatch` is `True` when it differs from the
-requested mode, `False` when equal, `None` when unknown. The key name comes from
-the 1.0.0 reference and is not re-checked for 1.1.0; the gap analysis excludes
-rows with `droid_mode_mismatch: true`.
+session settings file into `droid_resolved_tool_execution_mode` as recorded
+(`None` when the key is absent). A real 1.1.0 file spells it with underscores
+(`script_only`, `direct_only`); the comparison normalises `_` to `-`, so
+`droid_mode_mismatch` is `False` when it equals the requested mode in either
+spelling, `True` when it differs, `None` when unknown. The gap analysis excludes
+rows with `droid_mode_mismatch: true`. The session file's `reasoningEffort` and
+`model` are recorded as `droid_session_reasoning_effort` and
+`droid_session_model` (plus `droid_session_id` and `droid_session_settings`):
+effort is observed, still not forced.
+
+**Re-deriving usage.** `python scripts/bench/droid_usage.py rederive RUNS_DIR
+[--home DIR]` recomputes the Droid usage fields for the Droid rows of
+`results.jsonl` from the preserved session files and prints one JSON line per
+row, next to the values the row holds. A row's session is its recorded
+`droid_session_id`, or else the one session id under the sessions root that
+appears in the run's saved `<harness>/<task>-r<rep>.stdout.jsonl`; zero or
+several matches print an `error`. It is read-only and never rewrites
+`results.jsonl`.
 
 **INCOMPLETE rule.** Any absent usage field stays `None`, never zero, and the
 row is marked incomplete via `usage_available: false`. A Droid row cannot pass

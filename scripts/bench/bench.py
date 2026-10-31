@@ -48,7 +48,8 @@ import subscription_campaign
 import droid_arm
 import task_sources
 from droid_usage import (droid_usage_from_session, droid_request_count,
-                         droid_session_files, droid_log_text, droid_session_mode)
+                         droid_session_files, droid_log_text, droid_session_fields,
+                         normalize_mode)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TASKS = os.path.join(HERE, "tasks")
@@ -319,14 +320,16 @@ def droid_usage_for_run(stats, workdir, before=None, home=None, requested_mode=N
     against a live 1.1.0 run (ledger ruling R3).
     """
     usage = {"input": None, "cached": None, "output": None, "reasoning": None}
-    requests = uncached = error = resolved = None
+    requests = uncached = error = resolved = session_id = settings_path = None
+    fields = {"reasoning_effort": None, "model": None}
     new = droid_session_files(home) - (before or set())
     if len(new) != 1:
         error = f"expected exactly one new droid session settings file, found {len(new)}"
     else:
         settings_path = next(iter(new))
         session_id = Path(settings_path).name[:-len(".settings.json")]
-        resolved = droid_session_mode(settings_path)
+        fields = droid_session_fields(settings_path)
+        resolved = fields["mode"]
         try:
             usage = droid_usage_from_session(settings_path)
         except (OSError, ValueError) as exc:
@@ -351,7 +354,12 @@ def droid_usage_for_run(stats, workdir, before=None, home=None, requested_mode=N
     # from the 1.0.0 reference; not re-checked for 1.1.0). None when absent.
     stats["droid_resolved_tool_execution_mode"] = resolved
     stats["droid_mode_mismatch"] = (None if resolved is None or requested_mode is None
-                                    else resolved != requested_mode)
+                                    else normalize_mode(resolved) != normalize_mode(requested_mode))
+    # Observed in the session file: recorded, not forced by the bench (G5).
+    stats["droid_session_reasoning_effort"] = fields["reasoning_effort"]
+    stats["droid_session_model"] = fields["model"]
+    stats["droid_session_id"] = session_id
+    stats["droid_session_settings"] = settings_path
     stats["usage_available"] = all(
         value is not None for value in (usage["input"], usage["cached"], usage["output"], requests))
     return stats
@@ -847,6 +855,9 @@ def run_one(harness, tid, rep, campaign=None, warmup=False):
         result["droid_tool_execution_mode"] = mode
         result["droid_resolved_tool_execution_mode"] = s.get("droid_resolved_tool_execution_mode")
         result["droid_mode_mismatch"] = s.get("droid_mode_mismatch")
+        for key in ("droid_session_reasoning_effort", "droid_session_model",
+                    "droid_session_id", "droid_session_settings"):
+            result[key] = s.get(key)
         result["droid_model"] = droid_arm.droid_model(MODEL)
         result["droid_auto"] = droid_arm.droid_auto()
         result["droid_reasoning_effort"] = droid_arm.REASONING_EFFORT
