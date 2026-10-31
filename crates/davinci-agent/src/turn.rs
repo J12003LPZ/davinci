@@ -9557,6 +9557,88 @@ mod tests {
             crate::tool_ledger::ToolSideEffect::ReadOnly
         );
     }
+
+    #[test]
+    fn watchdog_pending_signal_queues_repair_reminder_and_continues() {
+        use crate::runtime::progress_watchdog::LoopSignal;
+        let mut agent = Agent::new("watchdog nudge fixture");
+        agent.prompt("Repair the failing assertion");
+        let watchdog = agent.runtime.as_ref().unwrap().progress_watchdog.clone();
+        watchdog
+            .lock()
+            .unwrap()
+            .pause(LoopSignal::RepeatedUnchangedReads {
+                path: "src/lib.rs".into(),
+                count: 3,
+            });
+
+        let calls = std::cell::Cell::new(0);
+        let events = agent
+            .run_loop(|_| {
+                calls.set(calls.get() + 1);
+                Ok(AssistantMessage {
+                    extra: Default::default(),
+                    id: "done".into(),
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::Text {
+                        text: "Done".into(),
+                    }],
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(StopReason::Stop),
+                    error_message: None,
+                })
+            })
+            .unwrap();
+
+        // The first signal queued a completion.repair reminder ...
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::MessageStart { message, .. }
+                if message
+                    .extra
+                    .get("davinciCapabilityReminder")
+                    .and_then(Value::as_str)
+                    == Some("completion.repair")
+        )));
+        // ... and the run continued to the provider instead of finishing early.
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::CompletionNotice { reason_code, .. }
+                if reason_code == "completion.no_progress"
+        )));
+        assert_eq!(calls.get(), 1, "the run must continue past the nudge");
+    }
+
+    #[test]
+    fn watchdog_escalated_signal_stops_run_without_provider_call() {
+        use crate::runtime::progress_watchdog::LoopSignal;
+        let mut agent = Agent::new("watchdog stop fixture");
+        agent.prompt("Repair the failing assertion");
+        let watchdog = agent.runtime.as_ref().unwrap().progress_watchdog.clone();
+        let signal = LoopSignal::RepeatedUnchangedReads {
+            path: "src/lib.rs".into(),
+            count: 3,
+        };
+        {
+            let mut guard = watchdog.lock().unwrap();
+            guard.pause(signal.clone());
+            guard.repair_action();
+            guard.pause(signal);
+        }
+
+        let events = agent
+            .run_loop(|_| -> Result<AssistantMessage, String> {
+                panic!("a stopped run dispatched another provider request")
+            })
+            .unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::CompletionNotice { reason_code, .. }
+                if reason_code == "completion.no_progress"
+        )));
+    }
 }
 
 #[cfg(test)]
