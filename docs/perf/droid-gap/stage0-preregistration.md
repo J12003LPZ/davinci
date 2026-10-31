@@ -131,6 +131,32 @@ as "the" metric after the data is seen; the Stage 1 triggers that name a metric 
 read it from this table as it stands. With few eligible tasks the interval is wide and the label will
 normally be `NO_CLEAR_GAP`; `n` is printed so the reader can see that.
 
+### Clarifications (readings where the text above is silent; not changes)
+
+These are implemented in `scripts/bench/gap_study.py` and fixed here before any run.
+
+- **Arm of a row:** the harness name (`davinci`, `droid-direct`, `droid-script`). A plain `droid` row
+  is assigned by its recorded `droid_tool_execution_mode`.
+- **One repetition:** the analysis stops with an error if an arm has more than one row for a task.
+- **Rows read:** `results.jsonl` only. `warmup.jsonl` and any row with `scored: false` are never read.
+- **INCOMPLETE rows:** a row with `usage_available` not true or `logical_requests` missing keeps its
+  pass or fail in the pass counts (a failure is a failure) but is left out of every ratio, counted
+  as `incomplete`. A row with `droid_mode_mismatch: true` is left out of ratios the same way, counted
+  as `mode_mismatch`.
+- **Pairing:** a task enters an estimate only if both arms pass, neither row is excluded above, and
+  both metric values are finite and greater than zero.
+- **Bootstrap:** a task is drawn with replacement `n` times per resample (`n` = eligible tasks), the
+  geometric mean is recomputed, and the interval is the 5th and 95th percentiles of the sorted
+  resample means (indexes `floor(0.05 B)` and `ceil(0.95 B) - 1` for `B` resamples). The seed is an
+  explicit required input.
+- **Few or no tasks:** with `n = 0` there is no estimate and the label is `NO_CLEAR_GAP` with `n = 0`
+  printed. With `n = 1` the interval collapses to the single ratio. No fourth label is added.
+- **Output plus reasoning:** `output_tokens` when the row says reasoning is included, otherwise
+  `output_tokens + reasoning_tokens`. The smoke-row check in G3 is applied with
+  `--droid-reasoning-excluded`.
+- **Success gap:** needs the human-read cause for each discordant task (`--causes`); without causes
+  the analysis reports none.
+
 ## 5. Gap rule
 
 | Label | Condition |
@@ -218,51 +244,52 @@ The bench-row fields the study reads, checked against `scripts/bench/bench.py`,
 | `droid_usage_error` | reason a Droid row is `INCOMPLETE` | not present | `None`, or why the session or its usage could not be identified |
 | `droid_log_uncached_input` | cross-check only; summed log `count`, never used in a ratio | not present | sum of the log `count` values, or `None` |
 | `droid_settings` (`path`, `sha256`) | records the requested tool-execution mode file | not present | set |
+| `droid_tool_execution_mode` | which Droid arm a row is (requested mode) | not present | set (`direct-only` or `script-only`) |
+| `droid_resolved_tool_execution_mode`, `droid_mode_mismatch` | the mode Droid resolved, and whether it differs; mismatched rows are left out of ratios | not present | set, or `None` when the session file has no `toolExecutionMode` |
+| `droid_model`, `droid_auto`, `droid_reasoning_effort` | model alias, autonomy level, and `"not forced"` | not present | set |
+| `scored` | `false` only on warm-up rows, which are written to `warmup.jsonl` and never read | `false` on warm-up only | `false` on warm-up only |
 | `codemode_mode`, `context_vm` | the DaVinci `/config` modes to record (D2) | set | `None` |
 | `execution_mode`, `model`, `effort_policy`, `service_tier`, `binary_sha256`, `campaign`, `fixture_hash` | provenance and pins (campaign rows) | set | set |
 
 An arm row is `INCOMPLETE` when `usage_available` is not true or `logical_requests` is `None`. An
 `INCOMPLETE` row is not scored, is not imputed, and aborts the smoke test.
 
-### Gaps for the parser (named, not assumed)
+### Parser gaps: status
 
-The study cannot be run as written until these are resolved. None is resolved by this document.
+The first version of this document named G1 to G9. G1, G2, G4, G5, G6 and G7 are now closed in the
+parser; G3, G8 and G9 are procedural and unchanged. Nothing below has been run live.
 
-- **G1. Task coverage.** `bench.py` loads tasks only from `scripts/bench/tasks/<id>/task.json`. There is
-  no adapter for the 6 `verified-core` tasks (graded by `cargo test` in `crates/davinci-evals`) or the 3
-  research fixtures (graded by `grade.ps1`). Only the 8 public tasks are runnable. Nine of the 17 tasks
-  have no bench path today.
-- **G2. Resolved tool-execution mode.** D2 requires the resolved mode to be recorded from the session
-  settings. The row records only the requested mode, as the path and SHA-256 of the per-process
-  settings file (`droid_settings`). `droid_usage.py` reads only `tokenUsage` from the session file.
-- **G3. Reasoning accounting for Droid.** `reasoning_included_in_output` is set to `True` for every
-  harness. That is verified for the Responses route DaVinci uses; it is not verified for Droid's
-  `outputTokens`. If Droid's `outputTokens` excludes reasoning, `output_plus_reasoning` would be
-  understated. Pre-registered check: in the smoke rows, if `reasoning_tokens` exceeds `output_tokens`
-  for a Droid row, the inclusion assumption is false for Droid and the metric for Droid is
-  `output_tokens + reasoning_tokens`; this is decided before the 51 runs, from the smoke rows only.
-- **G4. Arm identity.** The harness name is `droid` for both Droid arms and the mode comes from the
-  process-wide `BENCH_DROID_TOOL_EXECUTION_MODE`, so a row does not say which Droid arm it is and
-  `campaign.py schedule()` (which needs unique harness names) cannot schedule `Droid-direct` and
-  `Droid-script` in one campaign. Two arm names, or a recorded `droid_tool_execution_mode` field, are
-  needed.
-- **G5. Model and effort per harness.** `command()` passes the one `BENCH_MODEL` to every harness, but
-  Droid needs the proxy alias (`custom:Codex-via-ChatGPT-(gpt-6.1-sol)-0`), not `gpt-6.1-sol`. For
-  Droid, `--auto` is given `BENCH_EFFORT`, but `--auto` is Droid's autonomy level
-  (`low|medium|high`), not model reasoning effort, so "effort high" is not forced on the Droid model by
-  this flag.
-- **G6. Warm-up marker.** Rows have no "unscored" marker, and `run_one` appends every run to
-  `results.jsonl`. Warm-ups need a marker or a separate runs directory so they cannot enter the
-  integrity check or the ratios.
-- **G7. Analysis script.** No script computes the geometric mean and the 90% task-level bootstrap in
-  section 4. `campaign.py` has a 95% paired percentile bootstrap with a different design. The plan
-  requires "the gap table produced by the preregistered script", so this script must be written,
-  reviewed and committed before the first live run, and its hash recorded in the approval block.
-- **G8. Usage windows.** The `x-codex-*` windows are not a row field. They are recorded by hand (section 7).
-- **G9. Concurrent-session ambiguity.** Droid session discovery diffs the sessions directory around each
-  run (not re-checked against a live 1.1.0 run, ruling R3). Any other Droid process on the machine
-  during a run makes that run `INCOMPLETE` (`droid_usage_error`). Runs are therefore sequential, with no
-  other Droid in use.
+- **G1. Task coverage: resolved in code.** `scripts/bench/task_sources.py` serves the 6
+  `verified-core` tasks (`verified-*`) and the 3 research fixtures (`research-01..03`) through the
+  same `run_one` path as the public tasks. `--tasks study` selects the 17 tasks; `--tasks all` is
+  still the 8 public tasks only. The public tasks still need `scripts/bench/tasks` generated by
+  `make_tasks.py`. Allowed-change rules per source are in `scripts/bench/README.md`. The research
+  source needs `pwsh` and the fixtures root; it fails loudly without them.
+- **G2. Resolved tool-execution mode: resolved in code.** Rows carry
+  `droid_resolved_tool_execution_mode` (the session settings key `toolExecutionMode`, or `None`) and
+  `droid_mode_mismatch`. The key name comes from the 1.0.0 reference and is not re-checked for 1.1.0,
+  so a `None` here means "not recorded", not "default".
+- **G3. Reasoning accounting for Droid: procedural, unchanged.** Apply the smoke-row rule, then run
+  the analysis with `--droid-reasoning-excluded` if it says Droid's output excludes reasoning.
+- **G4. Arm identity: resolved in code.** The harness names `droid-direct` and `droid-script` pin the
+  mode, are accepted by `--harness`, the schedule, identities, the gate and campaign integrity, and
+  both use `BENCH_DROID`. Every Droid-family row records `droid_tool_execution_mode`. `gate` now
+  requires `davinci` plus at least one of `codex`, `droid`, `droid-direct`, `droid-script`.
+- **G5. Model and effort: resolved in code, with one limit that remains.** The Droid model is
+  `BENCH_DROID_MODEL` (fallback `BENCH_MODEL`); `--auto` is autonomy from `BENCH_DROID_AUTO`
+  (default `high`) and no longer takes `BENCH_EFFORT`. Rows record `droid_model`, `droid_auto` and
+  `droid_reasoning_effort: "not forced"`. **Remaining:** Droid 1.1.0 documents no reasoning-effort
+  flag for `droid exec`, so "effort high" is not forced on the Droid model; it follows the proxy model
+  configuration, which the bench must not write. The study therefore compares DaVinci at high effort
+  against Droid at whatever effort that configuration gives, and the report must say so.
+- **G6. Warm-up marker: resolved in code.** `run --warmup` writes `warmup.jsonl` with `scored: false`
+  in its own runs directory and never `results.jsonl`.
+- **G7. Analysis script: resolved in code.** `scripts/bench/gap_study.py` implements sections 3 to 6
+  with the readings in the section 4 clarifications. Its path and SHA-256 still go in the approval
+  block once the commit to run is fixed.
+- **G8. Usage windows: procedural, unchanged.** Recorded by hand (section 7).
+- **G9. Concurrent-session ambiguity: procedural, unchanged.** Runs are sequential with no other Droid
+  in use.
 
 ## 10. Approval block
 

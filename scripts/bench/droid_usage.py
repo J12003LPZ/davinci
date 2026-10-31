@@ -31,6 +31,19 @@ def droid_log_text(home=None):
                      for path in sorted(logs.glob("droid-log-single*.log*")) if path.is_file())
 
 
+def droid_session_mode(path):
+    """``toolExecutionMode`` recorded in a session settings file, else None.
+
+    The key name is the 1.0.0 reference's; it is not re-checked for 1.1.0.
+    """
+    try:
+        with open(path, encoding="utf-8") as source:
+            value = json.load(source).get("toolExecutionMode")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return value if isinstance(value, str) and value else None
+
+
 def _non_negative_int(value):
     return value if type(value) is int and not isinstance(value, bool) and value >= 0 else None
 

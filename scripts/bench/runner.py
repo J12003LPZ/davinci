@@ -16,6 +16,7 @@ import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+import droid_arm
 from campaign import LEGACY_TASKS, digest, file_hash
 
 _release_spec = importlib.util.spec_from_file_location(
@@ -44,7 +45,7 @@ def service_tier():
 
 def grading_isolation(harness=None):
     """Resolve the boundary for one harness without accepting ambiguous values."""
-    specific = ("BENCH_" + harness.upper() + "_GRADING_ISOLATION") if harness else None
+    specific = ("BENCH_" + harness.upper().replace("-", "_") + "_GRADING_ISOLATION") if harness else None
     value = os.environ.get(specific) if specific else None
     value = value or os.environ.get("BENCH_GRADING_ISOLATION", "diagnostic-only")
     value = value.strip().lower()
@@ -77,7 +78,7 @@ def _container_image_id(engine, image):
 
 
 def _container_binary(harness):
-    variable = "BENCH_" + harness.upper() + "_CONTAINER_BINARY"
+    variable = "BENCH_" + harness.upper().replace("-", "_") + "_CONTAINER_BINARY"
     selected = os.environ.get(variable, "").strip()
     if not selected:
         raise ValueError(variable + " is required for container grading")
@@ -331,6 +332,15 @@ def build_checkpoint(repo, destination):
     return binary
 
 
+def droid_arm_settings(harness, model):
+    """Pinned Droid arm configuration. ``--auto`` is autonomy, not reasoning effort."""
+    return {"tool_execution_mode": droid_arm.fixed_mode(harness)
+            or os.environ.get("BENCH_DROID_TOOL_EXECUTION_MODE", "script-only"),
+            "model": droid_arm.droid_model(model), "auto": droid_arm.droid_auto(),
+            "reasoning_effort": droid_arm.REASONING_EFFORT, "service_tier": service_tier(),
+            "telemetry": "droid-session-settings-and-log"}
+
+
 def campaign_identity(root, variant, fixtures, harnesses, model, effort, settings, repo):
     """Pin executable bytes and configuration before any timed subprocess."""
     executables, identities, containers, isolations, tooling = {}, {}, {}, {}, {}
@@ -356,7 +366,7 @@ def campaign_identity(root, variant, fixtures, harnesses, model, effort, setting
                                    "binary_target": "/opt/harness"}
         else:
             tooling[harness] = tooling_preflight()
-            selected = os.environ.get("BENCH_" + harness.upper(), harness)
+            selected = os.environ.get(droid_arm.binary_env(harness), "droid" if droid_arm.is_droid(harness) else harness)
             found = shutil.which(selected)
             if found is None:
                 raise ValueError("missing executable: " + harness)
@@ -373,7 +383,7 @@ def campaign_identity(root, variant, fixtures, harnesses, model, effort, setting
             "grading_assurance": "diagnostic-only",
             "credential_exposure": "readable-by-agent-process-and-tools",
             "fixture_secrecy": "public-generators-contain-graders-and-solutions",
-            "effective_settings": settings if harness == "davinci" else {
+            "effective_settings": settings if harness == "davinci" else droid_arm_settings(harness, model) if droid_arm.is_droid(harness) else {
                 "ignore_user_config": True, "effort": effort, "service_tier": service_tier(),
                 "telemetry": "local-sanitized-otlp-logs-and-traces"}}
         identities[harness]["configuration_sha256"] = hashlib.sha256(json.dumps(

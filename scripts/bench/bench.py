@@ -23,6 +23,7 @@ import argparse
 import hashlib
 import json
 import os
+import fnmatch
 import re
 import shutil
 import statistics
@@ -44,8 +45,10 @@ from codex_otel import Collector, request_metrics
 from private_suite import apply_hidden, argv, import_suite, load_frozen, run_check, GradingLifecycleError
 from readiness_metrics import report as readiness_report, load_prices
 import subscription_campaign
+import droid_arm
+import task_sources
 from droid_usage import (droid_usage_from_session, droid_request_count,
-                         droid_session_files, droid_log_text)
+                         droid_session_files, droid_log_text, droid_session_mode)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TASKS = os.path.join(HERE, "tasks")
@@ -75,6 +78,8 @@ def task_ids():
 
 
 def load(tid):
+    if task_sources.is_study_source(tid):
+        return task_sources.load_spec(tid)
     with open(os.path.join(TASKS, tid, "task.json"), encoding="utf-8") as f:
         return json.load(f)
 
@@ -106,11 +111,8 @@ def _force_remove(func, path, _exc):
     func(path)
 
 
-def prepare(tid, dest):
-    if os.path.exists(dest):
-        shutil.rmtree(dest, onexc=_force_remove)
-    os.makedirs(dest)
-    copy_tree(os.path.join(TASKS, tid, "repo"), dest)
+def git_baseline(dest, private=False, exclude=()):
+    """Initialise ``dest`` as a one-commit git baseline (hooks and config isolated)."""
     # The fixture baseline must not depend on the operator's global git
     # configuration: global hooks (for example secret scanners) could block
     # the commit and leave every starter file untracked, which would later be
@@ -123,12 +125,29 @@ def prepare(tid, dest):
     checked_git(dest, "config", "user.name", "bench")
     checked_git(dest, "config", "core.autocrlf", "false")
     checked_git(dest, "config", "commit.gpgsign", "false")
+    if exclude:
+        # Build output (for example cargo's target/) is never an agent change.
+        info = os.path.join(dest, ".git", "info")
+        os.makedirs(info, exist_ok=True)
+        with open(os.path.join(info, "exclude"), "a", encoding="utf-8") as handle:
+            handle.write("\n".join(exclude) + "\n")
     # A private export contains only original committed files, including files
     # force-added against repository/global ignores. Preserve that membership.
-    spec_path = os.path.join(TASKS, tid, "task.json")
-    private = os.path.isfile(spec_path) and "private_provenance" in load(tid)
     checked_git(dest, "add", "-A", *(["-f"] if private else []))
     checked_git(dest, "commit", "-q", "--no-verify", "-m", "fixture")
+
+
+def prepare(tid, dest):
+    if os.path.exists(dest):
+        shutil.rmtree(dest, onexc=_force_remove)
+    if task_sources.is_study_source(tid):
+        task_sources.prepare(tid, dest, git_baseline)
+        return
+    os.makedirs(dest)
+    copy_tree(os.path.join(TASKS, tid, "repo"), dest)
+    spec_path = os.path.join(TASKS, tid, "task.json")
+    private = os.path.isfile(spec_path) and "private_provenance" in load(tid)
+    git_baseline(dest, private)
 
 
 def run_grading_check(command, workdir, timeout, phase, evidence=None):
@@ -147,6 +166,8 @@ def run_grading_check(command, workdir, timeout, phase, evidence=None):
 
 
 def grade(tid, workdir, timeout=120, *, phase="grader", evidence=None):
+    if task_sources.is_study_source(tid):
+        return task_sources.grade(tid, workdir, timeout, phase, evidence, run_grading_check)
     hidden = os.path.join(TASKS, tid, "hidden")
     spec = load(tid)
     if "private_provenance" in spec:
@@ -211,15 +232,19 @@ def forbidden_artifacts(workdir, tid):
     """
     workdir = Path(workdir)
     hidden = Path(TASKS) / tid / "hidden"
-    if not hidden.is_dir():
-        raise RuntimeError("cannot inventory reserved hidden-grader paths")
-    reserved = {path.relative_to(hidden).as_posix() for path in hidden.rglob("*") if path.is_file()}
-    # A hidden grader file that also ships in the public repo (t8's
-    # test_calc.py) is the starter file, not a leak: grading copies the hidden
-    # version over it. Reserving it failed every harness on t8.
-    public = Path(TASKS) / tid / "repo"
-    if public.is_dir():
-        reserved -= {path.relative_to(public).as_posix() for path in public.rglob("*") if path.is_file()}
+    if task_sources.is_study_source(tid):
+        # Study-source graders live outside the workspace and outside TASKS.
+        reserved = set()
+    else:
+        if not hidden.is_dir():
+            raise RuntimeError("cannot inventory reserved hidden-grader paths")
+        reserved = {path.relative_to(hidden).as_posix() for path in hidden.rglob("*") if path.is_file()}
+        # A hidden grader file that also ships in the public repo (t8's
+        # test_calc.py) is the starter file, not a leak: grading copies the hidden
+        # version over it. Reserving it failed every harness on t8.
+        public = Path(TASKS) / tid / "repo"
+        if public.is_dir():
+            reserved -= {path.relative_to(public).as_posix() for path in public.rglob("*") if path.is_file()}
     forbidden_dirs = {"hidden", "solution", ".davinci-artifacts", ".bench-artifacts"}
     credential_names = {"auth.json", "credentials.json"}
     found, transactions = [], []
@@ -276,7 +301,12 @@ def droid_settings(workdir, mode=None):
     return path, hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def droid_usage_for_run(stats, workdir, before=None, home=None):
+def droid_mode(harness):
+    """The tool-execution mode a Droid harness runs: pinned by name, else the env default."""
+    return droid_arm.fixed_mode(harness) or DROID_TOOL_EXECUTION_MODE
+
+
+def droid_usage_for_run(stats, workdir, before=None, home=None, requested_mode=None):
     """Merge Droid usage from this run's own session into a parsed row.
 
     ``before`` is the set of ``*.settings.json`` files under the Droid sessions
@@ -289,13 +319,14 @@ def droid_usage_for_run(stats, workdir, before=None, home=None):
     against a live 1.1.0 run (ledger ruling R3).
     """
     usage = {"input": None, "cached": None, "output": None, "reasoning": None}
-    requests = uncached = error = None
+    requests = uncached = error = resolved = None
     new = droid_session_files(home) - (before or set())
     if len(new) != 1:
         error = f"expected exactly one new droid session settings file, found {len(new)}"
     else:
         settings_path = next(iter(new))
         session_id = Path(settings_path).name[:-len(".settings.json")]
+        resolved = droid_session_mode(settings_path)
         try:
             usage = droid_usage_from_session(settings_path)
         except (OSError, ValueError) as exc:
@@ -316,6 +347,11 @@ def droid_usage_for_run(stats, workdir, before=None, home=None):
     stats["request_metrics_available"] = stats["request_metrics_complete"] = requests is not None
     stats["droid_log_uncached_input"] = uncached
     stats["droid_usage_error"] = error
+    # The mode Droid actually resolved (session settings key `toolExecutionMode`,
+    # from the 1.0.0 reference; not re-checked for 1.1.0). None when absent.
+    stats["droid_resolved_tool_execution_mode"] = resolved
+    stats["droid_mode_mismatch"] = (None if resolved is None or requested_mode is None
+                                    else resolved != requested_mode)
     stats["usage_available"] = all(
         value is not None for value in (usage["input"], usage["cached"], usage["output"], requests))
     return stats
@@ -336,17 +372,19 @@ def command(harness, prompt, workdir, settings=None):
             *(["--append-system-prompt", steer] if steer else []),
             "--permission-mode", "always-approve", "-p", prompt,
         ]
-    if harness == "droid":
+    if droid_arm.is_droid(harness):
         # Flags verified in droid-1.1.0-identity.md §2. The tool-execution mode
         # is forced through the hidden --tool-execution-mode flag (the verified
         # mechanism) and mirrored in a per-process --settings file written under
         # the run directory (never the user's ~\.factory\settings.json), whose
         # path and content hash are recorded in the row for reproducibility.
-        mode = DROID_TOOL_EXECUTION_MODE
+        mode = droid_mode(harness)
         settings_path, _ = droid_settings(workdir, mode)
         return [
             os.environ.get("BENCH_DROID", "droid"), "exec",
-            "--model", MODEL, "--auto", EFFORT,
+            # --auto is Droid's autonomy level, not reasoning effort (G5); the
+            # model is the proxy alias from BENCH_DROID_MODEL when set.
+            "--model", droid_arm.droid_model(MODEL), "--auto", droid_arm.droid_auto(),
             "--tool-execution-mode", mode,
             "--output-format", "stream-json",
             "--settings", settings_path,
@@ -432,7 +470,7 @@ def parse_stream(harness, stdout):
             ):
                 stats["tool_calls"] += 1
                 stats["tools"][item["type"]] = stats["tools"].get(item["type"], 0) + 1
-        elif harness == "droid":
+        elif droid_arm.is_droid(harness):
             # Droid `--output-format stream-json`. Usage comes from the session
             # settings file and the `Streaming result` log lines (droid_usage),
             # never from this stream, so input/cached/output/requests stay None.
@@ -644,7 +682,7 @@ def wire_dump_directory(settings, harness, tid, rep):
     return os.path.join(RUNS, "wire", f"{tid}-r{rep}")
 
 
-def run_one(harness, tid, rep, campaign=None):
+def run_one(harness, tid, rep, campaign=None, warmup=False):
     subscription = campaign.get("subscription") if campaign else None
     if subscription:
         subscription_campaign.remaining_seconds(subscription)
@@ -684,7 +722,7 @@ def run_one(harness, tid, rep, campaign=None):
             for value in collector.overrides():
                 args[-1:-1] = ["-c", value]
         timeout = min(TIMEOUT, subscription_campaign.remaining_seconds(subscription)) if subscription else TIMEOUT
-        if harness == "droid":
+        if droid_arm.is_droid(harness):
             droid_before = droid_session_files()
         measured = execute(args, workdir, env, timeout)
     code, stdout, stderr = measured["exit"], measured["stdout"], measured["stderr"]
@@ -709,7 +747,9 @@ def run_one(harness, tid, rep, campaign=None):
             raise RuntimeError("cannot inspect a workspace while execution may still be active")
         inspection_phase = "changed_files"
         changed = changed_files(workdir)
-        unrelated = [p for p in changed if p not in spec["allowed"]]
+        globs = spec.get("allowed_globs", ())
+        unrelated = [p for p in changed if p not in spec["allowed"]
+                     and not any(fnmatch.fnmatchcase(p, pattern) for pattern in globs)]
         inspection_phase = "forbidden_artifacts"
         artifacts = forbidden_artifacts(workdir, tid)
         if artifacts["artifact_leak"]:
@@ -745,8 +785,8 @@ def run_one(harness, tid, rep, campaign=None):
             cleanup_complete = False
             ok, passed, failed, tail = False, 0, 0, str(error)
     s = parse_stream(harness, stdout)
-    if harness == "droid":
-        droid_usage_for_run(s, workdir, droid_before)
+    if droid_arm.is_droid(harness):
+        droid_usage_for_run(s, workdir, droid_before, requested_mode=droid_mode(harness))
     if collector:
         s.update(request_metrics(collector.records, collector.spans, collector.errors))
         Path(workdir + ".otel.json").write_text(json.dumps({
@@ -762,7 +802,8 @@ def run_one(harness, tid, rep, campaign=None):
         "started_at": measured["started_at"], "finished_at": measured["finished_at"],
         "grading_isolation": (campaign.get("grading_isolation", {}).get(harness, "diagnostic-only")
                                if campaign else "diagnostic-only"),
-        "task_set": "legacy" if tid in LEGACY_TASKS else "large",
+        "task_set": ("study" if task_sources.is_study_source(tid) else
+                     "legacy" if tid in LEGACY_TASKS else "large"),
         "stop_reason": stopped,
         "inspection_error": inspection_error,
         "regression_pass": regression["pass"] if regression else None,
@@ -799,18 +840,41 @@ def run_one(harness, tid, rep, campaign=None):
         for field in ("private_suite_digest", "price_table_hash"):
             if field in campaign:
                 result[field] = campaign[field]
-    if harness == "droid":
-        settings_path, settings_hash = droid_settings(workdir, DROID_TOOL_EXECUTION_MODE)
+    if droid_arm.is_droid(harness):
+        mode = droid_mode(harness)
+        settings_path, settings_hash = droid_settings(workdir, mode)
         result["droid_settings"] = {"path": settings_path, "sha256": settings_hash}
+        result["droid_tool_execution_mode"] = mode
+        result["droid_resolved_tool_execution_mode"] = s.get("droid_resolved_tool_execution_mode")
+        result["droid_mode_mismatch"] = s.get("droid_mode_mismatch")
+        result["droid_model"] = droid_arm.droid_model(MODEL)
+        result["droid_auto"] = droid_arm.droid_auto()
+        result["droid_reasoning_effort"] = droid_arm.REASONING_EFFORT
         result["droid_log_uncached_input"] = s.get("droid_log_uncached_input")
         result["droid_usage_error"] = s.get("droid_usage_error")
     result["pass"] = task_success(result)
-    with open(os.path.join(RUNS, "results.jsonl"), "a", encoding="utf-8") as f:
+    if warmup:
+        # Warm-up rows never enter results.jsonl, so integrity, gate, report,
+        # compare and the gap analysis cannot read them.
+        result["scored"] = False
+    with open(os.path.join(RUNS, "warmup.jsonl" if warmup else "results.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps(result) + "\n")
     print(json.dumps(result), flush=True)
     if stopped:
         raise RuntimeError("campaign stopped: " + stopped)
     return result
+
+
+def study_fixture_manifest(tids):
+    """Fixture manifest for public tasks (unchanged) plus study-source tasks."""
+    if not any(task_sources.is_study_source(tid) for tid in tids):
+        return fixture_manifest(TASKS, tids)
+    public = [tid for tid in tids if not task_sources.is_study_source(tid)]
+    members = fixture_manifest(TASKS, public)["files"] if public else {}
+    members = {tid: (task_sources.fixture_files(tid) if task_sources.is_study_source(tid) else members[tid])
+               for tid in tids}
+    return {"schema_version": 2, "tasks": list(tids), "files": members,
+            "fixture_hash": digest(members)}
 
 
 def directory_hash(directory):
@@ -1092,7 +1156,8 @@ def gate():
     errors = campaign_errors(RUNS, rows)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     harnesses = set(manifest.get("harnesses", []))
-    if "davinci" not in harnesses or not harnesses & {"codex", "droid"} or harnesses - {"davinci", "codex", "droid"}:
+    allowed = {"davinci", "codex", *droid_arm.DROID_HARNESSES}
+    if "davinci" not in harnesses or harnesses == {"davinci"} or harnesses - allowed:
         errors.append("paired screening requires DaVinci and at least one of Codex or Droid")
     if errors:
         print("FAIL campaign completeness: " + "; ".join(errors))
@@ -1110,7 +1175,9 @@ def build_parser():
     ap.add_argument("--private-suite", help="frozen private fixture directory")
     ap.add_argument("--price-table", help="explicit USD model price table to freeze with a new campaign")
     ap.add_argument("--split", choices=["dev", "holdout"], help="explicit private split; holdout is never a tuning set")
-    ap.add_argument("--harness", nargs="+", choices=["davinci", "codex", "droid"], default=["davinci", "codex"])
+    ap.add_argument("--harness", nargs="+", choices=["davinci", "codex", *droid_arm.DROID_HARNESSES], default=["davinci", "codex"])
+    ap.add_argument("--warmup", action="store_true",
+                    help="one unscored warm-up run per harness (first selected task, rep 0); rows go to warmup.jsonl; use a fresh BENCH_RUNS")
     ap.add_argument("--tasks", nargs="+", default=["all"])
     ap.add_argument("--reps", type=int, default=1)
     ap.add_argument("--rep-start", type=int, default=0)
@@ -1170,11 +1237,15 @@ def main():
             ap.error("reps must be positive and rep-start nonnegative")
         with campaign_lock(RUNS) as lock:
             large = json.loads(Path(args.large_manifest).read_text(encoding="utf-8")) if args.large_manifest else None
-            tids = private_tids or select_tasks(args.task_set, args.tasks, large)
+            tids = private_tids or task_sources.select_study(args.tasks) or select_tasks(args.task_set, args.tasks, large)
+            if args.warmup:
+                if args.reps != 1 or args.rep_start != 0:
+                    ap.error("--warmup runs exactly one repetition (rep 0)")
+                tids = tids[:1]
             frozen_errors = validate_fixture_manifest(tids, large) if large else []
             if frozen_errors:
                 raise ValueError("; ".join(frozen_errors))
-            fixtures = fixture_manifest(TASKS, tids)
+            fixtures = study_fixture_manifest(tids)
             settings = json.loads(Path(args.settings).read_text(encoding="utf-8")) if args.settings else BASE_SETTINGS
             codemode_arm(settings)
             bench_options(settings)
@@ -1201,6 +1272,7 @@ def main():
             # Dumping adds I/O to every request: such a campaign is for diagnosis,
             # never for a timing comparison.
             manifest["diagnostic_wire_dump"] = bool(bench_options(settings).get("wireDump"))
+            manifest["warmup"] = bool(args.warmup)
             manifest.update(tasks=tids, repetitions=repetitions, harnesses=args.harness,
                             order=args.order, order_seed=args.order_seed, schedule=order,
                             grading_timeout_seconds=args.grading_timeout)
@@ -1233,11 +1305,11 @@ def main():
             for harness, tid, rep in order:
                 if source_identity(Path(HERE).parents[1]) != manifest["runner_source"]:
                     raise ValueError("runner source changed during campaign")
-                if fixture_manifest(TASKS, tids)["fixture_hash"] != manifest["fixture_hash"]:
+                if study_fixture_manifest(tids)["fixture_hash"] != manifest["fixture_hash"]:
                     raise ValueError("fixture changed during campaign")
                 if private and load_frozen(TASKS, args.split)[2] != private_digest:
                     raise ValueError("private split metadata changed during campaign")
-                run_one(harness, tid, rep, manifest)
+                run_one(harness, tid, rep, manifest, warmup=args.warmup)
 
 
 if __name__ == "__main__":

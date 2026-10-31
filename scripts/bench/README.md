@@ -264,13 +264,30 @@ them before sharing. A receipt does not establish independent grader isolation.
 A `droid` arm runs Droid 1.1.0 through the same harness, schedule and grading as
 DaVinci and Codex. Select it with `--harness davinci droid` (or
 `--harness davinci codex droid`); `BENCH_DROID` selects the executable (default
-`droid` on PATH). `BENCH_MODEL`, `BENCH_EFFORT` and `BENCH_SERVICE_TIER` are
-shared with the other arms exactly as they are today.
+`droid` on PATH). `BENCH_SERVICE_TIER` is shared with the other arms as today.
+
+**Arm identity.** `droid` takes its tool-execution mode from
+`BENCH_DROID_TOOL_EXECUTION_MODE`. For the Stage 0 study use the two pinned
+arm names instead, `droid-direct` (`direct-only`) and `droid-script`
+(`script-only`): they are separate harnesses for scheduling, identities, the
+gate and campaign integrity, both run the binary named by `BENCH_DROID`, and
+every Droid-family row records `droid_tool_execution_mode`. For example
+`--harness davinci droid-direct droid-script`.
+
+**Model and effort.** The Droid model is `BENCH_DROID_MODEL` (the proxy alias,
+for example `custom:Codex-via-ChatGPT-(gpt-6.1-sol)-0`), falling back to
+`BENCH_MODEL`. `--auto` is Droid's autonomy level, not reasoning effort, so it
+comes from `BENCH_DROID_AUTO` (`low|medium|high`, default `high`) and
+`BENCH_EFFORT` is no longer passed to it. Droid 1.1.0 documents no
+reasoning-effort flag for `droid exec`; effort comes from the proxy model
+configuration, which the bench must not write. So reasoning effort is NOT
+forced on the Droid arm, and rows say so: `droid_model`, `droid_auto` and
+`droid_reasoning_effort: "not forced"`.
 
 The arm builds an argv list, never a shell string:
 
 ```sh
-droid exec --model <BENCH_MODEL> --auto <BENCH_EFFORT> \
+droid exec --model <BENCH_DROID_MODEL or BENCH_MODEL> --auto <BENCH_DROID_AUTO> \
   --tool-execution-mode <direct-only|script-only> \
   --output-format stream-json --settings <workspace>.droid-settings.json \
   --cwd <workspace> <prompt>
@@ -279,7 +296,8 @@ droid exec --model <BENCH_MODEL> --auto <BENCH_EFFORT> \
 `--tool-execution-mode` is the hidden flag Droid 1.1.0 still accepts
 (`docs/perf/droid-gap/droid-1.1.0-identity.md` §2). The mode is selected by
 `BENCH_DROID_TOOL_EXECUTION_MODE` (default `script-only`; the other value is
-`direct-only`).
+`direct-only`) for the plain `droid` harness; `droid-direct` and `droid-script`
+fix it by name.
 
 **Settings file.** The mode is also forced through a per-process `--settings`
 file written beside the run directory (`<workspace>.droid-settings.json`),
@@ -309,9 +327,59 @@ runs on the machine make the diff ambiguous and the row INCOMPLETE. Droid
 exposes no retry visibility, so `logical_requests` equals `requests` and
 `provider_attempts` is `None`.
 
+**Resolved mode.** After the run, `toolExecutionMode` is read from the discovered
+session settings file into `droid_resolved_tool_execution_mode` (`None` when the
+key is absent). `droid_mode_mismatch` is `True` when it differs from the
+requested mode, `False` when equal, `None` when unknown. The key name comes from
+the 1.0.0 reference and is not re-checked for 1.1.0; the gap analysis excludes
+rows with `droid_mode_mismatch: true`.
+
 **INCOMPLETE rule.** Any absent usage field stays `None`, never zero, and the
 row is marked incomplete via `usage_available: false`. A Droid row cannot pass
 request-reduction or per-success cost rules on missing usage.
+
+## Stage 0 gap study
+
+The 17-task study set is selected with `--tasks study`; `--tasks all` still means
+the public tasks only. Beyond the generated public tasks (`scripts/bench/tasks`,
+built by `make_tasks.py`) two task sources are wired in
+(`scripts/bench/task_sources.py`), and they go through the same `run_one` path:
+
+- `verified-range|slice|parser|dedupe|errors|path`: from
+  `crates/davinci-evals/fixtures/behavior/verified-core.json`. The prompt is the
+  scenario `request`; the workspace is a copy of its `fixtures/repos/<repo_fixture>`
+  with the same one-commit git baseline as public tasks; grading runs each
+  `verification_commands` entry (`cargo test --quiet`, its own timeout and
+  expected exit). Allowed changes are the scenario's `file_changed` paths
+  (`src/lib.rs`), matching its own `max_unrelated_files_changed: 0`; `target/`
+  and `Cargo.lock` are excluded through `.git/info/exclude`.
+- `research-01|02|03`: the external research fixtures at
+  `BENCH_RESEARCH_FIXTURES` (default
+  `C:\Users\sergi\Desktop\lean-droid-1.0\droid-re-research\fixtures`). The prompt
+  is the `## Instruction (give this verbatim)` section; the workspace comes from
+  `pwsh setup.ps1` and is graded by `pwsh grade.ps1 -Json` (`BENCH_PWSH`
+  overrides `pwsh`). A missing root or `pwsh`, grader exit 2 or a missing
+  verdict stops the run with an error, never a pass. The fixture's `.pre/` files
+  are committed into the baseline, so they never count as changes; allowed new
+  or edited paths are only the task's outputs (`answer.json`, `edit-report.json`
+  with `pkg/m*.ts` and `pkg/__tests__/*`, `results.json` with `jobs/out/*.txt`).
+  `pkg/other/*` is deliberately not allowed (the grader asserts it untouched).
+  The research grader's own "no extra files" check relies on `.git` being a
+  hidden directory on Windows.
+
+**Warm-up.** `run --warmup` runs the first selected task once (rep 0) per harness
+and writes rows to `warmup.jsonl` with `scored: false`, never `results.jsonl`.
+Campaign directories are created exclusively, so a warm-up needs its own
+`BENCH_RUNS`. Integrity, `gate`, `report`, `compare` and the analysis read only
+`results.jsonl`.
+
+**Analysis.** `python scripts/bench/gap_study.py RUNS_DIR --seed N` implements
+preregistration sections 4 to 6 (pure stdlib): 15 pair-by-metric estimates with
+a geometric mean, 90% percentile bootstrap over tasks (10,000 resamples), the
+GAP / AHEAD / NO_CLEAR_GAP label, and the pass guard. `--seed` is required and
+must be the seed written into the approval block; `--json` prints the full
+report; `--causes` takes the human-read discordant-task causes;
+`--droid-reasoning-excluded` applies the smoke-row result for gap G3.
 
 ## Metric definitions and acceptance
 
