@@ -412,7 +412,7 @@ pub fn compact_messages_within(
     let cannot_fit = |mandatory_tokens: u64| {
         let max = max_tokens.filter(|max| mandatory_tokens > *max)?;
         Some(format!(
-            "{CONTEXT_ADMISSION_FAILED}: the summary with the user requirements to carry needs ~{mandatory_tokens} tokens, more than the ~{max} the context has left; nothing was sent and the history is unchanged"
+            "{CONTEXT_ADMISSION_FAILED}: the compacted history (summary, carried user requirements, retained turns) needs ~{mandatory_tokens} tokens, more than the ~{max} the context has left; nothing was sent and the history is unchanged"
         ))
     };
     // The carried block alone is a lower bound: refuse before paying for a summary.
@@ -493,6 +493,11 @@ pub fn compact_messages_within(
     }
     compacted.extend(messages[cut_index..].iter().cloned());
     let tokens_after = estimate_context_tokens(&compacted);
+    // The retained tail is appended after the summary check above, so the whole
+    // replacement is admitted here before it can be committed.
+    if let Some(reason) = cannot_fit(tokens_after) {
+        return unchanged_result(messages, details, tokens_before, reason, usage);
+    }
     // Admission gate: a checkpoint that does not shrink the context only adds
     // cost and, on auto-compaction, repeats on the next turn.
     if tokens_after >= tokens_before {
@@ -2622,6 +2627,35 @@ the user said hi and the assistant said hello and then the user said ok",
         assert!(
             seen.lock().unwrap().is_empty(),
             "an oversized request was dispatched"
+        );
+        assert_eq!(result.messages, messages);
+    }
+
+    #[test]
+    fn admission_counts_the_retained_tail_not_only_the_summary() {
+        // 19k-token summary + ~10k-token retained turn against a 23k budget:
+        // the summary alone fits, the replacement does not.
+        let messages = vec![
+            ChatMessage::text("user", "start the export"),
+            ChatMessage::text("assistant", "a".repeat(200_000)),
+            ChatMessage::text("user", "next step"),
+            ChatMessage::text("assistant", "b".repeat(40_000)),
+        ];
+        let summarizer = fixed_summarizer(Box::leak("s".repeat(38_000).into_boxed_str()));
+        let result = compact_messages_within(
+            &messages,
+            None,
+            10_000,
+            20_000,
+            None,
+            Some(&summarizer),
+            Some(23_000),
+        );
+        assert!(!result.compacted, "{}", result.summary);
+        assert!(
+            result.summary.starts_with(CONTEXT_ADMISSION_FAILED),
+            "{}",
+            result.summary
         );
         assert_eq!(result.messages, messages);
     }
