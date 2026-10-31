@@ -597,6 +597,7 @@ impl WorktreeManager {
             .args([
                 "merge-tree",
                 "--write-tree",
+                "--allow-unrelated-histories",
                 "--no-messages",
                 "HEAD",
                 current_head,
@@ -2161,6 +2162,55 @@ mod tests {
             );
             assert_eq!(manager.get_lease(&lease.path).as_ref(), Some(&lease));
         }
+    }
+
+    /// An explicit branch can share no history with HEAD. `merge-tree` then
+    /// exits 128 unless told to allow it; that is unmerged work (its tree
+    /// differs), not unreadable state, so release must preserve it and only a
+    /// forced release may discard it.
+    #[test]
+    fn an_unrelated_explicit_branch_reads_as_unmerged_work() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        // A root commit carrying a file HEAD lacks: no common ancestor, and
+        // merging it would add content, so it is unmerged work.
+        let plumbing = |args: &[&str], stdin: &str| -> String {
+            let mut child = Command::new("git")
+                .current_dir(repo_dir.path())
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            std::io::Write::write_all(&mut child.stdin.take().unwrap(), stdin.as_bytes()).unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let blob = plumbing(&["hash-object", "-w", "--stdin"], "unrelated");
+        let tree = plumbing(
+            &["mktree"],
+            &format!(
+                "100644 blob {blob}	unrelated.txt
+"
+            ),
+        );
+        let root = plumbing(&["commit-tree", &tree, "-m", "unrelated root"], "");
+        let branch = "davinci/agent/unrelated";
+        git_in(repo_dir.path(), &["branch", branch, &root]);
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), Some(branch))
+            .unwrap();
+
+        assert!(manager.is_dirty(&lease), "an unrelated tip is unmerged");
+        assert!(matches!(
+            manager.release_lease(&lease, false),
+            Err(WorktreeError::DirtyWorktreePreserved { .. })
+        ));
+        assert!(branch_exists(repo_dir.path(), branch));
+        manager.release_lease(&lease, true).unwrap();
+        assert!(!branch_exists(repo_dir.path(), branch));
     }
 
     /// A real merge conflict is still known unmerged work: preserved, and
