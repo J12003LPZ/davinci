@@ -893,12 +893,12 @@ Issue the call again if it is still needed.";
             } else if self.auto_compaction {
                 let mut settings = self.compaction;
                 settings.enabled = true;
-                if crate::should_compact(tokens, self.context_window, &settings)
-                    && !self.auto_compaction_refusal_defers(tokens)
-                {
+                // Evaluated first so a marker that no longer matches is dropped
+                // even on a turn that is below the trigger.
+                let deferred = self.auto_compaction_refusal_defers(tokens);
+                if crate::should_compact(tokens, self.context_window, &settings) && !deferred {
                     let outcome = self.compact_automatic(tokens);
                     if outcome.compacted {
-                        self.refused_auto_compaction = None;
                         self.stats.compactions += 1;
                     } else if self.context_window > 0 && tokens >= self.context_window {
                         // Compaction failed and the request cannot fit: stop

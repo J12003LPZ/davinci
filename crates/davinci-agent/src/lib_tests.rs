@@ -6390,6 +6390,66 @@ fn a_refused_auto_compaction_below_the_window_is_reported_and_not_retried() {
     assert_eq!(notices, 1, "told once");
 }
 
+/// An agent whose first automatic attempt is refused, which arms the marker.
+fn agent_with_a_refused_auto_compaction() -> Agent {
+    let mut agent = Agent::new("fixture");
+    agent.context_window = 10_000;
+    agent.compaction.enabled = true;
+    agent.compaction.reserve_tokens = 500;
+    agent.compaction.keep_recent_tokens = 6_000;
+    agent.summarizer = Some(Summarizer::new(|_| {
+        Ok(crate::compaction::SummarizeResponse {
+            text: "s".repeat(38_000),
+            usage: Some(Default::default()),
+            stop_reason: Some(davinci_ai::StopReason::Stop),
+            error_message: None,
+            has_tool_call: false,
+        })
+    }));
+    agent.prompt("first request");
+    agent.record_assistant(&"x".repeat(20_000));
+    agent.prompt("second request");
+    agent.record_assistant(&"y".repeat(13_000));
+    agent.prompt("third request");
+    let _ = agent.run_loop(|_| Err::<crate::CompleteOutput, String>("stop here".into()));
+    assert!(
+        agent.refused_auto_compaction.is_some(),
+        "the refusal arms the marker"
+    );
+    agent
+}
+
+/// A successful compaction replaces the history the marker described. Left
+/// armed, it would suppress a fresh attempt once the context grows back into
+/// the old refused size.
+#[test]
+fn a_successful_manual_compaction_clears_the_refusal_marker() {
+    let mut agent = agent_with_a_refused_auto_compaction();
+    agent.summarizer = Some(Summarizer::new(|_| {
+        Ok(crate::compaction::SummarizeResponse {
+            text: "short summary".into(),
+            usage: Some(Default::default()),
+            stop_reason: Some(davinci_ai::StopReason::Stop),
+            error_message: None,
+            has_tool_call: false,
+        })
+    }));
+    agent.compaction.keep_recent_tokens = 500;
+    let result = agent.compact(None);
+    assert!(result.compacted, "{}", result.summary);
+    assert!(agent.refused_auto_compaction.is_none());
+}
+
+/// A context that dropped below the trigger no longer matches the refusal, so
+/// the marker is dropped on the next evaluation even though nothing compacts.
+#[test]
+fn a_turn_below_the_trigger_drops_a_stale_refusal_marker() {
+    let mut agent = agent_with_a_refused_auto_compaction();
+    agent.messages.truncate(1);
+    let _ = agent.run_loop(|_| Err::<crate::CompleteOutput, String>("stop here".into()));
+    assert!(agent.refused_auto_compaction.is_none());
+}
+
 #[test]
 fn switching_the_tree_branch_restores_that_branchs_verification_and_exposure() {
     let dir = tempfile::tempdir().unwrap();

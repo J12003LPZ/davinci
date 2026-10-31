@@ -5133,6 +5133,8 @@ impl Agent {
             before_tokens,
             after_tokens,
         });
+        // The history the refusal described is gone.
+        self.refused_auto_compaction = None;
         Ok(root)
     }
 
@@ -5661,6 +5663,10 @@ impl Agent {
             result
         };
         let result = self.commit_compaction(result);
+        if result.compacted {
+            // The history the refusal described is gone.
+            self.refused_auto_compaction = None;
+        }
         if self.context_vm_mode() == ContextVmMode::Hybrid {
             self.note_hybrid_outcome(skipped_before, &result, trigger_tokens, recovery);
         }
