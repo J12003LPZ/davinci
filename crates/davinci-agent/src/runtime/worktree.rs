@@ -587,6 +587,24 @@ impl WorktreeManager {
                 )));
             }
         }
+        // `--allow-unrelated-histories` below makes an unrelated branch with
+        // HEAD's tree merge to HEAD's tree, which would read as integrated.
+        // Without a merge base nothing was ever integrated. Exit 1 is "no
+        // merge base"; any other failure is unreadable history.
+        let base = isolated_git_command_in(&self.repo_root)?
+            .args(["merge-base", "HEAD", current_head])
+            .output()
+            .map_err(|e| WorktreeError::GitError(format!("Failed to execute git: {e}")))?;
+        match base.status.code() {
+            Some(0) => {}
+            Some(1) => return Ok(UnsavedWork::Unmerged),
+            code => {
+                return Err(WorktreeError::GitError(format!(
+                    "cannot find a merge base for {current_head} (status {code:?}): {}",
+                    String::from_utf8_lossy(&base.stderr).trim()
+                )));
+            }
+        }
         // Patch IDs used by `git cherry` ignore whitespace and merge-only
         // changes. Instead, compute the exact result of merging the worker
         // HEAD into the main checkout. Only a byte-identical tree proves that
@@ -2204,6 +2222,35 @@ mod tests {
             .unwrap();
 
         assert!(manager.is_dirty(&lease), "an unrelated tip is unmerged");
+        assert!(matches!(
+            manager.release_lease(&lease, false),
+            Err(WorktreeError::DirtyWorktreePreserved { .. })
+        ));
+        assert!(branch_exists(repo_dir.path(), branch));
+        manager.release_lease(&lease, true).unwrap();
+        assert!(!branch_exists(repo_dir.path(), branch));
+    }
+
+    /// An unrelated branch whose tree equals HEAD's merges to HEAD's tree, so
+    /// the tree comparison alone would call it integrated. With no merge base
+    /// it was never integrated: release must preserve it unless forced.
+    #[test]
+    fn an_unrelated_explicit_branch_with_the_same_tree_is_not_integrated() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let head_tree = run_git(repo_dir.path(), &["rev-parse", "HEAD^{tree}"]).unwrap();
+        let root = run_git(
+            repo_dir.path(),
+            &["commit-tree", &head_tree, "-m", "same tree, no ancestry"],
+        )
+        .unwrap();
+        let branch = "davinci/agent/same-tree";
+        git_in(repo_dir.path(), &["branch", branch, &root]);
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), Some(branch))
+            .unwrap();
+
         assert!(matches!(
             manager.release_lease(&lease, false),
             Err(WorktreeError::DirtyWorktreePreserved { .. })
