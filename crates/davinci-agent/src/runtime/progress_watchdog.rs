@@ -296,7 +296,7 @@ impl ProgressWatchdog {
                 let occurrence = if self
                     .last_escalation
                     .as_ref()
-                    .map_or(false, |last| same_escalation(last, &signal))
+                    .is_some_and(|last| same_escalation(last, &signal))
                 {
                     REPEATED_SIGNAL_STOP_AT
                 } else {
