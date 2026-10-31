@@ -513,18 +513,41 @@ impl WorktreeManager {
     /// discarded by a release, forced or not; only committed work that is not
     /// integrated may be, and only when the caller forces.
     fn unsaved_work(&self, lease: &WorktreeLease) -> Result<UnsavedWork, WorktreeError> {
-        if !lease.path.exists() {
-            return Ok(UnsavedWork::None);
+        if lease.path.exists() {
+            if !run_git(&lease.path, &["status", "--porcelain"])?.is_empty() {
+                return Ok(UnsavedWork::Uncommitted);
+            }
+            let current_head = run_git(&lease.path, &["rev-parse", "HEAD"])?;
+            let work = self.unintegrated_commit(lease, &current_head)?;
+            if work != UnsavedWork::None {
+                return Ok(work);
+            }
         }
-        if !run_git(&lease.path, &["status", "--porcelain"])?.is_empty() {
-            return Ok(UnsavedWork::Uncommitted);
+        // The checkout can sit detached at `base_head` (or be gone) while the
+        // managed branch still holds commits, and release deletes that branch.
+        // Its tip is checked on its own, directory or not.
+        if lease.branch.starts_with("davinci/agent/") && self.branch_exists(&lease.branch)? {
+            let tip = run_git(
+                &self.repo_root,
+                &["rev-parse", &format!("refs/heads/{}", lease.branch)],
+            )?;
+            return self.unintegrated_commit(lease, &tip);
         }
-        let current_head = run_git(&lease.path, &["rev-parse", "HEAD"])?;
+        Ok(UnsavedWork::None)
+    }
+
+    /// Whether `commit` would be lost by cleanup: neither the lease's original
+    /// base, reachable from the repository HEAD, nor an exact-tree match.
+    fn unintegrated_commit(
+        &self,
+        lease: &WorktreeLease,
+        current_head: &str,
+    ) -> Result<UnsavedWork, WorktreeError> {
         if current_head.is_empty() || current_head == lease.base_head {
             return Ok(UnsavedWork::None);
         }
         let integrated = isolated_git_command_in(&self.repo_root)?
-            .args(["merge-base", "--is-ancestor", &current_head, "HEAD"])
+            .args(["merge-base", "--is-ancestor", current_head, "HEAD"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
@@ -543,7 +566,7 @@ impl WorktreeManager {
                 "--write-tree",
                 "--no-messages",
                 "HEAD",
-                &current_head,
+                current_head,
             ],
         ) {
             Ok(tree) => tree,
@@ -1578,12 +1601,13 @@ mod tests {
         std::fs::write(&head_path, "garbage\n").unwrap();
 
         let err = manager.release_lease(&lease, true).unwrap_err();
+        // The branch tip cannot be read, so integration cannot be proved and
+        // nothing is torn down, forced or not.
         match &err {
-            WorktreeError::CleanupIncomplete { path, detail, .. } => {
-                assert!(path.is_some(), "registration state is unknown: {err}");
+            WorktreeError::GitError(detail) => {
                 assert!(detail.contains("git"), "names the failed check: {err}");
             }
-            other => panic!("expected CleanupIncomplete, got {other:?}"),
+            other => panic!("expected GitError, got {other:?}"),
         }
         assert_eq!(manager.get_lease(&lease.path).as_ref(), Some(&lease));
 
@@ -1811,6 +1835,56 @@ mod tests {
         assert!(!manager.is_dirty(&lease), "merged work is not dirty");
         manager.release_lease(&lease, false).unwrap();
         assert!(!lease.path.exists());
+    }
+
+    /// Committing unique work and detaching the checkout at `base_head` leaves
+    /// the checkout HEAD clean; the leased branch still holds the work.
+    fn commit_unique_work_on_branch(lease: &WorktreeLease) {
+        std::fs::write(lease.path.join("unique.txt"), "only on the branch").unwrap();
+        git_in(&lease.path, &["add", "unique.txt"]);
+        git_in(&lease.path, &["config", "user.name", "w"]);
+        git_in(&lease.path, &["config", "user.email", "w@x"]);
+        git_in(&lease.path, &["commit", "-m", "unique worker change"]);
+    }
+
+    #[test]
+    fn unique_branch_work_survives_release_when_checkout_is_detached_at_base() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        commit_unique_work_on_branch(&lease);
+        git_in(&lease.path, &["checkout", "--detach", &lease.base_head]);
+
+        assert!(manager.is_dirty(&lease), "the branch tip holds unmerged work");
+        assert!(matches!(
+            manager.release_lease(&lease, false),
+            Err(WorktreeError::DirtyWorktreePreserved { .. })
+        ));
+        assert!(branch_exists(repo_dir.path(), &lease.branch));
+        assert_eq!(manager.get_lease(&lease.path), Some(lease.clone()));
+    }
+
+    #[test]
+    fn unique_branch_work_survives_release_when_the_checkout_directory_is_missing() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let lease = manager
+            .create_lease(RunId::new(), AgentId::new(), None)
+            .unwrap();
+        commit_unique_work_on_branch(&lease);
+        std::fs::remove_dir_all(&lease.path).unwrap();
+
+        assert!(manager.is_dirty(&lease), "the branch tip holds unmerged work");
+        assert!(matches!(
+            manager.release_lease(&lease, false),
+            Err(WorktreeError::DirtyWorktreePreserved { .. })
+        ));
+        assert!(branch_exists(repo_dir.path(), &lease.branch));
+        assert_eq!(manager.get_lease(&lease.path), Some(lease.clone()));
     }
 
     #[test]
