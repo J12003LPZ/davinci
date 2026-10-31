@@ -2085,7 +2085,9 @@ mod tests {
                 .join(".git/objects")
                 .join(&tip[..2])
                 .join(&tip[2..]);
+            // Git writes loose objects read-only, which blocks deletion on Windows.
             let mut mode = std::fs::metadata(&object).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
             mode.set_readonly(false);
             std::fs::set_permissions(&object, mode).unwrap();
             std::fs::remove_file(&object).unwrap();
