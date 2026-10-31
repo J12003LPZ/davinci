@@ -534,6 +534,7 @@ impl WorktreeManager {
                 None
             };
         let mut work = UnsavedWork::None;
+        let mut checked_head = None;
         if lease.path.exists() {
             if !run_git(&lease.path, &["status", "--porcelain"])?.is_empty() {
                 return Ok(Inspection {
@@ -543,9 +544,19 @@ impl WorktreeManager {
             }
             let current_head = run_git(&lease.path, &["rev-parse", "HEAD"])?;
             work = self.unintegrated_commit(lease, &current_head)?;
+            checked_head = Some(current_head);
         }
-        if let (UnsavedWork::None, Some(tip)) = (work, &branch_tip) {
-            work = self.unintegrated_commit(lease, tip)?;
+        // A detached checkout can hold its own unmerged commits while the
+        // branch tip sits elsewhere. Both are inspected whatever the first
+        // found, so an unreadable tip is an error before `force` is weighed.
+        if let Some(tip) = branch_tip
+            .as_ref()
+            .filter(|tip| checked_head.as_ref() != Some(tip))
+        {
+            let tip_work = self.unintegrated_commit(lease, tip)?;
+            if work == UnsavedWork::None {
+                work = tip_work;
+            }
         }
         Ok(Inspection { work, branch_tip })
     }
@@ -2080,6 +2091,51 @@ mod tests {
             commit_unique_work_on_branch(&lease);
             let tip = rev_parse(&lease.path, "HEAD");
             std::fs::remove_dir_all(&lease.path).unwrap();
+            let object = repo_dir
+                .path()
+                .join(".git/objects")
+                .join(&tip[..2])
+                .join(&tip[2..]);
+            // Git writes loose objects read-only, which blocks deletion on Windows.
+            let mut mode = std::fs::metadata(&object).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            mode.set_readonly(false);
+            std::fs::set_permissions(&object, mode).unwrap();
+            std::fs::remove_file(&object).unwrap();
+
+            let err = manager.release_lease(&lease, force).unwrap_err();
+            assert!(
+                matches!(err, WorktreeError::GitError(_)),
+                "force={force}: {err:?}"
+            );
+            let reference = repo_dir.path().join(".git/refs/heads").join(&lease.branch);
+            assert_eq!(
+                std::fs::read_to_string(reference).unwrap().trim(),
+                tip,
+                "force={force}: the ref is untouched"
+            );
+            assert_eq!(manager.get_lease(&lease.path).as_ref(), Some(&lease));
+        }
+    }
+
+    /// A clean detached checkout with its own unmerged commit must not hide
+    /// the managed branch's separate tip. When that tip cannot be read, the
+    /// inspection fails before `force` is considered and the ref survives.
+    #[test]
+    fn an_unreadable_branch_tip_is_an_error_even_when_the_checkout_holds_unmerged_work() {
+        for force in [false, true] {
+            let repo_dir = init_temp_git_repo();
+            let wt_dir = tempdir().unwrap();
+            let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+            let lease = manager
+                .create_lease(RunId::new(), AgentId::new(), None)
+                .unwrap();
+            commit_unique_work_on_branch(&lease);
+            let tip = rev_parse(&lease.path, "HEAD");
+            git_in(&lease.path, &["checkout", "--detach", &lease.base_head]);
+            std::fs::write(lease.path.join("detached.txt"), "only detached").unwrap();
+            git_in(&lease.path, &["add", "detached.txt"]);
+            git_in(&lease.path, &["commit", "-m", "detached work"]);
             let object = repo_dir
                 .path()
                 .join(".git/objects")
