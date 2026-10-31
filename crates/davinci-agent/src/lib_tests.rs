@@ -6331,6 +6331,65 @@ fn failed_auto_compaction_with_headroom_still_sends_the_request() {
     assert!(dispatched, "headroom left: the turn proceeds");
 }
 
+/// A refused automatic compaction below the window must not be retried by
+/// every tool round of the same turn: the history is unchanged, so each retry
+/// would pay for another summary and get the same refusal. The user hears
+/// about it once.
+#[test]
+fn a_refused_auto_compaction_below_the_window_is_reported_and_not_retried() {
+    let summaries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&summaries);
+    let mut agent = Agent::new("fixture");
+    agent.context_window = 10_000;
+    agent.compaction.enabled = true;
+    agent.compaction.reserve_tokens = 500;
+    agent.compaction.keep_recent_tokens = 6_000;
+    // A summary as big as the window: the replacement can never be admitted.
+    agent.summarizer = Some(Summarizer::new(move |_| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(crate::compaction::SummarizeResponse {
+            text: "s".repeat(38_000),
+            usage: Some(Default::default()),
+            stop_reason: Some(davinci_ai::StopReason::Stop),
+            error_message: None,
+            has_tool_call: false,
+        })
+    }));
+    agent.prompt("first request");
+    agent.record_assistant(&"x".repeat(20_000));
+    agent.prompt("second request");
+    agent.record_assistant(&"y".repeat(13_000));
+    agent.prompt("third request");
+    let tokens = agent.estimated_context_tokens();
+    assert!(
+        tokens > 9_500 && tokens < 10_000,
+        "between the trigger and the window: {tokens}"
+    );
+
+    let events = agent
+        .run_loop(scripted_tool_calls(vec![
+            ("read", serde_json::json!({"path": "missing-1"})),
+            ("read", serde_json::json!({"path": "missing-2"})),
+            ("read", serde_json::json!({"path": "missing-3"})),
+        ]))
+        .unwrap();
+
+    assert_eq!(
+        summaries.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the refusal is remembered while the context has not grown enough"
+    );
+    let notices = events
+        .iter()
+        .filter(|event| {
+            matches!(event, AgentEvent::CompletionNotice { reason_code, text }
+                if reason_code == "compaction.admission_refused"
+                    && text.contains("CONTEXT_ADMISSION_FAILED") && text.contains("/compact"))
+        })
+        .count();
+    assert_eq!(notices, 1, "told once");
+}
+
 #[test]
 fn switching_the_tree_branch_restores_that_branchs_verification_and_exposure() {
     let dir = tempfile::tempdir().unwrap();

@@ -893,9 +893,12 @@ Issue the call again if it is still needed.";
             } else if self.auto_compaction {
                 let mut settings = self.compaction;
                 settings.enabled = true;
-                if crate::should_compact(tokens, self.context_window, &settings) {
+                if crate::should_compact(tokens, self.context_window, &settings)
+                    && !self.auto_compaction_refusal_defers(tokens)
+                {
                     let outcome = self.compact_automatic(tokens);
                     if outcome.compacted {
+                        self.refused_auto_compaction = None;
                         self.stats.compactions += 1;
                     } else if self.context_window > 0 && tokens >= self.context_window {
                         // Compaction failed and the request cannot fit: stop
@@ -905,6 +908,24 @@ Issue the call again if it is still needed.";
                             "Request blocked: the context is full and automatic compaction failed ({}). Run /compact or start a new session.",
                             outcome.summary
                         ));
+                    } else if outcome
+                        .summary
+                        .starts_with(crate::compaction::CONTEXT_ADMISSION_FAILED)
+                    {
+                        // The request still fits, so the turn proceeds, but the
+                        // history stays above the trigger. Say so once and do
+                        // not pay for the same refusal on every tool round.
+                        self.arm_auto_compaction_refusal(tokens);
+                        self.push_event(
+                            &mut events,
+                            AgentEvent::CompletionNotice {
+                                reason_code: "compaction.admission_refused".into(),
+                                text: format!(
+                                    "Automatic compaction was refused and the context is unchanged: {} Run /compact or start a new session.",
+                                    outcome.summary
+                                ),
+                            },
+                        );
                     }
                 }
             }

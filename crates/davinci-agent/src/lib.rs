@@ -780,6 +780,12 @@ pub struct Agent {
     /// about the new limits, and a new summarizer deserves its own attempt. A
     /// change of Context VM mode clears it in [`Agent::set_context_vm_mode`].
     hybrid_fold_backoff_settings: Option<HybridBackoffScope>,
+    /// Context size and limits at the last automatic compaction that was
+    /// refused with `CONTEXT_ADMISSION_FAILED` while the request still fit the
+    /// window. The history is unchanged by a refusal, so the turn loop waits
+    /// for the context to grow by `keep_recent_tokens` (or for a different
+    /// window, settings or summarizer) before paying for another attempt.
+    refused_auto_compaction: Option<(u64, HybridBackoffScope)>,
     /// Summarizer requests the last hybrid fold sent (0 when it sent none).
     hybrid_last_fold_requests: u64,
     observation_root_id: String,
@@ -1001,6 +1007,7 @@ impl Agent {
             hybrid_compaction_stats: HybridCompactionStats::default(),
             hybrid_fold_backoff: None,
             hybrid_fold_backoff_settings: None,
+            refused_auto_compaction: None,
             hybrid_last_fold_requests: 0,
             observation_root_id: uuid::Uuid::new_v4().to_string(),
             root_budget: None,
@@ -1823,6 +1830,7 @@ impl Agent {
     pub(crate) fn restore_branch_state(&mut self) {
         self.hybrid_fold_backoff = None;
         self.hybrid_fold_backoff_settings = None;
+        self.refused_auto_compaction = None;
         self.restore_mutation_verification();
         self.restore_completion_status();
         self.restore_tool_exposure();
@@ -5434,6 +5442,29 @@ impl Agent {
             compaction: self.compaction,
             summarizer: self.summarizer.clone(),
         }
+    }
+
+    /// Whether the turn loop should skip automatic compaction at `tokens`
+    /// because an identical attempt was refused and the context has not grown
+    /// enough since. Never defers a context that no longer fits the window:
+    /// that case blocks the request and is retried every turn.
+    pub(crate) fn auto_compaction_refusal_defers(&mut self, tokens: u64) -> bool {
+        let Some((refused_at, scope)) = &self.refused_auto_compaction else {
+            return false;
+        };
+        let unchanged = *scope == self.hybrid_backoff_scope()
+            && tokens >= *refused_at
+            && tokens < refused_at.saturating_add(self.compaction.keep_recent_tokens)
+            && !(self.context_window > 0 && tokens >= self.context_window);
+        if !unchanged {
+            self.refused_auto_compaction = None;
+        }
+        unchanged
+    }
+
+    /// Remember a refused automatic attempt at `tokens`; see [`Self::auto_compaction_refusal_defers`].
+    pub(crate) fn arm_auto_compaction_refusal(&mut self, tokens: u64) {
+        self.refused_auto_compaction = Some((tokens, self.hybrid_backoff_scope()));
     }
 
     fn clear_hybrid_backoff(&mut self) {
