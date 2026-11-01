@@ -265,15 +265,26 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&fake, permissions).unwrap();
 
-        let started = std::time::Instant::now();
-        let (out, status) = run_status_with_executable(
-            root.path(),
-            &["status"],
-            &|| false,
-            Duration::from_secs(5),
-            fake,
-        )
-        .unwrap();
+        // A concurrent fork can briefly hold the script's write descriptor,
+        // so exec fails with ETXTBSY. Retry only that, timing the last attempt.
+        let mut attempts = 0;
+        let (started, (out, status)) = loop {
+            attempts += 1;
+            let started = std::time::Instant::now();
+            match run_status_with_executable(
+                root.path(),
+                &["status"],
+                &|| false,
+                Duration::from_secs(5),
+                fake.clone(),
+            ) {
+                Ok(result) => break (started, result),
+                Err(error) if attempts < 20 && error.contains("Text file busy") => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
         assert!(status.success());
         assert!(String::from_utf8_lossy(&out).contains("ok"));
         assert!(started.elapsed() < Duration::from_secs(3));

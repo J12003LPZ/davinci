@@ -276,6 +276,8 @@ jobs:
     timeout-minutes: 60
     env:
       CARGO_INCREMENTAL: "0"
+      # Full debug info for three packages' test binaries filled the runner disk during linking.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Use repository-pinned Rust
