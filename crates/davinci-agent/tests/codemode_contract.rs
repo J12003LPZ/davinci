@@ -42,7 +42,7 @@ fn unknown_mutation_never_auto_replays() {
             OperationState::RecoveryRequired,
             OperationState::Failed,
         ] {
-            let resolution = resolve_script_effect(state.clone(), effect.clone());
+            let resolution = resolve_script_effect(state, effect);
             assert!(
                 matches!(resolution, ScriptEffectResolution::RecoveryRequired { .. }),
                 "{state:?}/{effect:?} -> {resolution:?}"
