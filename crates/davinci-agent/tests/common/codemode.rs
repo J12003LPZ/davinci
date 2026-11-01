@@ -547,6 +547,85 @@ fn in_flight_child_is_awaited_before_parent_evidence_is_taken() {
 }
 
 #[test]
+fn undrained_child_makes_the_run_recovery_required() {
+    use crate::codemode::*;
+    struct FinishesWhileChildRuns(
+        Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    );
+    impl CodeModeHost for FinishesWhileChildRuns {
+        fn execute(
+            &self,
+            _: &CodeModeRequest,
+            _: &CodeModeRunContext,
+            broker: Arc<dyn CodeModeBroker>,
+        ) -> CodeModeOutcome {
+            let worker = std::thread::spawn(move || {
+                let _ = broker.call(CodeModeCall {
+                    request_id: 1,
+                    tool: "read".into(),
+                    args: json!({"path":"input.txt"}),
+                });
+            });
+            *self.0.lock().unwrap() = Some(worker);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !self.1.load(std::sync::atomic::Ordering::SeqCst)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            CodeModeOutcome {
+                status: CodeModeStatus::Completed,
+                script_completed: true,
+                output_text: "done".into(),
+                output_complete: true,
+                output_artifact: None,
+                children: vec![],
+                host_notes: vec![],
+                operation_ref: "fixture".into(),
+                error: None,
+            }
+        }
+    }
+    let worker = Arc::new(Mutex::new(None));
+    let (mut agent, workspace, _) = configured_agent();
+    agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+    let admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = admitted.clone();
+    // The child ignores cancellation and outlasts the cleanup grace.
+    let grace = CodeModeLimits::default().cleanup_grace_ms;
+    agent.pre_tool = Some(PreToolHook(Arc::new(move |name, _| {
+        if name == "read" {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(grace + 600));
+        }
+        None
+    })));
+    agent
+        .enable_read_only_codemode(Arc::new(FinishesWhileChildRuns(
+            worker.clone(),
+            admitted.clone(),
+        )))
+        .unwrap();
+    let messages = agent.execute_tool_batch(
+        workspace.path(),
+        vec![(
+            "undrained-script".into(),
+            "codemode".into(),
+            json!({"code":"return 1"}),
+        )],
+        &mut Vec::new(),
+    );
+    worker.lock().unwrap().take().unwrap().join().unwrap();
+    let details = messages[0].extra["details"]["codemode"].clone();
+    assert_eq!(
+        details["status"],
+        json!("recoveryRequired"),
+        "an undrained broker must not look finished: {details}"
+    );
+}
+
+#[test]
 fn retained_broker_cannot_dispatch_after_parent_outcome() {
     use crate::codemode::*;
     struct RetainingHost(Arc<Mutex<Option<Arc<dyn CodeModeBroker>>>>);
@@ -2146,21 +2225,89 @@ fn wait_for_script_scoped_handle_and_terminal_status() {
     assert!(!waited.is_error, "{}", waited.content);
     assert!(waited.content.contains("running"), "{}", waited.content);
 
-    // Kill records cancellation and a repeat is safe.
+    // This process owns the record but has no worker for it, so nothing was
+    // observed stopping: Kill reports `recoveryRequired`, never `cancelled`.
     let killed = agent.wait_for_script(WaitForScriptRequest {
         tool_call_id: "run-wait".into(),
         action: WaitAction::Kill,
     });
     assert!(!killed.is_error, "{}", killed.content);
+    assert!(
+        killed.content.contains("recoveryRequired"),
+        "{}",
+        killed.content
+    );
+    assert_eq!(
+        registry.get("run-wait").unwrap().state,
+        ScriptRunState::RecoveryRequired
+    );
+    // Repeating it is refused with the unresolved-effect error and changes nothing.
     let again = agent.wait_for_script(WaitForScriptRequest {
         tool_call_id: "run-wait".into(),
         action: WaitAction::Kill,
     });
-    assert!(!again.is_error, "{}", again.content);
+    assert!(again.is_error, "{}", again.content);
     assert_eq!(
         registry.get("run-wait").unwrap().state,
-        ScriptRunState::Cancelled
+        ScriptRunState::RecoveryRequired
     );
+
+    // A run another host process owns is refused and left alone.
+    let mut foreign_owned = ScriptRunRecord::new(
+        "run-other-host",
+        "call-oh",
+        session.as_deref(),
+        &binding,
+        "rev",
+    );
+    // Unique per run: owner locks live in the shared agent directory.
+    let foreign_id = format!("1-another-host-{}", uuid::Uuid::new_v4().simple());
+    foreign_owned.owner = Some(foreign_id.clone());
+    registry.create(&foreign_owned).unwrap();
+    // A live owner holds its lock through a handle of its own.
+    let owners = davinci_session::default_agent_dir().join("script-owners");
+    std::fs::create_dir_all(&owners).unwrap();
+    let foreign_path = owners.join(format!("{foreign_id}.lock"));
+    // A sweep probing the fresh file can briefly hold it; retry before failing.
+    let foreign_lock = (0..10)
+        .find_map(|attempt| {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            crate::runtime::capacity::lock_file_exclusive(&foreign_path, true).unwrap()
+        })
+        .expect("the foreign lock is free to take");
+    registry
+        .transition("run-other-host", ScriptRunState::Running)
+        .unwrap();
+    let refused = agent.wait_for_script(WaitForScriptRequest {
+        tool_call_id: "run-other-host".into(),
+        action: WaitAction::Kill,
+    });
+    assert!(refused.is_error, "{}", refused.content);
+    assert!(refused.content.contains("NOT_OWNER"), "{}", refused.content);
+    assert_eq!(
+        registry.get("run-other-host").unwrap().state,
+        ScriptRunState::Running
+    );
+    // Once that owner dies, the same handle resolves instead of staying
+    // `NOT_OWNER` forever.
+    drop(foreign_lock);
+    let resolved = agent.wait_for_script(WaitForScriptRequest {
+        tool_call_id: "run-other-host".into(),
+        action: WaitAction::Kill,
+    });
+    assert!(
+        resolved.content.contains("recoveryRequired") || resolved.content.contains("RECOVERY"),
+        "{}",
+        resolved.content
+    );
+    assert_eq!(
+        registry.get("run-other-host").unwrap().state,
+        ScriptRunState::RecoveryRequired
+    );
+    // Resolving a dead owner already removed it; this is only a safety net.
+    let _ = std::fs::remove_file(&foreign_path);
 
     // A handle from another session never resolves.
     let foreign = ScriptRunRegistry::open(evidence_dir.join("script-runs")).unwrap();
@@ -2408,8 +2555,13 @@ impl crate::codemode::CodeModeHost for SlowScriptHost {
     }
 }
 
-fn background_agent(delay: std::time::Duration, admit: bool) -> (crate::Agent, tempfile::TempDir) {
-    let (mut agent, _workspace, _) = configured_agent();
+/// Guards come before the agent so they drop after it: the workspace and
+/// evidence directories must outlive background workers through shutdown.
+fn background_agent(
+    delay: std::time::Duration,
+    admit: bool,
+) -> (tempfile::TempDir, tempfile::TempDir, crate::Agent) {
+    let (mut agent, workspace, _) = configured_agent();
     let evidence = tempfile::tempdir().unwrap();
     agent.evidence = Some(crate::EvidenceStore::new(evidence.path()));
     agent
@@ -2421,7 +2573,7 @@ fn background_agent(delay: std::time::Duration, admit: bool) -> (crate::Agent, t
             crate::codemode::CodeModeMode::Controlled,
         )
         .unwrap();
-    (agent, evidence)
+    (workspace, evidence, agent)
 }
 
 fn background_request() -> serde_json::Value {
@@ -2432,7 +2584,8 @@ fn background_request() -> serde_json::Value {
 fn background_script_returns_running_and_can_finish() {
     use crate::codemode::{ScriptRunState, WaitAction, WaitForScriptRequest};
 
-    let (agent, _evidence) = background_agent(std::time::Duration::from_millis(200), true);
+    let (_workspace, evidence, mut agent) =
+        background_agent(std::time::Duration::from_millis(200), true);
     let started = agent.run_codemode("call-bg", &background_request(), None);
     assert!(!started.is_error, "{started:?}");
     let handle: serde_json::Value = serde_json::from_str(&started.content).unwrap();
@@ -2458,11 +2611,71 @@ fn background_script_returns_running_and_can_finish() {
     }
     assert_eq!(state, "completed");
 
-    // The wakeup is delivered exactly once.
-    let first = agent.take_script_notification().expect("notification");
-    assert_eq!(first["toolCallId"], json!(run_id));
-    assert_eq!(first["state"], json!("completed"));
-    assert!(agent.take_script_notification().is_none());
+    // The terminal record already carries its bounded summary and log reference.
+    let registry =
+        crate::codemode::ScriptRunRegistry::open(evidence.path().join("script-runs")).unwrap();
+    let record = registry.get(&run_id).unwrap();
+    let summary = record.summary.clone().expect("summary with terminal state");
+    assert_eq!(summary.status, "Completed");
+    assert!(summary.notifications.len() <= 16);
+    assert!(summary.notifications.iter().all(|text| text.len() <= 4096));
+    assert!(record
+        .log_ref
+        .as_deref()
+        .is_some_and(|log| log.starts_with("script-log-")));
+    assert!(
+        !summary.notifications.join(" ").contains("background done"),
+        "raw guest output must not be in the summary"
+    );
+
+    // Reading a wakeup does not consume it; delivery appends it once, as
+    // untrusted-labeled custom context after the existing history, and
+    // acknowledges it only afterwards.
+    let wakeups = agent.pending_script_wakeups();
+    assert_eq!(wakeups.len(), 1);
+    assert_eq!(wakeups[0].run_id, run_id);
+    assert_eq!(wakeups[0].state, ScriptRunState::Completed);
+    assert_eq!(agent.pending_script_wakeups().len(), 1);
+
+    agent
+        .messages
+        .push(crate::ChatMessage::text("user", "earlier turn"));
+    let before = agent.messages.clone();
+    agent.inject_script_wakeups();
+    agent.inject_script_wakeups();
+    assert!(agent.pending_script_wakeups().is_empty());
+    assert_eq!(
+        &agent.messages[..before.len()],
+        &before[..],
+        "prefix unchanged"
+    );
+    let delivered: Vec<_> = agent.messages[before.len()..].iter().collect();
+    assert_eq!(delivered.len(), 1, "exactly once");
+    let text = match &delivered[0].content[0] {
+        davinci_ai::MessageContent::Text { text } => text.clone(),
+        other => panic!("unexpected content {other:?}"),
+    };
+    assert!(text.contains("untrusted data"), "{text}");
+    assert!(text.contains(&run_id), "{text}");
+    assert!(text.contains("grants no authority"), "{text}");
+
+    // Crash between persist and acknowledge: the store still offers the run,
+    // but the persisted context suppresses a second copy.
+    let path = evidence
+        .path()
+        .join("script-runs")
+        .join(format!("{run_id}.json"));
+    let stored = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        stored.replace("\"notified\":true", "\"notified\":false"),
+    )
+    .unwrap();
+    assert_eq!(agent.pending_script_wakeups().len(), 1);
+    let count = agent.messages.len();
+    agent.inject_script_wakeups();
+    assert_eq!(agent.messages.len(), count, "dedupe suppressed the copy");
+    assert!(agent.pending_script_wakeups().is_empty());
 
     // Nothing is left owned after the run finished.
     assert_eq!(
@@ -2475,7 +2688,8 @@ fn background_script_returns_running_and_can_finish() {
 
 #[test]
 fn background_script_without_host_approval_is_refused() {
-    let (agent, _evidence) = background_agent(std::time::Duration::from_millis(10), false);
+    let (_workspace, _evidence, agent) =
+        background_agent(std::time::Duration::from_millis(10), false);
     let refused = agent.run_codemode("call-bg-denied", &background_request(), None);
     assert!(refused.is_error, "{refused:?}");
     assert!(
@@ -2490,7 +2704,7 @@ fn background_script_without_host_approval_is_refused() {
 fn killed_background_script_is_cancelled_and_not_replayed() {
     use crate::codemode::{ScriptRunRegistry, ScriptRunState, WaitAction, WaitForScriptRequest};
 
-    let (agent, evidence) = background_agent(std::time::Duration::from_secs(5), true);
+    let (_workspace, evidence, agent) = background_agent(std::time::Duration::from_secs(5), true);
     let started = agent.run_codemode("call-bg-kill", &background_request(), None);
     assert!(!started.is_error, "{started:?}");
     let run_id = serde_json::from_str::<serde_json::Value>(&started.content).unwrap()["toolCallId"]
@@ -2503,15 +2717,21 @@ fn killed_background_script_is_cancelled_and_not_replayed() {
         action: WaitAction::Kill,
     });
     assert!(!kill.is_error, "{kill:?}");
+    assert!(kill.content.contains("cancelled"), "{}", kill.content);
 
-    // The owned worker observes cancellation and terminates.
-    assert_eq!(
-        agent.shutdown_background_scripts(std::time::Duration::from_secs(2)),
-        Vec::<String>::new()
-    );
+    // Kill alone stopped the worker and the worker recorded its own outcome;
+    // no shutdown was needed.
+    assert_eq!(agent.background_runs.active(), 0);
     let registry = ScriptRunRegistry::open(evidence.path().join("script-runs")).unwrap();
     let record = registry.get(&run_id).unwrap();
     assert_eq!(record.state, ScriptRunState::Cancelled, "{record:?}");
+    // Shutdown is safe afterwards, and safe twice.
+    for _ in 0..2 {
+        assert_eq!(
+            agent.shutdown_background_scripts(std::time::Duration::from_secs(1)),
+            Vec::<String>::new()
+        );
+    }
     // A cancelled run is terminal and is never replayed.
     assert!(record.state.terminal());
     let repeated = agent.wait_for_script(WaitForScriptRequest {
@@ -2523,6 +2743,109 @@ fn killed_background_script_is_cancelled_and_not_replayed() {
         registry.get(&run_id).unwrap().state,
         ScriptRunState::Cancelled
     );
+}
+
+#[test]
+fn replacing_the_session_stops_detached_scripts() {
+    use crate::codemode::{ScriptRunRegistry, ScriptRunState};
+
+    let (_workspace, evidence, mut agent) =
+        background_agent(std::time::Duration::from_secs(5), true);
+    let started = agent.run_codemode("call-bg-replace", &background_request(), None);
+    assert!(!started.is_error, "{started:?}");
+    let run_id = serde_json::from_str::<serde_json::Value>(&started.content).unwrap()["toolCallId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(agent.background_runs.active(), 1);
+
+    let root = tempfile::tempdir().unwrap();
+    let replacement =
+        davinci_session::JsonlSession::create(root.path(), "/tmp/replacement", None).unwrap();
+    agent.load_from_session(replacement).unwrap();
+
+    assert_eq!(agent.background_runs.active(), 0);
+    let registry = ScriptRunRegistry::open(evidence.path().join("script-runs")).unwrap();
+    assert_eq!(
+        registry.get(&run_id).unwrap().state,
+        ScriptRunState::Cancelled
+    );
+    // The agent still accepts runs for the new session.
+    let next = agent.run_codemode("call-bg-after", &background_request(), None);
+    assert!(!next.is_error, "{next:?}");
+    agent.shutdown_session_scripts();
+}
+
+#[test]
+fn drain_refuses_launches_and_reopens() {
+    let (_workspace, _evidence, agent) = background_agent(std::time::Duration::from_secs(5), true);
+    agent.background_runs.close();
+    let refused = agent.run_codemode("call-bg-closing", &background_request(), None);
+    assert!(refused.is_error, "{refused:?}");
+    assert!(refused.content.contains("closing"), "{}", refused.content);
+    assert_eq!(agent.background_runs.active(), 0);
+    agent.background_runs.reopen();
+    let started = agent.run_codemode("call-bg-open", &background_request(), None);
+    assert!(!started.is_error, "{started:?}");
+    agent.shutdown_session_scripts();
+}
+
+#[test]
+fn explicit_branch_navigation_hides_runs_started_on_another_branch() {
+    use crate::codemode::{WaitAction, WaitForScriptRequest};
+    use davinci_session::SessionEntry;
+
+    let (_workspace, _evidence, mut agent) =
+        background_agent(std::time::Duration::from_secs(5), true);
+    let root = tempfile::tempdir().unwrap();
+    let mut session =
+        davinci_session::JsonlSession::create(root.path(), "/tmp/branch", None).unwrap();
+    for text in ["one", "two"] {
+        session
+            .append_entry(SessionEntry::message(
+                "user",
+                json!([{"type":"text","text":text}]),
+            ))
+            .unwrap();
+    }
+    let first = session.entries[0].id.clone();
+    agent.session = Some(session);
+
+    let started = agent.run_codemode("call-bg-branch", &background_request(), None);
+    let run_id = serde_json::from_str::<serde_json::Value>(&started.content).unwrap()["toolCallId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let status = |agent: &crate::Agent| {
+        agent.wait_for_script(WaitForScriptRequest {
+            tool_call_id: run_id.clone(),
+            action: WaitAction::Status,
+        })
+    };
+    assert!(!status(&agent).is_error);
+
+    agent
+        .navigate_tree_entry(&first, false, None, false, 16_384)
+        .unwrap();
+    let denied = status(&agent);
+    assert!(denied.is_error, "{}", denied.content);
+    assert!(denied.content.contains("DENIED"), "{}", denied.content);
+    assert!(agent.pending_script_wakeups().is_empty());
+    let second = agent.session.as_ref().unwrap().entries[1].id.clone();
+    let session_path = agent.session.as_ref().unwrap().path.clone();
+    agent.shutdown_session_scripts();
+
+    // A restart keeps no in-memory counter: a fresh agent on the same session
+    // applies the same rule, and returning to the branch restores access.
+    let (mut fresh, _fresh_workspace, _) = configured_agent();
+    fresh.cwd = agent.cwd.clone();
+    fresh.evidence = Some(crate::EvidenceStore::new(_evidence.path()));
+    let mut reopened = davinci_session::JsonlSession::open(&session_path).unwrap();
+    reopened.set_leaf(Some(first));
+    fresh.session = Some(reopened);
+    assert!(status(&fresh).is_error, "abandoned branch stays hidden");
+    fresh.session.as_mut().unwrap().set_leaf(Some(second));
+    assert!(!status(&fresh).is_error, "the run's own branch resolves");
 }
 
 #[test]
@@ -2560,14 +2883,15 @@ fn script_todo_alias_requires_the_host_gate_end_to_end() {
             cancellation: runtime.cancellation_token.child_token(),
             root_budget: runtime.root_budget.clone(),
         };
+        // The workspace guard comes first so it drops after the broker.
         (
-            AgentCodeModeBroker::new(agent, context, None).unwrap(),
             workspace,
+            AgentCodeModeBroker::new(agent, context, None).unwrap(),
         )
     };
 
     // Closed by default: the alias does not resolve.
-    let (closed, _) = build_broker(ScriptToolGates::default());
+    let (_closed_workspace, closed) = build_broker(ScriptToolGates::default());
     let denied = closed
         .call(CodeModeCall {
             request_id: 1,
@@ -2578,7 +2902,7 @@ fn script_todo_alias_requires_the_host_gate_end_to_end() {
     assert_eq!(denied.code, "DENIED", "{denied:?}");
 
     // Explicitly opened, the same alias reaches the host-owned todo tool.
-    let (open, _) = build_broker(ScriptToolGates {
+    let (_open_workspace, open) = build_broker(ScriptToolGates {
         allow_todo: true,
         allow_subagents: false,
     });

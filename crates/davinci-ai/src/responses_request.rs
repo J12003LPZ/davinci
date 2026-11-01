@@ -162,8 +162,15 @@ impl PreparedProviderRequest {
     /// Byte-identical prefixes produce identical digests; a reordered tool
     /// catalog or rewritten instructions produce different ones.
     pub fn cache_prefix_manifest(&self) -> Vec<WireSegmentDigest> {
-        self.manifest
-            .segments
+        self.manifest.cache_prefix_manifest()
+    }
+}
+
+impl WireManifest {
+    /// Same view as [`PreparedProviderRequest::cache_prefix_manifest`], for a
+    /// manifest recorded after the request was sent.
+    pub fn cache_prefix_manifest(&self) -> Vec<WireSegmentDigest> {
+        self.segments
             .iter()
             .filter(|segment| segment.cache_sensitive)
             .map(|segment| WireSegmentDigest {

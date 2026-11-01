@@ -46,6 +46,7 @@ from private_suite import apply_hidden, argv, import_suite, load_frozen, run_che
 from readiness_metrics import report as readiness_report, load_prices
 import subscription_campaign
 import droid_arm
+import arms
 import task_sources
 from droid_usage import (droid_usage_from_session, droid_request_count,
                          droid_session_files, droid_log_text, droid_session_fields,
@@ -271,9 +272,28 @@ def forbidden_artifacts(workdir, tid):
 def codemode_arm(settings):
     """Codemode mode selected by the DaVinci settings, validated before any launch."""
     mode = requested_codemode(settings)
-    if mode not in ("off", "read-only"):
-        raise ValueError("benchmark codemode arm must be off or read-only")
+    if mode not in ("off", "read-only", "controlled"):
+        raise ValueError("benchmark codemode arm must be off, read-only or controlled")
     return mode
+
+
+def validate_codemode(settings, preflight=arms.preflight):
+    """Validate the Codemode arm before any launch; returns the preflight record or None.
+
+    Controlled mode needs the trusted Node and host bundle. A failed preflight raises
+    ``arms.PreflightError``: there is no fallback to read-only or off.
+    """
+    if codemode_arm(settings) != "controlled":
+        return None
+    block = settings["codemode"]
+    return preflight("davinci_script", block.get("nodePath"), block.get("hostPath"))
+
+
+def row_arm(harness, settings):
+    """The four-arm name a run launched as, or None when harness plus mode do not name one."""
+    if harness == "davinci":
+        return {"off": "davinci_direct", "controlled": "davinci_script"}.get(requested_codemode(settings))
+    return {"droid-direct": "droid_direct", "droid-script": "droid_script"}.get(harness)
 
 
 def droid_settings_path(workdir):
@@ -864,6 +884,9 @@ def run_one(harness, tid, rep, campaign=None, warmup=False):
         result["droid_log_uncached_input"] = s.get("droid_log_uncached_input")
         result["droid_usage_error"] = s.get("droid_usage_error")
     result["pass"] = task_success(result)
+    arm = row_arm(harness, settings)
+    if arm:
+        result = arms.stamp_row(result, arm, campaign.get("arm_preflight") if campaign else None)
     if warmup:
         # Warm-up rows never enter results.jsonl, so integrity, gate, report,
         # compare and the gap analysis cannot read them.
@@ -1258,7 +1281,7 @@ def main():
                 raise ValueError("; ".join(frozen_errors))
             fixtures = study_fixture_manifest(tids)
             settings = json.loads(Path(args.settings).read_text(encoding="utf-8")) if args.settings else BASE_SETTINGS
-            codemode_arm(settings)
+            arm_preflight = validate_codemode(settings)
             bench_options(settings)
             manifest = campaign_identity(RUNS, args.variant, fixtures, args.harness,
                                          MODEL, EFFORT, settings, Path(HERE).parents[1])
@@ -1278,6 +1301,7 @@ def main():
             order = (schedule(tids, repetitions, args.harness, args.order_seed)
                      if args.order == "counterbalanced" else
                      [(h, t, r) for r in repetitions for t in tids for h in args.harness])
+            manifest["arm_preflight"] = arm_preflight
             manifest["campaign_lock"] = lock
             manifest["campaign_slot"] = campaign_slot()
             # Dumping adds I/O to every request: such a campaign is for diagnosis,

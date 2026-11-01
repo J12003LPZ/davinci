@@ -24,6 +24,10 @@ pub struct MutationBaseline {
     /// checkpoints keep file bytes in the content-addressed blob store.
     #[serde(default, skip_serializing)]
     pub contents: BTreeMap<String, Vec<u8>>,
+    /// Symlinks and junctions: path to link text. Recorded with `read_link`,
+    /// never followed, and kept out of `files`. Old checkpoints have none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub links: BTreeMap<String, String>,
 }
 
 impl MutationBaseline {
@@ -69,11 +73,15 @@ impl ChangedFile {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PatchChunk {
     pub file: String,
     pub patch: String,
+    /// The patch is a summary: the reviewer did not see the content (oversized
+    /// file, or a link whose target is never followed). Not an applyable patch.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub content_unavailable: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +101,23 @@ impl GraphMutation {
     }
 
     pub fn assess_risk(&self) -> crate::native_extensions::ecosystem::risk::RiskAssessment {
-        crate::native_extensions::ecosystem::risk::assess_change_risk(self)
+        use crate::native_extensions::ecosystem::risk::{ChangeRisk, RiskReason};
+        let mut assessment = crate::native_extensions::ecosystem::risk::assess_change_risk(self);
+        // Content nobody saw cannot be called low risk.
+        for chunk in self.patch_chunks.iter().filter(|c| c.content_unavailable) {
+            if !assessment
+                .reasons
+                .iter()
+                .any(|r| r.surface == "content_unavailable" && r.path == chunk.file)
+            {
+                assessment.reasons.push(RiskReason {
+                    surface: "content_unavailable",
+                    path: chunk.file.clone(),
+                });
+            }
+            assessment.level = ChangeRisk::High;
+        }
+        assessment
     }
 }
 
@@ -172,15 +196,14 @@ fn walk_dir_files(root: &Path) -> Vec<String> {
             {
                 continue;
             }
-            let Ok(kind) = entry.file_type() else {
+            let Ok(metadata) = entry.metadata() else {
                 continue;
             };
-            if kind.is_symlink() {
-                continue;
-            }
-            if kind.is_dir() {
+            // A link (including a Windows junction) is listed, never entered.
+            let is_link = workspace_files::is_redirected(&metadata);
+            if metadata.is_dir() && !is_link {
                 stack.push(path);
-            } else if kind.is_file() {
+            } else if is_link || metadata.is_file() {
                 if let Ok(rel) = path.strip_prefix(root) {
                     result.push(normalize_rel_path(&rel.to_string_lossy()));
                 }
@@ -191,32 +214,53 @@ fn walk_dir_files(root: &Path) -> Vec<String> {
     result
 }
 
+use super::workspace_files::{self, Entry};
+
+/// Baseline file bytes up to this size are kept in the blob store.
+const BASELINE_BLOB_LIMIT: u64 = 512 * 1024;
+/// Largest file whose bytes are read to produce a textual patch.
+const PATCH_CONTENT_LIMIT: u64 = 64 * 1024 * 1024;
+
 /// Capture baseline workspace fingerprints and contents before writer mutation.
 pub fn capture_baseline(cwd: &Path) -> Result<MutationBaseline, String> {
     let blob_dir = super::blobs::dir(cwd);
     let mut files = BTreeMap::new();
+    let mut links = BTreeMap::new();
 
     let paths = list_workspace_files(cwd)?;
     for rel_path in paths {
         if is_transaction_journal(&rel_path) {
             continue;
         }
-        let bytes = match super::workspace_files::read(cwd, Path::new(&rel_path)) {
-            Ok(bytes) => bytes,
+        match workspace_files::link_target(cwd, Path::new(&rel_path)) {
+            Ok(Some(target)) => {
+                links.insert(rel_path, target);
+                continue;
+            }
+            Ok(None) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(format!("Cannot read baseline file {rel_path}: {error}"));
             }
-        };
-        let hash = sha256_hex(&bytes);
-        if bytes.len() <= 512 * 1024 {
-            super::blobs::put(&blob_dir, &hash, &bytes).map_err(|error| error.to_string())?;
+        }
+        let captured =
+            match workspace_files::fingerprint(cwd, Path::new(&rel_path), BASELINE_BLOB_LIMIT) {
+                Ok(Entry::Present(captured)) => captured,
+                Ok(Entry::Excluded) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!("Cannot read baseline file {rel_path}: {error}"));
+                }
+            };
+        if let Some(bytes) = &captured.bytes {
+            super::blobs::put(&blob_dir, &captured.hash, bytes)
+                .map_err(|error| error.to_string())?;
         }
         files.insert(
             rel_path,
             FileFingerprint {
-                hash,
-                len: bytes.len() as u64,
+                hash: captured.hash,
+                len: captured.len,
             },
         );
     }
@@ -224,6 +268,7 @@ pub fn capture_baseline(cwd: &Path) -> Result<MutationBaseline, String> {
     Ok(MutationBaseline {
         files,
         contents: BTreeMap::new(),
+        links,
     })
 }
 
@@ -232,27 +277,47 @@ pub fn capture_graph_delta(
     cwd: &Path,
     baseline: &MutationBaseline,
 ) -> Result<GraphMutation, String> {
+    capture_graph_delta_with_limit(cwd, baseline, PATCH_CONTENT_LIMIT)
+}
+
+fn capture_graph_delta_with_limit(
+    cwd: &Path,
+    baseline: &MutationBaseline,
+    patch_limit: u64,
+) -> Result<GraphMutation, String> {
     let blob_dir = super::blobs::dir(cwd);
     let current_paths = list_workspace_files(cwd)?;
     let mut current_map = BTreeMap::new();
+    let mut current_links = BTreeMap::new();
 
     for rel_path in current_paths {
         if is_transaction_journal(&rel_path) {
             continue;
         }
-        let bytes = match super::workspace_files::read(cwd, Path::new(&rel_path)) {
-            Ok(bytes) => bytes,
+        match workspace_files::link_target(cwd, Path::new(&rel_path)) {
+            Ok(Some(target)) => {
+                current_links.insert(rel_path, target);
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!("Cannot read mutation file {rel_path}: {error}"));
+            }
+        }
+        let captured = match workspace_files::fingerprint(cwd, Path::new(&rel_path), 0) {
+            Ok(Entry::Present(captured)) => captured,
+            Ok(Entry::Excluded) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(format!("Cannot read mutation file {rel_path}: {error}"));
             }
         };
-        let hash = sha256_hex(&bytes);
         current_map.insert(
             rel_path,
             FileFingerprint {
-                hash,
-                len: bytes.len() as u64,
+                hash: captured.hash,
+                len: captured.len,
             },
         );
     }
@@ -262,31 +327,55 @@ pub fn capture_graph_delta(
 
     // Check for added or modified files
     for (path, fingerprint) in &current_map {
+        if let Some(old_target) = baseline.links.get(path) {
+            // A link replaced by a regular file; reported as that, not as an add.
+            changed_files.push(ChangedFile::modified(path));
+            patch_chunks.push(link_chunk(
+                path,
+                &link_side(old_target),
+                &file_side(fingerprint),
+            ));
+            continue;
+        }
         match baseline.files.get(path) {
             None => {
                 // Newly added by graph
                 changed_files.push(ChangedFile::added(path));
-                let current_bytes = super::workspace_files::read(cwd, Path::new(path))
-                    .map_err(|error| format!("Cannot read mutation file {path}: {error}"))?;
-                let patch = format_added_file_diff(path, &current_bytes);
+                let patch = if fingerprint.len > patch_limit {
+                    content_unavailable_summary(path, None, fingerprint, patch_limit)
+                } else {
+                    let current_bytes = workspace_files::read(cwd, Path::new(path))
+                        .map_err(|error| format!("Cannot read mutation file {path}: {error}"))?;
+                    format_added_file_diff(path, &current_bytes)
+                };
                 patch_chunks.push(PatchChunk {
                     file: path.clone(),
                     patch,
+                    content_unavailable: fingerprint.len > patch_limit,
                 });
             }
             Some(old_fp) if old_fp.hash != fingerprint.hash => {
                 // Modified by graph
                 changed_files.push(ChangedFile::modified(path));
                 let old_bytes = baseline.old_bytes(path, &blob_dir);
-                let current_bytes = super::workspace_files::read(cwd, Path::new(path))
-                    .map_err(|error| format!("Cannot read mutation file {path}: {error}"))?;
-                let patch = match old_bytes {
-                    Some(old_bytes) => format_modified_file_diff(path, &old_bytes, &current_bytes),
-                    None => unavailable_original_summary(path, old_fp, Some(fingerprint)),
+                // Without the original the reviewer sees no content change.
+                let original_missing = old_bytes.is_none();
+                let patch = if fingerprint.len > patch_limit {
+                    content_unavailable_summary(path, Some(old_fp), fingerprint, patch_limit)
+                } else {
+                    let current_bytes = workspace_files::read(cwd, Path::new(path))
+                        .map_err(|error| format!("Cannot read mutation file {path}: {error}"))?;
+                    match old_bytes {
+                        Some(old_bytes) => {
+                            format_modified_file_diff(path, &old_bytes, &current_bytes)
+                        }
+                        None => unavailable_original_summary(path, old_fp, Some(fingerprint)),
+                    }
                 };
                 patch_chunks.push(PatchChunk {
                     file: path.clone(),
                     patch,
+                    content_unavailable: fingerprint.len > patch_limit || original_missing,
                 });
             }
             _ => {
@@ -300,9 +389,18 @@ pub fn capture_graph_delta(
         if is_transaction_journal(old_path) {
             continue;
         }
-        if !current_map.contains_key(old_path) {
+        if let Some(new_target) = current_links.get(old_path) {
+            // A regular file replaced by a link; reported as that, not as a deletion.
+            changed_files.push(ChangedFile::modified(old_path));
+            patch_chunks.push(link_chunk(
+                old_path,
+                &file_side(&baseline.files[old_path]),
+                &link_side(new_target),
+            ));
+        } else if !current_map.contains_key(old_path) {
             changed_files.push(ChangedFile::deleted(old_path));
             let old_bytes = baseline.old_bytes(old_path, &blob_dir);
+            let original_missing = old_bytes.is_none();
             let patch = match old_bytes {
                 Some(old_bytes) => format_deleted_file_diff(old_path, &old_bytes),
                 None => unavailable_original_summary(old_path, &baseline.files[old_path], None),
@@ -310,14 +408,93 @@ pub fn capture_graph_delta(
             patch_chunks.push(PatchChunk {
                 file: old_path.clone(),
                 patch,
+                content_unavailable: original_missing,
             });
         }
+    }
+
+    // Links that were links before or are links now. A path that was or became
+    // a regular file was reported above.
+    for (path, new_target) in &current_links {
+        if baseline.files.contains_key(path) {
+            continue;
+        }
+        match baseline.links.get(path) {
+            None => {
+                changed_files.push(ChangedFile::added(path));
+                patch_chunks.push(link_chunk(path, "absent", &link_side(new_target)));
+            }
+            Some(old_target) if old_target != new_target => {
+                changed_files.push(ChangedFile::modified(path));
+                patch_chunks.push(link_chunk(
+                    path,
+                    &link_side(old_target),
+                    &link_side(new_target),
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    for (path, old_target) in &baseline.links {
+        if is_transaction_journal(path)
+            || current_links.contains_key(path)
+            || current_map.contains_key(path)
+        {
+            continue;
+        }
+        changed_files.push(ChangedFile::deleted(path));
+        patch_chunks.push(link_chunk(path, &link_side(old_target), "absent"));
     }
 
     Ok(GraphMutation {
         files: changed_files,
         patch_chunks,
     })
+}
+
+fn link_side(target: &str) -> String {
+    // Debug-quoted: the link text is workspace-controlled and may hold newlines.
+    format!("link -> {target:?}")
+}
+
+fn file_side(fingerprint: &FileFingerprint) -> String {
+    format!(
+        "regular file sha256 {} ({} bytes)",
+        fingerprint.hash, fingerprint.len
+    )
+}
+
+// Evidence, not an applyable patch: the link target is never opened or followed.
+fn link_chunk(path: &str, old: &str, new: &str) -> PatchChunk {
+    PatchChunk {
+        file: path.to_string(),
+        patch: format!(
+            "diff --git a/{path} b/{path}\nlink change; content unavailable, link targets are not followed\nold: {old}\nnew: {new}\n"
+        ),
+        content_unavailable: true,
+    }
+}
+
+// The file was fingerprinted in full but is too large to read into a patch.
+fn content_unavailable_summary(
+    path: &str,
+    old: Option<&FileFingerprint>,
+    new: &FileFingerprint,
+    limit: u64,
+) -> String {
+    let mut summary = format!(
+        "diff --git a/{path} b/{path}\ncontent unavailable; file exceeds the {limit}-byte patch limit\n"
+    );
+    if let Some(old) = old {
+        summary.push_str(&format!(
+            "old sha256 {} ({} bytes)\nmodified; ",
+            old.hash, old.len
+        ));
+    } else {
+        summary.push_str("added; ");
+    }
+    summary.push_str(&format!("new sha256 {} ({} bytes)\n", new.hash, new.len));
+    summary
 }
 
 // This is evidence, not an applyable textual patch: absence is not empty content.
@@ -593,7 +770,8 @@ mod tests {
                 std::fs::remove_file(blob).unwrap();
             }
             std::fs::write(dir.path().join("large.txt"), b"new contents").unwrap();
-            let modified = capture_graph_delta(dir.path(), &baseline).unwrap().diff();
+            let modified_delta = capture_graph_delta(dir.path(), &baseline).unwrap();
+            let modified = modified_delta.diff();
             assert!(
                 modified.contains("original bytes unavailable"),
                 "{modified}"
@@ -602,10 +780,70 @@ mod tests {
             assert!(modified.contains(&format!("{} bytes", fp.len)));
             assert!(!modified.contains("@@ -0,0"));
             std::fs::remove_file(dir.path().join("large.txt")).unwrap();
-            let deleted = capture_graph_delta(dir.path(), &baseline).unwrap().diff();
+            let deleted_delta = capture_graph_delta(dir.path(), &baseline).unwrap();
+            let deleted = deleted_delta.diff();
             assert!(deleted.contains("original bytes unavailable"));
             assert!(deleted.contains(&fp.hash));
+            // The reviewer saw nothing of the change, so risk must say so.
+            for delta in [&modified_delta, &deleted_delta] {
+                assert!(delta.patch_chunks.iter().all(|c| c.content_unavailable));
+                assert_eq!(
+                    delta.assess_risk().level,
+                    crate::native_extensions::ecosystem::risk::ChangeRisk::High
+                );
+            }
         }
+    }
+
+    /// A workspace without Git holding a directory link to a folder outside it
+    /// and a link back to its own root: each link is listed once and nothing
+    /// behind either is.
+    fn assert_walk_lists_directory_links_without_entering(
+        link_dir: impl Fn(&Path, &Path) -> std::io::Result<()>,
+    ) {
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"outside").unwrap();
+        std::fs::write(workspace.path().join("plain.txt"), b"plain").unwrap();
+        link_dir(&workspace.path().join("out-link"), outside.path())
+            .expect("directory link to the outside folder");
+        link_dir(&workspace.path().join("loop-link"), workspace.path())
+            .expect("directory link back to the workspace root");
+        assert_eq!(
+            walk_dir_files(workspace.path()),
+            ["loop-link", "out-link", "plain.txt"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_lists_directory_symlinks_without_entering_them() {
+        assert_walk_lists_directory_links_without_entering(|link, target| {
+            std::os::unix::fs::symlink(target, link)
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn walk_lists_directory_junctions_without_entering_them() {
+        assert_walk_lists_directory_links_without_entering(|link, target| {
+            let output = Command::new("cmd")
+                .arg("/c")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .output()?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!(
+                    "mklink /J failed: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )))
+            }
+        });
     }
 
     #[cfg(unix)]
@@ -624,6 +862,108 @@ mod tests {
         // Also exercise Git's tracked/untracked path enumeration.
         super::super::git::run(dir.path(), &["init"]).unwrap();
         assert!(capture_baseline(dir.path()).unwrap().files.is_empty());
+        std::fs::write(dir.path().join("plain.txt"), b"plain").unwrap();
+        let baseline = capture_baseline(dir.path()).unwrap();
+        assert_eq!(baseline.files.keys().collect::<Vec<_>>(), ["plain.txt"]);
+        let delta = capture_graph_delta(dir.path(), &baseline).unwrap();
+        assert!(delta.files.is_empty(), "{delta:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graph_integrity_unreadable_file_stays_fatal() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("locked.txt");
+        std::fs::write(&path, b"secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&path).is_ok() {
+            return; // running as root: permissions do not block the read
+        }
+        let error = capture_baseline(dir.path()).unwrap_err();
+        assert!(error.contains("locked.txt"), "{error}");
+        assert!(capture_graph_delta(dir.path(), &MutationBaseline::default()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graph_integrity_link_changes_are_reported_without_following() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"TOP-SECRET-CONTENT").unwrap();
+        std::fs::write(outside.path().join("other"), b"OTHER-CONTENT").unwrap();
+        let link = dir.path().join("config");
+        let baseline = capture_baseline(dir.path()).unwrap();
+
+        std::os::unix::fs::symlink(outside.path().join("secret"), &link).unwrap();
+        let added = capture_graph_delta(dir.path(), &baseline).unwrap();
+        assert_eq!(added.files, vec![ChangedFile::added("config")]);
+        assert!(added.diff().contains("secret"), "{}", added.diff());
+        assert!(added.patch_chunks[0].content_unavailable);
+
+        let with_link = capture_baseline(dir.path()).unwrap();
+        assert!(with_link.files.is_empty());
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("other"), &link).unwrap();
+        let retargeted = capture_graph_delta(dir.path(), &with_link).unwrap();
+        assert_eq!(retargeted.files, vec![ChangedFile::modified("config")]);
+        let diff = retargeted.diff();
+        assert!(diff.contains("secret") && diff.contains("other"), "{diff}");
+
+        std::fs::remove_file(&link).unwrap();
+        let removed = capture_graph_delta(dir.path(), &with_link).unwrap();
+        assert_eq!(removed.files, vec![ChangedFile::deleted("config")]);
+
+        for delta in [&added, &retargeted, &removed] {
+            let diff = delta.diff();
+            assert!(!diff.contains("TOP-SECRET-CONTENT"), "{diff}");
+            assert!(!diff.contains("OTHER-CONTENT"), "{diff}");
+        }
+    }
+
+    #[test]
+    fn old_checkpoint_without_links_still_loads() {
+        let old = r#"{"files":{"a.txt":{"hash":"h","len":3}}}"#;
+        let baseline: MutationBaseline = serde_json::from_str(old).unwrap();
+        assert!(baseline.links.is_empty());
+        assert!(!serde_json::to_string(&baseline).unwrap().contains("links"));
+        let chunk: PatchChunk = serde_json::from_str(r#"{"file":"a","patch":"p"}"#).unwrap();
+        assert!(!chunk.content_unavailable);
+    }
+
+    #[test]
+    fn unseen_content_raises_risk_to_the_highest_level() {
+        use crate::native_extensions::ecosystem::risk::ChangeRisk;
+        let mut mutation = GraphMutation {
+            files: vec![ChangedFile::added("big.txt")],
+            patch_chunks: vec![PatchChunk {
+                file: "big.txt".into(),
+                patch: "summary".into(),
+                content_unavailable: false,
+            }],
+        };
+        assert_eq!(mutation.assess_risk().level, ChangeRisk::Low);
+        mutation.patch_chunks[0].content_unavailable = true;
+        let assessment = mutation.assess_risk();
+        assert_eq!(assessment.level, ChangeRisk::High);
+        assert_eq!(assessment.reasons[0].path, "big.txt");
+    }
+
+    #[test]
+    fn graph_integrity_oversized_file_is_fingerprinted_and_summarized() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("big.txt"), b"0123456789").unwrap();
+        let baseline = capture_baseline(dir.path()).unwrap();
+        // Same length, different content: the full-content hash still sees it.
+        std::fs::write(dir.path().join("big.txt"), b"0123456780").unwrap();
+        std::fs::write(dir.path().join("new.txt"), b"abcdefghij").unwrap();
+        let delta = capture_graph_delta_with_limit(dir.path(), &baseline, 4).unwrap();
+        let diff = delta.diff();
+        assert_eq!(delta.files.len(), 2, "{delta:?}");
+        assert_eq!(diff.matches("content unavailable").count(), 2, "{diff}");
+        assert!(diff.contains(&baseline.files["big.txt"].hash), "{diff}");
+        assert!(!diff.contains("0123456780"), "{diff}");
+        assert!(delta.patch_chunks.iter().all(|c| c.content_unavailable));
     }
 
     #[test]

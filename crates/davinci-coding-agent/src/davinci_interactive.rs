@@ -5787,6 +5787,8 @@ pub fn run(
     }
     // Stop the Ollama this session started; one it found running is left alone.
     crate::native_extensions::service_supervisor::system_supervisor().shutdown_owned();
+    // Detached Script runs stop whether the loop ended cleanly or with an error.
+    crate::shutdown::stop_script_runs();
 
     {
         let locked = host.lock().unwrap_or_else(|e| e.into_inner());

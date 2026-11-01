@@ -1323,6 +1323,7 @@ mod tests {
                 )]
                 .into(),
                 contents: Default::default(),
+                links: Default::default(),
             }),
             ..Default::default()
         });
@@ -1374,6 +1375,7 @@ mod tests {
             saved_baseline: Some(MutationBaseline {
                 files,
                 contents: BTreeMap::new(),
+                links: BTreeMap::new(),
             }),
             ..GraphContinuation::default()
         });

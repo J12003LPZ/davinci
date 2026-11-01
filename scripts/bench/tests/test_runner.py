@@ -52,9 +52,34 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(on[on.index("--codemode") + 1], "read-only")
         explicit_off = bench.command("davinci", "prompt", "workdir", {"codemode": {"mode": "off"}})
         self.assertIn("--no-session", explicit_off)
-        for mode in ("controlled", "turbo"):
-            with self.assertRaises(ValueError):
-                bench.command("davinci", "prompt", "workdir", {"codemode": {"mode": mode}})
+        with self.assertRaises(ValueError):
+            bench.command("davinci", "prompt", "workdir", {"codemode": {"mode": "turbo"}})
+        controlled = bench.command("davinci", "prompt", "workdir", {"codemode": {"mode": "controlled"}})
+        self.assertNotIn("--no-session", controlled)
+        self.assertEqual(controlled[controlled.index("--codemode") + 1], "controlled")
+
+    def test_controlled_arm_needs_a_passing_preflight_before_launch(self):
+        settings = {"codemode": {"mode": "controlled", "nodePath": "rel/node", "hostPath": "rel/host"}}
+        with self.assertRaises(bench.arms.PreflightError):
+            bench.validate_codemode(settings)  # real preflight: relative paths are errors
+        def failing(*_):
+            raise bench.arms.PreflightError("Node must be exactly v24.21.0")
+        with self.assertRaisesRegex(bench.arms.PreflightError, "v24.21.0"):
+            bench.validate_codemode(settings, failing)
+        seen = []
+        record = bench.validate_codemode(settings, lambda *a: seen.append(a) or {"checked": True})
+        self.assertEqual(record, {"checked": True})
+        self.assertEqual(seen, [("davinci_script", "rel/node", "rel/host")])
+        self.assertIn("controlled", bench.command("davinci", "p", "w", settings))
+        self.assertIsNone(bench.validate_codemode({"codemode": {"mode": "read-only"}}, failing))
+        with self.assertRaises(ValueError):
+            bench.validate_codemode({"codemode": {"mode": "turbo"}}, failing)
+
+    def test_rows_are_stamped_only_when_harness_and_mode_name_an_arm(self):
+        self.assertEqual(bench.row_arm("davinci", {"codemode": {"mode": "controlled"}}), "davinci_script")
+        self.assertEqual(bench.row_arm("davinci", {}), "davinci_direct")
+        self.assertIsNone(bench.row_arm("davinci", {"codemode": {"mode": "read-only"}}))
+        self.assertIsNone(bench.row_arm("codex", {}))
 
     def test_bench_options_steer_the_prompt_and_disable_the_governor_file_only(self):
         steer = {"bench": {"appendSystemPrompt": "Prefer codemode."}}

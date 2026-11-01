@@ -46,12 +46,46 @@ can be inspected without re-running it. Both disappear when the mode is off.
 With controlled mode on, a script that opens with
 `// @script: {"startInBackground": true}` runs detached and returns
 `{"state": "running", "toolCallId": "<handle>"}` immediately. The run is owned
-by the session: its cancellation token is a child of the session token, so
-closing or cancelling the session stops it, and `wait_for_script` accepts
-`status`, a bounded `wait`, and `kill`. A finished run wakes the next turn once
-(`take_script_notification`), never on every poll. A run that cannot be stopped
+by the session: its cancellation token is a child of the session token, and
+session replacement, RPC `create_session` and exit paths drain open runs
+(a launch during a drain is refused). `wait_for_script` accepts
+`status`, a bounded `wait`, and `kill`. A finished detached run stores a bounded
+summary (status, at most 16 scrubbed notifications of 4096 bytes, and the
+retained Script log reference) in the same write that publishes its terminal
+state. The next turn that starts after the run finishes is told once, as
+persisted context appended after the existing history and labeled as untrusted
+Script data that grants no authority; it is acknowledged only after it is
+persisted, and a wakeup already in the session is not added again. An idle
+session does not start a turn by itself, so a run that finishes while nothing is
+running is reported only when the next turn begins. Polling with `status` or
+`wait` is not counted as a stalled loop by the progress watchdog; `kill` is. A run that cannot be stopped
 is recorded as `recoveryRequired`, never as completed or cancelled, and guest
 JavaScript is never resumed after a crash.
+
+`kill` cancels the run and waits a bounded grace; the worker records its own
+terminal state, and a timeout gives `recoveryRequired`. A run owned by another
+process returns `NOT_OWNER`. Liveness is a lock each process holds at
+`<agent dir>/script-owners/<owner>.lock`, outside any run directory. A dead owner's open runs are reconciled at the
+first registry open in a process, and again whenever a run in scope is looked up
+or checked for a wakeup. A worker that panics leaves its run `recoveryRequired`
+with a fixed summary, and a worker result that arrives after `recoveryRequired`
+keeps that state and only adds its summary if none is stored. Handles are scoped to a session
+branch: a run records the leaf it started from, and resolves only while that
+entry is on the path to the current leaf. A run from another branch does not
+resolve and its wakeup is not delivered there; navigating back to the branch
+restores access, including after a restart.
+
+## Function fallback (deferred gap)
+
+The design asks to preserve a function-typed script fallback when the custom
+freeform shape is rejected. Automatic retry is not implemented. Today the
+fallback is the opt-in rollout flag (`PI_CODEX_APPLY_PATCH`, shared with
+`apply_patch`): with it off, `codemode` is a function tool.
+`script_wire_mode` and `script_wire_fallback` exist with no production caller,
+because automatic fallback touches the request retry core and no real
+rejection of the custom shape has been observed (the route accepted it,
+`docs/cache/codex-backend-probe.md`). A captured real rejection would unblock
+it.
 
 ## Rollback
 

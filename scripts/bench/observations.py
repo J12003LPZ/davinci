@@ -76,6 +76,9 @@ def activity(events):
                     continue
                 target = attempts if phase == "attempt_start" else attempts_ended
                 target.add((purpose, request, attempt))
+            elif phase == "cache_drop":
+                # Diagnostic only: not a request, attempt or telemetry loss.
+                pass
             elif phase == "telemetry_overflow":
                 overflow = True
             else:

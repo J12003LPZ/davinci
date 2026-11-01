@@ -1157,6 +1157,9 @@ fn create_session(runtime: &mut RpcRuntime, parent: Option<&str>) -> Result<bool
     {
         eprintln!("Codemode is on in /config but stays off: {error}");
     }
+    // The old agent's detached Script runs end with its session: stop them
+    // (bounded) before the agent that owns them is dropped.
+    runtime.agent.shutdown_session_scripts();
     runtime.agent.reset_session_approvals();
     runtime.agent = next;
     Ok(false)

@@ -7,6 +7,7 @@ fn shutdown_steps_end_owned_children_before_user_code_runs() {
     assert_eq!(
         names,
         [
+            "Script runs",
             "background jobs",
             "MCP servers",
             "JS pool",

@@ -1097,31 +1097,46 @@ mod tests {
             std::fs::write(&cargo, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CARGO_CAPTURE\"\nif [ \"$1\" = fmt ]; then echo fixture-format-result; exit \"$FMT_EXIT\"; fi\necho fixture-test-result; exit \"$TEST_EXIT\"\n").unwrap();
             std::fs::set_permissions(cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
             let capture = dir.path().join("calls");
-            let mut command = Command::new("sh");
-            command
-                .arg(".davinci/finish-line.sh")
-                .current_dir(dir.path())
-                .env(
-                    "PATH",
-                    format!(
-                        "{}:{}",
-                        dir.path().join("bin").display(),
-                        std::env::var("PATH").unwrap_or_default()
-                    ),
+            // A concurrent fork can briefly hold the fixture's write descriptor,
+            // so sh fails to exec `cargo` with ETXTBSY. Rerun only for that;
+            // clearing the capture file keeps the call counts exact.
+            let mut attempts = 0;
+            let output = loop {
+                attempts += 1;
+                let mut command = Command::new("sh");
+                command
+                    .arg(".davinci/finish-line.sh")
+                    .current_dir(dir.path())
+                    .env(
+                        "PATH",
+                        format!(
+                            "{}:{}",
+                            dir.path().join("bin").display(),
+                            std::env::var("PATH").unwrap_or_default()
+                        ),
+                    )
+                    .env("CARGO_CAPTURE", &capture)
+                    .env("FMT_EXIT", fmt_exit.to_string())
+                    .env("TEST_EXIT", test_exit.to_string());
+                let output = davinci_sys::process::run_bounded(
+                    command,
+                    None,
+                    davinci_sys::process::RunLimits {
+                        timeout: Duration::from_secs(5),
+                        output_cap: MAX_HOOK_STREAM_BYTES,
+                    },
+                    &|| false,
                 )
-                .env("CARGO_CAPTURE", &capture)
-                .env("FMT_EXIT", fmt_exit.to_string())
-                .env("TEST_EXIT", test_exit.to_string());
-            let output = davinci_sys::process::run_bounded(
-                command,
-                None,
-                davinci_sys::process::RunLimits {
-                    timeout: Duration::from_secs(5),
-                    output_cap: MAX_HOOK_STREAM_BYTES,
-                },
-                &|| false,
-            )
-            .unwrap();
+                .unwrap();
+                if attempts < 20
+                    && String::from_utf8_lossy(&output.stderr).contains("Text file busy")
+                {
+                    let _ = std::fs::remove_file(&capture);
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                break output;
+            };
             assert!(!output.timed_out);
             assert_eq!(
                 output.status.unwrap().code(),

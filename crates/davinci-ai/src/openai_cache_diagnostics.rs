@@ -12,6 +12,7 @@ use crate::cache::{cache_retention_from_options, CacheRetention};
 use crate::catalog::Model;
 use crate::openai_cache_policy::OpenAiCacheCapabilities;
 use crate::responses_ledger::{NativeResponsesOutput, NativeResponsesResumeRecord};
+use crate::responses_request::WireSegmentDigest;
 use crate::stream::StreamOptions;
 use davinci_protocol::Usage;
 
@@ -180,6 +181,31 @@ pub fn classify_cache_drop(
         route: route.to_string(),
         reason,
     })
+}
+
+/// Digests of the two requests' cache-sensitive segments, for
+/// [`CacheRequestSample::wire_prefix_digest`]. A whole-request digest would
+/// include the input appended since the previous request, so ordinary history
+/// growth would look like a local change. When the previous request's segments
+/// are still the start of the next request's, both sides get the same digest;
+/// otherwise each side is digested whole and they differ.
+pub fn comparable_prefix_digests(
+    previous: &[WireSegmentDigest],
+    next: &[WireSegmentDigest],
+) -> (String, String) {
+    fn digest(segments: &[WireSegmentDigest]) -> String {
+        let bytes = serde_json::to_vec(segments).unwrap_or_default();
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+    let previous_digest = digest(previous);
+    if next.starts_with(previous) {
+        (previous_digest.clone(), previous_digest)
+    } else {
+        (previous_digest, digest(next))
+    }
 }
 
 /// Serialize unscored, secret-free drop evidence for one run.

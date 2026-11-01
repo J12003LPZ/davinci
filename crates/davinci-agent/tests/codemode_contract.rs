@@ -228,14 +228,17 @@ fn script_state_persists_and_reconciles() {
     use davinci_agent::codemode::{ScriptRunRecord, ScriptRunRegistry, ScriptRunState};
     let dir = tempfile::tempdir().unwrap();
     let registry = ScriptRunRegistry::open(dir.path()).unwrap();
-    let record = ScriptRunRecord::new(
+    let mut record = ScriptRunRecord::new(
         "run-1",
         "call-1",
         Some("session-a"),
         "workspace-a",
         "revision-a",
     );
+    record.branch_origin = Some("entry-a".into());
     registry.create(&record).unwrap();
+    let on_branch: std::collections::HashSet<String> = ["entry-a".to_string()].into();
+    let off_branch: std::collections::HashSet<String> = ["entry-b".to_string()].into();
     assert_eq!(
         registry.get("run-1").unwrap().state,
         ScriptRunState::Created
@@ -264,14 +267,30 @@ fn script_state_persists_and_reconciles() {
 
     // Handles are scoped to their session and workspace.
     assert!(reopened
-        .get_for("run-1", Some("session-b"), "workspace-a")
+        .get_for("run-1", Some("session-b"), "workspace-a", &on_branch)
         .is_err());
     assert!(reopened
-        .get_for("run-1", Some("session-a"), "workspace-b")
+        .get_for("run-1", Some("session-a"), "workspace-b", &on_branch)
         .is_err());
     assert!(reopened
-        .get_for("run-1", Some("session-a"), "workspace-a")
+        .get_for("run-1", Some("session-a"), "workspace-a", &on_branch)
         .is_ok());
+    // A run whose origin is off the current branch is denied and also drops out of wakeups.
+    let other_branch = reopened
+        .get_for("run-1", Some("session-a"), "workspace-a", &off_branch)
+        .unwrap_err();
+    assert_eq!(other_branch.code, "DENIED");
+    assert!(reopened
+        .pending_notifications(Some("session-a"), "workspace-a", &off_branch)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        reopened
+            .pending_notifications(Some("session-a"), "workspace-a", &on_branch)
+            .unwrap()
+            .len(),
+        1
+    );
     // A forged or foreign id never resolves.
     assert!(reopened.get("run-../../etc/passwd").is_err());
     assert!(reopened.get("run-missing").is_err());
@@ -658,4 +677,260 @@ fn directive_text_after_the_header_is_ordinary_content() {
             "{code:?}"
         );
     }
+}
+
+#[test]
+fn concurrent_registry_handles_never_lose_or_duplicate_a_transition() {
+    use davinci_agent::codemode::{ScriptRunRecord, ScriptRunRegistry, ScriptRunState};
+    let dir = tempfile::tempdir().unwrap();
+    let registry = ScriptRunRegistry::open(dir.path()).unwrap();
+    for run in ["shared", "other"] {
+        registry
+            .create(&ScriptRunRecord::new(run, "call", Some("s"), "w", "rev"))
+            .unwrap();
+        registry.transition(run, ScriptRunState::Running).unwrap();
+    }
+    let path = dir.path().to_path_buf();
+    let handles: Vec<_> = (0..16)
+        .map(|index| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                // Each thread has its own handle, like a clone of the agent.
+                let registry = ScriptRunRegistry::open(&path).unwrap();
+                let won = registry
+                    .transition("shared", ScriptRunState::Completed)
+                    .unwrap();
+                registry
+                    .create(&ScriptRunRecord::new(
+                        &format!("own-{index}"),
+                        "call",
+                        Some("s"),
+                        "w",
+                        "rev",
+                    ))
+                    .unwrap();
+                registry.mark_notified("other").unwrap();
+                won
+            })
+        })
+        .collect();
+    let winners = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .filter(|won| *won)
+        .count();
+    assert_eq!(winners, 1);
+    assert_eq!(
+        registry.get("shared").unwrap().state,
+        ScriptRunState::Completed
+    );
+    assert!(registry.get("other").unwrap().notified);
+    let leftovers = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("tmp"))
+        .count();
+    assert_eq!(leftovers, 0);
+}
+
+/// Hold `path` the way a live host process holds its owner lock, through a
+/// separate handle: `flock` is per open file description, and Windows opens
+/// with share mode 0.
+fn hold_exclusively(path: &std::path::Path) -> std::fs::File {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0);
+    }
+    let file = options.open(path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // LOCK_EX | LOCK_NB. A sweep probing the same file can briefly hold it,
+        // so retry before failing.
+        let locked = (0..10).any(|attempt| {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            unsafe { libc::flock(file.as_raw_fd(), 2 | 4) == 0 }
+        });
+        assert!(locked, "the lock is free to take");
+    }
+    file
+}
+
+#[test]
+fn first_open_recovers_only_runs_a_dead_process_left_open() {
+    use davinci_agent::codemode::{ScriptRunRecord, ScriptRunRegistry, ScriptRunState};
+    let dir = tempfile::tempdir().unwrap();
+    let write = |run: &str, owner: Option<String>, state: ScriptRunState| {
+        let mut record = ScriptRunRecord::new(run, "call", Some("s"), "w", "rev");
+        record.owner = owner;
+        record.state = state;
+        std::fs::write(
+            dir.path().join(format!("{run}.json")),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+    };
+    // Owner liveness is a held lock, not a pid: a stale lock file with nobody
+    // holding it is dead, and so is an owner with no lock file at all.
+    // Owner locks live in the shared agent directory, so ids are unique per run.
+    let owners = owner_locks_dir();
+    let tag = uuid::Uuid::new_v4().simple();
+    let dead_path = owners.join(format!("1-dead-{tag}.lock"));
+    let live_path = owners.join(format!("2-live-{tag}.lock"));
+    std::fs::write(&dead_path, b"").unwrap();
+    let dead = Some(format!("1-dead-{tag}"));
+    // Another host that is alive: a different handle holds its owner lock.
+    let live_lock = hold_exclusively(&live_path);
+    let live = Some(format!("2-live-{tag}"));
+    write("dead-running", dead.clone(), ScriptRunState::Running);
+    write("legacy-running", None, ScriptRunState::Running);
+    write("live-running", live, ScriptRunState::Running);
+    write("dead-done", dead, ScriptRunState::Completed);
+
+    let registry = ScriptRunRegistry::open(dir.path()).unwrap();
+    let state = |run: &str| registry.get(run).unwrap().state;
+    assert_eq!(state("dead-running"), ScriptRunState::RecoveryRequired);
+    assert_eq!(state("legacy-running"), ScriptRunState::RecoveryRequired);
+    assert_eq!(state("live-running"), ScriptRunState::Running);
+    assert_eq!(state("dead-done"), ScriptRunState::Completed);
+    assert!(!dead_path.exists(), "stale lock removed");
+
+    // The live owner dies later: resolving the single record recovers it, and
+    // does not wait for another first open.
+    let record = registry.get("live-running").unwrap();
+    registry.reconcile_if_owner_dead(&record);
+    assert_eq!(state("live-running"), ScriptRunState::Running);
+    drop(live_lock);
+    registry.reconcile_if_owner_dead(&record);
+    assert_eq!(state("live-running"), ScriptRunState::RecoveryRequired);
+
+    // A run this process creates afterwards is never claimed by a later open.
+    registry
+        .create(&ScriptRunRecord::new("mine", "call", Some("s"), "w", "rev"))
+        .unwrap();
+    registry
+        .transition("mine", ScriptRunState::Running)
+        .unwrap();
+    let again = ScriptRunRegistry::open(dir.path()).unwrap();
+    assert_eq!(again.get("mine").unwrap().state, ScriptRunState::Running);
+    let _ = std::fs::remove_file(&live_path);
+}
+
+#[test]
+fn an_owner_that_dies_after_the_open_is_offered_as_a_wakeup() {
+    use davinci_agent::codemode::{ScriptRunRecord, ScriptRunRegistry, ScriptRunState};
+    use std::collections::HashSet;
+    let dir = tempfile::tempdir().unwrap();
+    // Opened first: the first-open sweep has already run when the owner dies.
+    let registry = ScriptRunRegistry::open(dir.path()).unwrap();
+    let tag = uuid::Uuid::new_v4().simple();
+    let owner = format!("3-late-{tag}");
+    let lock_path = owner_locks_dir().join(format!("{owner}.lock"));
+    let lock = hold_exclusively(&lock_path);
+    let mut record = ScriptRunRecord::new("late", "call", Some("s"), "w", "rev");
+    record.owner = Some(owner);
+    record.state = ScriptRunState::Running;
+    std::fs::write(
+        dir.path().join("late.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let branch = HashSet::new();
+    let pending = || {
+        registry
+            .pending_notifications(Some("s"), "w", &branch)
+            .unwrap()
+    };
+
+    assert!(pending().is_empty());
+    drop(lock);
+    let offered = pending();
+    assert_eq!(offered.len(), 1);
+    assert_eq!(offered[0].state, ScriptRunState::RecoveryRequired);
+    registry.mark_notified("late").unwrap();
+    assert!(pending().is_empty());
+    let _ = std::fs::remove_file(&lock_path);
+}
+
+#[test]
+fn a_late_worker_summary_is_kept_without_changing_the_state() {
+    use davinci_agent::codemode::{
+        ScriptRunRecord, ScriptRunRegistry, ScriptRunState, ScriptRunSummary,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let registry = ScriptRunRegistry::open(dir.path()).unwrap();
+    let summary = |text: &str| ScriptRunSummary::bounded("late", &[text.to_string()]);
+    for (run, late_state) in [
+        ("same", ScriptRunState::RecoveryRequired),
+        ("refused", ScriptRunState::Cancelled),
+    ] {
+        registry
+            .create(&ScriptRunRecord::new(run, "call", Some("s"), "w", "rev"))
+            .unwrap();
+        registry.transition(run, ScriptRunState::Running).unwrap();
+        registry
+            .transition(run, ScriptRunState::RecoveryRequired)
+            .unwrap();
+        let _ = registry.finish(
+            run,
+            late_state,
+            Some((summary("first"), Some("log".into()))),
+        );
+        let record = registry.get(run).unwrap();
+        assert_eq!(record.state, ScriptRunState::RecoveryRequired, "{run}");
+        assert_eq!(record.summary, Some(summary("first")), "{run}");
+        assert_eq!(record.log_ref.as_deref(), Some("log"), "{run}");
+        assert!(!record.notified, "{run}");
+        // A stored summary is never replaced.
+        let _ = registry.finish(run, late_state, Some((summary("second"), None)));
+        assert_eq!(registry.get(run).unwrap().summary, Some(summary("first")));
+    }
+}
+
+fn owner_locks_dir() -> std::path::PathBuf {
+    let owners = davinci_session::default_agent_dir().join("script-owners");
+    std::fs::create_dir_all(&owners).unwrap();
+    owners
+}
+
+#[test]
+fn a_registry_directory_can_be_deleted_after_a_record_is_created() {
+    use davinci_agent::codemode::{ScriptRunRecord, ScriptRunRegistry};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("script-runs");
+    let registry = ScriptRunRegistry::open(&root).unwrap();
+    registry
+        .create(&ScriptRunRecord::new("run", "call", Some("s"), "w", "rev"))
+        .unwrap();
+    // No lock file is held inside the directory, so Windows can delete it.
+    std::fs::remove_dir_all(&root).unwrap();
+    assert!(!root.exists());
+}
+
+#[test]
+fn a_stale_owner_lock_counts_as_dead_and_is_removed() {
+    use davinci_agent::codemode::{ScriptRunRecord, ScriptRunRegistry, ScriptRunState};
+    let dir = tempfile::tempdir().unwrap();
+    let owner = format!("1-stale-{}", uuid::Uuid::new_v4().simple());
+    let lock = owner_locks_dir().join(format!("{owner}.lock"));
+    std::fs::write(&lock, b"").unwrap();
+    let mut record = ScriptRunRecord::new("stale", "call", Some("s"), "w", "rev");
+    record.owner = Some(owner);
+    record.state = ScriptRunState::Running;
+    std::fs::write(
+        dir.path().join("stale.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let registry = ScriptRunRegistry::open(dir.path()).unwrap();
+    assert_eq!(
+        registry.get("stale").unwrap().state,
+        ScriptRunState::RecoveryRequired
+    );
+    assert!(!lock.exists(), "stale lock removed");
 }

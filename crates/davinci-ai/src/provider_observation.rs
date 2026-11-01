@@ -82,9 +82,45 @@ pub struct ProviderAttemptObservation {
     /// None means the producer has no completeness evidence (including old records).
     #[serde(default)]
     pub usage_complete: Option<bool>,
+    /// Set only on a `cache_drop` observation: ids, counts and digests, no content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_drop: Option<crate::openai_cache_diagnostics::CacheDropRecord>,
 }
 
 impl ProviderAttemptObservation {
+    /// A `cache_drop` observation for a completed request on `model`.
+    pub fn for_cache_drop(
+        model: &str,
+        drop: crate::openai_cache_diagnostics::CacheDropRecord,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            kind: "cache_drop".into(),
+            logical_request_id: uuid::Uuid::new_v4().to_string(),
+            root_id: None,
+            actor_id: None,
+            parent_actor_id: None,
+            parent_logical_request_id: None,
+            attempt_id: None,
+            purpose: "coding".into(),
+            model: model.into(),
+            returned_model: None,
+            returned_service_tier: None,
+            requested_service_tier: None,
+            selected_effort: None,
+            schema_hash: String::new(),
+            transport: None,
+            elapsed_ms: 0.0,
+            duration_ms: None,
+            status: "completed".into(),
+            http_status: None,
+            usage: None,
+            raw_usage: None,
+            usage_complete: None,
+            cache_drop: Some(drop),
+        }
+    }
+
     /// Missing response metadata is unknown, including older recorded observations.
     pub fn service_tier_honored(&self) -> Option<bool> {
         let requested = self.requested_service_tier.as_deref()?;
@@ -291,6 +327,7 @@ impl ObservationScope {
                 usage: None,
                 raw_usage: None,
                 usage_complete: None,
+                cache_drop: None,
             },
             next_attempt: 0,
             events: Vec::new(),

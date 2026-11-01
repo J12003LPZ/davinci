@@ -13,7 +13,7 @@ mod runs;
 mod script_log;
 mod types;
 pub(crate) use authority::fingerprint as authority_fingerprint;
-pub use background::BackgroundRuns;
+pub use background::{shutdown_all_background_scripts, BackgroundRuns};
 pub(crate) use deadline::remaining_root_wall_ms;
 pub use dispatch::AgentCodeModeBroker;
 pub(crate) use execution::mandatory_facts;
@@ -27,7 +27,7 @@ pub use policy::{
 pub use recovery::{reconcile_script_child_effect, resolve_script_effect, ScriptEffectResolution};
 pub use runs::{
     reconcile_script_run, ReconciledScriptRun, ScriptRunError, ScriptRunRecord, ScriptRunRegistry,
-    ScriptRunState,
+    ScriptRunState, ScriptRunSummary, ScriptWakeup,
 };
 pub use script_log::{
     ScriptLogError, ScriptLogEvent, ScriptLogRef, ScriptLogSlice, ScriptLogStore,

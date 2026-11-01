@@ -904,6 +904,8 @@ pub struct Agent {
     /// Exact host session source and lineage captured at runtime installation.
     /// Separate from mutable public session/runtime fields to reject stale reuse.
     runtime_session: Option<(PathBuf, String, RunId)>,
+    /// Previous completed request's cache evidence, for drop observation.
+    cache_drop_sample: Option<turn::CacheDropSample>,
 }
 
 /// Summarizer requests one fold may make. Past it the fold fails closed.
@@ -1078,6 +1080,7 @@ impl Agent {
             runtime: None,
             prompt_checkpoint_bus: None,
             runtime_session: None,
+            cache_drop_sample: None,
         };
         *agent
             .tool_context
@@ -5895,6 +5898,9 @@ impl Agent {
         let rewind = runtime::rewind::prepare_prompt_rewind_or_reset(&session);
         let messages = messages_from_session(&session);
         if session_changed {
+            // Detached Script runs belong to the session being replaced. Stop
+            // them (bounded) before it goes; a same-session reload keeps them.
+            self.shutdown_session_scripts();
             self.runtime_environment = None;
             self.environment_key = None;
             self.last_verification_notice = None;

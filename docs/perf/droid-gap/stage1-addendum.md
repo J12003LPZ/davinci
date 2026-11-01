@@ -1,7 +1,8 @@
 # Stage 1 addendum to the Stage 0 report
 
-The preregistered [Stage 0 report](stage0-report.md) is unchanged and remains
-the source of the measured 17-task numbers. This addendum records only what
+The preregistered [Stage 0 report](stage0-report.md)'s measured results are
+unchanged and remain the source of the measured 17-task numbers; only its W3
+follow-up passage was updated with the probe result. This addendum records only what
 Stage 1 added, without re-measuring Stage 0 or restating its numbers as new
 results.
 

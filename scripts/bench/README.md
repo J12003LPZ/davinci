@@ -405,6 +405,36 @@ must be the seed written into the approval block; `--json` prints the full
 report; `--causes` takes the human-read discordant-task causes;
 `--droid-reasoning-excluded` applies the smoke-row result for gap G3.
 
+## Four-arm pilot (not run)
+
+The arms are `davinci_direct` (Codemode off), `davinci_script` (controlled
+Codemode), `droid_direct` and `droid_script`. Each is its own invocation with its
+own settings file and output directory, so none collide on `RUNS/davinci/...` or
+the pinned identity:
+
+```
+# davinci_direct: settings {"codemode": {"mode": "off"}}, --harness davinci
+# davinci_script: settings {"codemode": {"mode": "controlled",
+#     "nodePath": "/abs/node", "hostPath": "/abs/codemode-host"}}, --harness davinci
+# droid_direct:   --harness droid-direct
+# droid_script:   --harness droid-script
+```
+
+A `controlled` settings file must carry absolute `nodePath` and `hostPath`.
+Before any run starts, `arms.preflight` checks Node is exactly v24.21.0 and the
+host bundle matches the trusted manifest. A failure stops the campaign with its
+message; there is no fallback to read-only or off. A controlled run with zero
+`codemode` tool events is reported `no_calls_observed`, not as success. Result
+rows carry `arm`, `arm_requested_mode`, `arm_observed_mode` and
+`arm_attribution`; a run whose harness and mode do not name an arm (for example
+`read-only`, or Codex) is left unstamped.
+
+`python scripts/bench/arms.py plan --tasks T1 T2 --reps 2 --seed 7` prints the
+planned run count, per arm, before anything runs; approve that number first.
+
+**No pilot has been run.** The B03 four-arm analysis, which combines the separate
+campaigns and the plan's `matched_pilot_reports_unknown_values`, is not built.
+
 ## Metric definitions and acceptance
 
 ### Codex subscription acceptance

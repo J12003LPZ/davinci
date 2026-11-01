@@ -12,6 +12,9 @@ use crate::Agent;
 use crate::InternalPromptOrigin;
 use crate::ToolExecutionMode;
 
+/// `customType` of the persisted context that tells the model a detached Script run finished.
+pub(crate) const SCRIPT_WAKEUP_CUSTOM_TYPE: &str = "davinci.script_wakeup";
+
 /// Corrective turns allowed per run after a tool call is cut off by the
 /// output token limit.
 const MAX_TRUNCATED_CALL_RETRIES: u32 = 2;
@@ -134,7 +137,76 @@ enum HarnessVerification {
     Inconclusive,
 }
 
+/// The previous completed request's cache evidence, kept so the next request of
+/// the same session, route and model can be compared with it. One sample only.
+#[derive(Debug, Clone)]
+pub(crate) struct CacheDropSample {
+    scope: (Option<PathBuf>, String, String),
+    index: u64,
+    cache_read: Option<u64>,
+    prefix: Vec<davinci_ai::WireSegmentDigest>,
+}
+
 impl Agent {
+    /// Observation only: pair a completed request's usage with its recorded
+    /// manifest and classify a cache-read drop against the previous sample.
+    /// Failed or aborted results are not samples, so a retried request never
+    /// counts twice. Anything missing leaves no record.
+    fn observe_cache_drop(
+        &mut self,
+        message: &AssistantMessage,
+        resume: Option<&davinci_ai::NativeResponsesResumeRecord>,
+    ) -> Option<davinci_ai::CacheDropRecord> {
+        if matches!(
+            message.stop_reason,
+            Some(StopReason::Error | StopReason::Aborted)
+        ) {
+            return None;
+        }
+        let prefix = resume?.turn.wire_manifest.cache_prefix_manifest();
+        let scope = (
+            self.session.as_ref().map(|session| session.path.clone()),
+            self.provider.clone(),
+            self.model_id.clone(),
+        );
+        let cache_read = message
+            .usage
+            .as_ref()
+            .filter(|usage| !usage.cache_read_unreported)
+            .map(|usage| usage.cache_read);
+        let previous = self
+            .cache_drop_sample
+            .take()
+            .filter(|previous| previous.scope == scope);
+        let index = previous.as_ref().map_or(0, |previous| previous.index + 1);
+        let record = previous.as_ref().and_then(|previous| {
+            if previous.prefix.is_empty() || prefix.is_empty() {
+                return None;
+            }
+            let (previous_digest, next_digest) =
+                davinci_ai::comparable_prefix_digests(&previous.prefix, &prefix);
+            davinci_ai::classify_cache_drop(
+                index,
+                davinci_ai::CacheRequestSample {
+                    cache_read: previous.cache_read,
+                    wire_prefix_digest: &previous_digest,
+                },
+                davinci_ai::CacheRequestSample {
+                    cache_read,
+                    wire_prefix_digest: &next_digest,
+                },
+                &scope.1,
+            )
+        });
+        self.cache_drop_sample = Some(CacheDropSample {
+            scope,
+            index,
+            cache_read,
+            prefix,
+        });
+        record
+    }
+
     /// Run `last` as a normal tool call issued by the harness: an assistant
     /// message with the call, then the tool result, both in history and in
     /// the session, so replay and recovery see an ordinary tool exchange.
@@ -741,6 +813,7 @@ Issue the call again if it is still needed.";
 
             self.inject_queued(&mut events, &mut new_messages, true);
             self.inject_job_notices(&mut events, &mut new_messages)?;
+            self.inject_script_wakeups();
 
             let repair = self.runtime.as_ref().and_then(|runtime| {
                 runtime
@@ -1050,6 +1123,21 @@ Issue the call again if it is still needed.";
                         observation: Box::new(observation),
                     },
                 );
+            }
+            if let Ok((message, _, _, resume)) = &completion {
+                if let Some(record) = self.observe_cache_drop(message, resume.as_ref()) {
+                    let model = self.model_id.clone();
+                    self.push_event(
+                        &mut events,
+                        AgentEvent::ProviderObservation {
+                            observation: Box::new(
+                                davinci_ai::provider_observation::ProviderAttemptObservation::for_cache_drop(
+                                    &model, record,
+                                ),
+                            ),
+                        },
+                    );
+                }
             }
             self.stats.model_wall_ms += model_started.elapsed().as_millis() as u64;
             // A provider that refuses the input as too long has counted it;
@@ -1483,6 +1571,38 @@ Issue the call again if it is still needed.";
             self.push_event(events, AgentEvent::MessageEnd { message: notice });
         }
         Ok(())
+    }
+
+    /// Offer each finished detached Script run to the model once, as persisted
+    /// custom context appended after the existing history (never in the stable
+    /// prefix). The run is acknowledged only after the context is persisted,
+    /// and a wakeup already present in the session is not appended again, so a
+    /// crash between the two steps cannot duplicate it.
+    pub(crate) fn inject_script_wakeups(&mut self) {
+        for wakeup in self.pending_script_wakeups() {
+            let present = self.messages.iter().any(|message| {
+                message.extra_str("customType") == Some(SCRIPT_WAKEUP_CUSTOM_TYPE)
+                    && message
+                        .extra
+                        .get("details")
+                        .and_then(|details| details.get("runId"))
+                        .and_then(Value::as_str)
+                        == Some(wakeup.run_id.as_str())
+            });
+            if !present {
+                self.record_custom_message(&serde_json::json!({
+                    "customType": SCRIPT_WAKEUP_CUSTOM_TYPE,
+                    "content": wakeup.render(),
+                    "display": false,
+                    "details": {"runId": wakeup.run_id},
+                }));
+            }
+            // An unpersisted wakeup stays pending rather than being lost.
+            if self.persistence_failure.is_some() {
+                return;
+            }
+            self.acknowledge_script_wakeup(&wakeup.run_id);
+        }
     }
 
     /// What a finished tool owes the session beyond its result: the `todo`
@@ -3918,7 +4038,17 @@ Issue the call again if it is still needed.";
         let pre_hook_result = result.clone();
         let codemode_facts = (name == "codemode")
             .then(|| crate::codemode::mandatory_facts(&result))
-            .flatten();
+            .flatten()
+            .map(|mut facts| {
+                // Record the shape the call really arrived in; `mandatory_facts`
+                // only knows the outcome and defaults to `function`.
+                if let Some(kind) = davinci_ai::originating_tool_wire_kind(&self.messages, id) {
+                    if let Some(history) = facts.get_mut("history").and_then(Value::as_object_mut) {
+                        history.insert("wireKind".into(), Value::String(kind.as_str().into()));
+                    }
+                }
+                facts
+            });
         let codemode_authority = (name == "codemode")
             .then(|| {
                 result
@@ -4558,7 +4688,7 @@ Issue the call again if it is still needed.";
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
 
-            let is_job_poll = name == "job_output";
+            let is_job_poll = crate::runtime::progress_watchdog::is_poll_call(name, args);
 
             let observation = crate::runtime::progress_watchdog::ProgressObservation {
                 tool_name: name.to_string(),
@@ -6069,6 +6199,100 @@ mod tests {
             stop_reason: Some(davinci_ai::StopReason::Error),
             error_message: Some("overloaded_error".into()),
         }
+    }
+
+    #[test]
+    fn cache_drop_is_observed_once_per_completed_request_and_never_for_retries() {
+        let mut agent = Agent::new("cache drop fixture");
+        agent.auto_retry = true;
+        agent.retry_attempts = 1;
+        agent.retry_base_delay_ms = 0;
+        agent.auto_compaction = false;
+        // (cache_read, input items, first attempt fails with a retryable error)
+        let requests: [(u64, usize, bool); 3] = [
+            (500, 1, false),
+            // A retried request: the failed attempt is not a sample.
+            (500, 2, true),
+            (100, 3, false),
+        ];
+        let mut drops = Vec::new();
+        for (cache_read, items, fail_first) in requests {
+            agent.prompt("next");
+            let attempts = std::cell::Cell::new(0);
+            let events = agent
+                .run_loop(|_| {
+                    attempts.set(attempts.get() + 1);
+                    if fail_first && attempts.get() == 1 {
+                        return Ok::<_, String>(crate::CompleteOutput {
+                            message: overloaded(),
+                            stream_events: None,
+                            streamed_live: false,
+                            native_responses_resume: None,
+                        });
+                    }
+                    let input = (0..items)
+                        .map(|n| json!({"role": "user", "content": format!("secret prompt {n}")}))
+                        .collect::<Vec<_>>();
+                    let prepared = davinci_ai::PreparedProviderRequest::new(
+                        json!({"model": "fixture", "instructions": "stable", "input": input}),
+                    );
+                    let turn = davinci_ai::NativeResponsesTurn::from_prepared(
+                        &prepared,
+                        davinci_ai::NativeResponsesOutput {
+                            response_id: Some("fixture".into()),
+                            output_items: vec![],
+                            final_response: None,
+                            terminal_event_type: "response.completed".into(),
+                        },
+                    )
+                    .unwrap();
+                    let mut message: davinci_ai::AssistantMessage = serde_json::from_value(json!({
+                        "id": "answer", "role": "assistant", "model": "fixture",
+                        "content": [{"type": "text", "text": "Done"}], "stopReason": "stop"
+                    }))
+                    .unwrap();
+                    message.usage = Some(
+                        serde_json::from_value(json!({
+                            "input": 10, "output": 1, "cacheRead": cache_read, "cacheWrite": 0,
+                            "totalTokens": 11 + cache_read,
+                            "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}
+                        }))
+                        .unwrap(),
+                    );
+                    Ok(crate::CompleteOutput {
+                        message,
+                        stream_events: None,
+                        streamed_live: false,
+                        native_responses_resume: Some(davinci_ai::NativeResponsesResumeRecord {
+                            turn,
+                            resume_provider_message_count: 0,
+                            resume_provider_messages_fingerprint: String::new(),
+                        }),
+                    })
+                })
+                .unwrap();
+            assert_eq!(attempts.get(), if fail_first { 2 } else { 1 });
+            drops.extend(events.into_iter().filter_map(|event| match event {
+                crate::AgentEvent::ProviderObservation { observation } => observation.cache_drop,
+                _ => None,
+            }));
+        }
+        // 500 -> 500 (retried, no drop) -> 100: exactly one drop, with the
+        // prefix unchanged by history growth, so no local cause is invented.
+        assert_eq!(drops.len(), 1, "{drops:?}");
+        let drop = &drops[0];
+        assert_eq!(
+            (
+                drop.prev_cache_read,
+                drop.next_cache_read,
+                drop.request_index
+            ),
+            (500, 100, 2)
+        );
+        assert_eq!(drop.reason, davinci_ai::CacheDropReason::ProviderOrUnknown);
+        assert!(!serde_json::to_string(drop)
+            .unwrap()
+            .contains("secret prompt"));
     }
 
     fn retry_delays(agent: &mut Agent, events: &[crate::AgentEvent]) -> Vec<u64> {
