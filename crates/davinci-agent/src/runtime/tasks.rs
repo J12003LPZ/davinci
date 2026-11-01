@@ -1922,6 +1922,7 @@ impl TaskRegistry {
             .values()
             .filter(|t| {
                 t.state == TaskState::Ready
+                    && t.blocked_reasons.is_empty()
                     && run_id
                         .map(|r| self.matches_run(r, t.run_id))
                         .unwrap_or(true)
@@ -2050,6 +2051,9 @@ impl TaskRegistry {
                         t.advance_revision(committed_at)?;
                     }
                 } else {
+                    if t.state == TaskState::Ready {
+                        t.state = TaskState::Blocked;
+                    }
                     t.blocked_reasons.push(BlockReason {
                         code: "code_rewound".into(),
                         message: format!("Code was rewound to checkpoint {checkpoint_id}"),
@@ -4559,6 +4563,20 @@ mod tests {
                 });
         }
         let revision = registry.get_task(&id).unwrap().revision;
+        assert!(registry
+            .claim_task(id, run, AgentId::new(), revision)
+            .is_err());
+    }
+
+    #[test]
+    fn code_rewind_blocks_a_ready_target_and_hides_it_from_ready_queries() {
+        let registry = TaskRegistry::new();
+        let run = RunId::new();
+        let id = registry.create_task(TaskRecord::new(run, "root")).unwrap();
+        let revision = registry.get_task(&id).unwrap().revision;
+        registry.invalidate_for_code_rewind(id, "cp1").unwrap();
+        assert_eq!(state_of(&registry, id), TaskState::Blocked);
+        assert!(registry.get_ready_tasks(None).is_empty());
         assert!(registry
             .claim_task(id, run, AgentId::new(), revision)
             .is_err());

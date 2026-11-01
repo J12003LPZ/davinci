@@ -189,6 +189,14 @@ pub fn expand_local(path: &str, cwd: &Path) -> PathBuf {
     }
 }
 
+fn npm_component_is_safe(component: &str) -> bool {
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && !component.starts_with('-')
+        && !component.contains("..")
+}
+
 pub fn npm_name_is_safe(name: &str) -> bool {
     if name.is_empty()
         || name.starts_with('-')
@@ -204,11 +212,24 @@ pub fn npm_name_is_safe(name: &str) -> bool {
             matches!(
                 (parts.next(), parts.next(), parts.next()),
                 (Some(scope), Some(package), None)
-                    if !scope.is_empty() && !package.is_empty()
+                    if npm_component_is_safe(scope) && npm_component_is_safe(package)
             )
         }
-        None => !name.contains('/'),
+        None => !name.contains('/') && npm_component_is_safe(name),
     }
+}
+
+/// The package directory strictly below `node_modules` for a validated name.
+pub fn npm_package_dir(root: &Path, name: &str) -> Result<PathBuf, String> {
+    if !npm_name_is_safe(name) {
+        return Err(format!("Invalid npm package name: {name}"));
+    }
+    let node_modules = root.join("node_modules");
+    let path = node_modules.join(name);
+    if path == node_modules || !path.starts_with(&node_modules) {
+        return Err(format!("Invalid npm package path: {name}"));
+    }
+    Ok(path)
 }
 
 pub fn installed_root(source: &str, agent_dir: &Path, cwd: &Path) -> Option<PathBuf> {
@@ -271,6 +292,10 @@ mod tests {
         assert!(!npm_name_is_safe("--global"));
         assert!(!npm_name_is_safe("a/b"));
         assert!(!npm_name_is_safe("C:evil"));
+        assert!(!npm_name_is_safe("."));
+        assert!(!npm_name_is_safe("@scope/."));
+        assert!(!npm_name_is_safe("a/./b"));
+        assert!(!npm_name_is_safe("a//b"));
     }
 
     #[test]

@@ -1685,6 +1685,9 @@ impl TokenGovernor {
             }),
             None => {}
         }
+        // The line budget reserves the trailer, but no-match messages and
+        // other generated text still have to honor the same ceiling.
+        let text = truncate_to_bytes(&text, self.config.retrieve_max_bytes).to_string();
         let mut governor_details = json!({
             "outputId": id,
             "totalLines": total,
@@ -2430,6 +2433,14 @@ mod tests {
             .to_string();
         let page = governor.retrieve(&json!({"id": id})).unwrap();
         assert!(page.content.len() <= 1_024, "{}", page.content.len());
+        let no_match = governor
+            .retrieve(&json!({"id": id, "grep": "x".repeat(2_000)}))
+            .unwrap();
+        assert!(
+            no_match.content.len() <= 1_024,
+            "{}",
+            no_match.content.len()
+        );
     }
 
     #[test]
