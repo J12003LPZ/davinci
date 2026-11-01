@@ -4343,6 +4343,8 @@ fn run_print(
 ) -> Result<i32, String> {
     let mut last_reply = String::new();
     let result = run_print_turns(parsed, agent, &mut last_reply);
+    // Every outcome, errors included, leaves no detached Script run behind.
+    shutdown::stop_script_runs();
     let Some(path) = last_message_path else {
         return result;
     };
@@ -4869,11 +4871,14 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         return Ok(code);
     }
     install_mode_shutdown_watchers(parsed);
-    run_rpc_with_host(
+    let result = run_rpc_with_host(
         parsed,
         agent,
         Arc::new(Mutex::new(loaded_extension_host(parsed))),
-    )
+    );
+    // Error returns skip the shutdown event; the Script runs still stop.
+    shutdown::stop_script_runs();
+    result
 }
 
 fn run_rpc_with_host(
@@ -5892,6 +5897,9 @@ fn session_cleanup_steps(
 ) -> Vec<shutdown::Step> {
     let event_args = parsed.clone();
     vec![
+        // First, so signal watchers reach it and the work it stops is gone
+        // before the MCP servers and jobs its children may use.
+        shutdown::Step::new("Script runs", shutdown::stop_script_runs),
         shutdown::Step::new("background jobs", davinci_agent::jobs::kill_every_job),
         shutdown::Step::new("MCP servers", davinci_agent::McpRegistry::shutdown_all),
         shutdown::Step::new("JS pool", crate::js_host::shutdown_js_pool),

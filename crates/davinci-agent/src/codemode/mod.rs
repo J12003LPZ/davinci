@@ -13,7 +13,7 @@ mod runs;
 mod script_log;
 mod types;
 pub(crate) use authority::fingerprint as authority_fingerprint;
-pub use background::BackgroundRuns;
+pub use background::{shutdown_all_background_scripts, BackgroundRuns};
 pub(crate) use deadline::remaining_root_wall_ms;
 pub use dispatch::AgentCodeModeBroker;
 pub(crate) use execution::mandatory_facts;

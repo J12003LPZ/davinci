@@ -94,6 +94,10 @@ pub struct ScriptRunRecord {
     /// before the field existed.
     #[serde(default)]
     pub owner: Option<String>,
+    /// Branch navigation epoch the run was started under; a run started on
+    /// another branch does not resolve here. Old records read as 0.
+    #[serde(default)]
+    pub branch_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,7 +128,13 @@ impl ScriptRunRecord {
             log_ref: None,
             notified: false,
             owner: Some(process_owner().into()),
+            branch_epoch: 0,
         }
+    }
+
+    /// True when this process created the record, so it alone can stop it.
+    pub fn owned_by_this_process(&self) -> bool {
+        self.owner.as_deref() == Some(process_owner())
     }
 }
 
@@ -212,14 +222,16 @@ impl ScriptRunRegistry {
         run_id: &str,
         session_id: Option<&str>,
         workspace_binding: &str,
+        branch_epoch: u64,
     ) -> Result<ScriptRunRecord, ScriptRunError> {
         let record = self.get(run_id)?;
         if record.session_id.as_deref() != session_id
             || record.workspace_binding != workspace_binding
+            || record.branch_epoch != branch_epoch
         {
             return Err(ScriptRunError::new(
                 "DENIED",
-                "script run belongs to another session or workspace",
+                "script run belongs to another session, workspace or branch",
             ));
         }
         Ok(record)
@@ -341,6 +353,7 @@ impl ScriptRunRegistry {
         &self,
         session_id: Option<&str>,
         workspace_binding: &str,
+        branch_epoch: u64,
     ) -> Result<Vec<ScriptRunRecord>, ScriptRunError> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Ok(Vec::new());
@@ -361,6 +374,7 @@ impl ScriptRunRegistry {
                 && !record.notified
                 && record.session_id.as_deref() == session_id
                 && record.workspace_binding == workspace_binding
+                && record.branch_epoch == branch_epoch
             {
                 pending.push(record);
             }

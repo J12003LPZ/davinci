@@ -264,14 +264,30 @@ fn script_state_persists_and_reconciles() {
 
     // Handles are scoped to their session and workspace.
     assert!(reopened
-        .get_for("run-1", Some("session-b"), "workspace-a")
+        .get_for("run-1", Some("session-b"), "workspace-a", 0)
         .is_err());
     assert!(reopened
-        .get_for("run-1", Some("session-a"), "workspace-b")
+        .get_for("run-1", Some("session-a"), "workspace-b", 0)
         .is_err());
     assert!(reopened
-        .get_for("run-1", Some("session-a"), "workspace-a")
+        .get_for("run-1", Some("session-a"), "workspace-a", 0)
         .is_ok());
+    // A run from another branch epoch is denied and also drops out of wakeups.
+    let other_branch = reopened
+        .get_for("run-1", Some("session-a"), "workspace-a", 1)
+        .unwrap_err();
+    assert_eq!(other_branch.code, "DENIED");
+    assert!(reopened
+        .pending_notifications(Some("session-a"), "workspace-a", 1)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        reopened
+            .pending_notifications(Some("session-a"), "workspace-a", 0)
+            .unwrap()
+            .len(),
+        1
+    );
     // A forged or foreign id never resolves.
     assert!(reopened.get("run-../../etc/passwd").is_err());
     assert!(reopened.get("run-missing").is_err());

@@ -322,9 +322,10 @@ impl Agent {
                 .map_err(|_| CodeModeError::new("UNAVAILABLE", "workspace unavailable"))?
                 .to_string_lossy()
                 .into_owned();
+            let epoch = self.branch_epoch.load(std::sync::atomic::Ordering::SeqCst);
             let lookup = |run_id: &str| {
                 registry
-                    .get_for(run_id, runtime.session_id.as_deref(), &binding)
+                    .get_for(run_id, runtime.session_id.as_deref(), &binding, epoch)
                     .map_err(|error| CodeModeError::new(&error.code, &error.message))
             };
             let mut record = lookup(&request.tool_call_id)?;
@@ -350,10 +351,35 @@ impl Agent {
                             "script run has an unresolved effect; ownership is not confirmed",
                         ));
                     }
-                    if record.state == super::ScriptRunState::Running {
-                        registry
-                            .transition(&record.run_id, super::ScriptRunState::Cancelled)
-                            .map_err(|error| CodeModeError::new(&error.code, &error.message))?;
+                    // A run that already finished keeps its finished outcome.
+                    if !record.state.terminal() {
+                        if !record.owned_by_this_process() {
+                            return Err(CodeModeError::new(
+                                "NOT_OWNER",
+                                "script run belongs to another host process; it was not stopped",
+                            ));
+                        }
+                        // The worker records its own terminal state from what it
+                        // actually did, so Kill never writes `Cancelled` itself. No
+                        // registry lock is held while waiting.
+                        let stopped = self.background_runs.cancel(&record.run_id)
+                            && self.background_runs.wait_run(
+                                &record.run_id,
+                                std::time::Duration::from_millis(
+                                    CodeModeLimits::default().cleanup_grace_ms,
+                                ),
+                            );
+                        if !stopped {
+                            // Either the worker did not quiesce in time, or this
+                            // process has no worker for the run (for example its
+                            // registration failed). Neither proves the run stopped
+                            // or had no effect. A worker that finishes first wins:
+                            // the transition is refused once a state is terminal.
+                            let _ = registry.transition(
+                                &record.run_id,
+                                super::ScriptRunState::RecoveryRequired,
+                            );
+                        }
                         record = lookup(&request.tool_call_id)?;
                     }
                 }
@@ -471,7 +497,7 @@ impl Agent {
                     "bg-{outer}-{}",
                     &uuid::Uuid::new_v4().simple().to_string()[..12]
                 );
-                let record = super::ScriptRunRecord::new(
+                let mut record = super::ScriptRunRecord::new(
                     &run_id,
                     outer_call_id,
                     runtime.session_id.as_deref(),
@@ -480,17 +506,32 @@ impl Agent {
                         .capability_registry
                         .hash_tool_capabilities(&self.tools),
                 );
-                registry
-                    .create(&record)
-                    .map_err(|error| CodeModeError::new(&error.code, &error.message))?;
-                // The handle is visible as running before the thread does any work.
-                registry
-                    .transition(&run_id, super::ScriptRunState::Running)
-                    .map_err(|error| CodeModeError::new(&error.code, &error.message))?;
-
+                record.branch_epoch = self.branch_epoch.load(std::sync::atomic::Ordering::SeqCst);
                 // The run token is a child of the session's: closing or cancelling
-                // the session stops every detached Script it owns.
+                // the session stops every detached Script it owns. The run is
+                // admitted before anything is written or spawned, so a shutdown
+                // either refuses it here or sees and cancels it.
                 let token = runtime.cancellation_token.child_token();
+                if !self.background_runs.reserve(&run_id, token.clone()) {
+                    return Err(CodeModeError::new(
+                        "BACKGROUND_UNAVAILABLE",
+                        "the session is closing; no new background Script was started",
+                    ));
+                }
+                self.background_runs.track(&registry_dir);
+                let admitted = registry
+                    .create(&record)
+                    .and_then(|()| {
+                        // The handle is visible as running before the thread works.
+                        registry
+                            .transition(&run_id, super::ScriptRunState::Running)
+                            .map(|_| ())
+                    })
+                    .map_err(|error| {
+                        self.background_runs.release(&run_id);
+                        CodeModeError::new(&error.code, &error.message)
+                    });
+                admitted?;
                 let agent = self.clone();
                 let request = request.clone();
                 let spawned_run = run_id.clone();
@@ -520,9 +561,12 @@ impl Agent {
                         }
                     })
                     .map_err(|_| {
+                        self.background_runs.release(&run_id);
+                        // No worker ever ran, so the visible handle must not stay open.
+                        let _ = registry.transition(&run_id, super::ScriptRunState::Failed);
                         CodeModeError::new("UNAVAILABLE", "background Script worker unavailable")
                     })?;
-                self.background_runs.register(&run_id, token, handle);
+                self.background_runs.attach(&run_id, handle);
                 Ok(json!({"toolCallId": run_id, "state": "running"}))
             };
         match start() {
@@ -538,18 +582,28 @@ impl Agent {
     /// Stop every owned detached run. Returns the ids that did not finish in
     /// the grace period; those are recorded as `recoveryRequired`, never as
     /// successful or cancelled.
+    ///
+    /// New runs are refused while the drain is in progress, so a launch racing
+    /// it cannot escape. Safe to call more than once, including concurrently:
+    /// a second call finds nothing left or reports the same unfinished runs.
+    /// No registry lock is held while waiting.
     pub fn shutdown_background_scripts(&self, grace: std::time::Duration) -> Vec<String> {
+        self.background_runs.close();
         self.background_runs.cancel_all();
         let unfinished = self.background_runs.wait_finished(grace);
+        self.background_runs.reopen();
         if let Some(evidence) = self.evidence.as_ref() {
-            if let Ok(registry) = super::ScriptRunRegistry::open(evidence.dir().join("script-runs"))
-            {
-                for run_id in &unfinished {
-                    let _ = registry.transition(run_id, super::ScriptRunState::RecoveryRequired);
-                }
-            }
+            super::background::mark_unresolved(&evidence.dir().join("script-runs"), &unfinished);
         }
         unfinished
+    }
+
+    /// `shutdown_background_scripts` with the Script cleanup grace, for hosts
+    /// closing or replacing a session.
+    pub fn shutdown_session_scripts(&self) -> Vec<String> {
+        self.shutdown_background_scripts(std::time::Duration::from_millis(
+            CodeModeLimits::default().cleanup_grace_ms,
+        ))
     }
 
     /// The oldest finished run whose wakeup has not been delivered, marked
@@ -560,7 +614,11 @@ impl Agent {
         let workspace = self.cwd.canonicalize().ok()?.to_string_lossy().into_owned();
         let registry = super::ScriptRunRegistry::open(evidence.dir().join("script-runs")).ok()?;
         let pending = registry
-            .pending_notifications(runtime.session_id.as_deref(), &workspace)
+            .pending_notifications(
+                runtime.session_id.as_deref(),
+                &workspace,
+                self.branch_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            )
             .ok()?
             .into_iter()
             .next()?;
@@ -664,13 +722,14 @@ impl Agent {
                 super::ScriptRunRegistry::open(evidence.dir().join("script-runs")).ok()
             });
             if let Some(registry) = &runs {
-                let record = super::ScriptRunRecord::new(
+                let mut record = super::ScriptRunRecord::new(
                     &context.identity.invocation_id,
                     id,
                     context.identity.session_id.as_deref(),
                     &context.identity.workspace_binding,
                     &context.capability_revision,
                 );
+                record.branch_epoch = self.branch_epoch.load(std::sync::atomic::Ordering::SeqCst);
                 if registry.create(&record).is_ok() {
                     let _ = registry.transition(&record.run_id, super::ScriptRunState::Running);
                 }

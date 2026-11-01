@@ -638,6 +638,9 @@ pub struct Agent {
     pub(crate) staged_codemode: Option<codemode::CodeModeBinding>,
     /// Detached Script runs owned by this agent; cloned with it.
     pub(crate) background_runs: codemode::BackgroundRuns,
+    /// Bumped only by explicit branch navigation; Script runs record it so a
+    /// run from another branch does not resolve. Shared by clones.
+    pub(crate) branch_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Trusted host opt-ins for otherwise-excluded script tools.
     pub(crate) script_tool_gates: codemode::ScriptToolGates,
     /// The Codemode mode the host resolved from `--codemode` and `/config`,
@@ -985,6 +988,7 @@ impl Agent {
             codemode: None,
             staged_codemode: None,
             background_runs: codemode::BackgroundRuns::default(),
+            branch_epoch: Arc::default(),
             script_tool_gates: codemode::ScriptToolGates::default(),
             codemode_configured_mode: None,
             pre_tool: None,
@@ -5895,6 +5899,9 @@ impl Agent {
         let rewind = runtime::rewind::prepare_prompt_rewind_or_reset(&session);
         let messages = messages_from_session(&session);
         if session_changed {
+            // Detached Script runs belong to the session being replaced. Stop
+            // them (bounded) before it goes; a same-session reload keeps them.
+            self.shutdown_session_scripts();
             self.runtime_environment = None;
             self.environment_key = None;
             self.last_verification_notice = None;
@@ -6129,6 +6136,8 @@ impl Agent {
         } else if let Some(session) = &mut self.session {
             session.set_leaf(new_leaf);
         }
+        self.branch_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(session) = &self.session {
             self.messages = messages_from_session(session);
         }

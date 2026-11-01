@@ -24,6 +24,17 @@ pub fn fixture_shutdown_signal() -> Option<i32> {
 /// servers, jobs, stop hooks) before it gives up and leaves.
 pub const CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
 
+/// How long exit waits for detached Script runs to stop. Inside
+/// [`CLEANUP_DEADLINE`] with room left for the other steps.
+pub const SCRIPT_RUN_GRACE: Duration = Duration::from_secs(2);
+
+/// Stop every detached Script run in this process, bounded by
+/// [`SCRIPT_RUN_GRACE`]. Runs that do not stop are recorded as unresolved.
+/// Safe to call from several exit paths.
+pub fn stop_script_runs() {
+    davinci_agent::codemode::shutdown_all_background_scripts(SCRIPT_RUN_GRACE);
+}
+
 /// Runs cleanup at most once, from whichever exit path gets there first, and
 /// never makes a caller wait past one fixed deadline. The work runs on its own
 /// thread so a hung hook or destructor can be abandoned: the process is about

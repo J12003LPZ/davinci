@@ -2146,20 +2146,55 @@ fn wait_for_script_scoped_handle_and_terminal_status() {
     assert!(!waited.is_error, "{}", waited.content);
     assert!(waited.content.contains("running"), "{}", waited.content);
 
-    // Kill records cancellation and a repeat is safe.
+    // This process owns the record but has no worker for it, so nothing was
+    // observed stopping: Kill reports `recoveryRequired`, never `cancelled`.
     let killed = agent.wait_for_script(WaitForScriptRequest {
         tool_call_id: "run-wait".into(),
         action: WaitAction::Kill,
     });
     assert!(!killed.is_error, "{}", killed.content);
+    assert!(
+        killed.content.contains("recoveryRequired"),
+        "{}",
+        killed.content
+    );
+    assert_eq!(
+        registry.get("run-wait").unwrap().state,
+        ScriptRunState::RecoveryRequired
+    );
+    // Repeating it is refused with the unresolved-effect error and changes nothing.
     let again = agent.wait_for_script(WaitForScriptRequest {
         tool_call_id: "run-wait".into(),
         action: WaitAction::Kill,
     });
-    assert!(!again.is_error, "{}", again.content);
+    assert!(again.is_error, "{}", again.content);
     assert_eq!(
         registry.get("run-wait").unwrap().state,
-        ScriptRunState::Cancelled
+        ScriptRunState::RecoveryRequired
+    );
+
+    // A run another host process owns is refused and left alone.
+    let mut foreign_owned = ScriptRunRecord::new(
+        "run-other-host",
+        "call-oh",
+        session.as_deref(),
+        &binding,
+        "rev",
+    );
+    foreign_owned.owner = Some("1-another-host".into());
+    registry.create(&foreign_owned).unwrap();
+    registry
+        .transition("run-other-host", ScriptRunState::Running)
+        .unwrap();
+    let refused = agent.wait_for_script(WaitForScriptRequest {
+        tool_call_id: "run-other-host".into(),
+        action: WaitAction::Kill,
+    });
+    assert!(refused.is_error, "{}", refused.content);
+    assert!(refused.content.contains("NOT_OWNER"), "{}", refused.content);
+    assert_eq!(
+        registry.get("run-other-host").unwrap().state,
+        ScriptRunState::Running
     );
 
     // A handle from another session never resolves.
@@ -2510,15 +2545,21 @@ fn killed_background_script_is_cancelled_and_not_replayed() {
         action: WaitAction::Kill,
     });
     assert!(!kill.is_error, "{kill:?}");
+    assert!(kill.content.contains("cancelled"), "{}", kill.content);
 
-    // The owned worker observes cancellation and terminates.
-    assert_eq!(
-        agent.shutdown_background_scripts(std::time::Duration::from_secs(2)),
-        Vec::<String>::new()
-    );
+    // Kill alone stopped the worker and the worker recorded its own outcome;
+    // no shutdown was needed.
+    assert_eq!(agent.background_runs.active(), 0);
     let registry = ScriptRunRegistry::open(evidence.path().join("script-runs")).unwrap();
     let record = registry.get(&run_id).unwrap();
     assert_eq!(record.state, ScriptRunState::Cancelled, "{record:?}");
+    // Shutdown is safe afterwards, and safe twice.
+    for _ in 0..2 {
+        assert_eq!(
+            agent.shutdown_background_scripts(std::time::Duration::from_secs(1)),
+            Vec::<String>::new()
+        );
+    }
     // A cancelled run is terminal and is never replayed.
     assert!(record.state.terminal());
     let repeated = agent.wait_for_script(WaitForScriptRequest {
@@ -2530,6 +2571,95 @@ fn killed_background_script_is_cancelled_and_not_replayed() {
         registry.get(&run_id).unwrap().state,
         ScriptRunState::Cancelled
     );
+}
+
+#[test]
+fn replacing_the_session_stops_detached_scripts() {
+    use crate::codemode::{ScriptRunRegistry, ScriptRunState};
+
+    let (_workspace, evidence, mut agent) =
+        background_agent(std::time::Duration::from_secs(5), true);
+    let started = agent.run_codemode("call-bg-replace", &background_request(), None);
+    assert!(!started.is_error, "{started:?}");
+    let run_id = serde_json::from_str::<serde_json::Value>(&started.content).unwrap()["toolCallId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(agent.background_runs.active(), 1);
+
+    let root = tempfile::tempdir().unwrap();
+    let replacement =
+        davinci_session::JsonlSession::create(root.path(), "/tmp/replacement", None).unwrap();
+    agent.load_from_session(replacement).unwrap();
+
+    assert_eq!(agent.background_runs.active(), 0);
+    let registry = ScriptRunRegistry::open(evidence.path().join("script-runs")).unwrap();
+    assert_eq!(
+        registry.get(&run_id).unwrap().state,
+        ScriptRunState::Cancelled
+    );
+    // The agent still accepts runs for the new session.
+    let next = agent.run_codemode("call-bg-after", &background_request(), None);
+    assert!(!next.is_error, "{next:?}");
+    agent.shutdown_session_scripts();
+}
+
+#[test]
+fn drain_refuses_launches_and_reopens() {
+    let (_workspace, _evidence, agent) = background_agent(std::time::Duration::from_secs(5), true);
+    agent.background_runs.close();
+    let refused = agent.run_codemode("call-bg-closing", &background_request(), None);
+    assert!(refused.is_error, "{refused:?}");
+    assert!(refused.content.contains("closing"), "{}", refused.content);
+    assert_eq!(agent.background_runs.active(), 0);
+    agent.background_runs.reopen();
+    let started = agent.run_codemode("call-bg-open", &background_request(), None);
+    assert!(!started.is_error, "{started:?}");
+    agent.shutdown_session_scripts();
+}
+
+#[test]
+fn explicit_branch_navigation_hides_runs_started_on_another_branch() {
+    use crate::codemode::{WaitAction, WaitForScriptRequest};
+    use davinci_session::SessionEntry;
+
+    let (_workspace, _evidence, mut agent) =
+        background_agent(std::time::Duration::from_secs(5), true);
+    let root = tempfile::tempdir().unwrap();
+    let mut session =
+        davinci_session::JsonlSession::create(root.path(), "/tmp/branch", None).unwrap();
+    for text in ["one", "two"] {
+        session
+            .append_entry(SessionEntry::message(
+                "user",
+                json!([{"type":"text","text":text}]),
+            ))
+            .unwrap();
+    }
+    let first = session.entries[0].id.clone();
+    agent.session = Some(session);
+
+    let started = agent.run_codemode("call-bg-branch", &background_request(), None);
+    let run_id = serde_json::from_str::<serde_json::Value>(&started.content).unwrap()["toolCallId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let status = |agent: &crate::Agent| {
+        agent.wait_for_script(WaitForScriptRequest {
+            tool_call_id: run_id.clone(),
+            action: WaitAction::Status,
+        })
+    };
+    assert!(!status(&agent).is_error);
+
+    agent
+        .navigate_tree_entry(&first, false, None, false, 16_384)
+        .unwrap();
+    let denied = status(&agent);
+    assert!(denied.is_error, "{}", denied.content);
+    assert!(denied.content.contains("DENIED"), "{}", denied.content);
+    assert!(agent.take_script_notification().is_none());
+    agent.shutdown_session_scripts();
 }
 
 #[test]
