@@ -354,3 +354,36 @@ fn family_discovery_separates_authorization_from_schema_availability() {
     assert!(!agent.is_tool_visible("family_schema_less"));
     assert!(!agent.is_tool_visible("family_denied"));
 }
+
+#[test]
+fn deferred_tool_load_does_not_rewrite_history() {
+    use davinci_agent::runtime::ToolExposureState;
+
+    let mut exposure = ToolExposureState::new(["read", "grep", "exec_command"]);
+    let initial = exposure.stable_prefix_digest();
+    let before = exposure.delta(1);
+    assert!(before.added_names.is_empty());
+    assert_eq!(before.stable_prefix_digest, initial);
+
+    // Discovery adds a binding additively.
+    assert!(exposure.activate_authorized("history_lookup", true));
+    let after = exposure.delta(2);
+    assert_eq!(after.added_names, vec!["history_lookup".to_string()]);
+    // The initial prefix digest is unchanged, so an old request prefix is not
+    // rewritten by the new binding.
+    assert_eq!(after.stable_prefix_digest, initial);
+
+    // The new binding is visible now and callable in the next Script.
+    assert!(exposure.is_visible("history_lookup"));
+    // Revoking it invalidates the binding and leaves the prefix untouched.
+    assert!(!exposure.activate_authorized("history_lookup", false));
+    assert!(!exposure.is_visible("history_lookup"));
+    let revoked = exposure.delta(3);
+    assert!(revoked.added_names.is_empty());
+    assert_eq!(revoked.stable_prefix_digest, initial);
+    // A differing initial exposure yields a different digest.
+    assert_ne!(
+        ToolExposureState::new(["read"]).stable_prefix_digest(),
+        initial
+    );
+}

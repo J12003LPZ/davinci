@@ -166,3 +166,71 @@ fn volatile_hot_tail_does_not_change_stable_cache_affinity() {
     assert!(runtime.compile(&extended, &stable_packet, 1).is_err());
     assert_eq!(runtime.cache_affinity(), tight_before);
 }
+
+#[test]
+fn context_mode_comparison_does_not_lose_requirements() {
+    use davinci_agent::runtime::context_vm::ContextVmMode;
+
+    let requirement = "Keep the public API and the CLI flag exactly as documented";
+    for mode in [
+        ContextVmMode::Off,
+        ContextVmMode::Shadow,
+        ContextVmMode::Hybrid,
+        ContextVmMode::Active,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ContextVmRuntime::new(
+            ContextVmConfig {
+                mode: mode.clone(),
+                ..ContextVmConfig::default()
+            },
+            CacheRuntime::new(CacheConfig::default(), Some(directory.path().to_path_buf())),
+        );
+        let events = events_from_messages(&[
+            ChatMessage::text("user", requirement),
+            ChatMessage::text("assistant", "working"),
+            ChatMessage::text("user", "and keep the tests"),
+        ]);
+        // A budget at the measured requirement is the tightest accepted one;
+        // anything smaller fails closed instead of dropping the requirement.
+        let full = runtime
+            .compile(&events, &ContextPacket::empty(), 4_000)
+            .unwrap();
+        let budget = full.estimated_tokens;
+        let image = runtime
+            .compile(&events, &ContextPacket::empty(), budget)
+            .unwrap();
+        assert!(
+            runtime
+                .compile(&events, &ContextPacket::empty(), 1)
+                .is_err(),
+            "{mode:?} accepted an impossible budget"
+        );
+        assert!(
+            image.messages.iter().any(|message| {
+                davinci_ai::content_text(&message.content).contains("Keep the public API")
+            }),
+            "{mode:?} lost the user requirement"
+        );
+        // The configured mode is never silently changed by a compile.
+        assert_eq!(
+            runtime.config().mode,
+            mode,
+            "compile must not rewrite the selected context mode"
+        );
+        // No orphan tool output and no invented tool call.
+        let orphans = image
+            .messages
+            .iter()
+            .filter(|message| message.tool_call_id.is_some() && message.tool_name.is_none())
+            .count();
+        assert_eq!(orphans, 0, "{mode:?} produced an orphan tool output");
+        assert!(
+            !image
+                .messages
+                .iter()
+                .any(|message| message.tool_name.is_some()),
+            "{mode:?} invented a tool call"
+        );
+    }
+}

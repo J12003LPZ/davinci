@@ -58,7 +58,7 @@ pub use capabilities::{
     builtin_capabilities, compute_schema_hash, conservative_replay_policy,
     default_declared_effects, default_execution_policies, output_policy_for_tool, CapabilitySource,
     ConcurrencyPolicy, DeclaredEffect, OutputPolicy, PreparedAction, ReplayPolicy,
-    RuntimeCapability, RuntimeCapabilityRegistry, ToolExposureState,
+    RuntimeCapability, RuntimeCapabilityRegistry, ToolExposureDelta, ToolExposureState,
 };
 pub use checkpoints::{
     may_mutate_with_checkpoint, BlobStore, CheckpointError, CheckpointRef, FileCapture,

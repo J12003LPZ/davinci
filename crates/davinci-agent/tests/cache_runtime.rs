@@ -704,3 +704,81 @@ fn wor101_cache_leader_cancellation_still_serves_followers() {
     assert!(matches!(leader.join().unwrap(), Err(CacheError::Cancelled)));
     assert_eq!(*follower.join().unwrap().unwrap(), 11);
 }
+
+#[test]
+fn rollback_and_resume_cache_manifests_are_truthful() {
+    use davinci_ai::{
+        classify_cache_drop, request_body_with, CacheDropReason, CacheRequestSample, ChatMessage,
+        PreparedProviderRequest, StreamOptions,
+    };
+
+    // 1. Digest equality never becomes a cached-token claim: an unchanged
+    //    prefix with fewer cache reads is provider-side or unknown.
+    let drop = classify_cache_drop(
+        1,
+        CacheRequestSample {
+            cache_read: Some(500),
+            wire_prefix_digest: "same",
+        },
+        CacheRequestSample {
+            cache_read: Some(0),
+            wire_prefix_digest: "same",
+        },
+        "openai-codex",
+    )
+    .unwrap();
+    assert_eq!(drop.reason, CacheDropReason::ProviderOrUnknown);
+
+    let model = davinci_ai::load_builtin_models()
+        .into_iter()
+        .find(|model| model.provider == "openai" && model.id == "gpt-5.6-sol")
+        .expect("gpt-5.6-sol");
+    let options = StreamOptions {
+        cache_key: Some("session".into()),
+        cache_retention: Some("short".into()),
+        ..StreamOptions::default()
+    };
+    let build = |messages: &[ChatMessage]| {
+        PreparedProviderRequest::new(request_body_with(
+            &model,
+            messages,
+            Some("stable bootstrap"),
+            &[],
+            &options,
+        ))
+    };
+    let base = vec![
+        ChatMessage::text("user", "requirement A"),
+        ChatMessage::text("assistant", "working"),
+    ];
+    let original = build(&base);
+
+    // 2. A cold resume from the same durable history is byte-identical.
+    let resumed = build(&base);
+    assert_eq!(
+        original.manifest().ordered_prefix_fingerprint,
+        resumed.manifest().ordered_prefix_fingerprint
+    );
+    assert_eq!(
+        original.cache_prefix_manifest(),
+        resumed.cache_prefix_manifest()
+    );
+
+    // 3. A fork appends; it never rewrites the prefix that was already sent.
+    let mut forked = base.clone();
+    forked.push(ChatMessage::text("user", "requirement B"));
+    let fork = build(&forked);
+    let before = original.cache_prefix_manifest();
+    let after = fork.cache_prefix_manifest();
+    for (early, later) in before.iter().zip(after.iter()) {
+        assert_eq!(early.digest, later.digest, "{early:?}");
+    }
+    assert!(after.len() >= before.len());
+
+    // 4. Rolling back to the durable history restores the exact manifest.
+    let rolled_back = build(&base);
+    assert_eq!(
+        rolled_back.cache_prefix_manifest(),
+        original.cache_prefix_manifest()
+    );
+}
