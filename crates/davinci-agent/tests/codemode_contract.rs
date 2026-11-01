@@ -53,6 +53,46 @@ fn malformed_script_headers_are_rejected_before_dispatch() {
 }
 
 #[test]
+fn script_to_direct_switch_preserves_history_and_wire_kind() {
+    use davinci_agent::codemode::{
+        project_script_history, CodeModeOutcome, CodeModeStatus, SCRIPT_WIRE_KIND,
+    };
+    let outcome = CodeModeOutcome {
+        status: CodeModeStatus::Completed,
+        script_completed: true,
+        output_text: "{\"summary\":\"done\"}".into(),
+        output_complete: true,
+        output_artifact: None,
+        children: vec![],
+        host_notes: vec![],
+        operation_ref: "op-42".into(),
+        error: None,
+    };
+    let read_only = project_script_history(&outcome, &CodeModeMode::ReadOnly);
+    let controlled = project_script_history(&outcome, &CodeModeMode::Controlled);
+    // Switching modes must not rewrite an item already in history.
+    assert_eq!(read_only, controlled);
+    assert_eq!(
+        serde_json::to_vec(&read_only).unwrap(),
+        serde_json::to_vec(&controlled).unwrap()
+    );
+    // The wire identity is stable and survives a record/replay round trip.
+    assert_eq!(read_only.wire_kind, SCRIPT_WIRE_KIND);
+    assert_eq!(read_only.wire_name, "codemode");
+    assert_eq!(read_only.call_id, "op-42");
+    assert_eq!(read_only.operation_ref, "op-42");
+    assert_eq!(read_only.version, 1);
+    let bytes = serde_json::to_vec(&read_only).unwrap();
+    let restored: davinci_agent::codemode::ScriptHistoryItem =
+        serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(restored, read_only);
+    // A truncated run says so, so a later direct turn cannot read it as whole.
+    let mut partial = outcome.clone();
+    partial.output_complete = false;
+    assert!(!project_script_history(&partial, &CodeModeMode::Controlled).complete);
+}
+
+#[test]
 fn crashed_script_never_replays_mutation() {
     use davinci_agent::codemode::{
         reconcile_script_run, ScriptRunRecord, ScriptRunRegistry, ScriptRunState,
