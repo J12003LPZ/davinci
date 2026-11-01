@@ -74,26 +74,28 @@ const REDACTED: &str = "[redacted]";
 /// Scrub likely credentials before anything is retained or shown.
 pub fn scrub_secrets(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while !rest.is_empty() {
-        let end = rest.find(' ').map(|index| index + 1).unwrap_or(rest.len());
-        let (word, tail) = rest.split_at(end);
+    // Split after every whitespace character (spaces, tabs, newlines) so a
+    // secret at the start of a later line is still a token of its own.
+    let mut redact_credential = false;
+    for word in text.split_inclusive(char::is_whitespace) {
         let trimmed = word.trim_end();
         let lower = trimmed.to_ascii_lowercase();
-        let secret = trimmed.starts_with("sk-")
-            || trimmed.starts_with("Bearer ")
+        let secret = redact_credential
+            || trimmed.eq_ignore_ascii_case("Bearer")
+            || trimmed.starts_with("sk-")
             || lower.contains("password=")
             || lower.contains("token=")
             || lower.starts_with("authorization:");
+        // "Bearer <credential>" redacts the credential word too.
+        redact_credential = trimmed.eq_ignore_ascii_case("Bearer");
         if secret {
             out.push_str(REDACTED);
-            if word.ends_with(' ') {
-                out.push(' ');
+            if let Some(whitespace) = word.get(trimmed.len()..) {
+                out.push_str(whitespace);
             }
         } else {
             out.push_str(word);
         }
-        rest = tail;
     }
     out
 }

@@ -318,6 +318,20 @@ fn script_log_is_readable_without_reexecuting_commands() {
     assert!(!text.contains("sk-abcdef"), "{text}");
     assert!(!text.contains("hunter2"), "{text}");
 
+    // Secrets are scrubbed in the retained log.
+    let log = store
+        .persist_script_log(
+            "run-4",
+            &[ScriptLogEvent::output(
+                "line one\nsk-abcdef1234567890\nBearer abc",
+            )],
+        )
+        .unwrap();
+    let text = store.read_script_log(&log.id, 0, 4096).unwrap().text;
+    assert!(!text.contains("sk-abcdef"), "{text}");
+    assert!(!text.contains("Bearer abc"), "{text}");
+    assert!(text.contains("line one"), "{text}");
+
     // Retention is capped regardless of what the script emitted.
     let huge = ScriptLogEvent::output("x".repeat(2 * 1024 * 1024));
     let log = store.persist_script_log("run-3", &[huge]).unwrap();
