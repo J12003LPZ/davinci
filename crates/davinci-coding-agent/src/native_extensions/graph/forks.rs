@@ -223,6 +223,12 @@ pub(super) fn execute(
             }
         }
     }
+    // A fork rebuilds files from bytes; it has no way to recreate a link.
+    if let Some(path) = baseline.links.keys().next() {
+        return Err(format!(
+            "Fork checkpoint cannot restore historical link '{path}'; parent preserved"
+        ));
+    }
     // Preflight exact bytes before creating a worktree or pinning the parent.
     for path in baseline.files.keys() {
         checked_relative(path)?;

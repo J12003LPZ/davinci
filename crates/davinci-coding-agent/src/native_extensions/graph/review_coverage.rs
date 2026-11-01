@@ -261,6 +261,7 @@ mod tests {
             patch_chunks: vec![PatchChunk {
                 file: "src/lib.rs".into(),
                 patch: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new".into(),
+                ..Default::default()
             }],
         };
 
@@ -293,6 +294,7 @@ mod tests {
             patch_chunks: vec![PatchChunk {
                 file: "src/large.rs".into(),
                 patch: full_patch.clone(),
+                ..Default::default()
             }],
         };
 

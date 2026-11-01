@@ -268,6 +268,7 @@ mod tests {
             patch_chunks: vec![PatchChunk {
                 file: "docs/architecture/token_auth.md".into(),
                 patch: "+ This section describes token and password auth handling.".into(),
+                ..Default::default()
             }],
         };
         let assessment = assess_change_risk(&mutation);
@@ -282,6 +283,7 @@ mod tests {
             patch_chunks: vec![PatchChunk {
                 file: "crates/ui/src/button.rs".into(),
                 patch: "+ pub fn render_button() { println!(\"Button\"); }".into(),
+                ..Default::default()
             }],
         };
         let assessment = assess_change_risk(&mutation);
@@ -324,6 +326,7 @@ mod tests {
             patch_chunks: vec![PatchChunk {
                 file: "src/utils.rs".into(),
                 patch: "+ let output = std::process::Command::new(\"sh\").output();".into(),
+                ..Default::default()
             }],
         };
         let a4 = assess_change_risk(&m4);
@@ -336,6 +339,7 @@ mod tests {
             patch_chunks: vec![PatchChunk {
                 file: "src/extractor.rs".into(),
                 patch: "+ archive.unpack(dest)?;".into(),
+                ..Default::default()
             }],
         };
         let a5 = assess_change_risk(&m5);
@@ -361,6 +365,7 @@ mod tests {
             patch_chunks: vec![PatchChunk {
                 file: "docs/scripts/helper.rs".into(),
                 patch: "+ std::process::Command::new(\"sh\").status();".into(),
+                ..Default::default()
             }],
         };
         let assessment = assess_change_risk(&mutation);

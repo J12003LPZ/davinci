@@ -51,6 +51,35 @@ pub(super) enum Entry<T> {
     Present(T),
 }
 
+/// The link text of a symlink or junction at `relative`, read with `read_link`
+/// and never followed. `None` for anything that is not itself a link, including
+/// a path below a redirected ancestor.
+pub(super) fn link_target(root: &Path, relative: &Path) -> io::Result<Option<String>> {
+    let mut path = root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "non-relative workspace path",
+            ));
+        }
+        path.push(component);
+        if components.peek().is_some() {
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if !metadata.is_dir() || is_redirected(&metadata) {
+                return Ok(None);
+            }
+        }
+    }
+    if !is_redirected(&std::fs::symlink_metadata(&path)?) {
+        return Ok(None);
+    }
+    Ok(Some(
+        std::fs::read_link(&path)?.to_string_lossy().into_owned(),
+    ))
+}
+
 /// Streamed SHA-256 and length of a workspace file, plus its bytes when the
 /// file fit within the caller's keep limit.
 pub(super) struct Fingerprinted {
