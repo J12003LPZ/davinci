@@ -144,6 +144,7 @@ class ResearchFixtureTests(unittest.TestCase):
             with (patch.dict(os.environ, {"BENCH_RESEARCH_FIXTURES": str(root), "BENCH_PWSH": sys.executable}),
                   patch.object(task_sources.subprocess, "run", side_effect=fake_run)):
                 bench.prepare("research-01", str(dest))
+                allowed = bench.load("research-01")["allowed"]
             self.assertEqual(seen[0][seen[0].index("-Task") + 1], "01-read-many-filter")
             self.assertTrue((dest / "workspace" / "notes" / "note-000.md").is_file())
             # git lives at the run dir, not inside the graded fixture directory.
@@ -153,8 +154,7 @@ class ResearchFixtureTests(unittest.TestCase):
             self.assertEqual(bench.changed_files(str(dest)), [])
             (dest / "workspace" / "answer.json").write_text("{}")
             self.assertEqual(bench.changed_files(str(dest)), ["workspace/answer.json"])
-            self.assertEqual([p for p in bench.changed_files(str(dest))
-                              if p not in bench.load("research-01")["allowed"]], [])
+            self.assertEqual([p for p in bench.changed_files(str(dest)) if p not in allowed], [])
 
     def test_grader_is_called_with_the_dir_that_contains_notes(self):
         real_run = task_sources.subprocess.run
