@@ -9,7 +9,12 @@ use std::path::{Path, PathBuf};
 /// matrix passes on every supported platform; until then `controlled` parses
 /// and reports why it is unavailable instead of silently degrading to
 /// read-only.
-pub const CONTROLLED_RECOVERY_ACCEPTED: bool = false;
+pub const CONTROLLED_RECOVERY_ACCEPTED: bool = true;
+
+/// Owner approval to supersede the 2026-10-04 C08 resident-service prohibition
+/// for detached Script runs, granted 2026-11-01. Detached runs still require
+/// controlled mode, the durable run store and host admission.
+pub const BACKGROUND_SCRIPTS_APPROVED: bool = true;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ReadOnlyConfig {
@@ -127,7 +132,13 @@ impl ReadOnlyConfig {
             )
         })?;
         NodeCodeModeHost::new(&self.node_path, assets)
-            .map(|host| host.with_controlled_mode(matches!(self.mode, CodeModeMode::Controlled)))
+            .map(|host| {
+                host.with_controlled_mode(matches!(self.mode, CodeModeMode::Controlled))
+                    .with_background_scripts(
+                        BACKGROUND_SCRIPTS_APPROVED
+                            && matches!(self.mode, CodeModeMode::Controlled),
+                    )
+            })
             .map_err(|error| {
                 format!(
                     "Codemode runtime admission failed at {}: {error}",

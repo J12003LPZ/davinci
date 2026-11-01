@@ -42,7 +42,7 @@ fn agent_dir() -> &'static Path {
 }
 
 #[test]
-fn read_only_defaults_to_the_managed_runtime_and_controlled_is_unavailable() {
+fn read_only_defaults_to_the_managed_runtime_and_controlled_is_opt_in() {
     // `/config` only stores the mode, so missing paths mean the managed
     // install under <agent dir>/codemode.
     let managed = managed_paths(agent_dir());
@@ -78,9 +78,13 @@ fn read_only_defaults_to_the_managed_runtime_and_controlled_is_unavailable() {
     for bad in [json!({"nodePath":"relative"}), json!({"hostPath": 7})] {
         assert!(resolve_config(Some("read-only"), Some(&bad), agent_dir()).is_err());
     }
-    assert!(resolve_config(Some("controlled"), None, agent_dir())
-        .unwrap_err()
-        .contains("acceptance gates"));
+    // Controlled is selectable once its recovery gate is accepted; the mode
+    // round-trips and still uses the managed runtime by default.
+    let controlled = resolve_config(Some("controlled"), None, agent_dir())
+        .unwrap()
+        .unwrap();
+    assert_eq!(controlled.mode, CodeModeMode::Controlled);
+    assert_eq!(controlled.host_path, managed_paths(agent_dir()).host_path);
 }
 
 #[test]

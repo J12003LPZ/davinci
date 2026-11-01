@@ -1,5 +1,6 @@
 //! Default-off sandbox execution contracts and Rust-owned capability policy.
 mod authority;
+mod background;
 mod deadline;
 mod dispatch;
 mod execution;
@@ -12,6 +13,7 @@ mod runs;
 mod script_log;
 mod types;
 pub(crate) use authority::fingerprint as authority_fingerprint;
+pub use background::BackgroundRuns;
 pub(crate) use deadline::remaining_root_wall_ms;
 pub use dispatch::AgentCodeModeBroker;
 pub(crate) use execution::mandatory_facts;

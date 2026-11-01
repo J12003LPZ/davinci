@@ -81,13 +81,19 @@ fn controlled_codemode_reports_the_release_gate() {
         );
         (output.status.success(), text)
     };
-    let gate = "Controlled Codemode is unavailable until its recovery acceptance gates pass";
+    // The recovery gate is accepted: controlled is an opt-in mode. This test
+    // host has no admitted runtime, so the remaining failure is the runtime,
+    // not the mode.
     let (ok, text) = run(&[]);
     assert!(ok, "{text}");
-    assert!(text.contains(gate), "{text}");
+    assert!(
+        text.contains("Codemode is on in /config but stays off"),
+        "{text}"
+    );
+    assert!(text.contains("Node runtime unavailable"), "{text}");
     let (ok, text) = run(&["--codemode", "controlled"]);
     assert!(!ok, "{text}");
-    assert!(text.contains(gate), "{text}");
+    assert!(text.contains("Node runtime unavailable"), "{text}");
     let (ok, text) = run(&["--codemode", "bogus"]);
     assert!(!ok, "{text}");
     assert!(
@@ -134,7 +140,10 @@ fn controlled_script_rollout_can_disable_without_history_loss() {
     write_settings("controlled");
     let (ok, text) = run(&[]);
     assert!(ok, "{text}");
-    assert!(text.contains("recovery acceptance gates"), "{text}");
+    assert!(
+        text.contains("Codemode is on in /config but stays off"),
+        "{text}"
+    );
 
     // Roll back to off: still a valid run, and no Codemode surface is offered.
     write_settings("off");

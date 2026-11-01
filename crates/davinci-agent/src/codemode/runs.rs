@@ -32,6 +32,9 @@ pub struct ScriptRunRecord {
     pub started_at_ms: u64,
     pub state: ScriptRunState,
     pub log_ref: Option<String>,
+    /// A finished run's wakeup has been delivered exactly once.
+    #[serde(default)]
+    pub notified: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +63,7 @@ impl ScriptRunRecord {
                 .unwrap_or_default(),
             state: ScriptRunState::Created,
             log_ref: None,
+            notified: false,
         }
     }
 }
@@ -212,6 +216,49 @@ pub fn reconcile_script_run(
 impl ScriptRunRegistry {
     fn write_record(&self, record: &ScriptRunRecord) -> Result<(), ScriptRunError> {
         self.write(&self.path(&record.run_id)?, record)
+    }
+
+    /// Finished runs whose wakeup has not been delivered yet, oldest first.
+    pub fn pending_notifications(
+        &self,
+        session_id: Option<&str>,
+        workspace_binding: &str,
+    ) -> Result<Vec<ScriptRunRecord>, ScriptRunError> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Ok(Vec::new());
+        };
+        let mut pending = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_slice::<ScriptRunRecord>(&bytes) else {
+                continue;
+            };
+            if record.state.terminal()
+                && !record.notified
+                && record.session_id.as_deref() == session_id
+                && record.workspace_binding == workspace_binding
+            {
+                pending.push(record);
+            }
+        }
+        pending.sort_by_key(|record| record.started_at_ms);
+        Ok(pending)
+    }
+
+    /// Mark one finished run as delivered so it can never wake a turn twice.
+    pub fn mark_notified(&self, run_id: &str) -> Result<(), ScriptRunError> {
+        let mut record = self.get(run_id)?;
+        if record.notified {
+            return Ok(());
+        }
+        record.notified = true;
+        self.write_record(&record)
     }
 }
 

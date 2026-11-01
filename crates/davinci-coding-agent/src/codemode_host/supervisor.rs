@@ -19,6 +19,7 @@ pub struct NodeCodeModeHost {
     manifest: super::assets::AssetManifest,
     node_fingerprint: [u8; 32],
     controlled: bool,
+    background: bool,
 }
 
 /// The error for a script the sandbox reported as failed. The sandbox's own
@@ -694,12 +695,20 @@ impl NodeCodeModeHost {
             manifest,
             node_fingerprint: fingerprint,
             controlled: false,
+            background: false,
         })
     }
 
     /// Trusted host configuration acknowledges mutating script children.
     pub fn with_controlled_mode(mut self, controlled: bool) -> Self {
         self.controlled = controlled;
+        self
+    }
+
+    /// Trusted host configuration acknowledges detached Script runs. Controlled
+    /// mode is still required: detaching never widens the tool ceiling.
+    pub fn with_background_scripts(mut self, background: bool) -> Self {
+        self.background = background;
         self
     }
 
@@ -1065,6 +1074,10 @@ impl NodeCodeModeHost {
 impl CodeModeHost for NodeCodeModeHost {
     fn admits_controlled_mode(&self) -> bool {
         self.controlled
+    }
+
+    fn admits_background_scripts(&self) -> bool {
+        self.background && self.controlled
     }
 
     fn execute(

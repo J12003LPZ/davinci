@@ -636,6 +636,8 @@ pub struct Agent {
     /// Admitted at startup, registered on each turn's runtime once it has an
     /// operation journal (see `activate_staged_codemode`).
     pub(crate) staged_codemode: Option<codemode::CodeModeBinding>,
+    /// Detached Script runs owned by this agent; cloned with it.
+    pub(crate) background_runs: codemode::BackgroundRuns,
     /// The Codemode mode the host resolved from `--codemode` and `/config`,
     /// reported by `feature_use` even when the runtime was not admitted.
     codemode_configured_mode: Option<String>,
@@ -980,6 +982,7 @@ impl Agent {
             agent_profile_models: None,
             codemode: None,
             staged_codemode: None,
+            background_runs: codemode::BackgroundRuns::default(),
             codemode_configured_mode: None,
             pre_tool: None,
             post_tool: None,
@@ -2643,7 +2646,7 @@ impl Agent {
         }
     }
 
-    /// TS `evalSession.reload()` — isolated evals have no extensions; count the step.
+    /// TS `evalSession.reload()` â€” isolated evals have no extensions; count the step.
     pub fn reload(&mut self) {
         self.reload_count = self.reload_count.saturating_add(1);
         self.aborted = false;
@@ -4951,7 +4954,7 @@ impl Agent {
         self.sync_tool_authorization();
     }
 
-    /// TS `setActiveToolsByName` — only registry names are enabled; unknown names ignored.
+    /// TS `setActiveToolsByName` â€” only registry names are enabled; unknown names ignored.
     pub fn set_active_tools_by_name(&mut self, names: &[String]) {
         self.tools = names
             .iter()
@@ -6693,9 +6696,9 @@ pub fn default_system_prompt() -> String {
 
 /// The orchestration rules every pi prompt carries: they are what turns a
 /// thirty-turn investigation into a six-turn one. Runtime and prompt have
-/// to agree — the scheduler overlaps independent calls (`scheduler.rs`),
+/// to agree â€” the scheduler overlaps independent calls (`scheduler.rs`),
 /// `batch` hides several operations behind one boundary, `agent` fans out
-/// workers — and this is the prompt's half of that agreement.
+/// workers â€” and this is the prompt's half of that agreement.
 pub const TOOL_USE_STRATEGY: &str = prompt::tool_strategy::TOOL_USE_STRATEGY;
 
 pub fn new_message_id() -> String {

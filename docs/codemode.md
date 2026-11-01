@@ -23,10 +23,12 @@ on or change its runtime.
 ## Controlled mode
 
 `"codemode": {"mode": "controlled"}` selects controlled mode from trusted user
-settings or `davinci --codemode controlled`. Until the S05/S15 crash-recovery
-matrix is accepted it is refused with "Controlled Codemode is unavailable until
-its recovery acceptance gates pass". A script header can never select the mode,
-and project settings cannot turn Codemode on.
+settings or `davinci --codemode controlled`. It is opt-in: nothing enables it
+implicitly, a script header can never select it, and project settings cannot
+turn Codemode on. The recovery-release gate is accepted
+(`config::CONTROLLED_RECOVERY_ACCEPTED`); if the crash-recovery matrix ever
+regresses, set it back to `false` and controlled mode fails closed with the
+gate message instead of degrading to read-only.
 
 Controlled scripts get the Droid spellings `tools.Read`, `tools.Grep`,
 `tools.Glob`, `tools.LS`, `tools.Execute`, `tools.ApplyPatch`, `tools.Edit` and
@@ -38,6 +40,18 @@ not yet supported (an OPEN parity gap) and fails with `UNSUPPORTED_OUTPUT`.
 While controlled mode is on, the prompt carries a versioned Script reference
 built from the aliases actually bound, and `wait_for_script` is offered so a run
 can be inspected without re-running it. Both disappear when the mode is off.
+
+## Background Scripts
+
+With controlled mode on, a script that opens with
+`// @script: {"startInBackground": true}` runs detached and returns
+`{"state": "running", "toolCallId": "<handle>"}` immediately. The run is owned
+by the session: its cancellation token is a child of the session token, so
+closing or cancelling the session stops it, and `wait_for_script` accepts
+`status`, a bounded `wait`, and `kill`. A finished run wakes the next turn once
+(`take_script_notification`), never on every poll. A run that cannot be stopped
+is recorded as `recoveryRequired`, never as completed or cancelled, and guest
+JavaScript is never resumed after a crash.
 
 ## Rollback
 

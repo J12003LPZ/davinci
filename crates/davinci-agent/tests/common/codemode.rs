@@ -2357,3 +2357,170 @@ fn controlled_mode_advertises_script_and_wait_tools_with_the_prompt() {
     assert!(!after.iter().any(|name| name == "wait_for_script"));
     assert!(agent.script_mode_prompt_text().is_none());
 }
+
+/// A host that finishes after `delay` and honours cancellation.
+struct SlowScriptHost {
+    delay: std::time::Duration,
+    background: bool,
+}
+impl crate::codemode::CodeModeHost for SlowScriptHost {
+    fn admits_controlled_mode(&self) -> bool {
+        true
+    }
+    fn admits_background_scripts(&self) -> bool {
+        self.background
+    }
+    fn execute(
+        &self,
+        _: &crate::codemode::CodeModeRequest,
+        context: &crate::codemode::CodeModeRunContext,
+        _: Arc<dyn crate::codemode::CodeModeBroker>,
+    ) -> crate::codemode::CodeModeOutcome {
+        use crate::codemode::*;
+        let started = std::time::Instant::now();
+        while started.elapsed() < self.delay {
+            if context.cancellation.is_cancelled() {
+                return CodeModeOutcome {
+                    status: CodeModeStatus::Cancelled,
+                    script_completed: false,
+                    output_text: String::new(),
+                    output_complete: false,
+                    output_artifact: None,
+                    children: vec![],
+                    host_notes: vec![],
+                    operation_ref: "fixture".into(),
+                    error: Some(CodeModeError::new("CANCELLED", "worker cancelled")),
+                };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        CodeModeOutcome {
+            status: CodeModeStatus::Completed,
+            script_completed: true,
+            output_text: "background done".into(),
+            output_complete: true,
+            output_artifact: None,
+            children: vec![],
+            host_notes: vec![],
+            operation_ref: "fixture".into(),
+            error: None,
+        }
+    }
+}
+
+fn background_agent(delay: std::time::Duration, admit: bool) -> (crate::Agent, tempfile::TempDir) {
+    let (mut agent, _workspace, _) = configured_agent();
+    let evidence = tempfile::tempdir().unwrap();
+    agent.evidence = Some(crate::EvidenceStore::new(evidence.path()));
+    agent
+        .enable_codemode(
+            Arc::new(SlowScriptHost {
+                delay,
+                background: admit,
+            }),
+            crate::codemode::CodeModeMode::Controlled,
+        )
+        .unwrap();
+    (agent, evidence)
+}
+
+fn background_request() -> serde_json::Value {
+    json!({"code":"// @script: {\"startInBackground\": true}\nreturn 1;"})
+}
+
+#[test]
+fn background_script_returns_running_and_can_finish() {
+    use crate::codemode::{ScriptRunState, WaitAction, WaitForScriptRequest};
+
+    let (agent, _evidence) = background_agent(std::time::Duration::from_millis(200), true);
+    let started = agent.run_codemode("call-bg", &background_request(), None);
+    assert!(!started.is_error, "{started:?}");
+    let handle: serde_json::Value = serde_json::from_str(&started.content).unwrap();
+    assert_eq!(handle["state"], json!("running"));
+    let run_id = handle["toolCallId"].as_str().unwrap().to_string();
+
+    // The handle resolves to the same run and reaches a terminal state.
+    let mut state = String::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        let status = agent.wait_for_script(WaitForScriptRequest {
+            tool_call_id: run_id.clone(),
+            action: WaitAction::Status,
+        });
+        state = serde_json::from_str::<serde_json::Value>(&status.content).unwrap()["state"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if state == "completed" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(state, "completed");
+
+    // The wakeup is delivered exactly once.
+    let first = agent.take_script_notification().expect("notification");
+    assert_eq!(first["toolCallId"], json!(run_id));
+    assert_eq!(first["state"], json!("completed"));
+    assert!(agent.take_script_notification().is_none());
+
+    // Nothing is left owned after the run finished.
+    assert_eq!(
+        agent.shutdown_background_scripts(std::time::Duration::from_secs(1)),
+        Vec::<String>::new()
+    );
+    assert_eq!(agent.background_runs.active(), 0);
+    let _ = ScriptRunState::Running;
+}
+
+#[test]
+fn background_script_without_host_approval_is_refused() {
+    let (agent, _evidence) = background_agent(std::time::Duration::from_millis(10), false);
+    let refused = agent.run_codemode("call-bg-denied", &background_request(), None);
+    assert!(refused.is_error, "{refused:?}");
+    assert!(
+        refused.content.contains("BACKGROUND_UNAVAILABLE"),
+        "{}",
+        refused.content
+    );
+    assert_eq!(agent.background_runs.active(), 0);
+}
+
+#[test]
+fn killed_background_script_is_cancelled_and_not_replayed() {
+    use crate::codemode::{ScriptRunRegistry, ScriptRunState, WaitAction, WaitForScriptRequest};
+
+    let (agent, evidence) = background_agent(std::time::Duration::from_secs(5), true);
+    let started = agent.run_codemode("call-bg-kill", &background_request(), None);
+    assert!(!started.is_error, "{started:?}");
+    let run_id = serde_json::from_str::<serde_json::Value>(&started.content).unwrap()["toolCallId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let kill = agent.wait_for_script(WaitForScriptRequest {
+        tool_call_id: run_id.clone(),
+        action: WaitAction::Kill,
+    });
+    assert!(!kill.is_error, "{kill:?}");
+
+    // The owned worker observes cancellation and terminates.
+    assert_eq!(
+        agent.shutdown_background_scripts(std::time::Duration::from_secs(2)),
+        Vec::<String>::new()
+    );
+    let registry = ScriptRunRegistry::open(evidence.path().join("script-runs")).unwrap();
+    let record = registry.get(&run_id).unwrap();
+    assert_eq!(record.state, ScriptRunState::Cancelled, "{record:?}");
+    // A cancelled run is terminal and is never replayed.
+    assert!(record.state.terminal());
+    let repeated = agent.wait_for_script(WaitForScriptRequest {
+        tool_call_id: run_id.clone(),
+        action: WaitAction::Kill,
+    });
+    assert!(!repeated.is_error, "{repeated:?}");
+    assert_eq!(
+        registry.get(&run_id).unwrap().state,
+        ScriptRunState::Cancelled
+    );
+}

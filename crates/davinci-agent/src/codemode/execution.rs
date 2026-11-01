@@ -50,14 +50,6 @@ pub(crate) fn mandatory_facts(result: &ToolResult) -> Option<Value> {
     )
 }
 
-/// Whether the bound host admits detached runs. A missing binding fails closed.
-fn binding_host_admits_background(agent: &Agent) -> Result<bool, CodeModeError> {
-    Ok(agent
-        .codemode
-        .as_ref()
-        .is_some_and(|binding| binding.host.admits_background_scripts()))
-}
-
 #[derive(Clone)]
 pub(crate) struct CodeModeBinding {
     pub host: Arc<dyn CodeModeHost>,
@@ -419,27 +411,200 @@ impl Agent {
         crate::prompt::script_mode_module(&binding.mode, &policy.script_aliases())
     }
 
+    /// Start a detached run and return its opaque handle immediately. The run
+    /// is owned by this agent: closing the session cancels it, and a host that
+    /// cannot stop it must treat the run as unresolved.
+    fn start_background_script(
+        &self,
+        outer_call_id: &str,
+        request: &CodeModeRequest,
+    ) -> ToolResult {
+        let start =
+            || -> Result<serde_json::Value, CodeModeError> {
+                let binding = self.codemode.as_ref().ok_or_else(|| {
+                    CodeModeError::new("UNAVAILABLE", "Codemode host unavailable")
+                })?;
+                if !binding.host.admits_background_scripts() {
+                    return Err(CodeModeError::new(
+                        "BACKGROUND_UNAVAILABLE",
+                        "background Scripts are not admitted by this host",
+                    ));
+                }
+                // Reject an impossible request before a run id exists.
+                CodeModeLimits::default().for_request(request)?;
+                let evidence = self.evidence.as_ref().ok_or_else(|| {
+                    CodeModeError::new(
+                        "UNAVAILABLE",
+                        "background Scripts need the durable run store",
+                    )
+                })?;
+                let runtime = self.runtime.as_ref().ok_or_else(|| {
+                    CodeModeError::new("UNAVAILABLE", "parent runtime unavailable")
+                })?;
+                let workspace = self
+                    .cwd
+                    .canonicalize()
+                    .map_err(|_| CodeModeError::new("UNAVAILABLE", "workspace unavailable"))?
+                    .to_string_lossy()
+                    .into_owned();
+                let registry_dir = evidence.dir().join("script-runs");
+                let registry = super::ScriptRunRegistry::open(&registry_dir)
+                    .map_err(|error| CodeModeError::new(&error.code, &error.message))?;
+                let outer: String = outer_call_id
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
+                    .take(40)
+                    .collect();
+                let run_id = format!(
+                    "bg-{outer}-{}",
+                    &uuid::Uuid::new_v4().simple().to_string()[..12]
+                );
+                let record = super::ScriptRunRecord::new(
+                    &run_id,
+                    outer_call_id,
+                    runtime.session_id.as_deref(),
+                    &workspace,
+                    &runtime
+                        .capability_registry
+                        .hash_tool_capabilities(&self.tools),
+                );
+                registry
+                    .create(&record)
+                    .map_err(|error| CodeModeError::new(&error.code, &error.message))?;
+                // The handle is visible as running before the thread does any work.
+                registry
+                    .transition(&run_id, super::ScriptRunState::Running)
+                    .map_err(|error| CodeModeError::new(&error.code, &error.message))?;
+
+                // The run token is a child of the session's: closing or cancelling
+                // the session stops every detached Script it owns.
+                let token = runtime.cancellation_token.child_token();
+                let agent = self.clone();
+                let request = request.clone();
+                let spawned_run = run_id.clone();
+                let thread_token = token.clone();
+                let registry_dir = registry_dir.clone();
+                let handle = std::thread::Builder::new()
+                    .name(format!(
+                        "codemode-{}",
+                        &spawned_run[spawned_run.len().saturating_sub(8)..]
+                    ))
+                    .spawn(move || {
+                        // The run's own counters and terminal state are recorded by
+                        // `run_script`; a detached failure never escapes the thread.
+                        let result = agent.run_script(&spawned_run, &request, None, thread_token);
+                        let _ = agent.finish_script_run(|| result, None);
+                        if let Ok(registry) = super::ScriptRunRegistry::open(&registry_dir) {
+                            // `run_script` already set the terminal state; this is a
+                            // no-op unless it failed to, in which case the run must
+                            // not look like it finished successfully.
+                            if registry
+                                .get(&spawned_run)
+                                .is_ok_and(|record| !record.state.terminal())
+                            {
+                                let _ = registry
+                                    .transition(&spawned_run, super::ScriptRunState::Stalled);
+                            }
+                        }
+                    })
+                    .map_err(|_| {
+                        CodeModeError::new("UNAVAILABLE", "background Script worker unavailable")
+                    })?;
+                self.background_runs.register(&run_id, token, handle);
+                Ok(json!({"toolCallId": run_id, "state": "running"}))
+            };
+        match start() {
+            Ok(value) => ToolResult {
+                content: value.to_string(),
+                is_error: false,
+                details: Some(value),
+            },
+            Err(error) => self.script_error_result(None, error),
+        }
+    }
+
+    /// Stop every owned detached run. Returns the ids that did not finish in
+    /// the grace period; those are recorded as `recoveryRequired`, never as
+    /// successful or cancelled.
+    pub fn shutdown_background_scripts(&self, grace: std::time::Duration) -> Vec<String> {
+        self.background_runs.cancel_all();
+        let unfinished = self.background_runs.wait_finished(grace);
+        if let Some(evidence) = self.evidence.as_ref() {
+            if let Ok(registry) = super::ScriptRunRegistry::open(evidence.dir().join("script-runs"))
+            {
+                for run_id in &unfinished {
+                    let _ = registry.transition(run_id, super::ScriptRunState::RecoveryRequired);
+                }
+            }
+        }
+        unfinished
+    }
+
+    /// The oldest finished run whose wakeup has not been delivered, marked
+    /// delivered exactly once.
+    pub fn take_script_notification(&self) -> Option<serde_json::Value> {
+        let evidence = self.evidence.as_ref()?;
+        let runtime = self.runtime.as_ref()?;
+        let workspace = self.cwd.canonicalize().ok()?.to_string_lossy().into_owned();
+        let registry = super::ScriptRunRegistry::open(evidence.dir().join("script-runs")).ok()?;
+        let pending = registry
+            .pending_notifications(runtime.session_id.as_deref(), &workspace)
+            .ok()?
+            .into_iter()
+            .next()?;
+        registry.mark_notified(&pending.run_id).ok()?;
+        Some(json!({
+            "toolCallId": pending.run_id,
+            "state": pending.state,
+            "logRef": pending.log_ref,
+        }))
+    }
+
     pub(crate) fn run_codemode(
         &self,
         id: &str,
         args: &Value,
         parent: Option<OperationId>,
     ) -> ToolResult {
-        let run = || -> Result<(CodeModeOutcome, String), CodeModeError> {
-            let request: CodeModeRequest = serde_json::from_value(args.clone())
-                .map_err(|_| CodeModeError::new("INVALID_INPUT", "invalid Codemode request"))?;
-            // Detached runs change the C08 resident-service contract; until an
-            // owner approves it and the recovery gates pass, refuse rather than
-            // silently run in the foreground.
-            if super::script_requests_background(&request.code)
-                && !binding_host_admits_background(self)?
-            {
-                return Err(CodeModeError::new(
-                    "BACKGROUND_UNAVAILABLE",
-                    "background Scripts require explicit owner approval and the C08 recovery gates",
-                ));
+        let request: CodeModeRequest = match serde_json::from_value(args.clone()) {
+            Ok(request) => request,
+            Err(_) => {
+                let error = CodeModeError::new("INVALID_INPUT", "invalid Codemode request");
+                return self.script_error_result(parent, error);
             }
-            let mut limits = CodeModeLimits::default().for_request(&request)?;
+        };
+        // A background directive detaches the run instead of holding the turn.
+        if super::script_requests_background(&request.code) {
+            return self.start_background_script(id, &request);
+        }
+        let cancellation = self
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.cancellation_token.child_token())
+            .unwrap_or_default();
+        let run = || -> Result<(CodeModeOutcome, String), CodeModeError> {
+            self.run_script(id, &request, parent, cancellation)
+        };
+        self.finish_script_run(run, parent)
+    }
+
+    /// Run one script to completion with the given cancellation authority.
+    /// `parent` stays optional so a detached run needs no turn operation.
+    fn run_script(
+        &self,
+        id: &str,
+        request: &CodeModeRequest,
+        parent: Option<OperationId>,
+        cancellation: crate::runtime::CancellationToken,
+    ) -> Result<(CodeModeOutcome, String), CodeModeError> {
+        {
+            let mut limits = CodeModeLimits::default().for_request(request)?;
             let binding = self
                 .codemode
                 .as_ref()
@@ -451,8 +616,7 @@ impl Agent {
             if let Some(remaining) = super::remaining_root_wall_ms(runtime.root_budget.as_ref())? {
                 limits.wall_ms = limits.wall_ms.min(remaining);
             }
-            let parent = parent
-                .ok_or_else(|| CodeModeError::new("UNAVAILABLE", "parent operation unavailable"))?;
+            let parent_operation_ref = parent.map(|parent| parent.to_string());
             let context = CodeModeRunContext {
                 identity: CodeModeIdentity {
                     invocation_id: id.into(),
@@ -465,14 +629,14 @@ impl Agent {
                         .to_string_lossy()
                         .into_owned(),
                     runtime_run_id: runtime.run_id.to_string(),
-                    parent_operation_ref: Some(parent.to_string()),
+                    parent_operation_ref,
                 },
                 mode: binding.mode.clone(),
                 limits,
                 capability_revision: runtime
                     .capability_registry
                     .hash_tool_capabilities(&self.tools),
-                cancellation: runtime.cancellation_token.child_token(),
+                cancellation,
                 root_budget: runtime.root_budget.clone(),
             };
             let mut leaf_agent = self.clone();
@@ -485,7 +649,7 @@ impl Agent {
             let broker = Arc::new(AgentCodeModeBroker::new(
                 leaf_agent,
                 context.clone(),
-                Some(parent),
+                parent,
             )?);
             // Write-ahead the run before the guest starts, so a crash leaves a
             // durable record to reconcile instead of an invisible orphan.
@@ -505,7 +669,7 @@ impl Agent {
                 }
             }
             let authority = super::authority_fingerprint(self)?;
-            let mut outcome = binding.host.execute(&request, &context, broker.clone());
+            let mut outcome = binding.host.execute(request, &context, broker.clone());
             if let Some(registry) = &runs {
                 let state = match outcome.status {
                     CodeModeStatus::Completed | CodeModeStatus::Partial => {
@@ -562,7 +726,9 @@ impl Agent {
                     outcome.status = CodeModeStatus::Partial;
                 }
             }
-            outcome.operation_ref = parent.to_string();
+            outcome.operation_ref = parent
+                .map(|parent| parent.to_string())
+                .unwrap_or_else(|| format!("ephemeral:{id}"));
             let incomplete = outcome
                 .children
                 .iter()
@@ -607,9 +773,16 @@ impl Agent {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Ok((outcome, authority))
-        };
-        // Every terminal outcome counts once, including requests refused
-        // before a script ran, so attempts and failures are never undercounted.
+        }
+    }
+
+    /// Count every terminal outcome once and shape the tool result, including
+    /// requests refused before a script ran, so attempts are never undercounted.
+    fn finish_script_run(
+        &self,
+        run: impl FnOnce() -> Result<(CodeModeOutcome, String), CodeModeError>,
+        parent: Option<OperationId>,
+    ) -> ToolResult {
         let finish = |completed: bool| {
             use std::sync::atomic::Ordering::Relaxed;
             self.counters.codemode_runs.fetch_add(1, Relaxed);
@@ -656,5 +829,9 @@ impl Agent {
                 }
             }
         }
+    }
+
+    fn script_error_result(&self, parent: Option<OperationId>, error: CodeModeError) -> ToolResult {
+        self.finish_script_run(|| Err(error), parent)
     }
 }
