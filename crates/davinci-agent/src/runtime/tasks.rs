@@ -900,7 +900,10 @@ impl TaskRegistry {
             .get(&task_id)
             .cloned()
             .ok_or(TaskError::TaskNotFound(task_id))?;
-        if matches!(task.state, TaskState::Completed | TaskState::Cancelled) {
+        if matches!(
+            task.state,
+            TaskState::Completed | TaskState::Cancelled | TaskState::Failed
+        ) {
             return Ok(task);
         }
         let reasons = evaluate_decision_prerequisites(&task.decision_prerequisites, plan, cwd);
@@ -1005,10 +1008,14 @@ impl TaskRegistry {
             if task.revision != expected_revision || task.assigned_to.is_some() {
                 return Err(TaskError::RevisionConflict(task_id));
             }
-            if task.state != TaskState::Ready {
+            if task.state != TaskState::Ready || !task.blocked_reasons.is_empty() {
                 return Err(TaskError::InvalidTransition {
                     task_id,
-                    from: task.state,
+                    from: if task.blocked_reasons.is_empty() {
+                        task.state
+                    } else {
+                        TaskState::Blocked
+                    },
                     to: TaskState::Running,
                 });
             }
@@ -2028,7 +2035,13 @@ impl TaskRegistry {
                 stale_evidence.extend(t.evidence_refs.iter().copied());
                 if tid != task_id {
                     stale_tasks.push(tid);
-                    if t.state == TaskState::Completed || t.state == TaskState::Running {
+                    if matches!(
+                        t.state,
+                        TaskState::Completed
+                            | TaskState::Running
+                            | TaskState::Ready
+                            | TaskState::Pending
+                    ) {
                         t.state = TaskState::Blocked;
                         t.blocked_reasons.push(BlockReason {
                             code: "code_rewound".into(),
@@ -4042,6 +4055,25 @@ mod tests {
     }
 
     #[test]
+    fn failed_task_is_not_reopened_by_prerequisite_evaluation() {
+        let registry = TaskRegistry::new();
+        let run_id = RunId::new();
+        let dir = tempfile::tempdir().unwrap();
+        let task = TaskRecord::new(run_id, "Failed prerequisite task")
+            .with_decision_prerequisites(vec![DecisionPrerequisiteRef::new("missing", 1)]);
+        let task_id = registry.create_task(task).unwrap();
+        registry.fail_task(task_id, Some("boom".into())).unwrap();
+        let plan = crate::LivingPlan {
+            revision: 1,
+            ..Default::default()
+        };
+        let updated = registry
+            .evaluate_and_update_decision_prerequisites(task_id, &plan, dir.path())
+            .unwrap();
+        assert_eq!(updated.state, TaskState::Failed);
+    }
+
+    #[test]
     fn f02_deferred_decision_keeps_task_blocked() {
         let registry = TaskRegistry::new();
         let run_id = RunId::new();
@@ -4506,6 +4538,44 @@ mod tests {
             .blocked_reasons
             .iter()
             .any(|reason| reason.code == "code_rewound"));
+    }
+
+    #[test]
+    fn claim_refuses_a_ready_task_with_blocking_reasons() {
+        let registry = TaskRegistry::new();
+        let run = RunId::new();
+        let id = registry
+            .create_task(TaskRecord::new(run, "blocked"))
+            .unwrap();
+        {
+            let mut tasks = registry.tasks.write().unwrap();
+            tasks
+                .get_mut(&id)
+                .unwrap()
+                .blocked_reasons
+                .push(BlockReason {
+                    code: "code_rewound".into(),
+                    message: "stale".into(),
+                });
+        }
+        let revision = registry.get_task(&id).unwrap().revision;
+        assert!(registry
+            .claim_task(id, run, AgentId::new(), revision)
+            .is_err());
+    }
+
+    #[test]
+    fn code_rewind_blocks_ready_dependents() {
+        let registry = TaskRegistry::new();
+        let run = RunId::new();
+        let root = registry.create_task(TaskRecord::new(run, "root")).unwrap();
+        let dependent = registry
+            .create_task(TaskRecord::new(run, "dependent").with_dependencies(vec![root]))
+            .unwrap();
+        registry.complete_task(root, None).unwrap();
+        assert_eq!(state_of(&registry, dependent), TaskState::Ready);
+        registry.invalidate_for_code_rewind(root, "cp1").unwrap();
+        assert_eq!(state_of(&registry, dependent), TaskState::Blocked);
     }
 
     // WOR-150: an overflowing revision rolls the whole invalidation back

@@ -118,10 +118,10 @@ pub(super) fn detect(text: &str) -> Vec<Hit> {
         if is_comment(line) {
             continue;
         }
-        if eval_call()
-            .find_iter(line)
-            .any(|found| !declares_eval(&line[..found.start() + 1]))
-        {
+        if eval_call().find_iter(line).any(|found| {
+            let eval_at = found.as_str().find("eval").unwrap_or(0);
+            !declares_eval(&line[..found.start() + eval_at])
+        }) {
             hits.push(Hit {
                 rule_id: "command.eval",
                 severity: FindingSeverity::Medium,
@@ -299,6 +299,12 @@ mod tests {
         );
         let hit = &detect("k=sk-proj-4f9Qa2Lk8Zt3Vb7Nc1Xd6Rm0Hs")[0];
         assert!(!hit.evidence.contains("4f9Qa2Lk8Zt3"), "{}", hit.evidence);
+    }
+
+    #[test]
+    fn security_gate_rules_handle_multibyte_before_eval() {
+        assert_eq!(rules("→eval(user_input)"), ["command.eval"]);
+        assert_eq!(rules("const s = \"…eval(x)\";"), ["command.eval"]);
     }
 
     #[test]

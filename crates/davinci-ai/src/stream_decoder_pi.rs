@@ -170,7 +170,9 @@ impl StreamDecoder for PiMessagesDecoder {
                 if let Some(ContentBlock::Text { text }) =
                     self.message.content.get_mut(content_index)
                 {
-                    *text = content.clone();
+                    if event.get("content").and_then(Value::as_str).is_some() {
+                        *text = content.clone();
+                    }
                 }
                 out.push(AssistantMessageEvent::TextEnd {
                     content_index,
@@ -349,6 +351,21 @@ mod tests {
             decoder.feed(event, &mut out);
         }
         (decoder.finish(&mut out), out)
+    }
+
+    #[test]
+    fn text_end_without_content_keeps_streamed_text() {
+        let (message, _) = run(&[
+            serde_json::json!({"type":"text_start","contentIndex":0}),
+            serde_json::json!({"type":"text_delta","contentIndex":0,"delta":"hello"}),
+            serde_json::json!({"type":"text_end","contentIndex":0}),
+        ]);
+        assert_eq!(
+            message.content[0],
+            ContentBlock::Text {
+                text: "hello".into()
+            }
+        );
     }
 
     #[test]

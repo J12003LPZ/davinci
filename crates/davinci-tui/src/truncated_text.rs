@@ -30,10 +30,7 @@ impl Component for TruncatedText {
         // when it fits, and shrink the side padding when it does not.
         let padding_x = self.padding_x.min(width.saturating_sub(1) / 2);
         let available_width = width.saturating_sub(padding_x.saturating_mul(2)).max(1);
-        let single_line = self
-            .text
-            .split_once('\n')
-            .map_or(self.text.as_str(), |(first, _)| first);
+        let single_line = self.text.lines().next().unwrap_or_default();
         let display = truncate_to_width(single_line, available_width, "...", false);
         let left = " ".repeat(padding_x);
         let right = " ".repeat(padding_x);
@@ -70,6 +67,12 @@ mod tests {
             .chars()
             .filter(|ch| *ch != '[')
             .collect()
+    }
+
+    #[test]
+    fn crlf_input_never_emits_a_carriage_return() {
+        let lines = TruncatedText::new("Hello world\r\nSecond", 1, 0).render(20);
+        assert!(!lines[0].contains('\r'), "{:?}", lines[0]);
     }
 
     #[test]

@@ -1183,8 +1183,13 @@ impl Parser {
         }
         let rest = self.rest();
         let end = rest.find(']')?;
-        let value: String = rest.chars().skip(1).take(end.saturating_sub(1)).collect();
-        self.position += end + 1;
+        let end_chars = rest[..end].chars().count();
+        let value: String = rest
+            .chars()
+            .skip(1)
+            .take(end_chars.saturating_sub(1))
+            .collect();
+        self.position += end_chars + 1;
         Some(self.render_nested(&value))
     }
 
@@ -1261,8 +1266,9 @@ impl Parser {
             self.supported = false;
             return String::new();
         };
-        let body: String = rest.chars().take(end).collect();
-        self.position += end + end_marker.chars().count();
+        let end_chars = rest[..end].chars().count();
+        let body: String = rest.chars().take(end_chars).collect();
+        self.position += end_chars + end_marker.chars().count();
         if matches!(
             environment.as_str(),
             "equation" | "equation*" | "displaymath"
@@ -1610,5 +1616,11 @@ mod tests {
         let pmatrix = render_latex("\\begin{pmatrix}1&200\\\\3000&4\\end{pmatrix}", false).unwrap();
         assert!(pmatrix.contains('1') && pmatrix.contains("3000"));
         assert!(render_latex("\\unknowncommand{x}", false).is_none());
+    }
+
+    #[test]
+    fn unicode_optional_arguments_and_environments_render() {
+        assert!(render_latex("\\sqrt[é]{x}", false).is_some());
+        assert!(render_latex("\\begin{pmatrix}α&β\\\\γ&δ\\end{pmatrix}", false).is_some());
     }
 }

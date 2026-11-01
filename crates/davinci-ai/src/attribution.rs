@@ -21,7 +21,7 @@ fn is_openrouter_model(model: &Model) -> bool {
         || model
             .base_url
             .as_deref()
-            .is_some_and(|url| url.contains(OPENROUTER_HOST))
+            .is_some_and(|url| matches_host(url, OPENROUTER_HOST))
 }
 
 fn is_nvidia_nim_model(model: &Model) -> bool {
@@ -149,6 +149,15 @@ mod tests {
             headers: Default::default(),
             thinking_level_map: Default::default(),
         }
+    }
+
+    #[test]
+    fn openrouter_attribution_requires_the_exact_host() {
+        let headers = default_attribution_headers(
+            &model("custom", "https://openrouter.ai.example.test/v1"),
+            true,
+        );
+        assert!(headers.is_empty(), "{headers:?}");
     }
 
     #[test]

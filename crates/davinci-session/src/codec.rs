@@ -520,6 +520,9 @@ fn parse_iso_ms(text: &str) -> Option<u64> {
     let second = number(17..19)?;
     let (millis, timezone_start) = if bytes[19] == b'.' {
         let fraction_end = 20 + text[20..].bytes().take_while(u8::is_ascii_digit).count();
+        if fraction_end == 20 {
+            return None;
+        }
         let mut padded = text[20..fraction_end].to_string();
         while padded.len() < 3 {
             padded.push('0');
@@ -578,6 +581,12 @@ fn decode_cwd_component(encoded: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iso_timestamp_requires_digits_after_the_fraction_dot() {
+        assert!(parse_iso_ms("2024-01-01T00:00:00.Z").is_none());
+        assert!(parse_iso_ms("2024-01-01T00:00:00.123Z").is_some());
+    }
 
     #[test]
     fn header_error_strings_match_ts() {

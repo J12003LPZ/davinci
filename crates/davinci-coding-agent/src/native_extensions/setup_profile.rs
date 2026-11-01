@@ -234,7 +234,14 @@ impl SetupProfile {
         }
         let path = Self::path(agent_dir);
         if path.exists() {
-            let _ = std::fs::copy(&path, path.with_extension("json.bak"));
+            let backup = path.with_extension("json.bak");
+            std::fs::copy(&path, &backup).map_err(|error| {
+                format!(
+                    "could not keep the previous {} as {}: {error}",
+                    path.display(),
+                    backup.display()
+                )
+            })?;
         }
         let mut body = serde_json::to_string_pretty(self).map_err(|error| error.to_string())?;
         body.push('\n');
@@ -572,6 +579,9 @@ fn resolve_enabled(
         }
         return (false, EnabledSource::Profile);
     }
+    if matches!(file, ConfigFileState::Corrupt(_)) {
+        return (false, EnabledSource::FailClosed);
+    }
     if let Some((var, _)) = env {
         return (file_enabled, EnabledSource::Environment(var));
     }
@@ -579,5 +589,34 @@ fn resolve_enabled(
         ConfigFileState::Corrupt(_) => (false, EnabledSource::FailClosed),
         ConfigFileState::Present => (file_enabled, EnabledSource::ConfigFile),
         ConfigFileState::Missing => (file_enabled, EnabledSource::Default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corrupt_config_fails_closed_even_with_environment_override() {
+        let mut issues = Vec::new();
+        let (enabled, source) = resolve_enabled(
+            &ConfigFileState::Corrupt("bad json".into()),
+            true,
+            None,
+            Some(("PI_MEMORY_ENABLED".into(), true)),
+            &mut issues,
+            "memory",
+        );
+        assert!(!enabled);
+        assert!(matches!(source, EnabledSource::FailClosed));
+    }
+
+    #[test]
+    fn save_refuses_to_drop_the_previous_profile_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = SetupProfile::default();
+        profile.save(dir.path()).unwrap();
+        std::fs::create_dir(SetupProfile::path(dir.path()).with_extension("json.bak")).unwrap();
+        assert!(profile.save(dir.path()).is_err());
     }
 }

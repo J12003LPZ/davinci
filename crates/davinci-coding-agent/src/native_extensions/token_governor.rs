@@ -1605,7 +1605,14 @@ impl TokenGovernor {
             .map(|line| line as usize);
         let pattern = args.get("grep").and_then(Value::as_str);
         let total = line_count(&content);
-        let budget = self.config.retrieve_max_bytes;
+        // The continuation trailer is appended after the page is selected; it
+        // must fit inside the same per-call byte cap.
+        const TRAILER_RESERVE: usize = 256;
+        let budget = self
+            .config
+            .retrieve_max_bytes
+            .saturating_sub(TRAILER_RESERVE)
+            .max(1);
         let mut selected = Vec::new();
         let mut used = 0usize;
         let mut matched = 0usize;
@@ -2402,6 +2409,27 @@ mod tests {
         assert!(empty.content.contains("no line of"));
         let missing = governor.retrieve(&json!({"id": "out-ffffffffffff"}));
         assert!(missing.is_err());
+    }
+
+    #[test]
+    fn retrieval_never_exceeds_the_configured_byte_cap() {
+        let dir = tempdir().unwrap();
+        let config = TokenGovernorConfig {
+            retrieve_max_bytes: 1_024,
+            ..tiny_thresholds()
+        };
+        let mut governor = TokenGovernor::with_store("test", config, OutputStore::new(dir.path()));
+        let original = (1..=300)
+            .map(|n| format!("row {n:04} {}", "x".repeat(20)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = governor.after_tool("bash", &json!({}), ok(&original));
+        let id = result.details.unwrap()["tokenGovernor"]["outputId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let page = governor.retrieve(&json!({"id": id})).unwrap();
+        assert!(page.content.len() <= 1_024, "{}", page.content.len());
     }
 
     #[test]

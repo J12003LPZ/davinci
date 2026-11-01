@@ -389,7 +389,7 @@ pub fn extract_ansi_code(text: &str, pos: usize) -> Option<(String, usize)> {
             let bytes = rest.as_bytes();
             while j < rest.len() {
                 let b = bytes[j];
-                if matches!(b, b'm' | b'G' | b'K' | b'H' | b'J') {
+                if (0x40..=0x7e).contains(&b) {
                     return Some((rest[..j + 1].to_string(), j + 1));
                 }
                 j += 1;
@@ -1432,6 +1432,19 @@ pub fn extract_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn csi_sequences_end_at_any_final_byte() {
+        assert_eq!(
+            extract_ansi_code("\x1b[1A", 0),
+            Some(("\x1b[1A".to_string(), 4))
+        );
+        assert_eq!(
+            extract_ansi_code("\x1b[?25l", 0),
+            Some(("\x1b[?25l".to_string(), 6))
+        );
+        assert_eq!(visible_width("\x1b[1A"), 0);
+    }
 
     #[test]
     fn truncate_to_width_matches_ts() {
