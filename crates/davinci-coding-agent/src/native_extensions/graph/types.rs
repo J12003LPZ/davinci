@@ -506,8 +506,12 @@ impl WorkerUsage {
         self.governor_compressed_outputs = self
             .governor_compressed_outputs
             .saturating_add(other.governor_compressed_outputs);
-        self.governor_retrievals = self.governor_retrievals.saturating_add(other.governor_retrievals);
-        self.governor_prunings = self.governor_prunings.saturating_add(other.governor_prunings);
+        self.governor_retrievals = self
+            .governor_retrievals
+            .saturating_add(other.governor_retrievals);
+        self.governor_prunings = self
+            .governor_prunings
+            .saturating_add(other.governor_prunings);
     }
 
     /// Governor counters summed over `tasks`, the run's own governor totals.

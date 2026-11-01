@@ -51,6 +51,118 @@ impl ReviewCoverage {
     }
 }
 
+/// Split a unified diff into review chunks before it reaches a model.
+///
+/// A `diff --git` header starts a new section. Sections are packed into
+/// chunks no larger than `max_bytes`; a single line longer than the budget is
+/// split across consecutive chunks, so no part of the diff is dropped. Callers
+/// must present these chunk patches verbatim: a truncation marker cannot be
+/// evidence that the omitted bytes were reviewed.
+pub fn chunk_text_diff(label: &str, diff: &str, max_bytes: usize) -> Vec<ReviewChunk> {
+    let max_bytes = max_bytes.max(1);
+    if diff.is_empty() {
+        return vec![ReviewChunk {
+            id: format!("{label}#chunk-0"),
+            file: label.to_string(),
+            patch: String::new(),
+        }];
+    }
+
+    // Group lines by file section, keeping the original order and bytes.
+    let mut sections: Vec<(String, Vec<&str>)> = Vec::new();
+    for line in diff.lines() {
+        let starts_section = line.starts_with("diff --git ");
+        if starts_section || sections.is_empty() {
+            let file = if starts_section {
+                line.split_whitespace()
+                    .nth(3)
+                    .map(|path| path.trim_start_matches("b/"))
+                    .filter(|path| !path.is_empty())
+                    .unwrap_or(label)
+            } else {
+                label
+            };
+            sections.push((file.to_string(), Vec::new()));
+        }
+        sections
+            .last_mut()
+            .expect("a section was just created")
+            .1
+            .push(line);
+    }
+
+    let mut chunks = Vec::new();
+    let mut index = 0usize;
+    for (file, lines) in sections {
+        let mut current = String::new();
+        for line in lines {
+            let mut remaining = line;
+            loop {
+                let separator = usize::from(!current.is_empty());
+                let available = max_bytes.saturating_sub(current.len() + separator);
+                if available == 0 {
+                    chunks.push(ReviewChunk {
+                        id: format!("{file}#chunk-{index}"),
+                        file: file.clone(),
+                        patch: std::mem::take(&mut current),
+                    });
+                    index += 1;
+                    continue;
+                }
+                if remaining.len() <= available {
+                    if !current.is_empty() {
+                        current.push('\n');
+                    }
+                    current.push_str(remaining);
+                    break;
+                }
+                let split = floor_char_boundary(remaining, available);
+                if split == 0 {
+                    // `available` cannot hold one character; flush and retry.
+                    chunks.push(ReviewChunk {
+                        id: format!("{file}#chunk-{index}"),
+                        file: file.clone(),
+                        patch: std::mem::take(&mut current),
+                    });
+                    index += 1;
+                    continue;
+                }
+                if !current.is_empty() {
+                    current.push('\n');
+                }
+                current.push_str(&remaining[..split]);
+                remaining = &remaining[split..];
+                chunks.push(ReviewChunk {
+                    id: format!("{file}#chunk-{index}"),
+                    file: file.clone(),
+                    patch: std::mem::take(&mut current),
+                });
+                index += 1;
+            }
+        }
+        if !current.is_empty() {
+            chunks.push(ReviewChunk {
+                id: format!("{file}#chunk-{index}"),
+                file: file.clone(),
+                patch: current,
+            });
+            index += 1;
+        }
+    }
+    chunks
+}
+
+fn floor_char_boundary(value: &str, max: usize) -> usize {
+    if max >= value.len() {
+        return value.len();
+    }
+    let mut boundary = max;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
+}
+
 /// Returns true if every required chunk in the coverage has been reviewed.
 pub fn coverage_complete(coverage: &ReviewCoverage) -> bool {
     let reviewed: HashSet<&str> = coverage
@@ -230,5 +342,55 @@ mod tests {
         coverage.record_reviewed(&["src/a.rs#chunk-1".to_string()]);
         assert!(coverage_complete(&coverage));
         assert!(coverage.missing_chunk_ids().is_empty());
+    }
+
+    #[test]
+    fn text_diff_is_chunked_without_dropping_any_bytes() {
+        let mut diff = String::new();
+        for file in ["src/a.rs", "src/b.rs"] {
+            diff.push_str(&format!("diff --git a/{file} b/{file}\n"));
+            diff.push_str(&format!("--- a/{file}\n+++ b/{file}\n"));
+            for line in 0..120 {
+                diff.push_str(&format!(
+                    "+{file} line {line} with enough text to need several chunks\n"
+                ));
+            }
+        }
+
+        let chunks = chunk_text_diff("workspace", &diff, 512);
+        assert!(chunks.len() > 5, "expected many chunks: {}", chunks.len());
+        assert!(chunks.iter().all(|chunk| !chunk.patch.is_empty()));
+        let ids: HashSet<&str> = chunks.iter().map(|chunk| chunk.id.as_str()).collect();
+        assert_eq!(ids.len(), chunks.len(), "chunk IDs must be unique");
+        assert!(chunks.iter().any(|chunk| chunk.file == "src/a.rs"));
+        assert!(chunks.iter().any(|chunk| chunk.file == "src/b.rs"));
+
+        // Every non-newline byte of the diff appears, in order, across chunks.
+        let reassembled: String = chunks.iter().map(|chunk| chunk.patch.as_str()).collect();
+        assert_eq!(
+            reassembled.replace('\n', ""),
+            diff.replace('\n', ""),
+            "chunking must not omit or reorder diff content"
+        );
+    }
+
+    #[test]
+    fn a_single_oversized_line_is_split_across_chunks() {
+        let line = format!("+{}", "x".repeat(5_000));
+        let diff = format!("diff --git a/big.rs b/big.rs\n{line}\n");
+        let chunks = chunk_text_diff("workspace", &diff, 256);
+        assert!(chunks.len() > 1);
+        let reassembled: String = chunks.iter().map(|chunk| chunk.patch.as_str()).collect();
+        assert_eq!(reassembled.replace('\n', ""), diff.replace('\n', ""));
+    }
+
+    #[test]
+    fn an_empty_working_tree_diff_is_still_a_required_chunk() {
+        let chunks = chunk_text_diff("workspace", "", 512);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].id, "workspace#chunk-0");
+        assert!(chunks[0].patch.is_empty());
+        let coverage = ReviewCoverage::new(vec![chunks[0].id.clone()]);
+        assert!(!coverage_complete(&coverage));
     }
 }

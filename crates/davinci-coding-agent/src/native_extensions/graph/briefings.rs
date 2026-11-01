@@ -489,18 +489,6 @@ pub struct ReviewInput<'a> {
         Option<&'a crate::native_extensions::ecosystem::verification::SecurityVerification>,
 }
 
-fn bounded_patch(patch: &str) -> String {
-    const MAX_PATCH_CHARS: usize = 60_000;
-    if patch.chars().count() <= MAX_PATCH_CHARS {
-        return patch.to_string();
-    }
-    let marker = "\n[... patch truncated ...]\n";
-    let keep = MAX_PATCH_CHARS.saturating_sub(marker.chars().count());
-    let mut out: String = patch.chars().take(keep).collect();
-    out.push_str(marker);
-    out
-}
-
 pub fn review_briefing(input: &ReviewInput<'_>) -> String {
     let verification_lines = input
         .verification
@@ -543,7 +531,9 @@ pub fn review_briefing(input: &ReviewInput<'_>) -> String {
             if chunk.patch.is_empty() {
                 "(empty patch for this file)".to_string()
             } else {
-                format!("```diff\n{}\n```", bounded_patch(&chunk.patch))
+                // Chunk patches are already bounded by the chunker; presenting
+                // them verbatim is what makes chunk coverage meaningful.
+                format!("```diff\n{}\n```", chunk.patch)
             },
         ]);
     } else if let Some(summaries) = input.chunk_summaries {

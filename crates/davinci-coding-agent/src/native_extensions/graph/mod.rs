@@ -362,7 +362,7 @@ fn saved_definition_from_run(
         .iter()
         .map(|node| definitions::SavedStageBinding {
             node_id: node.id.clone(),
-            stage: node.role.to_string(),
+            stage: saved_stage_for_node(node).to_string(),
             input_artifacts: vec![],
         })
         .collect();
@@ -1895,12 +1895,7 @@ fn strip_continuation(mut value: Value) -> Value {
 fn unrelated_dirty_files(cwd: &Path) -> Vec<String> {
     let Ok(raw) = git::run(
         cwd,
-        &[
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-        ],
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
     ) else {
         return Vec::new();
     };
@@ -3177,5 +3172,11 @@ name = \"x\"
             .unwrap();
         let path = written["path"].as_str().unwrap();
         assert!(std::path::Path::new(path).exists());
+        // The export document is generated from the same stage mapping as
+        // `/graph save`; its bindings must compile, not just serialize.
+        let current = load_run(dir.path(), &run.run_id).expect("run state");
+        let exported = saved_definition_from_run(&current, "review").expect("export definition");
+        bindings::compile_saved_definition(&exported)
+            .expect("an exported generated graph must reload");
     }
 }

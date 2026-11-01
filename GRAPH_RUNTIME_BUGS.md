@@ -1142,16 +1142,16 @@ All 53 findings were fixed on branch `fix/graph-runtime-bugs`. Regression tests 
 | 2 | `store.rs`: transcript/state/artifact/graph reads use no-symlink readers (`open_regular`, `check_run_path`) and reject redirected ancestors; `load_run_checked` rejects a non-absolute checkpoint `cwd`. |
 | 3 | `mutation.rs`: `format_large_modified_file_diff` trims the common prefix/suffix and emits an index-aligned change script, so large files carry every changed line. |
 | 4 | `render.rs`: tokenizer failure makes `parse_advanced_graph_command` return `None` (goal text) instead of a quote error. |
-| 5 | `controller.rs`: `failure_branch_succeeded` treats a completed `OnFailure` branch as satisfying a failed required node. |
+| 5 | `controller.rs`: `failure_branch_succeeded` requires every terminal node reachable from the `OnFailure` branch to have succeeded; an intermediate descendant or a failed terminal reviewer does not recover a required node. |
 | 6 | `briefings.rs`: `push_bounded_section` charges risks, gaps, and the test baseline against the same evidence budget. |
-| 7 | `bindings.rs`: saved review receives bound plan artifacts, the saved security verdict, and a diff bounded by `bounded_review_diff`. |
+| 7 | `bindings.rs`: saved review receives bound plan artifacts and the saved security verdict; its diff is split into tracked review chunks instead of being truncated (`bounded_review_diff` removed). |
 | 8 | `process.rs`: post-exit drain is bounded by `DRAIN_BUDGET` wall time instead of a frame count. |
 | 9 | `worker.rs`: a failed artifact unlink is a worker failure instead of being ignored. |
 | 10 | `worker.rs`: supervisor errors report `worker supervisor failed` with exit code, stderr tail, delivered text, and usage. |
 | 11 | `operations.rs`: `max-researchers`, `max-revision-cycles`, and `max-replans` reject zero. |
 | 12 | `preflight.rs`: writer/reviewer checks are computed from the definition, concurrency is the configured ceiling, and `valid` requires every check to be `Permitted`. |
 | 13 | `mutation.rs`: an unreadable baseline/mutation file is an error, not a deletion (`NotFound` still counts as absent). |
-| 14 | `replay.rs`, `controller.rs`, `controller_attempts.rs`: `ReplayFingerprint` records the worker model and replay requires the stored and current model to match. |
+| 14 | `replay.rs`, `controller.rs`, `controller_attempts.rs`: `ReplayFingerprint` records the worker model; replay and the completed-task fast path resolve the model the controller would spawn now and refuse a mismatch or a one-sided unresolved identity. |
 | 15 | `topology.rs`: reachability starts from every in-degree-zero node, so multi-root and unsorted DAGs are valid. |
 | 16 | `workspace_files.rs`: reads are capped at 64 MiB; `mutation.rs` propagates capture errors. |
 | 17 | `process.rs`: `fallback_exit_code` maps a Unix signal death to `128 + signal`. |
@@ -1173,12 +1173,12 @@ All 53 findings were fixed on branch `fix/graph-runtime-bugs`. Regression tests 
 | 33 | `definitions.rs`: `strip_yaml_comment` tracks double-quoted escapes and doubled single quotes. |
 | 34 | `verify.rs`: a timed-out command is recorded as exit 124 even if the kill raced a clean exit. |
 | 35 | `replay.rs`: an existing but unreadable config hashes to a fresh value (fail closed) instead of `{}`. |
-| 36 | `controller.rs`: a no-mutation review gets a required `workspace#chunk-0` chunk plus `truncate_diff`'s truncation marker. |
+| 36 | `controller.rs`, `review_coverage.rs`: a no-mutation review's working-tree diff is split into tracked chunks up to `DIFF_MAX_CHARS` before any model request; no truncation marker can stand in for a reviewed chunk. |
 | 37 | `worker_hooks.rs`: artifacts are capped at 64 KiB before validation. |
 | 38 | `mod.rs`: `/graph diff` passes working-tree files not owned by the run as unattributed (NUL-safe status parsing). |
 | 39 | `mod.rs`: `/graph verify` collects configured `verifyCommands` plus detected commands through `verify::collect_verify_commands`. |
 | 40 | `controller.rs`, `mod.rs`: a saved graph's `verificationPolicy.required` blocks on failure; `maxTokens` is rejected instead of silently ignored. |
-| 41 | `validate.rs`, `operations.rs`: `changedFiles` is limited to 512 workspace-relative paths and is re-checked before becoming a source-manifest path. |
+| 41 | `validate.rs`, `operations.rs`: `changedFiles` is limited to 512 paths, checked with platform-independent syntax (backslashes, drive/UNC prefixes, `.`/`..`, empty segments, control characters), and re-checked before becoming a source-manifest path. |
 | 42 | `controller.rs`, `replay.rs`: every git call uses `--no-ext-diff --no-textconv`, and output paths are NUL-safe (`ls-files -z`). |
 | 43 | `store.rs`: `migrate_baseline` restores the inline contents when a blob write fails. |
 | 44 | `replay.rs`, `controller.rs`: repo-state and diff commands exclude `.davinci`, `.pi`, `target`, and `node_modules`. |
@@ -1190,14 +1190,24 @@ All 53 findings were fixed on branch `fix/graph-runtime-bugs`. Regression tests 
 | 50 | `history.rs`: `find_before_writer_checkpoint` returns only the writer's own checkpoint instead of the newest unrelated one. |
 | 51 | `worker_hooks.rs`: `PI_GRAPH_AUTHORIZED_TOOLS` is authoritative and role defaults are intersected with it. |
 | 52 | `controller.rs`: git failure in a repository yields `DIFF_UNAVAILABLE_PREFIX` and blocks the review instead of approving from an empty diff. |
-| 53 | `mod.rs`: `saved_stage_for_node` maps roles to runtime stage names; the roundtrip test now asserts the saved run reaches `Done`. |
+| 53 | `mod.rs`: `saved_stage_for_node` maps roles to runtime stage names for both `/graph save` and `/graph export`; the roundtrip and export tests compile the generated bindings. |
 
 **Test evidence (fixed branch):**
 
-- `cargo test -p davinci-coding-agent --lib native_extensions::graph`: **486 passed; 0 failed; 5 ignored**.
+- `cargo test -p davinci-coding-agent --lib native_extensions::graph`: **494 passed; 0 failed; 5 ignored**.
 - `cargo test -p davinci-tui --lib graph`: **58 passed; 0 failed; 1 ignored**.
-- `cargo test -p davinci-coding-agent --lib`: **1644 passed; 0 failed; 19 ignored**.
+- `cargo test -p davinci-coding-agent --lib`: **1652 passed; 0 failed; 19 ignored**.
 - `cargo clippy -p davinci-coding-agent -p davinci-tui --all-targets -- -D warnings`: clean.
 
 New regression tests cover goal/indentation preservation, apostrophe goals, dry-run name validation, multi-root topology, evidence `refs`, `changedFiles` escape/forgery, large-file diffs, saved-run completion, fallback review chunks, and the process-wide registry guard used by shutdown tests.
+
+**PR review follow-up:** six findings from the review of PR #266 were fixed on top of the first pass:
+
+1. The live-browser fixture's writer authorization list now includes every browser tool the graph phase invokes (`browser_click`, `browser_network`); strict parent authorization is unchanged.
+2. Working-tree review diffs are chunked into tracked pieces before any model request; `truncate_diff`/`bounded_patch` no longer let a prefix satisfy coverage, and a regression test drives a >60k untracked diff through multiple chunk reviews and checks the last line reached a reviewer.
+3. `/graph export` uses the same `saved_stage_for_node` mapping as `/graph save`; the export test compiles the exported bindings.
+4. The completed-task fast path and replay admission resolve the model the controller would spawn now (not the old task's recorded model) and refuse a mismatch or a one-sided unresolved identity.
+5. `is_safe_workspace_relative_path` applies platform-independent syntax checks (backslashes, drive/UNC prefixes, `.`/`..`, empty segments) before native path parsing, with direct and artifact-level tests.
+6. Recovery of a failed required node requires every terminal node of its `OnFailure` branch to have succeeded; an intermediate success or a failed terminal reviewer no longer counts.
+
 

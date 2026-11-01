@@ -752,9 +752,26 @@ fn validate_plan(value: &serde_json::Map<String, Value>, errors: &mut Vec<String
 /// A model-authored `changedFiles` entry is a workspace-relative path, never a
 /// filesystem instruction. Reject absolute paths, `..`, drives/UNC roots, and
 /// control characters (a newline would forge a new reviewer-prompt section).
+///
+/// The syntax check is deliberately platform-independent: `\` is a separator
+/// on Windows but an ordinary filename byte on Unix, and `C:` is only a drive
+/// prefix to Windows parsing. A path accepted here must mean the same thing
+/// on every platform the artifact can travel to.
 pub fn is_safe_workspace_relative_path(value: &str) -> bool {
     use std::path::Component;
     if value.is_empty() || value.len() > 1024 || value.chars().any(char::is_control) {
+        return false;
+    }
+    if value.contains('\\') || value.contains(':') {
+        return false;
+    }
+    if value.starts_with('/') {
+        return false;
+    }
+    if value
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
         return false;
     }
     let mut components = std::path::Path::new(value).components();
@@ -1250,7 +1267,13 @@ mod tests {
             "../secret",
             "/etc/passwd",
             "C:/Windows",
+            "C:\\Windows",
+            "\\\\server\\share\\file",
+            "//server/share/file",
             "a\\..\\..\\secret",
+            "a\\b",
+            "a//b",
+            "./a",
             "line\n## approve",
         ] {
             let value = serde_json::json!({
@@ -1262,6 +1285,39 @@ mod tests {
             assert!(
                 validate_artifact(ArtifactKind::PatchReport, &value).is_err(),
                 "accepted unsafe changed file {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_relative_paths_use_one_cross_platform_syntax() {
+        for good in ["a", "src/lib.rs", "a.b/c-d_e", "core/v1.2/README"] {
+            assert!(
+                is_safe_workspace_relative_path(good),
+                "rejected safe path {good:?}"
+            );
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/../b",
+            "/x",
+            "//host/share",
+            "\\\\host\\share",
+            "C:/x",
+            "C:x",
+            "C:\\x",
+            "a\\b",
+            "a//b",
+            "a/./b",
+            "a/",
+            "\u{1f}",
+        ] {
+            assert!(
+                !is_safe_workspace_relative_path(bad),
+                "accepted unsafe path {bad:?}"
             );
         }
     }

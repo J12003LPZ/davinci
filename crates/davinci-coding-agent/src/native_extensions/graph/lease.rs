@@ -40,7 +40,8 @@ impl WorkspaceLease {
         {
             directory.push(component);
             match std::fs::symlink_metadata(&directory) {
-                Ok(metadata) if metadata.is_dir() && !super::workspace_files::is_redirected(&metadata) => {}
+                Ok(metadata)
+                    if metadata.is_dir() && !super::workspace_files::is_redirected(&metadata) => {}
                 Ok(_) => return Err("Graph lease directory is not an ordinary directory".into()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     match std::fs::create_dir(&directory) {

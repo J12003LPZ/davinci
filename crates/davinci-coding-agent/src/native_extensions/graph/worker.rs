@@ -212,8 +212,14 @@ pub fn parse_worker_event(
     };
     state.usage.input = state.usage.input.saturating_add(number("/usage/input"));
     state.usage.output = state.usage.output.saturating_add(number("/usage/output"));
-    state.usage.cache_read = state.usage.cache_read.saturating_add(number("/usage/cacheRead"));
-    state.usage.cache_write = state.usage.cache_write.saturating_add(number("/usage/cacheWrite"));
+    state.usage.cache_read = state
+        .usage
+        .cache_read
+        .saturating_add(number("/usage/cacheRead"));
+    state.usage.cache_write = state
+        .usage
+        .cache_write
+        .saturating_add(number("/usage/cacheWrite"));
     state.usage.cost_usd += message
         .pointer("/usage/cost/total")
         .and_then(Value::as_f64)
@@ -691,7 +697,7 @@ pub fn run_worker(
                 usage: state.usage,
                 recovery_required: state.recovery_error.is_some(),
                 ..WorkerResult::default()
-            }
+            };
         }
     };
 

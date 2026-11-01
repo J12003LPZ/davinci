@@ -19,7 +19,9 @@ use super::recovery::{
     RetryDecision, RetryRecoveryInput, WorkerFailureClass,
 };
 use super::replay::{incompatibility_reason, replay_compatible, ReplayFingerprint};
-use super::review_coverage::{chunk_graph_mutation, coverage_complete, ReviewChunk, ReviewCoverage};
+use super::review_coverage::{
+    chunk_graph_mutation, chunk_text_diff, coverage_complete, ReviewCoverage,
+};
 use super::roles::{
     ensure_governor_recovery_tool, initial_worker_tools, requires_task_coordinator,
     role_for_research_kind, role_tools,
@@ -195,12 +197,7 @@ pub fn default_get_diff(cwd: &Path) -> String {
         ":(exclude)target",
         ":(exclude)node_modules",
     ];
-    let mut head_args = vec![
-        "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        "HEAD",
-    ];
+    let mut head_args = vec!["diff", "--no-ext-diff", "--no-textconv", "HEAD"];
     head_args.extend(exclusions);
     let mut work_args = vec!["diff", "--no-ext-diff", "--no-textconv"];
     work_args.extend(exclusions);
@@ -213,9 +210,7 @@ pub fn default_get_diff(cwd: &Path) -> String {
     let mut diff = match (head, work) {
         (Some(diff), _) => diff,
         (None, Some(diff)) => diff,
-        (None, None) if default_is_git_repo(cwd) => {
-            return DIFF_UNAVAILABLE_PREFIX.to_string()
-        }
+        (None, None) if default_is_git_repo(cwd) => return DIFF_UNAVAILABLE_PREFIX.to_string(),
         (None, None) => String::new(),
     };
     let mut untracked_args = vec!["ls-files", "-z", "--others", "--exclude-standard"];
@@ -283,17 +278,6 @@ fn truncate(text: &str, max_chars: usize) -> String {
         return text.to_string();
     }
     text.chars().take(max_chars).collect()
-}
-
-fn truncate_diff(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let marker = "\n[... diff truncated ...]\n";
-    let keep = max_chars.saturating_sub(marker.chars().count());
-    let mut out: String = text.chars().take(keep).collect();
-    out.push_str(marker);
-    out
 }
 
 /// Upper bound on the assistant text kept on a task for the live view. The
@@ -765,6 +749,18 @@ impl GraphExecution {
         tools
     }
 
+    fn current_worker_model(&self, role: Role) -> Option<String> {
+        let configured_model = self.deps.config.models.get(&role).cloned();
+        let role_model_override = configured_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        super::resolve_worker_model_identity(
+            role_model_override,
+            self.deps.session_model.as_deref(),
+        )
+    }
+
     fn worker_spec(
         &self,
         task: &GraphTaskState,
@@ -773,15 +769,15 @@ impl GraphExecution {
     ) -> WorkerSpec {
         let run = self.snapshot();
         let role = task.role;
-        let configured_model = self.deps.config.models.get(&role).cloned();
-        let role_model_override = configured_model
-            .as_deref()
+        let resolved_model = self.current_worker_model(role);
+        let role_model_override = self
+            .deps
+            .config
+            .models
+            .get(&role)
+            .map(String::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let resolved_model = super::resolve_worker_model_identity(
-            role_model_override,
-            self.deps.session_model.as_deref(),
-        );
         let authorized_tools = self.authorized_worker_tools(role);
         let has_recovery = authorized_tools.iter().any(|t| t == "retrieve_output");
         let initially_exposed_tools = initial_worker_tools(role, &authorized_tools);
@@ -833,20 +829,15 @@ impl GraphExecution {
             .is_some_and(|existing| existing.status == TaskStatus::Succeeded)
         {
             // A different worker model is a different execution input; do not
-            // hand a new model the old model's artifact.
-            let model_changed = match (
-                existing
-                    .as_ref()
-                    .and_then(|task| task.fingerprint.as_ref())
-                    .and_then(|fingerprint| fingerprint.model_id.as_deref()),
-                existing
-                    .as_ref()
-                    .and_then(|task| task.model.as_deref()),
-            ) {
-                (Some(stored), Some(current)) => stored != current,
-                _ => false,
-            };
-            if !model_changed {
+            // hand a new model the old model's artifact. Compare the stored
+            // identity with the model this controller would spawn now, not
+            // with the model recorded on the old task (which is also history).
+            let stored_model = existing
+                .as_ref()
+                .and_then(|task| task.fingerprint.as_ref())
+                .and_then(|fingerprint| fingerprint.model_id.as_deref());
+            let current_model = self.current_worker_model(role);
+            if super::replay::model_identity_matches(stored_model, current_model.as_deref()) {
                 let run = self.snapshot();
                 return match super::store::read_artifact(
                     &self.options.cwd,
@@ -965,6 +956,7 @@ impl GraphExecution {
                 let dry_run = run.dry_run;
                 (run_version, cwd, definition_digest, dry_run)
             };
+            let current_model = self.current_worker_model(role);
             let current_fingerprint = ReplayFingerprint::for_saved_task(
                 &cwd,
                 run_version,
@@ -973,7 +965,7 @@ impl GraphExecution {
                 definition_digest.as_deref(),
                 dry_run,
             )
-            .with_model(task.model.as_deref());
+            .with_model(current_model.as_deref());
 
             let is_compatible = match stored_fingerprint {
                 Some(stored) => {
@@ -2227,33 +2219,48 @@ fn saved_review_approves(artifact: &Artifact) -> bool {
 }
 
 /// A required node whose OnFailure branch completed is recovered: the fallback
-/// did the work the failed node was required to do. Without this, any
-/// `required: true` node with a failure edge made the whole saved graph
-/// unsatisfiable.
+/// did the work the failed node was required to do.
+///
+/// Recovery is complete only when every terminal node reachable from the
+/// failure branch succeeded. An intermediate researcher succeeding (while the
+/// branch's terminal reviewer fails) is not proof that the original required
+/// work was recovered, and a branch that never terminates (a cycle) proves
+/// nothing. Without this contract, any optional descendant success would
+/// satisfy a failed `required: true` node.
 fn failure_branch_succeeded(
     definition: &GraphDefinition,
     state: &GraphRunState,
     node_id: &str,
 ) -> bool {
+    let mut branch = std::collections::HashSet::new();
     let mut queue = std::collections::VecDeque::new();
     for edge in definition.outgoing_edges(node_id) {
         if edge.condition == EdgeCondition::OnFailure {
             queue.push_back(edge.to.as_str());
         }
     }
-    let mut seen = std::collections::HashSet::new();
     while let Some(current) = queue.pop_front() {
-        if !seen.insert(current) {
+        if !branch.insert(current.to_string()) {
             continue;
-        }
-        if state.succeeded_tasks.contains(current) {
-            return true;
         }
         for edge in definition.outgoing_edges(current) {
             queue.push_back(edge.to.as_str());
         }
     }
-    false
+    if branch.is_empty() {
+        return false;
+    }
+    let mut terminals = 0usize;
+    for current in &branch {
+        let mut outgoing = definition.outgoing_edges(current).peekable();
+        if outgoing.peek().is_none() {
+            terminals += 1;
+            if !state.succeeded_tasks.contains(current) {
+                return false;
+            }
+        }
+    }
+    terminals > 0
 }
 
 fn saved_stage_inputs_unchanged(execution: &GraphExecution, task_id: &str) -> bool {
@@ -2641,7 +2648,8 @@ fn drive_compiled_saved_graph(
                     .is_some_and(|policy| policy.required)
             {
                 execution.blocked(
-                    "saved graph verification failed and verificationPolicy.required is true".into(),
+                    "saved graph verification failed and verificationPolicy.required is true"
+                        .into(),
                 );
                 return execution.snapshot();
             }
@@ -3834,9 +3842,28 @@ fn deliver_goal(
         if !execution.save_delivery(&saved, *indices, Some("review cursor saved")) {
             return Delivery::Stop;
         }
-        let graph_diff = cumulative_delta.diff();
-
-        let chunks = chunk_graph_mutation(&cumulative_delta, DIFF_MAX_CHARS);
+        // Every byte the reviewer is asked to approve must live in a tracked
+        // chunk. Only mutation chunks are available here; a run without graph
+        // mutations falls back to the working tree, which is chunked in full
+        // before any review request is built. Truncating the diff and calling
+        // the prefix "reviewed" would let unexamined changes pass.
+        let mutation_chunks = chunk_graph_mutation(&cumulative_delta, DIFF_MAX_CHARS);
+        let fallback_diff = mutation_chunks.is_empty().then(|| default_get_diff(&cwd));
+        if let Some(diff) = &fallback_diff {
+            if diff.starts_with(DIFF_UNAVAILABLE_PREFIX) {
+                execution.blocked(diff.clone());
+                return Delivery::Stop;
+            }
+        }
+        let chunks = if mutation_chunks.is_empty() {
+            chunk_text_diff(
+                "workspace",
+                fallback_diff.as_deref().unwrap_or(""),
+                DIFF_MAX_CHARS,
+            )
+        } else {
+            mutation_chunks
+        };
         let required_chunk_ids: Vec<String> = chunks.iter().map(|c| c.id.clone()).collect();
         let mut coverage = ReviewCoverage::new(required_chunk_ids);
 
@@ -3934,28 +3961,9 @@ fn deliver_goal(
             final_review.issues.extend(all_issues);
             Some(final_review)
         } else {
-            // Single chunk or no graph diff
-            let fallback_diff = graph_diff.is_empty().then(|| default_get_diff(&cwd));
-            if let Some(diff) = &fallback_diff {
-                if diff.starts_with(DIFF_UNAVAILABLE_PREFIX) {
-                    execution.blocked(diff.clone());
-                    return Delivery::Stop;
-                }
-            }
-            let diff = if !graph_diff.is_empty() {
-                truncate_diff(&graph_diff, DIFF_MAX_CHARS)
-            } else {
-                truncate_diff(fallback_diff.as_deref().unwrap_or(""), DIFF_MAX_CHARS)
-            };
-            // A no-mutation run still has working-tree evidence to review. Make
-            // it a required chunk so coverage cannot report "complete" after
-            // showing only a truncated prefix.
-            let fallback_chunk = chunks.is_empty().then(|| ReviewChunk {
-                id: "workspace#chunk-0".into(),
-                file: "(working tree)".into(),
-                patch: diff.clone(),
-            });
-            let single_chunk = chunks.first().or(fallback_chunk.as_ref());
+            // Exactly one chunk (or one empty working-tree chunk): show it in
+            // full. `chunks` is never empty here.
+            let single_chunk = chunks.first();
             let req_ids = single_chunk.map(|c| vec![c.id.clone()]);
             let task = GraphTaskState::new(
                 format!("review-{}", indices.review),
@@ -3970,7 +3978,7 @@ fn deliver_goal(
                     review_briefing(&ReviewInput {
                         goal: goal_text,
                         plan: plan.as_ref(),
-                        diff: &diff,
+                        diff: "",
                         changed_files: &changed_files,
                         verification: &verification,
                         chunk: single_chunk,
@@ -5110,6 +5118,232 @@ mod tests {
         assert!(coverage
             .missing_chunk_ids()
             .contains(&"code.rs#chunk-0".to_string()));
+    }
+
+    fn recovery_node(id: &str, role: Role) -> NodeDefinition {
+        NodeDefinition {
+            id: id.into(),
+            role,
+            expect: ArtifactKind::Review,
+            required: false,
+            allows_mutation: false,
+        }
+    }
+
+    #[test]
+    fn a_failed_required_node_needs_a_completed_recovery_branch() {
+        let definition = GraphDefinition {
+            graph_id: "recovery".into(),
+            version: 1,
+            mode: GraphMode::Standard,
+            nodes: vec![
+                recovery_node("writer", Role::Writer),
+                recovery_node("fallback", Role::Researcher),
+                recovery_node("fallback-review", Role::Reviewer),
+            ],
+            edges: vec![
+                EdgeDefinition {
+                    from: "writer".into(),
+                    to: "fallback".into(),
+                    condition: EdgeCondition::OnFailure,
+                },
+                EdgeDefinition {
+                    from: "fallback".into(),
+                    to: "fallback-review".into(),
+                    condition: EdgeCondition::Always,
+                },
+            ],
+        };
+        let mut state = GraphRunState {
+            succeeded_tasks: std::collections::HashSet::new(),
+            failed_tasks: std::collections::HashSet::new(),
+            running_tasks: std::collections::HashSet::new(),
+        };
+        state.failed_tasks.insert("writer".into());
+        state.succeeded_tasks.insert("fallback".into());
+
+        // The intermediate fallback succeeded, but the branch's terminal
+        // reviewer failed: the original required node was not recovered.
+        state.failed_tasks.insert("fallback-review".into());
+        assert!(!failure_branch_succeeded(&definition, &state, "writer"));
+
+        // A completed branch recovers it.
+        state.failed_tasks.remove("fallback-review");
+        state.succeeded_tasks.insert("fallback-review".into());
+        assert!(failure_branch_succeeded(&definition, &state, "writer"));
+    }
+
+    #[test]
+    fn a_recovery_branch_without_a_terminal_is_not_complete() {
+        let definition = GraphDefinition {
+            graph_id: "cycle".into(),
+            version: 1,
+            mode: GraphMode::Standard,
+            nodes: vec![
+                recovery_node("writer", Role::Writer),
+                recovery_node("a", Role::Researcher),
+                recovery_node("b", Role::Reviewer),
+            ],
+            edges: vec![
+                EdgeDefinition {
+                    from: "writer".into(),
+                    to: "a".into(),
+                    condition: EdgeCondition::OnFailure,
+                },
+                EdgeDefinition {
+                    from: "a".into(),
+                    to: "b".into(),
+                    condition: EdgeCondition::Always,
+                },
+                EdgeDefinition {
+                    from: "b".into(),
+                    to: "a".into(),
+                    condition: EdgeCondition::Always,
+                },
+            ],
+        };
+        let mut state = GraphRunState {
+            succeeded_tasks: std::collections::HashSet::new(),
+            failed_tasks: std::collections::HashSet::new(),
+            running_tasks: std::collections::HashSet::new(),
+        };
+        state.succeeded_tasks.insert("a".into());
+        state.succeeded_tasks.insert("b".into());
+        assert!(!failure_branch_succeeded(&definition, &state, "writer"));
+    }
+
+    #[test]
+    fn a_large_working_tree_diff_is_reviewed_in_full_tracked_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        super::super::git::run(dir.path(), &["init"]).unwrap();
+        // Just under the 64 KiB per-file display cap, but well above one
+        // 60k-character review chunk.
+        let content: String = (0..1000)
+            .map(|index| {
+                format!("untracked line {index:04} ...........................................\n")
+            })
+            .collect();
+        std::fs::write(dir.path().join("large.txt"), &content).unwrap();
+
+        let briefings = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&briefings);
+        let runner: Arc<WorkerRunner> = Arc::new(move |spec, _abort, _on_progress| {
+            let artifact = match spec.expect {
+                ArtifactKind::Classification => Artifact::Classification(Classification {
+                    task_class: TaskClass::Feature,
+                    complexity: Complexity::Standard,
+                    rationale: "standard test".into(),
+                    research_tasks: vec![ResearchRequest {
+                        kind: ResearchKind::CodeSearch,
+                        focus: "find code".into(),
+                    }],
+                    milestones: None,
+                }),
+                ArtifactKind::Evidence => Artifact::Evidence(Box::new(EvidenceArtifact {
+                    kind: ResearchKind::CodeSearch,
+                    findings: vec![EvidenceFinding {
+                        claim: "found code".into(),
+                        refs: vec!["large.txt:1".into()],
+                        confidence: Confidence::High,
+                    }],
+                    risks: vec![],
+                    gaps: vec![],
+                    test_baseline: None,
+                })),
+                ArtifactKind::Plan => Artifact::Plan(Box::new(ImplementationPlan {
+                    steps: vec![PlanStep {
+                        description: "no graph mutation".into(),
+                        files: vec!["large.txt".into()],
+                    }],
+                    tests_to_add: vec![],
+                    tests_to_run: vec!["true".into()],
+                    completion_criteria: vec!["done".into()],
+                    invariants: vec![],
+                    out_of_scope: vec![],
+                })),
+                ArtifactKind::PatchReport => Artifact::PatchReport(Box::new(PatchReport {
+                    changed_files: vec![],
+                    summary: "only the working tree changed".into(),
+                    deviations: vec![],
+                    plan_invalidated: false,
+                    invalidation_reason: None,
+                })),
+                ArtifactKind::Review => {
+                    seen.lock().unwrap().push(spec.briefing.clone());
+                    Artifact::Review(Box::new(ReviewDecision {
+                        verdict: Verdict::Approve,
+                        issues: vec![],
+                        notes: "ok".into(),
+                        reviewed_chunk_ids: vec![],
+                    }))
+                }
+            };
+            let _ = write_artifact(&spec.artifact_path, &artifact);
+            WorkerResult {
+                ok: true,
+                artifact: Some(artifact),
+                ..WorkerResult::default()
+            }
+        });
+
+        let verify_exec: Arc<VerifyExec> = Arc::new(|_, _, _, _| (0, String::new(), 0));
+        let config = GraphConfig {
+            verify_commands: vec![VerifyCommandSpec {
+                command: "echo test".into(),
+                name: "test".into(),
+                from_plan: false,
+            }],
+            ..Default::default()
+        };
+        let deps = ControllerDeps {
+            runner,
+            verify_exec,
+            config,
+            session_model: None,
+            session_thinking: None,
+            session_service_tier: davinci_ai::CodexServiceTier::Standard,
+            project_trusted: false,
+            on_update: Arc::new(|_, _| {}),
+            memory: None,
+            learning: None,
+            governor: None,
+            language_intelligence: None,
+            processes: None,
+            browser: None,
+            runtime: None,
+            permissions: None,
+            task_contract: None,
+        };
+        let run = run_graph(
+            RunOptions {
+                goal: "review the large working tree diff".into(),
+                cwd: dir.path().to_path_buf(),
+                forced: None,
+                dry_run: false,
+                abort: Arc::new(AtomicBool::new(false)),
+                resume_artifacts: HashMap::new(),
+                resume_run: None,
+            },
+            deps,
+        );
+
+        assert_eq!(run.phase, Phase::Done, "{:?}", run.blocked_reason);
+        let coverage = run.review_coverage.expect("review coverage");
+        assert!(
+            coverage.required_chunk_ids.len() > 1,
+            "a >60k working-tree diff must be split into tracked chunks: {:?}",
+            coverage.required_chunk_ids
+        );
+        assert!(coverage_complete(&coverage));
+        let seen = briefings.lock().unwrap();
+        assert!(seen
+            .iter()
+            .any(|briefing| briefing.contains("untracked line 0999")));
+        assert!(
+            seen.iter()
+                .all(|briefing| !briefing.contains("[... diff truncated")),
+            "a truncated prefix cannot stand in for a reviewed chunk"
+        );
     }
 
     #[test]

@@ -89,10 +89,24 @@ pub fn replay_compatible(stored: &ReplayFingerprint, current: &ReplayFingerprint
     ) {
         return false;
     }
-    if stored.model_id != current.model_id {
+    if !model_identity_matches(stored.model_id.as_deref(), current.model_id.as_deref()) {
         return false;
     }
     stored.input_hash == current.input_hash
+}
+
+/// Whether two fingerprints describe the same worker model.
+///
+/// Two unresolved identities both mean the provider's default worker, so they
+/// match. A one-sided resolution cannot prove the old artifact came from the
+/// current model, and two different identities are a different execution
+/// input; both are refused.
+pub fn model_identity_matches(stored: Option<&str>, current: Option<&str>) -> bool {
+    match (stored, current) {
+        (Some(stored), Some(current)) => stored == current,
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 pub fn incompatibility_reason(
@@ -102,7 +116,7 @@ pub fn incompatibility_reason(
     if stored.simulated.unwrap_or(false) && !current.simulated.unwrap_or(false) {
         return Some("cannot replay simulated artifact from dry-run in real execution".into());
     }
-    if stored.model_id != current.model_id {
+    if !model_identity_matches(stored.model_id.as_deref(), current.model_id.as_deref()) {
         return Some(format!(
             "model changed: stored={:?}, current={:?}",
             stored.model_id, current.model_id
@@ -441,6 +455,28 @@ mod tests {
         assert!(!replay_compatible(&fp1, &fp2));
         let reason = incompatibility_reason(&fp1, &fp2).unwrap();
         assert!(reason.contains("input hash changed"));
+    }
+
+    #[test]
+    fn graph_replay_model_identity_mismatch_is_incompatible() {
+        let mut stored = sample_fingerprint();
+        stored.model_id = Some("openai/gpt-a".into());
+        let mut current = sample_fingerprint();
+        current.model_id = Some("openai/gpt-b".into());
+        assert!(!replay_compatible(&stored, &current));
+        assert!(incompatibility_reason(&stored, &current)
+            .unwrap()
+            .contains("model changed"));
+
+        // One resolved side cannot prove the artifact came from the current
+        // model, in either direction.
+        let mut unresolved = sample_fingerprint();
+        unresolved.model_id = None;
+        assert!(!replay_compatible(&stored, &unresolved));
+        assert!(!replay_compatible(&unresolved, &stored));
+
+        // Two unresolved identities both mean the provider default.
+        assert!(model_identity_matches(None, None));
     }
 
     #[test]

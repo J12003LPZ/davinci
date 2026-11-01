@@ -220,7 +220,9 @@ pub fn apply_budget_update(
         "max-researchers" => {
             let value = parse_u32_budget(raw_value, resource)?;
             if value == 0 {
-                return Err("max-researchers must be positive; zero is not a researcher ceiling".into());
+                return Err(
+                    "max-researchers must be positive; zero is not a researcher ceiling".into(),
+                );
             }
             let running = run
                 .tasks
@@ -235,7 +237,9 @@ pub fn apply_budget_update(
         "max-revision-cycles" => {
             let value = parse_u32_budget(raw_value, resource)?;
             if value == 0 {
-                return Err("max-revision-cycles must be positive; zero is not a revision ceiling".into());
+                return Err(
+                    "max-revision-cycles must be positive; zero is not a revision ceiling".into(),
+                );
             }
             if value < run.counters.revision_cycles {
                 return Err("max-revision-cycles cannot be below completed revision cycles".into());

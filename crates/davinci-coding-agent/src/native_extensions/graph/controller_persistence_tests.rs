@@ -101,7 +101,10 @@ fn checkpoint_failure_prevents_dispatch_and_preserves_last_durable_state() {
                 "{blocked}"
             );
         } else {
-            assert!(blocked.contains("checkpoint persistence failed"), "{blocked}");
+            assert!(
+                blocked.contains("checkpoint persistence failed"),
+                "{blocked}"
+            );
         }
         let updates = updates.lock().unwrap();
         assert_eq!(updates.last().unwrap().0, Phase::Blocked);
