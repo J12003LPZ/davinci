@@ -191,7 +191,7 @@ fn script_subagent_requires_user_authority_and_budget() {
         allow: true,
         depth: 0,
         max_depth: 2,
-        ..Default::default()
+        allow: true,
     };
     assert!(admit_script_subagent(&request, &allowed, 1).is_ok());
     assert_eq!(
@@ -241,7 +241,7 @@ fn script_todo_update_shares_work_without_extra_turn() {
         vec![capability("todo", false), capability("read", true)],
         ScriptToolGates {
             allow_todo: true,
-            ..Default::default()
+            allow_subagents: false,
         },
     )
     .unwrap();
