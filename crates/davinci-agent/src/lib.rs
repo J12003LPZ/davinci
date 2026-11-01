@@ -907,6 +907,8 @@ pub struct Agent {
     /// Exact host session source and lineage captured at runtime installation.
     /// Separate from mutable public session/runtime fields to reject stale reuse.
     runtime_session: Option<(PathBuf, String, RunId)>,
+    /// Previous completed request's cache evidence, for drop observation.
+    cache_drop_sample: Option<turn::CacheDropSample>,
 }
 
 /// Summarizer requests one fold may make. Past it the fold fails closed.
@@ -1082,6 +1084,7 @@ impl Agent {
             runtime: None,
             prompt_checkpoint_bus: None,
             runtime_session: None,
+            cache_drop_sample: None,
         };
         *agent
             .tool_context

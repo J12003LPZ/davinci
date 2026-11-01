@@ -168,11 +168,12 @@ pub use oauth_providers::{
     AuthorizationCallbackInput, AuthorizeRequest, OauthTokens, Pkce, TokenExchangeRequest,
 };
 pub use openai_cache_diagnostics::{
-    cache_drop_report, classify_cache_drop, configured_comparison_response_id,
-    diagnostics_every_n_from_env, latest_applied_policy, latest_diagnostic,
-    sampled_comparison_response_id, should_sample_comparison, AppliedPromptCachePolicy,
-    CacheDropReason, CacheDropRecord, CacheRequestSample, ProviderCacheUsageBreakdown,
-    ProviderPromptCacheDiagnostics, OPENAI_CACHE_DIAGNOSTICS_EVERY_N_ENV,
+    cache_drop_report, classify_cache_drop, comparable_prefix_digests,
+    configured_comparison_response_id, diagnostics_every_n_from_env, latest_applied_policy,
+    latest_diagnostic, sampled_comparison_response_id, should_sample_comparison,
+    AppliedPromptCachePolicy, CacheDropReason, CacheDropRecord, CacheRequestSample,
+    ProviderCacheUsageBreakdown, ProviderPromptCacheDiagnostics,
+    OPENAI_CACHE_DIAGNOSTICS_EVERY_N_ENV,
 };
 pub use openai_cache_policy::{
     BoundaryStrategy, CacheCapabilitySource, CacheControlFamily, CacheIntent,
