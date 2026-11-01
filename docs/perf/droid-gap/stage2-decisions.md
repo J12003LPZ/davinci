@@ -63,11 +63,11 @@ sections 2 and 3.
 | Field | Value |
 |---|---|
 | Hypothesis | Droid's Script-first surface spends fewer model requests per verified task than DaVinci's add-on Codemode |
-| Change | none yet; the probe cases are written and offline-tested (`codex_probe.rs`; PR #269, open) |
+| Change | step 2 was implemented without the probe, on the operator's decision (`e84830a7`, PR #271): `codemode` is projected as a custom freeform tool and the decoded `{"input": …}` maps to `code`, behind the same freeform rollout flag as `apply_patch`; no default changed. The probe cases are written and offline-tested (`codex_probe.rs`, merged in #269). |
 | Baseline | `main` `ecc84853`; Codemode as an add-on tool, `ReadOnly` production mode |
 | Raw results | `stage0-report.md` sections 4 and 7 |
 | Gate | trigger **fired on its letter**: Droid-script vs Droid-direct requests `GAP` 0.750 [0.669, 0.840]; Droid-script vs DaVinci requests `GAP` 0.307 and total input `GAP` 0.298. Caveats recorded in the report: the Script effect is on requests only (input, output and wall are `NO_CLEAR_GAP`), the test pools all tasks both arms pass (n = 11) rather than verified tasks only, and wall time is not lower. |
-| Outcome | **no default change.** The capability probe (at most 4 requests) has not run; it needs its own approval naming the runs, pins and model, and a checkpoint built from a commit with green CI. Steps 2 to 4 stay conditional on its result. |
+| Outcome | **no default change.** Step 2 shipped behind the flag, so backend acceptance can be checked before anyone enables it. The capability probe (at most 4 requests) has not run; it needs its own approval naming the runs, pins and model, and a checkpoint built from a commit with green CI. Steps 1, 3 and 4 stay conditional on its result. |
 
 ### W4 - pruning and compaction cost
 
@@ -191,11 +191,12 @@ covered there, not here.
 | Step | Runs or requests | Needs |
 |---|---|---|
 | W3 probe: `custom_freeform_non_patch` and `programmatic_tool_calling`, each with a byte-identical reuse follow-up | 4 requests | its own approval naming the runs, pins and model, and a checkpoint built from a commit with green CI (`scripts/bench/runner.py` `checkpoint_identity` requires schema-3 provenance) |
-| W3 step 2: project `codemode` as a custom freeform tool | 0 | only if the custom case is accepted |
+| W3 step 2: project `codemode` as a custom freeform tool | 0 | delivered behind the freeform flag (`e84830a7`); enabling it still needs the probe's acceptance evidence |
 | W3 step 3: Script-first A/B | at most 24 runs | its own preregistration and approval |
 | W3 step 4: controlled mode | 0 runs, C08 gate | only if step 3 wins |
 | Cache-drop investigation (16 mid-run drops, 32.6% of uncached input) | not estimated | approval; it is the largest untriggered cost in the data |
 | Stage 2 gate | 0 | a candidate default change to gate; none exists |
 
-None of these was started. The program's delivered state is: Stage 0 measured, S1 and
-S2 merged, W1/W2/W4/W5 closed as no measured gap, W3 open with its probe unrun.
+None of the live steps was started. The program's delivered state is: Stage 0 measured, S1 and
+S2 merged, W1/W2/W4/W5 closed as no measured gap, W3 open with its probe unrun and its
+step 2 shipped behind the freeform flag.
