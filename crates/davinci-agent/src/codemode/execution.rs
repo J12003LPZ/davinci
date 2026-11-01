@@ -38,15 +38,21 @@ pub(crate) const EMPTY_RESULT_NOTE: &str = "The script returned an empty value a
 
 /// Preserve lineage and status without restoring text that a safety hook redacted.
 pub(crate) fn mandatory_facts(result: &ToolResult) -> Option<Value> {
-    let outcome = result.details.as_ref()?.get("codemode")?;
-    let children = outcome.get("children")?.as_array()?.iter().take(64).map(|child| {
+    let outcome_value = result.details.as_ref()?.get("codemode")?;
+    let children = outcome_value.get("children")?.as_array()?.iter().take(64).map(|child| {
         json!({"requestId":child.get("requestId"),"ordinal":child.get("ordinal"),
             "tool":child.get("tool"),"operationRef":child.get("operationRef"),"status":child.get("status"),
             "incomplete":child.get("incomplete").cloned().unwrap_or(json!(false))})
     }).collect::<Vec<_>>();
+    // The persisted history item is append-only: a later mode switch or model
+    // change replays this exact wire identity instead of rewriting it.
+    let history = serde_json::from_value::<CodeModeOutcome>(outcome_value.clone())
+        .ok()
+        .map(|outcome| super::ScriptHistoryItem::from_outcome(&outcome));
     Some(
-        json!({"status":outcome.get("status"),"scriptCompleted":outcome.get("scriptCompleted"),
-        "operationRef":outcome.get("operationRef"),"children":children}),
+        json!({"status":outcome_value.get("status"),"scriptCompleted":outcome_value.get("scriptCompleted"),
+        "operationRef":outcome_value.get("operationRef"),"children":children,
+        "history":history}),
     )
 }
 

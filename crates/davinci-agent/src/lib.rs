@@ -638,6 +638,8 @@ pub struct Agent {
     pub(crate) staged_codemode: Option<codemode::CodeModeBinding>,
     /// Detached Script runs owned by this agent; cloned with it.
     pub(crate) background_runs: codemode::BackgroundRuns,
+    /// Trusted host opt-ins for otherwise-excluded script tools.
+    pub(crate) script_tool_gates: codemode::ScriptToolGates,
     /// The Codemode mode the host resolved from `--codemode` and `/config`,
     /// reported by `feature_use` even when the runtime was not admitted.
     codemode_configured_mode: Option<String>,
@@ -983,6 +985,7 @@ impl Agent {
             codemode: None,
             staged_codemode: None,
             background_runs: codemode::BackgroundRuns::default(),
+            script_tool_gates: codemode::ScriptToolGates::default(),
             codemode_configured_mode: None,
             pre_tool: None,
             post_tool: None,
@@ -4702,6 +4705,13 @@ impl Agent {
         self.activate_tool_families(&families);
     }
 
+    /// Host-owned opt-ins for tools a Script may otherwise never reach
+    /// (`TodoWrite`, script subagents). Both default off.
+    pub fn set_script_tool_gates(&mut self, gates: crate::codemode::ScriptToolGates) {
+        self.script_tool_gates = gates;
+    }
+
+    /// Perceive the run's tool exposure for diagnostics.
     pub fn visible_tool_names(&self) -> std::collections::BTreeSet<String> {
         self.tool_context
             .tool_exposure

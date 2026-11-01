@@ -104,7 +104,11 @@ impl AgentCodeModeBroker {
             .into_iter()
             .filter(|capability| authorized.contains(&capability.name))
             .collect();
-        let policy = CapabilityPolicy::new(context.mode.clone(), capabilities)?;
+        let policy = CapabilityPolicy::new_with_gates(
+            context.mode.clone(),
+            capabilities,
+            agent.script_tool_gates,
+        )?;
         if context.capability_revision
             != runtime
                 .capability_registry

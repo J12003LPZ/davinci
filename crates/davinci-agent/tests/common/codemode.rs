@@ -2524,3 +2524,96 @@ fn killed_background_script_is_cancelled_and_not_replayed() {
         ScriptRunState::Cancelled
     );
 }
+
+#[test]
+fn script_todo_alias_requires_the_host_gate_end_to_end() {
+    use crate::codemode::{
+        AgentCodeModeBroker, CodeModeBroker as _, CodeModeCall, CodeModeIdentity, CodeModeLimits,
+        CodeModeMode, CodeModeRunContext, ScriptToolGates,
+    };
+    let build_broker = |gates: ScriptToolGates| {
+        let (mut agent, workspace, _) = configured_agent();
+        agent.tools = vec!["read".into(), "todo".into()];
+        agent.set_script_tool_gates(gates);
+        agent.sync_tool_authorization();
+        let runtime = agent.runtime.as_ref().unwrap();
+        let revision = runtime
+            .capability_registry
+            .hash_tool_capabilities(&agent.tools);
+        let context = CodeModeRunContext {
+            identity: CodeModeIdentity {
+                invocation_id: "todo-gate-fixture".into(),
+                session_id: runtime.session_id.clone(),
+                branch_leaf: None,
+                workspace_binding: workspace
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into(),
+                runtime_run_id: runtime.run_id.to_string(),
+                parent_operation_ref: None,
+            },
+            mode: CodeModeMode::Controlled,
+            limits: CodeModeLimits::default(),
+            capability_revision: revision,
+            cancellation: runtime.cancellation_token.child_token(),
+            root_budget: runtime.root_budget.clone(),
+        };
+        (
+            AgentCodeModeBroker::new(agent, context, None).unwrap(),
+            workspace,
+        )
+    };
+
+    // Closed by default: the alias does not resolve.
+    let (closed, _) = build_broker(ScriptToolGates::default());
+    let denied = closed
+        .call(CodeModeCall {
+            request_id: 1,
+            tool: "tools.TodoWrite".into(),
+            args: json!({"items":[{"text":"step","status":"pending"}]}),
+        })
+        .unwrap_err();
+    assert_eq!(denied.code, "DENIED", "{denied:?}");
+
+    // Explicitly opened, the same alias reaches the host-owned todo tool.
+    let (open, _) = build_broker(ScriptToolGates {
+        allow_todo: true,
+        allow_subagents: false,
+    });
+    let value = open
+        .call(CodeModeCall {
+            request_id: 1,
+            tool: "tools.TodoWrite".into(),
+            args: json!({"items":[{"text":"step","status":"pending"}]}),
+        })
+        .expect("the gated alias reaches the todo tool");
+    assert!(value.operation_ref.starts_with("ephemeral:") || !value.operation_ref.is_empty());
+}
+
+#[test]
+fn script_history_is_persisted_with_a_stable_wire_kind() {
+    let (mut agent, workspace, _) = configured_agent();
+    agent
+        .enable_read_only_codemode(Arc::new(ReadOnlyFixtureHost))
+        .unwrap();
+    let messages = agent.execute_tool_batch(
+        workspace.path(),
+        vec![(
+            "history-call".into(),
+            "codemode".into(),
+            json!({"code":"return 1"}),
+        )],
+        &mut Vec::new(),
+    );
+    // The persisted tool-result facts carry the append-only history item, so a
+    // later mode switch or model change replays it instead of rewriting it.
+    let facts = messages[0].extra["details"]["codemode_facts"].clone();
+    let history = &facts["history"];
+    assert_eq!(history["wireKind"], json!("function"), "{facts}");
+    assert_eq!(history["wireName"], json!("codemode"), "{facts}");
+    assert_eq!(history["version"], json!(1), "{facts}");
+    assert_eq!(history["complete"], json!(true), "{facts}");
+    assert_eq!(history["callId"], facts["operationRef"], "{facts}");
+}
