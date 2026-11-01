@@ -2045,3 +2045,58 @@ fn controlled_script_execute_uses_the_guarded_shell() {
     );
     assert_eq!(broker.children().len(), 2);
 }
+
+#[test]
+fn failed_sibling_keeps_successful_script_evidence() {
+    use crate::codemode::{
+        AgentCodeModeBroker, CodeModeBroker as _, CodeModeCall, CodeModeChildStatus,
+        CodeModeIdentity, CodeModeLimits, CodeModeMode, CodeModeRunContext,
+    };
+    let (agent, workspace, _) = configured_agent();
+    let runtime = agent.runtime.as_ref().unwrap();
+    let revision = runtime
+        .capability_registry
+        .hash_tool_capabilities(&agent.tools);
+    let context = CodeModeRunContext {
+        identity: CodeModeIdentity {
+            invocation_id: "sibling-fixture".into(),
+            session_id: runtime.session_id.clone(),
+            branch_leaf: None,
+            workspace_binding: workspace
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into(),
+            runtime_run_id: runtime.run_id.to_string(),
+            parent_operation_ref: None,
+        },
+        mode: CodeModeMode::ReadOnly,
+        limits: CodeModeLimits::default(),
+        capability_revision: revision,
+        cancellation: runtime.cancellation_token.child_token(),
+        root_budget: runtime.root_budget.clone(),
+    };
+    let broker = AgentCodeModeBroker::new(agent.clone(), context, None).unwrap();
+    broker
+        .call(CodeModeCall {
+            request_id: 1,
+            tool: "read".into(),
+            args: json!({"path":"input.txt"}),
+        })
+        .unwrap();
+    // A sibling that fails never erases the successful child's evidence.
+    let _ = broker.call(CodeModeCall {
+        request_id: 2,
+        tool: "read".into(),
+        args: json!({"path":"missing.txt"}),
+    });
+    let children = broker.children();
+    assert_eq!(children.len(), 2);
+    assert!(matches!(children[0].status, CodeModeChildStatus::Succeeded));
+    assert!(!matches!(
+        children[1].status,
+        CodeModeChildStatus::Succeeded
+    ));
+    assert!(children[0].ordinal < children[1].ordinal);
+}

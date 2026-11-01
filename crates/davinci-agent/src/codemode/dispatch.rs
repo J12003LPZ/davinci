@@ -436,6 +436,15 @@ impl CodeModeBroker for AgentCodeModeBroker {
                     "child request budget exhausted",
                 ));
             }
+            // Bound in-flight and pending work independently of the total
+            // call budget, so a fan-out cannot exhaust workers.
+            if state.in_flight >= self.context.limits.pending_calls {
+                state.terminal = true;
+                return Err(CodeModeError::new(
+                    "LIMIT_EXCEEDED",
+                    "too many pending child calls",
+                ));
+            }
             state.in_flight += 1;
             // The guest numbers requests in source order; callback threads may
             // reach this lock in any order, so admission order is not stable.
@@ -655,7 +664,8 @@ fn shared_limit(
     policy: ConcurrencyPolicy,
     parallelism: usize,
 ) -> Option<usize> {
-    (matches!(mode, CodeModeMode::ReadOnly) && policy == ConcurrencyPolicy::ParallelSafe)
+    (matches!(mode, CodeModeMode::ReadOnly | CodeModeMode::Controlled)
+        && policy == ConcurrencyPolicy::ParallelSafe)
         .then(|| parallelism.max(1))
 }
 
@@ -675,13 +685,38 @@ mod tests {
             shared(CodeModeMode::ReadOnly, ConcurrencyPolicy::SerialBarrier),
             None
         );
+        // Controlled mode shares only parallel-safe reads; serial calls below
+        // keep the exclusive lane.
         assert_eq!(
             shared(CodeModeMode::Controlled, ConcurrencyPolicy::ParallelSafe),
-            None
+            Some(4)
         );
         assert_eq!(
             shared_limit(&CodeModeMode::ReadOnly, ConcurrencyPolicy::ParallelSafe, 0),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn parallel_reads_overlap_mutations_serialize() {
+        // Independent reads share a bounded lane in every enabled mode.
+        for mode in [CodeModeMode::ReadOnly, CodeModeMode::Controlled] {
+            assert_eq!(
+                shared_limit(&mode, ConcurrencyPolicy::ParallelSafe, 4),
+                Some(4),
+                "{mode:?}"
+            );
+            // Ambiguous or mutating calls keep the exclusive lane: a
+            // same-file writer can never overlap another writer.
+            assert_eq!(
+                shared_limit(&mode, ConcurrencyPolicy::SerialBarrier, 4),
+                None,
+                "{mode:?}"
+            );
+        }
+        assert_eq!(
+            shared_limit(&CodeModeMode::Off, ConcurrencyPolicy::ParallelSafe, 4),
+            None
         );
     }
 }
