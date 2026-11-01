@@ -373,16 +373,23 @@ built by `make_tasks.py`) two task sources are wired in
 - `research-01|02|03`: the external research fixtures at
   `BENCH_RESEARCH_FIXTURES` (default
   `C:\Users\sergi\Desktop\lean-droid-1.0\droid-re-research\fixtures`). The prompt
-  is the `## Instruction (give this verbatim)` section; the workspace comes from
-  `pwsh setup.ps1` and is graded by `pwsh grade.ps1 -Json` (`BENCH_PWSH`
-  overrides `pwsh`). A missing root or `pwsh`, grader exit 2 or a missing
-  verdict stops the run with an error, never a pass. The fixture's `.pre/` files
-  are committed into the baseline, so they never count as changes; allowed new
-  or edited paths are only the task's outputs (`answer.json`, `edit-report.json`
-  with `pkg/m*.ts` and `pkg/__tests__/*`, `results.json` with `jobs/out/*.txt`).
-  `pkg/other/*` is deliberately not allowed (the grader asserts it untouched).
-  The research grader's own "no extra files" check relies on `.git` being a
-  hidden directory on Windows.
+  is the `## Instruction (give this verbatim)` section; `pwsh setup.ps1` builds
+  the fixture and `pwsh grade.ps1 -Json` grades it (`BENCH_PWSH` overrides
+  `pwsh`). A missing root or `pwsh`, grader exit 2 or a missing verdict stops the
+  run with an error, never a pass.
+  **Layout.** The verbatim instruction says "Write workspace/answer.json" and
+  names `workspace/notes`, so the fixture is materialised at
+  `<run dir>/workspace` and the agent runs with cwd `<run dir>`, where those
+  paths resolve. Git baseline, changed-files and unrelated checks use
+  `<run dir>` (paths read `workspace/...`); the grader gets
+  `-Workspace <run dir>/workspace`, which contains `notes/` and no `.git`. The
+  fixture's `.pre/` files are committed into the baseline, so they never count as
+  changes. Allowed new or edited paths are only the task's outputs
+  (`workspace/answer.json`; `workspace/edit-report.json` with
+  `workspace/pkg/m*.ts` and `workspace/pkg/__tests__/*`; `workspace/results.json`
+  with `workspace/jobs/out/*.txt`). `workspace/pkg/other/*` is deliberately not
+  allowed (the grader asserts it untouched). Earlier, the fixture sat at the run
+  dir root and every research task failed for that reason (Stage 0 report).
 
 **Warm-up.** `run --warmup` runs the first selected task once (rep 0) per harness
 and writes rows to `warmup.jsonl` with `scored: false`, never `results.jsonl`.

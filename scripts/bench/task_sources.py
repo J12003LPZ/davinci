@@ -12,17 +12,29 @@ This module adds the other two corpora of the 17-task study set:
   ``tasks/<id>.md``, the workspace is made by ``setup.ps1`` and graded by
   ``grade.ps1 -Json`` through ``pwsh``.
 
+Research layout. The verbatim instruction says "Write workspace/answer.json" and
+names ``workspace/notes``, so the fixture is materialised at
+``<run dir>/workspace`` (``setup.ps1 -Path`` that directory) while the agent runs
+with cwd ``<run dir>``, where those ``workspace/...`` paths resolve. The git
+baseline, the changed-files and unrelated-changes checks all use ``<run dir>``,
+so paths are ``workspace/...``; the grader is called with
+``-Workspace <run dir>/workspace``. That directory holds no ``.git``, so the
+grader's "no extra files" check no longer depends on ``.git`` being a hidden
+directory. (Stage 0 first ran the fixture at the run dir root and every research
+task failed for that reason; see ``docs/perf/droid-gap/stage0-report.md``.)
+
 Allowed (not "unrelated") changed paths, per source:
 
 * verified: exactly the scenario's ``file_changed`` requirement paths, matching
   its own ``max_unrelated_files_changed: 0`` limit. ``target/`` and ``Cargo.lock``
   are build output and are excluded through ``.git/info/exclude``, not tracked.
-* research: only the outputs the task asks for (``answer.json``,
-  ``edit-report.json``, ``results.json``) plus, where the task edits or runs
-  files, the exact families it names (``pkg/m*.ts``, ``pkg/__tests__/*``,
-  ``jobs/out/*.txt``). The fixture's own ``.pre/`` setup artefacts are committed
-  into the baseline, so they never show as changed. A change to
-  ``pkg/other/*`` is deliberately NOT allowed: the grader asserts it untouched.
+* research: only the outputs the task asks for (``workspace/answer.json``,
+  ``workspace/edit-report.json``, ``workspace/results.json``) plus, where the
+  task edits or runs files, the exact families it names (``workspace/pkg/m*.ts``,
+  ``workspace/pkg/__tests__/*``, ``workspace/jobs/out/*.txt``). The fixture's own
+  ``.pre/`` setup artefacts are committed into the baseline, so they never show
+  as changed. A change to ``workspace/pkg/other/*`` is deliberately NOT allowed:
+  the grader asserts it untouched.
 
 Nothing here makes a model call. Missing prerequisites fail loudly.
 """
@@ -46,11 +58,14 @@ VERIFIED = ("verified-range", "verified-slice", "verified-parser",
 RESEARCH = {"research-01": "01-read-many-filter",
             "research-02": "02-bulk-edit-verify",
             "research-03": "03-independent-parallel"}
+# The fixture lives in <run dir>/workspace (see the module docstring), so every
+# allowed path carries the "workspace/" prefix.
+WORKSPACE_DIR = "workspace"
 RESEARCH_ALLOWED = {
-    "research-01": {"allowed": ["answer.json"], "allowed_globs": []},
-    "research-02": {"allowed": ["edit-report.json"],
-                    "allowed_globs": ["pkg/m*.ts", "pkg/__tests__/*"]},
-    "research-03": {"allowed": ["results.json"], "allowed_globs": ["jobs/out/*.txt"]},
+    "research-01": {"allowed": ["workspace/answer.json"], "allowed_globs": []},
+    "research-02": {"allowed": ["workspace/edit-report.json"],
+                    "allowed_globs": ["workspace/pkg/m*.ts", "workspace/pkg/__tests__/*"]},
+    "research-03": {"allowed": ["workspace/results.json"], "allowed_globs": ["workspace/jobs/out/*.txt"]},
 }
 INSTRUCTION_HEADING = "## Instruction (give this verbatim)"
 STUDY_TASKS = VERIFIED + tuple(LEGACY_TASKS) + tuple(RESEARCH)
@@ -184,9 +199,11 @@ def _research_files(tid):
 
 def _research_setup(tid, dest):
     root = _research_root()
+    Path(dest).mkdir(parents=True, exist_ok=True)
+    fixture = Path(dest) / WORKSPACE_DIR
     result = subprocess.run(
         [_pwsh(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(root / "setup.ps1"),
-         "-Task", RESEARCH[tid], "-Path", str(dest)],
+         "-Task", RESEARCH[tid], "-Path", str(fixture)],
         capture_output=True, text=True, encoding="utf-8", timeout=300)
     if result.returncode != 0:
         raise RuntimeError(f"research fixture setup failed for {tid}: exit {result.returncode}")
@@ -197,7 +214,7 @@ def _research_grade(tid, workdir, timeout, phase, evidence, run_check_fn):
     root = _research_root()
     checked = run_check_fn(
         [_pwsh(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(root / "grade.ps1"),
-         "-Task", RESEARCH[tid], "-Workspace", str(workdir), "-Json"],
+         "-Task", RESEARCH[tid], "-Workspace", str(Path(workdir) / WORKSPACE_DIR), "-Json"],
         workdir, timeout, phase, evidence)
     if checked["exit"] == 2:
         raise RuntimeError(f"research grader rejected the invocation for {tid} (exit 2)")
@@ -236,9 +253,9 @@ def prepare(tid, dest, baseline):
         dest.mkdir(parents=True)
         exclude = _verified_copy(tid, dest)
     else:
-        exclude = _research_setup(tid, dest)  # setup.ps1 recreates the directory itself
-        if not dest.is_dir():
-            raise RuntimeError("research setup did not create the workspace: " + str(dest))
+        exclude = _research_setup(tid, dest)  # setup.ps1 recreates <dest>/workspace itself
+        if not (dest / WORKSPACE_DIR).is_dir():
+            raise RuntimeError("research setup did not create the workspace: " + str(dest / WORKSPACE_DIR))
     baseline(str(dest), exclude=exclude)
 
 

@@ -116,7 +116,7 @@ class ResearchFixtureTests(unittest.TestCase):
             with patch.dict(os.environ, {"BENCH_RESEARCH_FIXTURES": str(root)}):
                 spec = bench.load("research-01")
                 self.assertEqual(spec["prompt"], "Find tokens.\nWrite answer.json.")
-                self.assertEqual(spec["allowed"], ["answer.json"])
+                self.assertEqual(spec["allowed"], ["workspace/answer.json"])
                 self.assertEqual(sorted(task_sources.fixture_files("research-01")),
                                  ["grade.ps1", "setup.ps1", "tasks/01-read-many-filter.md"])
 
@@ -129,6 +129,7 @@ class ResearchFixtureTests(unittest.TestCase):
                 return real_run(command, **kwargs)
             seen.append(command)
             dest = Path(command[command.index("-Path") + 1])
+            self.assertEqual(dest.name, "workspace")  # setup targets <run dir>/workspace
             (dest / ".pre").mkdir(parents=True)
             (dest / ".pre" / "manifest.json").write_text("[]")
             (dest / "notes").mkdir()
@@ -144,11 +145,51 @@ class ResearchFixtureTests(unittest.TestCase):
                   patch.object(task_sources.subprocess, "run", side_effect=fake_run)):
                 bench.prepare("research-01", str(dest))
             self.assertEqual(seen[0][seen[0].index("-Task") + 1], "01-read-many-filter")
-            self.assertFalse(dest.joinpath("answer.json").exists())
+            self.assertTrue((dest / "workspace" / "notes" / "note-000.md").is_file())
+            # git lives at the run dir, not inside the graded fixture directory.
+            self.assertTrue((dest / ".git").is_dir())
+            self.assertFalse((dest / "workspace" / ".git").exists())
             # The fixture's own .pre/ files are in the baseline, so they are not "changed".
             self.assertEqual(bench.changed_files(str(dest)), [])
-            (dest / "answer.json").write_text("{}")
-            self.assertEqual(bench.changed_files(str(dest)), ["answer.json"])
+            (dest / "workspace" / "answer.json").write_text("{}")
+            self.assertEqual(bench.changed_files(str(dest)), ["workspace/answer.json"])
+            self.assertEqual([p for p in bench.changed_files(str(dest))
+                              if p not in bench.load("research-01")["allowed"]], [])
+
+    def test_grader_is_called_with_the_dir_that_contains_notes(self):
+        real_run = task_sources.subprocess.run
+
+        def fake_run(command, **kwargs):
+            if "-Path" not in command:
+                return real_run(command, **kwargs)
+            notes = Path(command[command.index("-Path") + 1]) / "notes"
+            notes.mkdir(parents=True)
+            (notes / "note-000.md").write_text("alpha")
+
+            class Done:
+                returncode = 0
+            return Done()
+
+        seen = []
+
+        def fake_check(command, workdir, timeout=120):
+            seen.append((command, workdir))
+            return {"pass": True, "exit": 0, "cleanup_complete": True,
+                    "stdout": json.dumps({"pass": True, "passed": 1, "total": 1}), "stderr": ""}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.make_root(tmp)
+            run_dir = Path(tmp) / "run"
+            with (patch.dict(os.environ, {"BENCH_RESEARCH_FIXTURES": str(root), "BENCH_PWSH": sys.executable}),
+                  patch.object(task_sources.subprocess, "run", side_effect=fake_run),
+                  patch.object(bench, "run_check", side_effect=fake_check)):
+                bench.prepare("research-01", str(run_dir))
+                bench.grade("research-01", str(run_dir))
+            command, workdir = seen[0]
+            graded = Path(command[command.index("-Workspace") + 1])
+            self.assertEqual(graded, run_dir / "workspace")
+            self.assertTrue((graded / "notes").is_dir())
+            self.assertEqual(Path(workdir), run_dir)
 
     def test_grade_parses_the_json_verdict_and_fails_loudly_otherwise(self):
         verdict = json.dumps({"task": "01", "pass": True, "passed": 3, "total": 3, "assertions": []})
