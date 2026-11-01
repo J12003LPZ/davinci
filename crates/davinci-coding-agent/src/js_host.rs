@@ -2827,6 +2827,39 @@ module.exports = () => { new tuiModule.TUI(); };
 "#;
 
     #[test]
+    fn runner_waits_for_a_late_split_stdin_payload() {
+        if find_node().is_none() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let module = dir.path().join("index.js");
+        std::fs::write(&module, "module.exports = () => {};").unwrap();
+        let mut child = Command::new(find_node().unwrap())
+            .arg(runner_path().unwrap())
+            .arg(&module)
+            .arg("load")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        // Nothing is written until the runner is already blocked reading, and a
+        // two-byte character is split across writes.
+        std::thread::sleep(Duration::from_millis(400));
+        stdin.write_all(b"{\"theme\":\"\xc3").unwrap();
+        stdin.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        stdin.write_all(b"\xa9\"}").unwrap();
+        drop(stdin);
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let parsed: Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|err| panic!("bad runner output {stdout:?}: {err}"));
+        assert_eq!(parsed["ok"], true, "{stdout}");
+    }
+
+    #[test]
     fn parallel_runners_always_see_complete_virtual_modules() {
         if find_node().is_none() {
             return;

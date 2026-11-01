@@ -462,6 +462,37 @@ function serializeOverlayOptions(options, width, height) {
 	return out;
 }
 
+// Reads all of stdin synchronously. Touching process.stdin makes libuv set a pipe
+// non-blocking, so fs.readFileSync(0) throws EAGAIN when the parent has not
+// written yet; wait briefly and retry instead. Bytes are decoded once at the end
+// so a multibyte character split across reads survives.
+function readStdinSync() {
+	const chunks = [];
+	const buffer = Buffer.allocUnsafe(65536);
+	const pause = new Int32Array(new SharedArrayBuffer(4));
+	for (;;) {
+		let count;
+		try {
+			count = fs.readSync(0, buffer, 0, buffer.length, null);
+		} catch (error) {
+			if (error && error.code === "EAGAIN") {
+				Atomics.wait(pause, 0, 0, 5);
+				continue;
+			}
+			// Windows reports a closed pipe as EOF.
+			if (error && error.code === "EOF" && process.platform === "win32") {
+				break;
+			}
+			throw error;
+		}
+		if (count === 0) {
+			break;
+		}
+		chunks.push(Buffer.from(buffer.subarray(0, count)));
+	}
+	return Buffer.concat(chunks).toString("utf8");
+}
+
 async function main() {
 	const extPath = path.resolve(process.argv[2] || "");
 	const persistentMode = process.argv.includes("--persistent");
@@ -470,7 +501,7 @@ async function main() {
 	if (!persistentMode) {
 		let input = "";
 		if (!process.stdin.isTTY) {
-			input = fs.readFileSync(0, "utf8");
+			input = readStdinSync();
 		}
 		payload = input.trim() ? JSON.parse(input) : {};
 	}
