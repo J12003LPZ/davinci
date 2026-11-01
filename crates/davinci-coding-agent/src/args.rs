@@ -72,6 +72,8 @@ pub struct Args {
     pub export: Option<String>,
     /// Hidden maintainer command: write a live Codex backend capability report.
     pub codex_probe: Option<String>,
+    /// Hidden maintainer option: `--codex-probe-case <name>[,<name>]` (repeatable) runs only the named probe cases.
+    pub codex_probe_case: Vec<String>,
     pub no_skills: bool,
     pub skills: Vec<String>,
     pub prompt_templates: Vec<String>,
@@ -405,6 +407,11 @@ pub fn parse_args(args: &[String]) -> Args {
         } else if arg == "--codex-probe" && i + 1 < args.len() {
             i += 1;
             result.codex_probe = Some(args[i].clone());
+        } else if arg == "--codex-probe-case" && i + 1 < args.len() {
+            i += 1;
+            result
+                .codex_probe_case
+                .extend(args[i].split(',').map(|s| s.trim().to_string()));
         } else if (arg == "--extension" || arg == "-e") && i + 1 < args.len() {
             i += 1;
             result.extensions.push(args[i].clone());
@@ -708,6 +715,20 @@ mod tests {
         assert!(parsed.unknown_flags.is_empty());
         assert!(parsed.no_mcp);
         assert_eq!(parsed.messages, vec!["explain this"]);
+    }
+
+    #[test]
+    fn codex_probe_case_accepts_repeated_and_comma_separated_names() {
+        let parsed = parse_args(&[
+            "--codex-probe-case".into(),
+            "baseline, cache_warm".into(),
+            "--codex-probe-case".into(),
+            "prewarm".into(),
+        ]);
+        assert_eq!(
+            parsed.codex_probe_case,
+            vec!["baseline", "cache_warm", "prewarm"]
+        );
     }
 
     #[test]
