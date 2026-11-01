@@ -2408,8 +2408,13 @@ impl crate::codemode::CodeModeHost for SlowScriptHost {
     }
 }
 
-fn background_agent(delay: std::time::Duration, admit: bool) -> (crate::Agent, tempfile::TempDir) {
-    let (mut agent, _workspace, _) = configured_agent();
+/// Guards come before the agent so they drop after it: the workspace and
+/// evidence directories must outlive background workers through shutdown.
+fn background_agent(
+    delay: std::time::Duration,
+    admit: bool,
+) -> (tempfile::TempDir, tempfile::TempDir, crate::Agent) {
+    let (mut agent, workspace, _) = configured_agent();
     let evidence = tempfile::tempdir().unwrap();
     agent.evidence = Some(crate::EvidenceStore::new(evidence.path()));
     agent
@@ -2421,7 +2426,7 @@ fn background_agent(delay: std::time::Duration, admit: bool) -> (crate::Agent, t
             crate::codemode::CodeModeMode::Controlled,
         )
         .unwrap();
-    (agent, evidence)
+    (workspace, evidence, agent)
 }
 
 fn background_request() -> serde_json::Value {
@@ -2432,7 +2437,8 @@ fn background_request() -> serde_json::Value {
 fn background_script_returns_running_and_can_finish() {
     use crate::codemode::{ScriptRunState, WaitAction, WaitForScriptRequest};
 
-    let (agent, _evidence) = background_agent(std::time::Duration::from_millis(200), true);
+    let (_workspace, _evidence, agent) =
+        background_agent(std::time::Duration::from_millis(200), true);
     let started = agent.run_codemode("call-bg", &background_request(), None);
     assert!(!started.is_error, "{started:?}");
     let handle: serde_json::Value = serde_json::from_str(&started.content).unwrap();
@@ -2475,7 +2481,8 @@ fn background_script_returns_running_and_can_finish() {
 
 #[test]
 fn background_script_without_host_approval_is_refused() {
-    let (agent, _evidence) = background_agent(std::time::Duration::from_millis(10), false);
+    let (_workspace, _evidence, agent) =
+        background_agent(std::time::Duration::from_millis(10), false);
     let refused = agent.run_codemode("call-bg-denied", &background_request(), None);
     assert!(refused.is_error, "{refused:?}");
     assert!(
@@ -2490,7 +2497,7 @@ fn background_script_without_host_approval_is_refused() {
 fn killed_background_script_is_cancelled_and_not_replayed() {
     use crate::codemode::{ScriptRunRegistry, ScriptRunState, WaitAction, WaitForScriptRequest};
 
-    let (agent, evidence) = background_agent(std::time::Duration::from_secs(5), true);
+    let (_workspace, evidence, agent) = background_agent(std::time::Duration::from_secs(5), true);
     let started = agent.run_codemode("call-bg-kill", &background_request(), None);
     assert!(!started.is_error, "{started:?}");
     let run_id = serde_json::from_str::<serde_json::Value>(&started.content).unwrap()["toolCallId"]
@@ -2560,14 +2567,15 @@ fn script_todo_alias_requires_the_host_gate_end_to_end() {
             cancellation: runtime.cancellation_token.child_token(),
             root_budget: runtime.root_budget.clone(),
         };
+        // The workspace guard comes first so it drops after the broker.
         (
-            AgentCodeModeBroker::new(agent, context, None).unwrap(),
             workspace,
+            AgentCodeModeBroker::new(agent, context, None).unwrap(),
         )
     };
 
     // Closed by default: the alias does not resolve.
-    let (closed, _) = build_broker(ScriptToolGates::default());
+    let (_closed_workspace, closed) = build_broker(ScriptToolGates::default());
     let denied = closed
         .call(CodeModeCall {
             request_id: 1,
@@ -2578,7 +2586,7 @@ fn script_todo_alias_requires_the_host_gate_end_to_end() {
     assert_eq!(denied.code, "DENIED", "{denied:?}");
 
     // Explicitly opened, the same alias reaches the host-owned todo tool.
-    let (open, _) = build_broker(ScriptToolGates {
+    let (_open_workspace, open) = build_broker(ScriptToolGates {
         allow_todo: true,
         allow_subagents: false,
     });

@@ -191,6 +191,13 @@ fn walk_dir_files(root: &Path) -> Vec<String> {
     result
 }
 
+use super::workspace_files::{self, Entry};
+
+/// Baseline file bytes up to this size are kept in the blob store.
+const BASELINE_BLOB_LIMIT: u64 = 512 * 1024;
+/// Largest file whose bytes are read to produce a textual patch.
+const PATCH_CONTENT_LIMIT: u64 = 64 * 1024 * 1024;
+
 /// Capture baseline workspace fingerprints and contents before writer mutation.
 pub fn capture_baseline(cwd: &Path) -> Result<MutationBaseline, String> {
     let blob_dir = super::blobs::dir(cwd);
@@ -201,22 +208,24 @@ pub fn capture_baseline(cwd: &Path) -> Result<MutationBaseline, String> {
         if is_transaction_journal(&rel_path) {
             continue;
         }
-        let bytes = match super::workspace_files::read(cwd, Path::new(&rel_path)) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(format!("Cannot read baseline file {rel_path}: {error}"));
-            }
-        };
-        let hash = sha256_hex(&bytes);
-        if bytes.len() <= 512 * 1024 {
-            super::blobs::put(&blob_dir, &hash, &bytes).map_err(|error| error.to_string())?;
+        let captured =
+            match workspace_files::fingerprint(cwd, Path::new(&rel_path), BASELINE_BLOB_LIMIT) {
+                Ok(Entry::Present(captured)) => captured,
+                Ok(Entry::Excluded) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!("Cannot read baseline file {rel_path}: {error}"));
+                }
+            };
+        if let Some(bytes) = &captured.bytes {
+            super::blobs::put(&blob_dir, &captured.hash, bytes)
+                .map_err(|error| error.to_string())?;
         }
         files.insert(
             rel_path,
             FileFingerprint {
-                hash,
-                len: bytes.len() as u64,
+                hash: captured.hash,
+                len: captured.len,
             },
         );
     }
@@ -232,6 +241,14 @@ pub fn capture_graph_delta(
     cwd: &Path,
     baseline: &MutationBaseline,
 ) -> Result<GraphMutation, String> {
+    capture_graph_delta_with_limit(cwd, baseline, PATCH_CONTENT_LIMIT)
+}
+
+fn capture_graph_delta_with_limit(
+    cwd: &Path,
+    baseline: &MutationBaseline,
+    patch_limit: u64,
+) -> Result<GraphMutation, String> {
     let blob_dir = super::blobs::dir(cwd);
     let current_paths = list_workspace_files(cwd)?;
     let mut current_map = BTreeMap::new();
@@ -240,19 +257,19 @@ pub fn capture_graph_delta(
         if is_transaction_journal(&rel_path) {
             continue;
         }
-        let bytes = match super::workspace_files::read(cwd, Path::new(&rel_path)) {
-            Ok(bytes) => bytes,
+        let captured = match workspace_files::fingerprint(cwd, Path::new(&rel_path), 0) {
+            Ok(Entry::Present(captured)) => captured,
+            Ok(Entry::Excluded) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(format!("Cannot read mutation file {rel_path}: {error}"));
             }
         };
-        let hash = sha256_hex(&bytes);
         current_map.insert(
             rel_path,
             FileFingerprint {
-                hash,
-                len: bytes.len() as u64,
+                hash: captured.hash,
+                len: captured.len,
             },
         );
     }
@@ -266,9 +283,13 @@ pub fn capture_graph_delta(
             None => {
                 // Newly added by graph
                 changed_files.push(ChangedFile::added(path));
-                let current_bytes = super::workspace_files::read(cwd, Path::new(path))
-                    .map_err(|error| format!("Cannot read mutation file {path}: {error}"))?;
-                let patch = format_added_file_diff(path, &current_bytes);
+                let patch = if fingerprint.len > patch_limit {
+                    content_unavailable_summary(path, None, fingerprint, patch_limit)
+                } else {
+                    let current_bytes = workspace_files::read(cwd, Path::new(path))
+                        .map_err(|error| format!("Cannot read mutation file {path}: {error}"))?;
+                    format_added_file_diff(path, &current_bytes)
+                };
                 patch_chunks.push(PatchChunk {
                     file: path.clone(),
                     patch,
@@ -278,11 +299,17 @@ pub fn capture_graph_delta(
                 // Modified by graph
                 changed_files.push(ChangedFile::modified(path));
                 let old_bytes = baseline.old_bytes(path, &blob_dir);
-                let current_bytes = super::workspace_files::read(cwd, Path::new(path))
-                    .map_err(|error| format!("Cannot read mutation file {path}: {error}"))?;
-                let patch = match old_bytes {
-                    Some(old_bytes) => format_modified_file_diff(path, &old_bytes, &current_bytes),
-                    None => unavailable_original_summary(path, old_fp, Some(fingerprint)),
+                let patch = if fingerprint.len > patch_limit {
+                    content_unavailable_summary(path, Some(old_fp), fingerprint, patch_limit)
+                } else {
+                    let current_bytes = workspace_files::read(cwd, Path::new(path))
+                        .map_err(|error| format!("Cannot read mutation file {path}: {error}"))?;
+                    match old_bytes {
+                        Some(old_bytes) => {
+                            format_modified_file_diff(path, &old_bytes, &current_bytes)
+                        }
+                        None => unavailable_original_summary(path, old_fp, Some(fingerprint)),
+                    }
                 };
                 patch_chunks.push(PatchChunk {
                     file: path.clone(),
@@ -318,6 +345,28 @@ pub fn capture_graph_delta(
         files: changed_files,
         patch_chunks,
     })
+}
+
+// The file was fingerprinted in full but is too large to read into a patch.
+fn content_unavailable_summary(
+    path: &str,
+    old: Option<&FileFingerprint>,
+    new: &FileFingerprint,
+    limit: u64,
+) -> String {
+    let mut summary = format!(
+        "diff --git a/{path} b/{path}\ncontent unavailable; file exceeds the {limit}-byte patch limit\n"
+    );
+    if let Some(old) = old {
+        summary.push_str(&format!(
+            "old sha256 {} ({} bytes)\nmodified; ",
+            old.hash, old.len
+        ));
+    } else {
+        summary.push_str("added; ");
+    }
+    summary.push_str(&format!("new sha256 {} ({} bytes)\n", new.hash, new.len));
+    summary
 }
 
 // This is evidence, not an applyable textual patch: absence is not empty content.
@@ -624,6 +673,43 @@ mod tests {
         // Also exercise Git's tracked/untracked path enumeration.
         super::super::git::run(dir.path(), &["init"]).unwrap();
         assert!(capture_baseline(dir.path()).unwrap().files.is_empty());
+        std::fs::write(dir.path().join("plain.txt"), b"plain").unwrap();
+        let baseline = capture_baseline(dir.path()).unwrap();
+        assert_eq!(baseline.files.keys().collect::<Vec<_>>(), ["plain.txt"]);
+        let delta = capture_graph_delta(dir.path(), &baseline).unwrap();
+        assert!(delta.files.is_empty(), "{delta:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graph_integrity_unreadable_file_stays_fatal() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("locked.txt");
+        std::fs::write(&path, b"secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&path).is_ok() {
+            return; // running as root: permissions do not block the read
+        }
+        let error = capture_baseline(dir.path()).unwrap_err();
+        assert!(error.contains("locked.txt"), "{error}");
+        assert!(capture_graph_delta(dir.path(), &MutationBaseline::default()).is_err());
+    }
+
+    #[test]
+    fn graph_integrity_oversized_file_is_fingerprinted_and_summarized() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("big.txt"), b"0123456789").unwrap();
+        let baseline = capture_baseline(dir.path()).unwrap();
+        // Same length, different content: the full-content hash still sees it.
+        std::fs::write(dir.path().join("big.txt"), b"0123456780").unwrap();
+        std::fs::write(dir.path().join("new.txt"), b"abcdefghij").unwrap();
+        let delta = capture_graph_delta_with_limit(dir.path(), &baseline, 4).unwrap();
+        let diff = delta.diff();
+        assert_eq!(delta.files.len(), 2, "{delta:?}");
+        assert_eq!(diff.matches("content unavailable").count(), 2, "{diff}");
+        assert!(diff.contains(&baseline.files["big.txt"].hash), "{diff}");
+        assert!(!diff.contains("0123456780"), "{diff}");
     }
 
     #[test]
