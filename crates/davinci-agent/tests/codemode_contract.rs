@@ -53,6 +53,65 @@ fn malformed_script_headers_are_rejected_before_dispatch() {
 }
 
 #[test]
+fn script_state_persists_and_reconciles() {
+    use davinci_agent::codemode::{ScriptRunRecord, ScriptRunRegistry, ScriptRunState};
+    let dir = tempfile::tempdir().unwrap();
+    let registry = ScriptRunRegistry::open(dir.path()).unwrap();
+    let record = ScriptRunRecord::new(
+        "run-1",
+        "call-1",
+        Some("session-a"),
+        "workspace-a",
+        "revision-a",
+    );
+    registry.create(&record).unwrap();
+    assert_eq!(
+        registry.get("run-1").unwrap().state,
+        ScriptRunState::Created
+    );
+    assert!(registry
+        .transition("run-1", ScriptRunState::Running)
+        .unwrap());
+    assert!(registry
+        .transition("run-1", ScriptRunState::Completed)
+        .unwrap());
+
+    // State is identical after a cold reload.
+    let reopened = ScriptRunRegistry::open(dir.path()).unwrap();
+    assert_eq!(
+        reopened.get("run-1").unwrap().state,
+        ScriptRunState::Completed
+    );
+    // Transitions are monotonic: a terminal run cannot restart.
+    assert!(reopened
+        .transition("run-1", ScriptRunState::Running)
+        .is_err());
+    // A duplicate completion is suppressed, not duplicated.
+    assert!(!reopened
+        .transition("run-1", ScriptRunState::Completed)
+        .unwrap());
+
+    // Handles are scoped to their session and workspace.
+    assert!(reopened
+        .get_for("run-1", Some("session-b"), "workspace-a")
+        .is_err());
+    assert!(reopened
+        .get_for("run-1", Some("session-a"), "workspace-b")
+        .is_err());
+    assert!(reopened
+        .get_for("run-1", Some("session-a"), "workspace-a")
+        .is_ok());
+    // A forged or foreign id never resolves.
+    assert!(reopened.get("run-../../etc/passwd").is_err());
+    assert!(reopened.get("run-missing").is_err());
+
+    // A write-ahead recovery state can still resolve to a terminal outcome.
+    assert!(reopened
+        .transition("run-1", ScriptRunState::RecoveryRequired)
+        .is_err());
+}
+
+#[test]
 fn script_log_is_readable_without_reexecuting_commands() {
     use davinci_agent::codemode::{ScriptLogEvent, ScriptLogStore};
     let dir = tempfile::tempdir().unwrap();

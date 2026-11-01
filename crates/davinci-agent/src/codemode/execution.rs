@@ -315,8 +315,36 @@ impl Agent {
                 context.clone(),
                 Some(parent),
             )?);
+            // Write-ahead the run before the guest starts, so a crash leaves a
+            // durable record to reconcile instead of an invisible orphan.
+            let runs = self.evidence.as_ref().and_then(|evidence| {
+                super::ScriptRunRegistry::open(evidence.dir().join("script-runs")).ok()
+            });
+            if let Some(registry) = &runs {
+                let record = super::ScriptRunRecord::new(
+                    &context.identity.invocation_id,
+                    id,
+                    context.identity.session_id.as_deref(),
+                    &context.identity.workspace_binding,
+                    &context.capability_revision,
+                );
+                if registry.create(&record).is_ok() {
+                    let _ = registry.transition(&record.run_id, super::ScriptRunState::Running);
+                }
+            }
             let authority = super::authority_fingerprint(self)?;
             let mut outcome = binding.host.execute(&request, &context, broker.clone());
+            if let Some(registry) = &runs {
+                let state = match outcome.status {
+                    CodeModeStatus::Completed | CodeModeStatus::Partial => {
+                        super::ScriptRunState::Completed
+                    }
+                    CodeModeStatus::Failed => super::ScriptRunState::Failed,
+                    CodeModeStatus::Cancelled => super::ScriptRunState::Cancelled,
+                    CodeModeStatus::RecoveryRequired => super::ScriptRunState::RecoveryRequired,
+                };
+                let _ = registry.transition(&context.identity.invocation_id, state);
+            }
             let drained = broker.close(std::time::Duration::from_millis(
                 context.limits.cleanup_grace_ms,
             ));
