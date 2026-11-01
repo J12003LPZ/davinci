@@ -547,6 +547,85 @@ fn in_flight_child_is_awaited_before_parent_evidence_is_taken() {
 }
 
 #[test]
+fn undrained_child_makes_the_run_recovery_required() {
+    use crate::codemode::*;
+    struct FinishesWhileChildRuns(
+        Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    );
+    impl CodeModeHost for FinishesWhileChildRuns {
+        fn execute(
+            &self,
+            _: &CodeModeRequest,
+            _: &CodeModeRunContext,
+            broker: Arc<dyn CodeModeBroker>,
+        ) -> CodeModeOutcome {
+            let worker = std::thread::spawn(move || {
+                let _ = broker.call(CodeModeCall {
+                    request_id: 1,
+                    tool: "read".into(),
+                    args: json!({"path":"input.txt"}),
+                });
+            });
+            *self.0.lock().unwrap() = Some(worker);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !self.1.load(std::sync::atomic::Ordering::SeqCst)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            CodeModeOutcome {
+                status: CodeModeStatus::Completed,
+                script_completed: true,
+                output_text: "done".into(),
+                output_complete: true,
+                output_artifact: None,
+                children: vec![],
+                host_notes: vec![],
+                operation_ref: "fixture".into(),
+                error: None,
+            }
+        }
+    }
+    let worker = Arc::new(Mutex::new(None));
+    let (mut agent, workspace, _) = configured_agent();
+    agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+    let admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = admitted.clone();
+    // The child ignores cancellation and outlasts the cleanup grace.
+    let grace = CodeModeLimits::default().cleanup_grace_ms;
+    agent.pre_tool = Some(PreToolHook(Arc::new(move |name, _| {
+        if name == "read" {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(grace + 600));
+        }
+        None
+    })));
+    agent
+        .enable_read_only_codemode(Arc::new(FinishesWhileChildRuns(
+            worker.clone(),
+            admitted.clone(),
+        )))
+        .unwrap();
+    let messages = agent.execute_tool_batch(
+        workspace.path(),
+        vec![(
+            "undrained-script".into(),
+            "codemode".into(),
+            json!({"code":"return 1"}),
+        )],
+        &mut Vec::new(),
+    );
+    worker.lock().unwrap().take().unwrap().join().unwrap();
+    let details = messages[0].extra["details"]["codemode"].clone();
+    assert_eq!(
+        details["status"],
+        json!("recoveryRequired"),
+        "an undrained broker must not look finished: {details}"
+    );
+}
+
+#[test]
 fn retained_broker_cannot_dispatch_after_parent_outcome() {
     use crate::codemode::*;
     struct RetainingHost(Arc<Mutex<Option<Arc<dyn CodeModeBroker>>>>);
@@ -2183,6 +2262,13 @@ fn wait_for_script_scoped_handle_and_terminal_status() {
     );
     foreign_owned.owner = Some("1-another-host".into());
     registry.create(&foreign_owned).unwrap();
+    // A live owner holds its lock through a handle of its own.
+    let owners = evidence_dir.join("script-runs").join("owners");
+    std::fs::create_dir_all(&owners).unwrap();
+    let foreign_lock =
+        crate::runtime::capacity::lock_file_exclusive(&owners.join("1-another-host.lock"), true)
+            .unwrap()
+            .expect("the foreign lock is free to take");
     registry
         .transition("run-other-host", ScriptRunState::Running)
         .unwrap();
@@ -2195,6 +2281,22 @@ fn wait_for_script_scoped_handle_and_terminal_status() {
     assert_eq!(
         registry.get("run-other-host").unwrap().state,
         ScriptRunState::Running
+    );
+    // Once that owner dies, the same handle resolves instead of staying
+    // `NOT_OWNER` forever.
+    drop(foreign_lock);
+    let resolved = agent.wait_for_script(WaitForScriptRequest {
+        tool_call_id: "run-other-host".into(),
+        action: WaitAction::Kill,
+    });
+    assert!(
+        resolved.content.contains("recoveryRequired") || resolved.content.contains("RECOVERY"),
+        "{}",
+        resolved.content
+    );
+    assert_eq!(
+        registry.get("run-other-host").unwrap().state,
+        ScriptRunState::RecoveryRequired
     );
 
     // A handle from another session never resolves.
@@ -2719,7 +2821,21 @@ fn explicit_branch_navigation_hides_runs_started_on_another_branch() {
     assert!(denied.is_error, "{}", denied.content);
     assert!(denied.content.contains("DENIED"), "{}", denied.content);
     assert!(agent.pending_script_wakeups().is_empty());
+    let second = agent.session.as_ref().unwrap().entries[1].id.clone();
+    let session_path = agent.session.as_ref().unwrap().path.clone();
     agent.shutdown_session_scripts();
+
+    // A restart keeps no in-memory counter: a fresh agent on the same session
+    // applies the same rule, and returning to the branch restores access.
+    let (mut fresh, _fresh_workspace, _) = configured_agent();
+    fresh.cwd = agent.cwd.clone();
+    fresh.evidence = Some(crate::EvidenceStore::new(_evidence.path()));
+    let mut reopened = davinci_session::JsonlSession::open(&session_path).unwrap();
+    reopened.set_leaf(Some(first));
+    fresh.session = Some(reopened);
+    assert!(status(&fresh).is_error, "abandoned branch stays hidden");
+    fresh.session.as_mut().unwrap().set_leaf(Some(second));
+    assert!(!status(&fresh).is_error, "the run's own branch resolves");
 }
 
 #[test]

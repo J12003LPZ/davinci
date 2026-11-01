@@ -149,15 +149,34 @@ fn acquire_scan_file(dir: &Path, cancelled: &dyn Fn() -> bool) -> Option<File> {
 }
 
 fn try_lock_scan_slot(dir: &Path, slot: usize) -> Option<File> {
-    let path = dir.join(format!("scan-{slot}.lock"));
+    lock_file_exclusive(&dir.join(format!("scan-{slot}.lock")), true)
+        .ok()
+        .flatten()
+}
+
+/// Take an exclusive, non-blocking lock on `path` that the OS drops when the
+/// holder exits, however it exits. `Ok(None)` means another handle holds it;
+/// any other failure (including a missing file when `create` is false) is an
+/// error, so the caller decides what an unknown state means.
+pub(crate) fn lock_file_exclusive(path: &Path, create: bool) -> std::io::Result<Option<File>> {
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
+    options
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         options.share_mode(0);
     }
-    let file = options.open(&path).ok()?;
+    let file = match options.open(path) {
+        Ok(file) => file,
+        // ERROR_SHARING_VIOLATION: another handle holds the file exclusively.
+        #[cfg(windows)]
+        Err(error) if error.raw_os_error() == Some(32) => return Ok(None),
+        Err(error) => return Err(error),
+    };
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -168,10 +187,15 @@ fn try_lock_scan_slot(dir: &Path, slot: usize) -> Option<File> {
         const LOCK_EX: i32 = 2;
         const LOCK_NB: i32 = 4;
         if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
-            return None;
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::WouldBlock {
+                Ok(None)
+            } else {
+                Err(error)
+            };
         }
     }
-    Some(file)
+    Ok(Some(file))
 }
 
 pub struct RequestPermit<'a> {

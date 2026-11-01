@@ -322,13 +322,19 @@ impl Agent {
                 .map_err(|_| CodeModeError::new("UNAVAILABLE", "workspace unavailable"))?
                 .to_string_lossy()
                 .into_owned();
-            let epoch = self.branch_epoch.load(std::sync::atomic::Ordering::SeqCst);
+            let branch = self.current_branch_ids();
             let lookup = |run_id: &str| {
                 registry
-                    .get_for(run_id, runtime.session_id.as_deref(), &binding, epoch)
+                    .get_for(run_id, runtime.session_id.as_deref(), &binding, &branch)
                     .map_err(|error| CodeModeError::new(&error.code, &error.message))
             };
             let mut record = lookup(&request.tool_call_id)?;
+            // A foreign owner that died after this process opened the store is
+            // resolved here, so Kill reports the real state, not `NOT_OWNER`.
+            if !record.state.terminal() && !record.owned_by_this_process() {
+                registry.reconcile_if_owner_dead(&record);
+                record = lookup(&request.tool_call_id)?;
+            }
             match request.action {
                 super::WaitAction::Status => {}
                 super::WaitAction::Wait => {
@@ -507,7 +513,7 @@ impl Agent {
                     .capability_registry
                     .hash_tool_capabilities(&self.tools),
             );
-            record.branch_epoch = self.branch_epoch.load(std::sync::atomic::Ordering::SeqCst);
+            record.branch_origin = self.branch_origin();
             // The run token is a child of the session's: closing or cancelling
             // the session stops every detached Script it owns. The run is
             // admitted before anything is written or spawned, so a shutdown
@@ -519,7 +525,13 @@ impl Agent {
                     "the session is closing; no new background Script was started",
                 ));
             }
-            self.background_runs.track(&registry_dir);
+            if !self.background_runs.track(&registry_dir) {
+                self.background_runs.release(&run_id);
+                return Err(CodeModeError::new(
+                    "BACKGROUND_UNAVAILABLE",
+                    "the process is shutting down; no new background Script was started",
+                ));
+            }
             let admitted = registry
                 .create(&record)
                 .and_then(|()| {
@@ -607,6 +619,26 @@ impl Agent {
         ))
     }
 
+    /// Entry ids on the path from the session root to the current leaf.
+    fn current_branch_ids(&self) -> std::collections::HashSet<String> {
+        self.session
+            .as_ref()
+            .map(|session| {
+                davinci_session::branch_entries(&session.entries, session.leaf_id.as_deref())
+                    .into_iter()
+                    .map(|entry| entry.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The leaf a run starting now belongs to.
+    fn branch_origin(&self) -> Option<String> {
+        self.session
+            .as_ref()
+            .and_then(|session| session.leaf_id.clone())
+    }
+
     fn script_wakeup_registry(&self) -> Option<(super::ScriptRunRegistry, String)> {
         let evidence = self.evidence.as_ref()?;
         let workspace = self.cwd.canonicalize().ok()?.to_string_lossy().into_owned();
@@ -627,7 +659,7 @@ impl Agent {
             .pending_notifications(
                 runtime.session_id.as_deref(),
                 &workspace,
-                self.branch_epoch.load(std::sync::atomic::Ordering::SeqCst),
+                &self.current_branch_ids(),
             )
             .unwrap_or_default()
             .iter()
@@ -743,7 +775,7 @@ impl Agent {
                     &context.identity.workspace_binding,
                     &context.capability_revision,
                 );
-                record.branch_epoch = self.branch_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                record.branch_origin = self.branch_origin();
                 if registry.create(&record).is_ok() {
                     let _ = registry.transition(&record.run_id, super::ScriptRunState::Running);
                 }
@@ -792,9 +824,6 @@ impl Agent {
                 outcome
                     .host_notes
                     .push("A child call was still running when the run closed; child evidence may be incomplete.".into());
-                if matches!(outcome.status, CodeModeStatus::Completed) {
-                    outcome.status = CodeModeStatus::Partial;
-                }
             }
             outcome.operation_ref = parent
                 .map(|parent| parent.to_string())
@@ -836,6 +865,10 @@ impl Agent {
                 && outcome.script_completed
             {
                 outcome.status = CodeModeStatus::Partial;
+            }
+            if !drained {
+                // A child may still be making effects: no other status is true.
+                outcome.status = CodeModeStatus::RecoveryRequired;
             }
             if empty {
                 self.counters

@@ -65,9 +65,11 @@ JavaScript is never resumed after a crash.
 `kill` cancels the run and waits a bounded grace; the worker records its own
 terminal state, and a timeout gives `recoveryRequired`. A run owned by another
 process returns `NOT_OWNER`. A dead owner's open runs are reconciled at the
-first registry open in a process. Handles are scoped to a branch navigation
-epoch: a run started on another branch does not resolve and its wakeup is not
-delivered there, and navigating back does not restore access.
+first registry open in a process. Handles are scoped to a session
+branch: a run records the leaf it started from, and resolves only while that
+entry is on the path to the current leaf. A run from another branch does not
+resolve and its wakeup is not delivered there; navigating back to the branch
+restores access, including after a restart.
 
 ## Function fallback (deferred gap)
 

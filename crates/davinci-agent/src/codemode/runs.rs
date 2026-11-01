@@ -12,35 +12,51 @@ fn process_owner() -> &'static str {
     OWNER.get_or_init(|| format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()))
 }
 
-fn owner_pid(owner: &str) -> Option<u32> {
-    owner.split('-').next()?.parse().ok()
+/// Hold this process's owner lock for `dir` for the life of the process. The
+/// OS releases it on any exit, so another process can tell a dead owner from a
+/// live one even if the dead one's pid has been reused.
+fn hold_owner_lock(dir: &Path) -> Result<(), ScriptRunError> {
+    static HELD: OnceLock<Mutex<HashMap<PathBuf, std::fs::File>>> = OnceLock::new();
+    let key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let mut held = HELD
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if held.contains_key(&key) {
+        return Ok(());
+    }
+    let unavailable = || ScriptRunError::new("UNAVAILABLE", "script run owner lock unavailable");
+    let owners = dir.join("owners");
+    std::fs::create_dir_all(&owners).map_err(|_| unavailable())?;
+    let lock = crate::runtime::capacity::lock_file_exclusive(
+        &owners.join(format!("{}.lock", process_owner())),
+        true,
+    )
+    .map_err(|_| unavailable())?
+    .ok_or_else(unavailable)?;
+    held.insert(key, lock);
+    Ok(())
 }
 
-#[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
-    // SAFETY: signal 0 only checks that the process exists.
-    let signalled = unsafe { libc::kill(pid as i32, 0) };
-    let errno = std::io::Error::last_os_error().raw_os_error();
-    signalled == 0 || errno == Some(libc::EPERM)
-}
-
-#[cfg(windows)]
-fn process_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED};
-    use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-    const STILL_ACTIVE: u32 = 259;
-    // SAFETY: query-only handle, closed before returning.
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle.is_null() {
-            return GetLastError() == ERROR_ACCESS_DENIED;
+/// True when `owner`'s lock can be taken, which means its process is gone. No
+/// lock file (a record from before locks) counts as dead; any other failure
+/// counts as alive, the conservative answer. The stale lock file is removed.
+fn owner_is_dead(dir: &Path, owner: &str) -> bool {
+    if owner == process_owner() {
+        return false;
+    }
+    if !owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return true;
+    }
+    let path = dir.join("owners").join(format!("{owner}.lock"));
+    match crate::runtime::capacity::lock_file_exclusive(&path, false) {
+        Ok(Some(lock)) => {
+            drop(lock);
+            let _ = std::fs::remove_file(&path);
+            true
         }
-        let mut code = 0u32;
-        let ok = GetExitCodeProcess(handle, &mut code) != 0;
-        CloseHandle(handle);
-        !ok || code == STILL_ACTIVE
+        Ok(None) => false,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
     }
 }
 
@@ -181,10 +197,11 @@ pub struct ScriptRunRecord {
     /// before the field existed.
     #[serde(default)]
     pub owner: Option<String>,
-    /// Branch navigation epoch the run was started under; a run started on
-    /// another branch does not resolve here. Old records read as 0.
+    /// Session entry id of the leaf when the run started. The run resolves
+    /// only while that entry is on the path to the current leaf; `None` (no
+    /// session, or an old record) resolves everywhere.
     #[serde(default)]
-    pub branch_epoch: u64,
+    pub branch_origin: Option<String>,
     /// Final summary of a detached run; absent on old records and on runs
     /// that ended without the worker publishing one.
     #[serde(default)]
@@ -219,9 +236,16 @@ impl ScriptRunRecord {
             log_ref: None,
             notified: false,
             owner: Some(process_owner().into()),
-            branch_epoch: 0,
+            branch_origin: None,
             summary: None,
         }
+    }
+
+    /// True when the run started on the branch whose entry ids are `branch`.
+    pub fn on_branch(&self, branch: &HashSet<String>) -> bool {
+        self.branch_origin
+            .as_ref()
+            .is_none_or(|origin| branch.contains(origin))
     }
 
     /// True when this process created the record, so it alone can stop it.
@@ -280,19 +304,26 @@ impl ScriptRunRegistry {
             let Ok(record) = self.get(run_id) else {
                 continue;
             };
-            let owner_live = record.owner.as_deref().is_some_and(|owner| {
-                owner == process_owner() || owner_pid(owner).is_some_and(process_alive)
-            });
-            if record.state.terminal() || owner_live {
-                continue;
-            }
-            let _ = reconcile_script_run(self, run_id);
+            self.reconcile_if_owner_dead(&record);
+        }
+    }
+
+    /// Recover one open record whose owner process is gone. Records owned by
+    /// this process or by a live one are never touched.
+    pub fn reconcile_if_owner_dead(&self, record: &ScriptRunRecord) {
+        let owner_dead = record
+            .owner
+            .as_deref()
+            .is_none_or(|owner| owner_is_dead(&self.dir, owner));
+        if !record.state.terminal() && owner_dead {
+            let _ = reconcile_script_run(self, &record.run_id);
         }
     }
 
     /// Write-ahead creation: the record is durable before the script runs.
     pub fn create(&self, record: &ScriptRunRecord) -> Result<(), ScriptRunError> {
         let path = self.path(&record.run_id)?;
+        hold_owner_lock(&self.dir)?;
         let _guard = self.guard();
         if path.exists() {
             return Err(ScriptRunError::new("DENIED", "script run already exists"));
@@ -314,12 +345,12 @@ impl ScriptRunRegistry {
         run_id: &str,
         session_id: Option<&str>,
         workspace_binding: &str,
-        branch_epoch: u64,
+        branch: &HashSet<String>,
     ) -> Result<ScriptRunRecord, ScriptRunError> {
         let record = self.get(run_id)?;
         if record.session_id.as_deref() != session_id
             || record.workspace_binding != workspace_binding
-            || record.branch_epoch != branch_epoch
+            || !record.on_branch(branch)
         {
             return Err(ScriptRunError::new(
                 "DENIED",
@@ -475,7 +506,7 @@ impl ScriptRunRegistry {
         &self,
         session_id: Option<&str>,
         workspace_binding: &str,
-        branch_epoch: u64,
+        branch: &HashSet<String>,
     ) -> Result<Vec<ScriptRunRecord>, ScriptRunError> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Ok(Vec::new());
@@ -496,7 +527,7 @@ impl ScriptRunRegistry {
                 && !record.notified
                 && record.session_id.as_deref() == session_id
                 && record.workspace_binding == workspace_binding
-                && record.branch_epoch == branch_epoch
+                && record.on_branch(branch)
             {
                 pending.push(record);
             }

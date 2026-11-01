@@ -139,21 +139,51 @@ impl BackgroundRuns {
 
     /// Remember this set, with its registry directory, so process exit can
     /// stop it without a handle to the agent. Sets nobody else holds any more
-    /// are dropped here.
-    pub(crate) fn track(&self, registry_dir: &Path) {
-        let mut all = tracked().lock().unwrap_or_else(|error| error.into_inner());
-        all.retain(|(runs, _)| Arc::strong_count(&runs.inner) > 1);
-        if !all
-            .iter()
-            .any(|(runs, _)| Arc::ptr_eq(&runs.inner, &self.inner))
-        {
-            all.push((self.clone(), registry_dir.to_path_buf()));
-        }
+    /// are dropped here. False once process-wide shutdown has begun: the
+    /// caller must refuse the launch.
+    pub(crate) fn track(&self, registry_dir: &Path) -> bool {
+        tracked()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .track(self, registry_dir)
     }
 }
 
-fn tracked() -> &'static Mutex<Vec<(BackgroundRuns, PathBuf)>> {
-    static TRACKED: OnceLock<Mutex<Vec<(BackgroundRuns, PathBuf)>>> = OnceLock::new();
+/// The sets process exit must stop, and the permanent flag saying exit has
+/// begun. Both sit under one lock, so a launch is either tracked before the
+/// shutdown snapshot (and cancelled) or sees the flag (and is refused).
+#[derive(Default)]
+struct Tracking {
+    shutdown: bool,
+    sets: Vec<(BackgroundRuns, PathBuf)>,
+}
+
+impl Tracking {
+    fn track(&mut self, runs: &BackgroundRuns, registry_dir: &Path) -> bool {
+        if self.shutdown {
+            return false;
+        }
+        self.sets
+            .retain(|(held, _)| Arc::strong_count(&held.inner) > 1);
+        if !self
+            .sets
+            .iter()
+            .any(|(held, _)| Arc::ptr_eq(&held.inner, &runs.inner))
+        {
+            self.sets.push((runs.clone(), registry_dir.to_path_buf()));
+        }
+        true
+    }
+
+    /// Set the flag and snapshot the sets in one step.
+    fn begin_shutdown(&mut self) -> Vec<(BackgroundRuns, PathBuf)> {
+        self.shutdown = true;
+        self.sets.clone()
+    }
+}
+
+fn tracked() -> &'static Mutex<Tracking> {
+    static TRACKED: OnceLock<Mutex<Tracking>> = OnceLock::new();
     TRACKED.get_or_init(Default::default)
 }
 
@@ -173,10 +203,10 @@ pub(crate) fn mark_unresolved(registry_dir: &Path, run_ids: &[String]) {
 /// shared `grace`, for process exit. New launches stay refused afterwards.
 /// Safe to call more than once.
 pub fn shutdown_all_background_scripts(grace: Duration) -> Vec<String> {
-    let all: Vec<(BackgroundRuns, PathBuf)> = tracked()
+    let all = tracked()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .clone();
+        .begin_shutdown();
     let deadline = Instant::now() + grace;
     for (runs, _) in &all {
         runs.close();
@@ -189,4 +219,25 @@ pub fn shutdown_all_background_scripts(grace: Duration) -> Vec<String> {
         unfinished.extend(ids);
     }
     unfinished
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A launch tracked before the shutdown snapshot is in it; one tracked
+    /// after is refused. Uses a private `Tracking`, so the process-wide flag
+    /// is never set by a test.
+    #[test]
+    fn launch_after_shutdown_snapshot_is_refused() {
+        let mut tracking = Tracking::default();
+        let early = BackgroundRuns::default();
+        assert!(tracking.track(&early, Path::new("early")));
+        let snapshot = tracking.begin_shutdown();
+        assert_eq!(snapshot.len(), 1);
+        assert!(Arc::ptr_eq(&snapshot[0].0.inner, &early.inner));
+
+        let late = BackgroundRuns::default();
+        assert!(!tracking.track(&late, Path::new("late")));
+    }
 }

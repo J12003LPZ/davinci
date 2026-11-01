@@ -358,6 +358,8 @@ fn capture_graph_delta_with_limit(
                 // Modified by graph
                 changed_files.push(ChangedFile::modified(path));
                 let old_bytes = baseline.old_bytes(path, &blob_dir);
+                // Without the original the reviewer sees no content change.
+                let original_missing = old_bytes.is_none();
                 let patch = if fingerprint.len > patch_limit {
                     content_unavailable_summary(path, Some(old_fp), fingerprint, patch_limit)
                 } else {
@@ -373,7 +375,7 @@ fn capture_graph_delta_with_limit(
                 patch_chunks.push(PatchChunk {
                     file: path.clone(),
                     patch,
-                    content_unavailable: fingerprint.len > patch_limit,
+                    content_unavailable: fingerprint.len > patch_limit || original_missing,
                 });
             }
             _ => {
@@ -398,6 +400,7 @@ fn capture_graph_delta_with_limit(
         } else if !current_map.contains_key(old_path) {
             changed_files.push(ChangedFile::deleted(old_path));
             let old_bytes = baseline.old_bytes(old_path, &blob_dir);
+            let original_missing = old_bytes.is_none();
             let patch = match old_bytes {
                 Some(old_bytes) => format_deleted_file_diff(old_path, &old_bytes),
                 None => unavailable_original_summary(old_path, &baseline.files[old_path], None),
@@ -405,7 +408,7 @@ fn capture_graph_delta_with_limit(
             patch_chunks.push(PatchChunk {
                 file: old_path.clone(),
                 patch,
-                ..PatchChunk::default()
+                content_unavailable: original_missing,
             });
         }
     }
@@ -767,7 +770,8 @@ mod tests {
                 std::fs::remove_file(blob).unwrap();
             }
             std::fs::write(dir.path().join("large.txt"), b"new contents").unwrap();
-            let modified = capture_graph_delta(dir.path(), &baseline).unwrap().diff();
+            let modified_delta = capture_graph_delta(dir.path(), &baseline).unwrap();
+            let modified = modified_delta.diff();
             assert!(
                 modified.contains("original bytes unavailable"),
                 "{modified}"
@@ -776,9 +780,18 @@ mod tests {
             assert!(modified.contains(&format!("{} bytes", fp.len)));
             assert!(!modified.contains("@@ -0,0"));
             std::fs::remove_file(dir.path().join("large.txt")).unwrap();
-            let deleted = capture_graph_delta(dir.path(), &baseline).unwrap().diff();
+            let deleted_delta = capture_graph_delta(dir.path(), &baseline).unwrap();
+            let deleted = deleted_delta.diff();
             assert!(deleted.contains("original bytes unavailable"));
             assert!(deleted.contains(&fp.hash));
+            // The reviewer saw nothing of the change, so risk must say so.
+            for delta in [&modified_delta, &deleted_delta] {
+                assert!(delta.patch_chunks.iter().all(|c| c.content_unavailable));
+                assert_eq!(
+                    delta.assess_risk().level,
+                    crate::native_extensions::ecosystem::risk::ChangeRisk::High
+                );
+            }
         }
     }
 

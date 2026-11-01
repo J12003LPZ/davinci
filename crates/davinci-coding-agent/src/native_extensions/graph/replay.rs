@@ -262,21 +262,30 @@ pub fn compute_repo_state_hash(cwd: &Path) -> String {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error.to_string()),
                 };
-                let bytes = if metadata.file_type().is_symlink() {
+                let (len, hash) = if metadata.file_type().is_symlink() {
                     // Hash the link text, never dereference the target.
                     let target = std::fs::read_link(&full).map_err(|error| error.to_string())?;
                     manifest.extend_from_slice(b"symlink\0");
-                    target.as_os_str().as_encoded_bytes().to_vec()
+                    let bytes = target.as_os_str().as_encoded_bytes();
+                    (bytes.len() as u64, sha256_hex(bytes))
                 } else if metadata.is_file() {
                     manifest.extend_from_slice(b"file\0");
-                    super::workspace_files::read(cwd, path).map_err(|error| error.to_string())?
+                    // Streamed, so a file over the capture limit still counts.
+                    match super::workspace_files::fingerprint(cwd, path, 0)
+                        .map_err(|error| error.to_string())?
+                    {
+                        super::workspace_files::Entry::Present(file) => (file.len, file.hash),
+                        super::workspace_files::Entry::Excluded => {
+                            return Err("not an ordinary workspace file".into());
+                        }
+                    }
                 } else {
                     continue;
                 };
                 manifest.extend_from_slice(&(record.len() as u64).to_le_bytes());
                 manifest.extend_from_slice(record);
-                manifest.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-                manifest.extend_from_slice(sha256_hex(&bytes).as_bytes());
+                manifest.extend_from_slice(&len.to_le_bytes());
+                manifest.extend_from_slice(hash.as_bytes());
             }
             Ok(sha256_hex(&manifest))
         }
@@ -311,16 +320,18 @@ pub fn compute_repo_state_hash(cwd: &Path) -> String {
                         continue;
                     }
                     if kind.is_file() {
-                        if let Ok(bytes) = super::workspace_files::read(
-                            root,
-                            path.strip_prefix(root).unwrap_or(&path),
-                        ) {
-                            let rel = path
-                                .strip_prefix(root)
-                                .unwrap_or(&path)
-                                .to_string_lossy()
-                                .replace('\\', "/");
-                            entries.push(format!("{}:{}:{}", rel, bytes.len(), sha256_hex(&bytes)));
+                        let relative = path.strip_prefix(root).unwrap_or(&path);
+                        let rel = relative.to_string_lossy().replace('\\', "/");
+                        // Streamed, so a file over the capture limit still counts.
+                        match super::workspace_files::fingerprint(root, relative, 0) {
+                            Ok(super::workspace_files::Entry::Present(file)) => {
+                                entries.push(format!("{}:{}:{}", rel, file.len, file.hash));
+                            }
+                            Ok(super::workspace_files::Entry::Excluded) => {}
+                            // A file that cannot be read must not look unchanged.
+                            Err(error) => {
+                                entries.push(format!("unreadable:{rel}:{:?}", error.kind()));
+                            }
                         }
                     } else if kind.is_dir() {
                         collect_entries(root, &path, entries);
@@ -385,6 +396,37 @@ mod tests {
         let nested = compute_repo_state_hash(dir.path());
         std::fs::write(dir.path().join("untracked/nested"), b"two").unwrap();
         assert_ne!(nested, compute_repo_state_hash(dir.path()));
+    }
+
+    #[test]
+    fn graph_integrity_replay_sees_edits_to_files_over_the_capture_limit() {
+        use std::io::{Seek, SeekFrom, Write};
+        for git in [false, true] {
+            let dir = tempdir().unwrap();
+            if git {
+                super::super::git::run(dir.path(), &["init"]).unwrap();
+            }
+            let path = dir.path().join("big.bin");
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.set_len(64 * 1024 * 1024 + 1).unwrap();
+            let before = compute_repo_state_hash(dir.path());
+            file.seek(SeekFrom::Start(1024)).unwrap();
+            file.write_all(b"x").unwrap();
+            drop(file);
+            assert_ne!(
+                before,
+                compute_repo_state_hash(dir.path()),
+                "same-length edit of an oversized file (git: {git})"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_integrity_replay_hash_text_is_unchanged_for_ordinary_files() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        let expected = sha256_hex(format!("a.txt:5:{}", sha256_hex(b"hello")).as_bytes());
+        assert_eq!(compute_repo_state_hash(dir.path()), expected);
     }
 
     #[cfg(unix)]

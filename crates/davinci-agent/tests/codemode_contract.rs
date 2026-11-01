@@ -228,14 +228,17 @@ fn script_state_persists_and_reconciles() {
     use davinci_agent::codemode::{ScriptRunRecord, ScriptRunRegistry, ScriptRunState};
     let dir = tempfile::tempdir().unwrap();
     let registry = ScriptRunRegistry::open(dir.path()).unwrap();
-    let record = ScriptRunRecord::new(
+    let mut record = ScriptRunRecord::new(
         "run-1",
         "call-1",
         Some("session-a"),
         "workspace-a",
         "revision-a",
     );
+    record.branch_origin = Some("entry-a".into());
     registry.create(&record).unwrap();
+    let on_branch: std::collections::HashSet<String> = ["entry-a".to_string()].into();
+    let off_branch: std::collections::HashSet<String> = ["entry-b".to_string()].into();
     assert_eq!(
         registry.get("run-1").unwrap().state,
         ScriptRunState::Created
@@ -264,26 +267,26 @@ fn script_state_persists_and_reconciles() {
 
     // Handles are scoped to their session and workspace.
     assert!(reopened
-        .get_for("run-1", Some("session-b"), "workspace-a", 0)
+        .get_for("run-1", Some("session-b"), "workspace-a", &on_branch)
         .is_err());
     assert!(reopened
-        .get_for("run-1", Some("session-a"), "workspace-b", 0)
+        .get_for("run-1", Some("session-a"), "workspace-b", &on_branch)
         .is_err());
     assert!(reopened
-        .get_for("run-1", Some("session-a"), "workspace-a", 0)
+        .get_for("run-1", Some("session-a"), "workspace-a", &on_branch)
         .is_ok());
-    // A run from another branch epoch is denied and also drops out of wakeups.
+    // A run whose origin is off the current branch is denied and also drops out of wakeups.
     let other_branch = reopened
-        .get_for("run-1", Some("session-a"), "workspace-a", 1)
+        .get_for("run-1", Some("session-a"), "workspace-a", &off_branch)
         .unwrap_err();
     assert_eq!(other_branch.code, "DENIED");
     assert!(reopened
-        .pending_notifications(Some("session-a"), "workspace-a", 1)
+        .pending_notifications(Some("session-a"), "workspace-a", &off_branch)
         .unwrap()
         .is_empty());
     assert_eq!(
         reopened
-            .pending_notifications(Some("session-a"), "workspace-a", 0)
+            .pending_notifications(Some("session-a"), "workspace-a", &on_branch)
             .unwrap()
             .len(),
         1
@@ -730,6 +733,27 @@ fn concurrent_registry_handles_never_lose_or_duplicate_a_transition() {
     assert_eq!(leftovers, 0);
 }
 
+/// Hold `path` the way a live host process holds its owner lock, through a
+/// separate handle: `flock` is per open file description, and Windows opens
+/// with share mode 0.
+fn hold_exclusively(path: &std::path::Path) -> std::fs::File {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0);
+    }
+    let file = options.open(path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // LOCK_EX | LOCK_NB
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), 2 | 4) }, 0);
+    }
+    file
+}
+
 #[test]
 fn first_open_recovers_only_runs_a_dead_process_left_open() {
     use davinci_agent::codemode::{ScriptRunRecord, ScriptRunRegistry, ScriptRunState};
@@ -744,9 +768,15 @@ fn first_open_recovers_only_runs_a_dead_process_left_open() {
         )
         .unwrap();
     };
-    let dead = Some("2147483646-dead".to_string());
-    // Another host that is alive: this test process under a different owner id.
-    let live = Some(format!("{}-another-host", std::process::id()));
+    // Owner liveness is a held lock, not a pid: a stale lock file with nobody
+    // holding it is dead, and so is an owner with no lock file at all.
+    let owners = dir.path().join("owners");
+    std::fs::create_dir_all(&owners).unwrap();
+    std::fs::write(owners.join("1-dead.lock"), b"").unwrap();
+    let dead = Some("1-dead".to_string());
+    // Another host that is alive: a different handle holds its owner lock.
+    let live_lock = hold_exclusively(&owners.join("2-live.lock"));
+    let live = Some("2-live".to_string());
     write("dead-running", dead.clone(), ScriptRunState::Running);
     write("legacy-running", None, ScriptRunState::Running);
     write("live-running", live, ScriptRunState::Running);
@@ -758,6 +788,16 @@ fn first_open_recovers_only_runs_a_dead_process_left_open() {
     assert_eq!(state("legacy-running"), ScriptRunState::RecoveryRequired);
     assert_eq!(state("live-running"), ScriptRunState::Running);
     assert_eq!(state("dead-done"), ScriptRunState::Completed);
+    assert!(!owners.join("1-dead.lock").exists(), "stale lock removed");
+
+    // The live owner dies later: resolving the single record recovers it, and
+    // does not wait for another first open.
+    let record = registry.get("live-running").unwrap();
+    registry.reconcile_if_owner_dead(&record);
+    assert_eq!(state("live-running"), ScriptRunState::Running);
+    drop(live_lock);
+    registry.reconcile_if_owner_dead(&record);
+    assert_eq!(state("live-running"), ScriptRunState::RecoveryRequired);
 
     // A run this process creates afterwards is never claimed by a later open.
     registry
