@@ -1,9 +1,14 @@
 # ChatGPT Codex backend route (the `openai-codex` OAuth login)
 
-Status: implemented offline. **No live request has been made through this route from DaVinci.** `/login openai-codex`
-is the only OAuth login; it uses the Codex CLI OAuth client and the route below. API-key use goes through `openai`.
-A Sign in with ChatGPT login stored by an earlier build (no route marker) still resolves on the documented
-`https://api.openai.com/v1` route until `/login openai-codex` replaces it.
+Status: implemented, and used for live runs from DaVinci. The owner-approved runs of 2026-10-22
+(`docs/perf/codex-efficiency/live-2026-10-22.md`) sent 6 Task 0 requests, 7 coding runs (155 coding and 35 compaction
+attempts) and 6 survey sessions on `gpt-6-luna`, all on a fresh `/login openai-codex` credential that carries the route
+marker. That file infers the backend route from the marker; the base URL was not observed. The 2026-10-31 Stage 0 study
+(`docs/perf/droid-gap/stage0-report.md` section 2) also ran DaVinci on `openai-codex`, but that report records neither the
+marker nor the base URL, so it is not cited as route evidence here. `/login openai-codex` is the only OAuth login; it uses
+the Codex CLI OAuth client and the route below. API-key use goes through `openai`. A Sign in with ChatGPT login stored by
+an earlier build (no route marker) still resolves on the documented `https://api.openai.com/v1` route until
+`/login openai-codex` replaces it.
 
 ## Why it exists
 
@@ -50,8 +55,9 @@ changes: no catalog entry, no setting, no other provider.
 
 - The Fast service tier is not changed or enabled.
 - Model catalog refresh (`https://api.openai.com/v1/models`) and the plan-account email check read a Sign in with ChatGPT token and skip a Codex CLI login, so the built-in catalog is used. Whether the Codex CLI token is accepted by the catalog endpoint is unverified.
-- No live verification. Before relying on it, run one scoped probe through the backend login and record the outcome
-  here: first request accepted, cached tokens, tokens per second against the documented route.
+- The 2026-10-22 runs (`docs/perf/codex-efficiency/live-2026-10-22.md`) recorded accepted requests, usage, cache reads and
+  wall time on this route, but the base URL was not observed and there is no tokens-per-second comparison against the
+  documented route. Before relying on either, run one scoped probe through the backend login and record the outcome here.
 
 ## Tests
 
