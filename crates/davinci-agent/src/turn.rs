@@ -12,10 +12,11 @@ use crate::Agent;
 use crate::InternalPromptOrigin;
 use crate::ToolExecutionMode;
 
-/// Corrective turns allowed per run after a tool call is cut off by the
-/// output token limit.
 /// `customType` of the persisted context that tells the model a detached Script run finished.
 pub(crate) const SCRIPT_WAKEUP_CUSTOM_TYPE: &str = "davinci.script_wakeup";
+
+/// Corrective turns allowed per run after a tool call is cut off by the
+/// output token limit.
 const MAX_TRUNCATED_CALL_RETRIES: u32 = 2;
 
 /// What stage one decided about a call.
@@ -3953,7 +3954,17 @@ Issue the call again if it is still needed.";
         let pre_hook_result = result.clone();
         let codemode_facts = (name == "codemode")
             .then(|| crate::codemode::mandatory_facts(&result))
-            .flatten();
+            .flatten()
+            .map(|mut facts| {
+                // Record the shape the call really arrived in; `mandatory_facts`
+                // only knows the outcome and defaults to `function`.
+                if let Some(kind) = davinci_ai::originating_tool_wire_kind(&self.messages, id) {
+                    if let Some(history) = facts.get_mut("history").and_then(Value::as_object_mut) {
+                        history.insert("wireKind".into(), Value::String(kind.as_str().into()));
+                    }
+                }
+                facts
+            });
         let codemode_authority = (name == "codemode")
             .then(|| {
                 result
