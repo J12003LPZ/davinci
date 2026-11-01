@@ -11,7 +11,7 @@ pub(crate) use deadline::remaining_root_wall_ms;
 pub use dispatch::AgentCodeModeBroker;
 pub(crate) use execution::mandatory_facts;
 pub(crate) use execution::CodeModeBinding;
-pub use policy::{js_name, CapabilityPolicy};
+pub use policy::{js_name, resolve_script_alias, CapabilityPolicy};
 pub use types::*;
 
 impl Default for CodeModeMode {

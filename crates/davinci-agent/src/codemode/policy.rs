@@ -50,10 +50,60 @@ pub fn js_name(name: &str) -> String {
     }
 }
 
+/// Droid-compatible script aliases, in preference order per alias. The alias
+/// only ever names a capability that is already admitted: it never adds one.
+const SCRIPT_ALIASES: &[(&str, &[&str])] = &[
+    ("Read", &["read"]),
+    ("Grep", &["grep"]),
+    ("Glob", &["find"]),
+    ("LS", &["ls"]),
+    ("Execute", &["exec_command", "bash", "powershell"]),
+    ("ApplyPatch", &["apply_patch"]),
+    ("Edit", &["edit"]),
+    ("Write", &["write"]),
+];
+
+/// Resolve a Droid-compatible `tools.<Alias>` name to the canonical capability
+/// the run already admitted. Aliasing never creates authority.
+pub fn resolve_script_alias(
+    name: &str,
+    mode: CodeModeMode,
+    registry: &CapabilityPolicy,
+) -> Result<String, CodeModeError> {
+    if matches!(mode, CodeModeMode::Off) {
+        return Err(CodeModeError::new(
+            "DENIED",
+            "script aliases require an enabled Codemode mode",
+        ));
+    }
+    let alias = name.strip_prefix("tools.").ok_or_else(|| {
+        CodeModeError::new("DENIED", "script alias must use the tools.<Name> spelling")
+    })?;
+    if registry
+        .script_alias_collisions()
+        .iter()
+        .any(|collision| collision == alias)
+    {
+        return Err(CodeModeError::new(
+            "DENIED",
+            "script alias collides with a discovered tool",
+        ));
+    }
+    registry
+        .aliases
+        .get(&format!("tools.{alias}"))
+        .cloned()
+        .ok_or_else(|| CodeModeError::new("DENIED", "unsupported script alias"))
+}
+
 pub struct CapabilityPolicy {
     capabilities: BTreeMap<String, RuntimeCapability>,
     /// Admissible tools excluded because their JS aliases collide.
     collisions: BTreeSet<String>,
+    /// Frozen `alias -> canonical` snapshot for this Script's lifetime.
+    aliases: BTreeMap<String, String>,
+    /// Aliases withheld because a discovered tool already owns the name.
+    alias_collisions: BTreeSet<String>,
 }
 
 impl CapabilityPolicy {
@@ -123,9 +173,27 @@ impl CapabilityPolicy {
                 "capability catalog exceeds limit",
             ));
         }
+        // Snapshot the alias binding once, from the admitted catalog. A name a
+        // discovered tool already uses is ambiguous and stays unbound.
+        let mut script_aliases = BTreeMap::new();
+        let mut alias_collisions = BTreeSet::new();
+        for (alias, candidates) in SCRIPT_ALIASES {
+            if aliases.contains_key(*alias) {
+                alias_collisions.insert((*alias).to_string());
+                continue;
+            }
+            if let Some(canonical) = candidates
+                .iter()
+                .find(|candidate| admitted.contains_key(**candidate))
+            {
+                script_aliases.insert(format!("tools.{alias}"), (*canonical).to_string());
+            }
+        }
         Ok(Self {
             capabilities: admitted,
             collisions,
+            aliases: script_aliases,
+            alias_collisions,
         })
     }
 
@@ -133,9 +201,34 @@ impl CapabilityPolicy {
         self.capabilities.values().collect()
     }
 
+    /// Frozen alias snapshot for this Script, `tools.<Alias> -> canonical`.
+    pub fn script_aliases(&self) -> BTreeMap<String, String> {
+        self.aliases.clone()
+    }
+
+    /// Canonical names of tools the given script alias resolves to.
+    pub fn resolve_alias(&self, alias: &str) -> Result<&RuntimeCapability, CodeModeError> {
+        if self.alias_collisions.contains(alias) {
+            return Err(CodeModeError::new(
+                "DENIED",
+                "script alias collides with a discovered tool",
+            ));
+        }
+        let canonical = self
+            .aliases
+            .get(alias)
+            .ok_or_else(|| CodeModeError::new("DENIED", "unsupported script alias"))?;
+        self.resolve(canonical)
+    }
+
     /// Canonical names excluded because their script aliases collide.
     pub fn alias_collisions(&self) -> Vec<String> {
         self.collisions.iter().cloned().collect()
+    }
+
+    /// Droid alias names withheld because a discovered tool owns the name.
+    pub fn script_alias_collisions(&self) -> Vec<String> {
+        self.alias_collisions.iter().cloned().collect()
     }
 
     pub fn resolve(&self, canonical_name: &str) -> Result<&RuntimeCapability, CodeModeError> {
