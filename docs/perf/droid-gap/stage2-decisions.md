@@ -56,7 +56,7 @@ sections 2 and 3.
 | Baseline | Full tool surface (40 tools); Lean (16) remains selectable |
 | Raw results | `stage0-report.md` section 10; `first-request-anatomy.md` |
 | Gate | trigger not fired. Total input is `GAP` for both Droid arms, but the first request is not larger: DaVinci median 10,802 tokens against 10,946 (Droid-direct) and 11,845 (Droid-script). Uncached input is `AHEAD` for Droid-direct and `NO_CLEAR_GAP` for Droid-script. |
-| Outcome | **keep Full as the default.** The two probe cases the plan conditions on `tool_search`/`additional_tools` were not written, because the trigger that would justify them did not fire. |
+| Outcome | **keep Full as the default.** The two probe cases the plan conditions on `tool_search`/`additional_tools` were not written, because the trigger that would justify them did not fire. The closure reason is recorded in `docs/tool-discovery.md`. |
 
 ### W3 - Script-first surface
 

@@ -4,6 +4,15 @@ The [October 2 keep/cut record](readiness/openai-harness-implementation.md)
 retains Full as the default. No local fixture result promotes Lean or establishes
 lower end-to-end cost; comparisons must include expanded operations and task success.
 
+The Droid gap study closed the tool-surface workstream (W2) without running its probe
+(`docs/perf/droid-gap/stage0-report.md` sections 10 and 11). Its trigger needs a first
+request materially larger than Droid's, and the measured first request is not larger:
+median 10,802 tokens against 10,946 (Droid-direct) and 11,845 (Droid-script). Total
+input is still `GAP` for both Droid arms, so the cache loss is real but does not come
+from a larger opening request. The two probe cases the plan conditions on
+(`tool_search` with `defer_loading`, `additional_tools`) were therefore not written;
+the decision is recorded in `docs/perf/droid-gap/stage2-decisions.md`.
+
 `ToolSurface::Lean` remains opt-in. On cache-sensitive routes, a fresh Lean
 root exposes the authorized core: `read`, `grep`, `find`, `ls`, `exec_command`,
 `write_stdin`, `apply_patch`, `batch`, `tool_search`, `update_plan`,
