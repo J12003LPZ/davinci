@@ -184,6 +184,127 @@ fn controlled_broker_lost_mutation_response_closes_admission() {
     assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
+/// A guest that catches the uncertain child's error and finishes "cleanly".
+struct CatchingHost;
+impl crate::codemode::CodeModeHost for CatchingHost {
+    fn admits_controlled_mode(&self) -> bool {
+        true
+    }
+    fn execute(
+        &self,
+        _: &crate::codemode::CodeModeRequest,
+        _: &crate::codemode::CodeModeRunContext,
+        broker: Arc<dyn crate::codemode::CodeModeBroker>,
+    ) -> crate::codemode::CodeModeOutcome {
+        use crate::codemode::*;
+        let _ = broker.call(CodeModeCall {
+            request_id: 1,
+            tool: "mcp__lost__effect".into(),
+            args: json!({}),
+        });
+        CodeModeOutcome {
+            status: CodeModeStatus::Completed,
+            script_completed: true,
+            output_text: "caught".into(),
+            output_complete: true,
+            output_artifact: None,
+            children: vec![],
+            host_notes: vec![],
+            operation_ref: "fixture".into(),
+            error: None,
+        }
+    }
+}
+
+#[test]
+fn run_with_an_uncertain_child_is_stored_as_recovery_required() {
+    use crate::codemode::*;
+    let client = davinci_mcp::Client::connect_transport(
+        "lost",
+        Box::new(LostMutationResponse(
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(Mutex::new(Vec::new())),
+        )),
+    )
+    .unwrap();
+    let registry = McpRegistry::default();
+    {
+        let mut inner = registry.lock();
+        inner.clients.insert("lost".into(), ClientSlot::new(client));
+        inner
+            .routes
+            .insert("mcp__lost__effect".into(), ("lost".into(), "effect".into()));
+    }
+    use crate::runtime::operations::*;
+    use crate::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+    let workspace = tempfile::tempdir().unwrap();
+    let root = RootNamespaceId::new();
+    let identity = JournalIdentity::new(
+        JournalId::new(),
+        WorkspaceIdentity {
+            id: WorkspaceId::new(),
+            binding_version: 1,
+        },
+    )
+    .unwrap();
+    let (run_id, agent_id) = (RunId::new(), AgentId::new());
+    let context = OperationContext {
+        journal_id: identity.journal_id,
+        root_namespace_id: root,
+        session_id: "recovery-status-fixture".into(),
+        runtime_run_id: run_id,
+        parent_operation_id: None,
+        agent_id,
+        worker_id: None,
+        task_id: None,
+        graph: None,
+        workspace: identity.workspace.clone(),
+        caller: CallerType::ProviderToolCall,
+        wire_tool_call_id: None,
+    };
+    let journal = Arc::new(
+        OperationJournal::open(&workspace.path().join("journal"), identity, root).unwrap(),
+    );
+    let operations = ToolOperationRuntime::new(
+        journal,
+        context,
+        ExecutionOwner::new(ExecutionOwnerId::new(), 1).unwrap(),
+        workspace.path(),
+    )
+    .unwrap();
+    let mut agent = crate::Agent::new("recovery-status fixture");
+    agent.cwd = workspace.path().to_path_buf();
+    agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+    agent.set_runtime(
+        RuntimeHandle::new(run_id, agent_id, RuntimeBus::new()).with_operation_runtime(operations),
+    );
+    let evidence = tempfile::tempdir().unwrap();
+    agent.evidence = Some(crate::EvidenceStore::new(evidence.path()));
+    agent.attach_mcp(registry);
+    agent
+        .enable_codemode(Arc::new(CatchingHost), CodeModeMode::Controlled)
+        .unwrap();
+    let result = agent.run_codemode("call-lost", &json!({"code":"return 1;"}), None);
+    assert!(result.is_error, "{result:?}");
+    assert!(
+        result.content.contains("recoveryRequired"),
+        "{}",
+        result.content
+    );
+    let runs = ScriptRunRegistry::open(evidence.path().join("script-runs")).unwrap();
+    let stored: Vec<_> = std::fs::read_dir(evidence.path().join("script-runs"))
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| entry.path().file_stem()?.to_str().map(str::to_owned))
+        .filter(|id| !id.contains('.'))
+        .collect();
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert_eq!(
+        runs.get(&stored[0]).unwrap().state,
+        ScriptRunState::RecoveryRequired
+    );
+}
+
 struct FixtureTransport {
     mixed: bool,
     failed: bool,

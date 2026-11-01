@@ -1,7 +1,62 @@
 //! Durable, host-owned Script run records. Guest code never writes these
 //! fields and never supplies a handle it can forge.
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Identity of this host process, stored on every record it creates so a later
+/// process can tell its own runs from runs a dead process left open.
+fn process_owner() -> &'static str {
+    static OWNER: OnceLock<String> = OnceLock::new();
+    OWNER.get_or_init(|| format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()))
+}
+
+fn owner_pid(owner: &str) -> Option<u32> {
+    owner.split('-').next()?.parse().ok()
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    let signalled = unsafe { libc::kill(pid as i32, 0) };
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    signalled == 0 || errno == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    // SAFETY: query-only handle, closed before returning.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        !ok || code == STILL_ACTIVE
+    }
+}
+
+/// One lock per registry directory, shared by every registry handle and every
+/// clone of the agent in this process.
+fn directory_lock(dir: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key)
+        .or_default()
+        .clone()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +90,10 @@ pub struct ScriptRunRecord {
     /// A finished run's wakeup has been delivered exactly once.
     #[serde(default)]
     pub notified: bool,
+    /// Host process that created the record; `None` for records written
+    /// before the field existed.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,12 +123,14 @@ impl ScriptRunRecord {
             state: ScriptRunState::Created,
             log_ref: None,
             notified: false,
+            owner: Some(process_owner().into()),
         }
     }
 }
 
 pub struct ScriptRunRegistry {
     dir: PathBuf,
+    lock: Arc<Mutex<()>>,
 }
 
 impl ScriptRunRegistry {
@@ -77,12 +138,60 @@ impl ScriptRunRegistry {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)
             .map_err(|_| ScriptRunError::new("UNAVAILABLE", "script run store unavailable"))?;
-        Ok(Self { dir })
+        let registry = Self {
+            lock: directory_lock(&dir),
+            dir,
+        };
+        registry.reconcile_once();
+        Ok(registry)
+    }
+
+    fn guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.lock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The first open of a directory in this process recovers records that a
+    /// dead process left open. Records owned by this process or by a process
+    /// that is still alive are never touched.
+    fn reconcile_once(&self) {
+        static SEEN: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+        let key = self.dir.canonicalize().unwrap_or_else(|_| self.dir.clone());
+        let first = SEEN
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key);
+        if !first {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(run_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let Ok(record) = self.get(run_id) else {
+                continue;
+            };
+            let owner_live = record.owner.as_deref().is_some_and(|owner| {
+                owner == process_owner() || owner_pid(owner).is_some_and(process_alive)
+            });
+            if record.state.terminal() || owner_live {
+                continue;
+            }
+            let _ = reconcile_script_run(self, run_id);
+        }
     }
 
     /// Write-ahead creation: the record is durable before the script runs.
     pub fn create(&self, record: &ScriptRunRecord) -> Result<(), ScriptRunError> {
         let path = self.path(&record.run_id)?;
+        let _guard = self.guard();
         if path.exists() {
             return Err(ScriptRunError::new("DENIED", "script run already exists"));
         }
@@ -119,6 +228,7 @@ impl ScriptRunRegistry {
     /// Advance the state monotonically. A repeated terminal state is a
     /// suppressed duplicate (`false`); going backwards is refused.
     pub fn transition(&self, run_id: &str, next: ScriptRunState) -> Result<bool, ScriptRunError> {
+        let _guard = self.guard();
         let mut record = self.get(run_id)?;
         if record.state == next && next.terminal() {
             return Ok(false);
@@ -162,14 +272,21 @@ impl ScriptRunRegistry {
         use std::io::Write;
         let bytes = serde_json::to_vec(record)
             .map_err(|_| ScriptRunError::new("PROTOCOL_ERROR", "invalid script run record"))?;
-        let temp = path.with_extension("json.tmp");
+        static TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let temp = path.with_extension(format!(
+            "json.{}.{}.tmp",
+            std::process::id(),
+            TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let mut file = std::fs::File::create(&temp)
             .map_err(|_| ScriptRunError::new("UNAVAILABLE", "script run write failed"))?;
         file.write_all(&bytes)
             .and_then(|()| file.sync_all())
             .map_err(|_| ScriptRunError::new("UNAVAILABLE", "script run write failed"))?;
-        std::fs::rename(&temp, path)
-            .map_err(|_| ScriptRunError::new("UNAVAILABLE", "script run write failed"))
+        std::fs::rename(&temp, path).map_err(|_| {
+            let _ = std::fs::remove_file(&temp);
+            ScriptRunError::new("UNAVAILABLE", "script run write failed")
+        })
     }
 }
 
@@ -190,6 +307,7 @@ pub fn reconcile_script_run(
     registry: &ScriptRunRegistry,
     run_id: &str,
 ) -> Result<ReconciledScriptRun, ScriptRunError> {
+    let _guard = registry.guard();
     let mut record = registry.get(run_id)?;
     if record.state.terminal() {
         // RecoveryRequired may resolve through the operation journal, but this
@@ -253,6 +371,7 @@ impl ScriptRunRegistry {
 
     /// Mark one finished run as delivered so it can never wake a turn twice.
     pub fn mark_notified(&self, run_id: &str) -> Result<(), ScriptRunError> {
+        let _guard = self.guard();
         let mut record = self.get(run_id)?;
         if record.notified {
             return Ok(());

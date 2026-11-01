@@ -659,3 +659,97 @@ fn directive_text_after_the_header_is_ordinary_content() {
         );
     }
 }
+
+#[test]
+fn concurrent_registry_handles_never_lose_or_duplicate_a_transition() {
+    use davinci_agent::codemode::{ScriptRunRecord, ScriptRunRegistry, ScriptRunState};
+    let dir = tempfile::tempdir().unwrap();
+    let registry = ScriptRunRegistry::open(dir.path()).unwrap();
+    for run in ["shared", "other"] {
+        registry
+            .create(&ScriptRunRecord::new(run, "call", Some("s"), "w", "rev"))
+            .unwrap();
+        registry.transition(run, ScriptRunState::Running).unwrap();
+    }
+    let path = dir.path().to_path_buf();
+    let handles: Vec<_> = (0..16)
+        .map(|index| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                // Each thread has its own handle, like a clone of the agent.
+                let registry = ScriptRunRegistry::open(&path).unwrap();
+                let won = registry
+                    .transition("shared", ScriptRunState::Completed)
+                    .unwrap();
+                registry
+                    .create(&ScriptRunRecord::new(
+                        &format!("own-{index}"),
+                        "call",
+                        Some("s"),
+                        "w",
+                        "rev",
+                    ))
+                    .unwrap();
+                registry.mark_notified("other").unwrap();
+                won
+            })
+        })
+        .collect();
+    let winners = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .filter(|won| *won)
+        .count();
+    assert_eq!(winners, 1);
+    assert_eq!(
+        registry.get("shared").unwrap().state,
+        ScriptRunState::Completed
+    );
+    assert!(registry.get("other").unwrap().notified);
+    let leftovers = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("tmp"))
+        .count();
+    assert_eq!(leftovers, 0);
+}
+
+#[test]
+fn first_open_recovers_only_runs_a_dead_process_left_open() {
+    use davinci_agent::codemode::{ScriptRunRecord, ScriptRunRegistry, ScriptRunState};
+    let dir = tempfile::tempdir().unwrap();
+    let write = |run: &str, owner: Option<String>, state: ScriptRunState| {
+        let mut record = ScriptRunRecord::new(run, "call", Some("s"), "w", "rev");
+        record.owner = owner;
+        record.state = state;
+        std::fs::write(
+            dir.path().join(format!("{run}.json")),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+    };
+    let dead = Some("2147483646-dead".to_string());
+    // Another host that is alive: this test process under a different owner id.
+    let live = Some(format!("{}-another-host", std::process::id()));
+    write("dead-running", dead.clone(), ScriptRunState::Running);
+    write("legacy-running", None, ScriptRunState::Running);
+    write("live-running", live, ScriptRunState::Running);
+    write("dead-done", dead, ScriptRunState::Completed);
+
+    let registry = ScriptRunRegistry::open(dir.path()).unwrap();
+    let state = |run: &str| registry.get(run).unwrap().state;
+    assert_eq!(state("dead-running"), ScriptRunState::RecoveryRequired);
+    assert_eq!(state("legacy-running"), ScriptRunState::RecoveryRequired);
+    assert_eq!(state("live-running"), ScriptRunState::Running);
+    assert_eq!(state("dead-done"), ScriptRunState::Completed);
+
+    // A run this process creates afterwards is never claimed by a later open.
+    registry
+        .create(&ScriptRunRecord::new("mine", "call", Some("s"), "w", "rev"))
+        .unwrap();
+    registry
+        .transition("mine", ScriptRunState::Running)
+        .unwrap();
+    let again = ScriptRunRegistry::open(dir.path()).unwrap();
+    assert_eq!(again.get("mine").unwrap().state, ScriptRunState::Running);
+}

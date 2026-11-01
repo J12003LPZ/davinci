@@ -657,6 +657,7 @@ impl Agent {
                 context.clone(),
                 parent,
             )?);
+            let authority = super::authority_fingerprint(self)?;
             // Write-ahead the run before the guest starts, so a crash leaves a
             // durable record to reconcile instead of an invisible orphan.
             let runs = self.evidence.as_ref().and_then(|evidence| {
@@ -674,19 +675,7 @@ impl Agent {
                     let _ = registry.transition(&record.run_id, super::ScriptRunState::Running);
                 }
             }
-            let authority = super::authority_fingerprint(self)?;
             let mut outcome = binding.host.execute(request, &context, broker.clone());
-            if let Some(registry) = &runs {
-                let state = match outcome.status {
-                    CodeModeStatus::Completed | CodeModeStatus::Partial => {
-                        super::ScriptRunState::Completed
-                    }
-                    CodeModeStatus::Failed => super::ScriptRunState::Failed,
-                    CodeModeStatus::Cancelled => super::ScriptRunState::Cancelled,
-                    CodeModeStatus::RecoveryRequired => super::ScriptRunState::RecoveryRequired,
-                };
-                let _ = registry.transition(&context.identity.invocation_id, state);
-            }
             let drained = broker.close(std::time::Duration::from_millis(
                 context.limits.cleanup_grace_ms,
             ));
@@ -777,6 +766,19 @@ impl Agent {
                 self.counters
                     .codemode_empty_results
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // Only the final status is published: the registry never records a
+            // terminal state that the evaluation above then contradicts.
+            if let Some(registry) = &runs {
+                let state = match outcome.status {
+                    CodeModeStatus::Completed | CodeModeStatus::Partial => {
+                        super::ScriptRunState::Completed
+                    }
+                    CodeModeStatus::Failed => super::ScriptRunState::Failed,
+                    CodeModeStatus::Cancelled => super::ScriptRunState::Cancelled,
+                    CodeModeStatus::RecoveryRequired => super::ScriptRunState::RecoveryRequired,
+                };
+                let _ = registry.transition(&context.identity.invocation_id, state);
             }
             Ok((outcome, authority))
         }
