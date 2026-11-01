@@ -330,9 +330,10 @@ are not part of this selection.
 
 Live follow-ups (each needs its own approval naming runs, pins and model; none was started):
 
-- **W3 probe** (at most 4 requests): one non-patch custom freeform tool case and one hosted
-  `programmatic_tool_calling` case, then, only if accepted, the offline projection work and a
-  Script-first A/B (at most 24 runs).
+- **W3 probe** (at most 4 requests): **run 2026-10-31** on `gpt-5.6-luna` after fixing the probe's
+  route. The non-patch custom freeform case was accepted (HTTP 200, 0 cached, 0 cache-write);
+  hosted `programmatic_tool_calling` was rejected (HTTP 400, `Unsupported tool type`). Step 2 shipped
+  behind the freeform flag; the Script-first A/B (at most 24 runs) has not run.
 - **Cache-drop investigation** (not a plan workstream): enable cache-identity logging for DaVinci runs
   so the 16 mid-run drops in Section 9 can be explained, then a small A/B only if a DaVinci-side cause
   is found. This is the largest untriggered cost seen in the data (32.6% of uncached input).

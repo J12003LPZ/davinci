@@ -1,7 +1,7 @@
 //! Explicit maintainer probe for the ChatGPT Codex Responses backend.
 //! Tests never call this module's network runner.
 
-use davinci_ai::RawProviderReply;
+use davinci_ai::{Model, RawProviderReply, ResolvedAuth};
 use serde_json::{json, Value};
 
 pub(crate) struct ProbeCase {
@@ -361,13 +361,23 @@ fn select_case_names(
     Ok(selected)
 }
 
+/// The probe must follow the same route as a live turn: a ChatGPT backend login
+/// moves the model to the backend, and every other credential keeps the
+/// documented public route. Without this the probe sent the subscription token
+/// to `api.openai.com` and recorded a 401 instead of a capability result.
+fn probe_target(model: &Model, auth: &ResolvedAuth) -> (Model, String) {
+    let routed = davinci_ai::codex_backend::route_model(model, auth).into_owned();
+    let url = davinci_ai::request_url(&routed, auth);
+    (routed, url)
+}
+
 pub(crate) fn run(parsed: &crate::Args, report_path: &std::path::Path) -> Result<(), String> {
     let model_id = parsed
         .model
         .clone()
         .unwrap_or_else(|| "gpt-5.6-luna".into());
     let (model, auth) = crate::resolve_model_and_auth(parsed, "openai-codex", &model_id)?;
-    let url = davinci_ai::request_url(&model, &auth);
+    let (model, url) = probe_target(&model, &auth);
     let bootstrap = "DaVinci probe stable text. ".repeat(260);
     let cases = probe_cases(&model.id, &bootstrap);
     let names: Vec<&'static str> = cases.iter().map(|case| case.name).collect();
@@ -442,6 +452,42 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), cases.len());
+    }
+
+    fn codex_model() -> Model {
+        serde_json::from_value(json!({
+            "id":"gpt-5.6-luna", "name":"fixture", "api":"openai-codex-responses",
+            "provider":"openai-codex", "baseUrl":"https://api.openai.com/v1", "reasoning":true,
+            "input":["text"], "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},
+            "contextWindow":1000,"maxTokens":100
+        }))
+        .expect("model fixture")
+    }
+
+    fn auth(source: &str) -> ResolvedAuth {
+        ResolvedAuth {
+            api_key: Some("tok".into()),
+            headers: std::collections::HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer tok".to_string(),
+            )]),
+            source: source.into(),
+        }
+    }
+
+    #[test]
+    fn probe_follows_the_same_route_as_a_live_turn() {
+        let model = codex_model();
+        let (routed, url) = probe_target(&model, &auth(davinci_ai::codex_backend::AUTH_SOURCE));
+        assert_eq!(url, "https://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(
+            routed.base_url.as_deref(),
+            Some(davinci_ai::codex_backend::BACKEND_BASE_URL)
+        );
+
+        let (kept, public) = probe_target(&model, &auth("api-key"));
+        assert_eq!(public, "https://api.openai.com/v1/responses");
+        assert_eq!(kept.base_url.as_deref(), Some("https://api.openai.com/v1"));
     }
 
     fn find_case(name: &str) -> ProbeCase {

@@ -168,3 +168,35 @@ runtime-bound cache, and `cache-status`/summary, proving that an omitted write c
 stays null/unreported and an explicit zero stays numeric/reported. It performs no
 live model call. This distinguishes decoder correctness from an incorrectly bound
 test cache and covers the actual transport boundary as well as fixtures.
+
+## W3 capability probe (2026-10-31)
+
+Ran `davinci --codex-probe` with `--model gpt-5.6-luna` against the ChatGPT backend, four requests:
+the two W3 cases and their byte-identical reuse follow-ups. The capture was sanitized before
+retention (outcome, status, cache counts, header names); it is at
+`C:\bench\droid-gap-2026-10-31\w3-probe-sanitized.json`.
+
+| Probe case | Result |
+| --- | --- |
+| `custom_freeform_non_patch` | Accepted HTTP 200; cached 0, cache-write 0 |
+| `custom_freeform_non_patch_reuse` | Accepted HTTP 200; cached 0, cache-write 0 |
+| `programmatic_tool_calling` | Rejected HTTP 400, `Unsupported tool type: programmatic_tool_calling` |
+| `programmatic_tool_calling_reuse` | Rejected HTTP 400, same message |
+
+- The backend accepts a custom freeform tool whose name is not `apply_patch` and that carries no
+  `format` or `parameters`, so Codemode can be projected as a custom freeform tool.
+- The hosted `programmatic_tool_calling` tool is not available on this route. This matches the plan's
+  decision to cut the hosted-PTC adapter; no support is claimed.
+- Both accepted cases reported zero cached and zero cache-write tokens, and the identical repeat read
+  no cached prefix. That is consistent with the earlier probe cases on this route.
+- A rejected base case cannot produce cache evidence through its reuse: the 400 is request-shape
+  validation, so the identical repeat fails identically.
+
+### Route defect found and fixed
+
+The probe built its URL with `davinci_ai::request_url` on the model returned by
+`resolve_model_and_auth`, without the `codex_backend::route_model` step every live turn performs.
+With a ChatGPT login that sent the subscription token to `api.openai.com` and returned
+`401 ... Missing scopes: api.responses.write` for all four cases. The probe now routes the model the
+same way a live turn does; `codex_probe::tests::probe_follows_the_same_route_as_a_live_turn` pins
+both outcomes (backend URL for a backend credential, public URL otherwise).
