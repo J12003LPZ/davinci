@@ -181,7 +181,7 @@ fn context_mode_comparison_does_not_lose_requirements() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = ContextVmRuntime::new(
             ContextVmConfig {
-                mode: mode.clone(),
+                mode,
                 ..ContextVmConfig::default()
             },
             CacheRuntime::new(CacheConfig::default(), Some(directory.path().to_path_buf())),
