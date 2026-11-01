@@ -5,6 +5,11 @@ command run in this session (see [Commands run](#commands-run)); the 1.0.0 refer
 (`C:\Users\sergi\Desktop\lean-droid-1.0\droid-re-research\DROID-1.0.0-COMPLETE-RUNTIME-REFERENCE.md`,
 build `0.244.0`) is quoted only where a row is labelled `not re-checked`.
 
+Update 2026-10-31 (Task 11): the mock suite was later re-run against a local mock on an alternate
+port, with no provider request and CLIProxyAPI untouched. Rows 4-8 and 12 below carry the result;
+section 7 gives the method and the per-scenario numbers. Sections 1-4 and 6 are the original,
+offline Stage 0 record.
+
 ## 1. Identity table
 
 ### Droid
@@ -120,8 +125,8 @@ it always prints the base catalog.
 Byte size: `--list-tools` does **not** report a request-visible tool-schema byte size. The
 `-o json` dump of the 30 tool definitions is **79,558 bytes** of JSON (measured file size), which
 is a serialization of the `--list-tools` output, not the request tool-schema bytes. The request
-tool-schema bytes (Script 29,728 / direct 69,689) require the mock capture and are `not
-re-checked` here.
+tool-schema bytes (Script 29,728 / direct 69,689) require the mock capture; they were taken in the
+Task 11 mock re-run (section 7): Script 29,746 B, direct 69,711 B.
 
 ## 4. Account-scoped config (redacted `node effective-config.js`)
 
@@ -179,16 +184,17 @@ Labels: `same as 1.0.0` / `changed` / `not re-checked`.
 | 1 | `--tool-execution-mode` hidden flag exists | **same as 1.0.0** | accepted + validated: `--tool-execution-mode bogus` → `error: ... Expected direct-only or script-only`; `direct-only`/`script-only` run exit 0. Absent from help in both versions. |
 | 2 | `--auto` levels | **same as 1.0.0** | 1.1.0 CLI flag accepts three values `low|medium|high`; the no-flag DEFAULT is read-only, which corresponds to the settings-enum value `off` (the settings `autonomyLevel` enum has four values `off|low|medium|high`). Same surface as 1.0.0. |
 | 3 | `--list-tools` availability | **same as 1.0.0** | present in help; exits before any model call; returns 30 tools for the GPT-family alias (1.0.0: 30 GPT / 31 Claude). |
-| 4 | Script-mode tool count / bytes (5 / 29,728 B) | **not re-checked** | needs the mock capture (ch. 19 §2.1); mock suite forbidden (R3 — binds 8317 where CLIProxyAPI runs). |
-| 5 | Direct-mode tool count / bytes (23 / 69,689 B) | **not re-checked** | needs the mock capture (ch. 19 §2.1); same R3 reason. |
-| 6 | 3/6 repeat thresholds (nudge 3, stop 6) | **not re-checked** | runtime-proven only via mock (ch. 19 §5.1, X27); static constants not re-extracted from the 1.1.0 binary. R3. |
-| 7 | 3 silent turns stop | **not re-checked** | runtime-proven only via mock (ch. 19 §5.2, X28). R3. |
-| 8 | Background wait and kill | **not re-checked** | runtime-proven only via mock (ch. 19 §5.4, X25/X26/X30). R3. |
+| 4 | Script-mode tool count / bytes (5 / 29,728 B) | **changed** (bytes only) | Mock capture (section 7): 5 tools, same set (`Script`, `WaitForScript`, `TaskOutput`, `TaskStop`, `Task`); `tools` array 29,746 B, which is +18 B on 1.0.0. |
+| 5 | Direct-mode tool count / bytes (23 / 69,689 B) | **changed** (bytes only) | Mock capture (section 7): 23 tools; `tools` array 69,711 B, which is +22 B on 1.0.0. |
+| 6 | 3/6 repeat thresholds (nudge 3, stop 6) | **same as 1.0.0** | Runtime-proven on the mock (`repeat_read`, 6 requests): the "You repeated identical tool calls 3 times" reminder first rides on request 4 and stays in requests 5-6; droid log `Stopping run after repeated identical tool calls {"count":6,"limit":6}`. Static constants were still not re-extracted from the 1.1.0 binary. |
+| 7 | 3 silent turns stop | **same as 1.0.0** | Runtime-proven on the mock with the reasoning-only scenario (`reasoning`): two `Response had no visible output, continuing agent loop` lines, then `Stopping run after consecutive no-output turns {"count":3}`. (An empty-message mock, `silent`, ends the run after one request without a nudge; it is not the same case.) |
+| 8 | Background wait and kill | **same as 1.0.0** for wait and kill; **changed** for exit with a live Script (X30) | `bg_wait`: `WaitForScript` returns `BG_DONE` after 2.0 s. `bg_kill`: `WaitForScript {action:"kill"}` returns `cancelled`. X30 (one-shot `droid exec` ends while a background Script runs): the stderr line still appears, now reading `exiting with 1 undelivered Script result(s) [call_s1] (script-run-not-awaited: ...)`, but the exit code is **0**, not 1 (stdout JSON `is_error` false). New in 1.1.0: after the first turn end with a live Script the model gets a one-time system reminder ("Script run `call_s1` is still running ... This is the only reminder: ending your turn again while it runs stops it and discards its result"). |
 | 9 | Script allow-list (12 models) | **same as 1.0.0** | `effective-config.js` 1.1.0 list is byte-identical to 1.0.0's (reference lines 5013–5024). |
 | 10 | Subagent limits (1 / 8 / 15) | **same as 1.0.0** | `nested_task_delegation_limits {max_depth:1, max_active_descendants_per_root:8, max_active_task_subagents_per_daemon:15}` identical (reference 5027–5031). |
 | 11 | Compaction flags | **same as 1.0.0** | `adaptive_compaction_prompt=true`, `mid_conversation_tool_changes=true`; all 19 flags identical to 1.0.0 snapshot (reference 4989–5008). |
-| 12 | Model alias resolution (`custom:Codex-via-ChatGPT-(gpt-6.1-sol)-0`) | **not re-checked** | Established this session: the CLI accepts the alias and maps it to the display name "Codex via ChatGPT (gpt-6.1-sol)"; `--list-tools` runs against it; settings.json still maps `baseUrl http://localhost:8317/v1`, `provider openai`. Not established: whether the alias resolves to the allow-list entry `gpt-6.1-sol` for Script mode — the 1.0.0 reference grades that Inferred/Unknown (`ya()` unresolved, reference line 3643), and `--list-tools` only prints the base catalog built *before* mode resolution (`jZ`), with `Script`/`WaitForScript` injected at session scope (reference line 3748; see §3). |
+| 12 | Model alias resolution (`custom:Codex-via-ChatGPT-(gpt-6.1-sol)-0`) | **not re-checked** | Task 11 note: the Codex alias was deliberately never used (a provider-request risk); a probe alias `custom:mock-probe-0` whose `model` is `gpt-6.1-sol` did get Script mode (the `Script` tool is present in the request). The alias format `custom:<displayName>-<index>` is confirmed. Established in Stage 0: the CLI accepts the alias and maps it to the display name "Codex via ChatGPT (gpt-6.1-sol)"; `--list-tools` runs against it; settings.json still maps `baseUrl http://localhost:8317/v1`, `provider openai`. Not established: whether the alias resolves to the allow-list entry `gpt-6.1-sol` for Script mode — the 1.0.0 reference grades that Inferred/Unknown (`ya()` unresolved, reference line 3643), and `--list-tools` only prints the base catalog built *before* mode resolution (`jZ`), with `Script`/`WaitForScript` injected at session scope (reference line 3748; see §3). |
 | 13 | Proxy endpoint as part of the system under test | **changed** | endpoint URL config unchanged (`http://localhost:8317/v1`), but liveness changed: 1.0.0 `connection refused` (ch. 16 §2.1) → 1.1.0 **listening** (`Test-NetConnection 127.0.0.1:8317` → `TcpTestSucceeded=True`). |
+| 14 | Per-process `--settings` file can define a custom model with its own `baseUrl` (new; not a relied-on 1.0.0 fact) | **works in 1.1.0** | Gate run: `droid exec -m custom:mock-probe-0 --settings <file>` sent its requests to `http://127.0.0.1:18317/v1/responses` (mock log), exit 0. No `~\.factory\settings.json` write. |
 
 Additional identity deltas (not part of the 13 relied-on facts above, but recorded because
 finding 1 flags them): product version `1.0.0 → 1.1.0`, build tag `0.244.0 → 1.1.0`, binary
@@ -198,8 +204,8 @@ size `326,704,352 → 327,162,080` B, SHA-256 changed.
 
 No provider request was made: only `--help`, `--version`, `--list-tools` (which exits before any
 model call), file hashing, config reads, and one TCP port check. No prompt was ever passed to
-`droid exec`, and the mock suite (`run-live-script-experiments.ps1`) and
-`mock-responses-server.js` were **not** run.
+`droid exec` during the original Stage 0 pass; the mock suite (`run-live-script-experiments.ps1`) and
+`mock-responses-server.js` were **not** run then (the later Task 11 re-run is section 7).
 
 ```
 git rev-parse --abbrev-ref HEAD                                   # J12003LPZ/droid-gap-stage0
@@ -221,3 +227,47 @@ Test-NetConnection 127.0.0.1 -Port 8317                                         
 ```
 
 No settings file, CLIProxyAPI config, or `~\.factory` file was written.
+
+## 7. Mock re-run on an alternate port (Task 11, 2026-10-31)
+
+Method. CLIProxyAPI on port 8317 was not stopped, restarted or reconfigured, and 8317 was never
+bound. A copy of `mock-responses-server.js` (scratchpad, not the original) listened on
+`127.0.0.1:18317` and refused 8317; it adds a per-request `epoch_ms` and the HTTP method to its
+log. Every Droid process ran with `--settings <scratchpad file>` whose only `customModels` entry is
+`{model: gpt-6.1-sol, displayName: mock-probe, baseUrl: http://127.0.0.1:18317/v1, provider: openai,
+dummy apiKey}`, i.e. the alias `custom:mock-probe-0`, which exists only in that file (the
+`Codex-via-ChatGPT` alias was never used). Every Droid and DaVinci process also ran with
+`HTTP_PROXY=HTTPS_PROXY=http://127.0.0.1:9` and `NO_PROXY=127.0.0.1,localhost`, so any non-local
+HTTP would have failed. `~\.factory\settings.json` and the CLIProxyAPI config were not written
+(only Droid's own session and log files under `~\.factory`). Droid exited 0 in all 14 mock runs; the
+mock saw every request and nothing else was contacted.
+
+Gate. One `droid exec -m custom:mock-probe-0 --settings <file> --tool-execution-mode script-only
+--auto high -o json hello` returned exit 0, `num_turns` 2, usage 200 in / 10 out, and the mock log
+holds 2 `POST /v1/responses` (model `gpt-6.1-sol`, 5 tools, 54,621 and 54,845 B). PASS.
+
+Scenarios (the runner's 12 plus `silent`; requests and total request bytes per run):
+
+| Scenario | Mode | Requests | Request bytes | Outcome |
+|---|---|---:|---:|---|
+| `nested` | script | 2 | 110,309 | nested `Read` OK; nested `Execute` without `riskLevel` rejected |
+| `nested2` | script | 2 | 110,042 | nested `Execute` with `riskLevel` low returned `NESTED_OK` |
+| `sandbox` | script | 2 | 110,456 | `require`, dynamic import, `process`, `fetch`, `Deno`, `Bun` denied; `globalThis.process` undefined |
+| `failure` | script | 2 | 109,573 | Script status `failed` with `BOOM_TEST` |
+| `syntax` | script | 2 | 109,663 | "Unterminated string literal at program line 1, column 6" plus the input-block hint |
+| `script_reads` | script | 2 | 110,285 | three reads in one Script result |
+| `direct_reads` | direct | 4 | 379,701 | three reads over four requests |
+| `repeat_read` | direct | 6 | 572,025 | nudge on request 4, stop at 6 |
+| `reasoning` | direct | 6 | n/r | reasoning-only turns; stop after 3 no-output turns |
+| `bg` | script | 3 | 165,386 | status `running`; exit 0 (see row 8) |
+| `bg_wait` | script | 3 | 164,895 | `BG_DONE` after 2.0 s |
+| `bg_kill` | script | 3 | 164,956 | `cancelled` |
+| `silent` | direct | 1 | n/r | empty message ends the run |
+
+`n/r`: not recorded in this table. Only the facts in section 5 are compared with 1.0.0 (X29:
+`direct_reads` 4 requests / 379,701 B against 1.0.0's 379,787 B, and `script_reads` 2 requests /
+110,285 B against 110,307 B). The other outcomes are 1.1.0 observations, not compared line by line.
+
+Tool counts and bytes (first request, `script_reads` and `direct_reads`; byte counts are the
+compact JSON substrings of the raw request body, so they match the wire): see
+[first-request-anatomy.md](first-request-anatomy.md) section 1b.

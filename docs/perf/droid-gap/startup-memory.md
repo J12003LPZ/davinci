@@ -151,22 +151,51 @@ Ratio is DaVinci / Droid on the medians; below 1 means DaVinci is lower.
 |---|---:|---:|---:|---:|---|
 | `--version` wall time | 17.56 ms | 82.78 ms | 0.212 | DaVinci 78.8% lower | No. DaVinci is faster. |
 | Peak RSS at `--version` | 9.14 MiB | 105.20 MiB | 0.087 | DaVinci 91.3% lower | No. DaVinci is lower. |
-| Time to first provider request | not measured | not measured | n/a | n/a | not measured |
+| Time to first provider request (spawn to the mock receiving request 1) | 461 ms | 791 ms | 0.583 | DaVinci 41.7% lower | No. DaVinci is faster. |
 
 No measured row shows DaVinci worse than Droid by more than 25%, so nothing is filed under the
 resource-lifecycle plan and `docs/superpowers/plans/2026-10-21-resource-lifecycle.md` is unchanged.
 The plan's note that Droid 1.0.0 was about 218 MB is a different version and a different point in the
 process (a session, not `--version`); it is not comparable to the 105 MiB above.
 
+## 5b. Time to first provider request (Task 11)
+
+Ten repetitions per harness, interleaved (Droid, DaVinci, Droid, ...), same Windows machine, one local
+mock on `127.0.0.1:18317`. Time runs from the driver's high-resolution clock just before spawning the
+process to the mock's `epoch_ms` stamp on the first `POST /v1/responses` (both from the host's system
+clock). No provider was contacted: Droid used `--settings` with the alias `custom:mock-probe-0` and
+`--tool-execution-mode script-only`; DaVinci used the checkpoint binary `davinci.exe` (SHA-256
+`11e6b08f...a6e`, source `c3868d87`) with a temp agent directory whose `models.json` defines an
+`openai-responses` provider at the mock, `--no-session`, `-p hello`. Both ran with
+`HTTP_PROXY=HTTPS_PROXY=http://127.0.0.1:9`, and CLIProxyAPI on 8317 was not touched.
+
+| Rep | Droid 1.1.0 (ms) | DaVinci (ms) |
+|---:|---:|---:|
+| 1 | 806 | 482 |
+| 2 | 791 | 429 |
+| 3 | 758 | 431 |
+| 4 | 708 | 461 |
+| 5 | 946 | 460 |
+| 6 | 796 | 464 |
+| 7 | 700 | 503 |
+| 8 | 802 | 411 |
+| 9 | 791 | 502 |
+| 10 | 790 | 437 |
+
+| Statistic | DaVinci | Droid 1.1.0 |
+|---|---:|---:|
+| median | 461 ms | 791 ms |
+| min | 411 ms | 700 ms |
+| max | 503 ms | 946 ms |
+
+Reading it: both runs continue past request 1 (two requests each) but only request 1 is timed. The
+DaVinci configuration is the minimal one (no session, no MCP, dummy credentials) and the Droid one
+is Droid's normal `exec` start, so this is a spawn-to-first-request figure for a trivial prompt, not a
+task-latency claim. The OS file cache was warm after the first pair, and no repetition was discarded.
+Rep order is the driver order (`Droid`, `DaVinci` alternating), not sorted.
+
 ## 6. Not measured
 
-- **Time to first provider request, both harnesses.** The Droid side needs a mock, and
-  `mock-responses-server.js` is hard-wired to port 8317, where the live CLIProxyAPI runs (Task 3;
-  ledger ruling R3). It was not run, the proxy was not stopped, and `run-live-script-experiments.ps1`
-  was not run. No existing Droid stub that binds another port was found. DaVinci's existing offline stub
-  (`docs/perf/resource-lifecycle.md`, offline CLI invocation) is an in-process stub, not a server a
-  request can be timed against, and a one-sided number would not be comparable. The row is
-  `not measured`, not zero, and no live request was made.
 - **Peak RSS from a post-exit read.** The method fell back to sampling (section 2), so the RSS values
   are sampled lower bounds.
 - **Child processes** of either binary, and cold-cache versus warm-cache behavior (OS caches were not
@@ -176,7 +205,7 @@ process (a session, not `--version`); it is not comparable to the 105 MiB above.
 
 - Process start for `--version` is not task latency. It shows how heavy each runtime is to start (a
   native Rust binary against a Bun standalone runtime, per the identity doc), not how fast either
-  finishes a coding task or issues its first request.
+  finishes a coding task. Section 5b adds the spawn-to-first-request time, still for a trivial prompt.
 - RSS at `--version` is not RSS mid-session. Neither process had loaded a session, a model catalog,
   tools or a conversation. Mid-session memory needs a live or mocked session and is not measured here.
 - The DaVinci binary's source commit is unrecorded (section 1), so this describes that binary, not a
