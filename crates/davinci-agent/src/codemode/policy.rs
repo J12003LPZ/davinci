@@ -117,6 +117,64 @@ pub fn effect_is_admitted(mode: &CodeModeMode, effect: &DeclaredEffect) -> bool 
     }
 }
 
+/// Explicit host opt-ins for tools a Script may otherwise never reach. Both
+/// default off: a script can never widen its own catalog.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScriptToolGates {
+    pub allow_todo: bool,
+    pub allow_subagents: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScriptSubagentPolicy {
+    pub allow: bool,
+    pub depth: u32,
+    pub max_depth: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptSubagentRequest {
+    pub description: String,
+}
+
+/// Admit one child agent from inside a Script. Off unless the host enabled it,
+/// bounded by depth and the parent's remaining budget.
+pub fn admit_script_subagent(
+    request: &ScriptSubagentRequest,
+    policy: &ScriptSubagentPolicy,
+    budget_remaining: usize,
+) -> Result<(), CodeModeError> {
+    if !policy.allow {
+        return Err(CodeModeError::new(
+            "DENIED",
+            "subagents inside a Script require explicit feature approval",
+        ));
+    }
+    if request.description.trim().is_empty() || request.description.len() > 4096 {
+        return Err(CodeModeError::new(
+            "INVALID_INPUT",
+            "subagent brief must be non-empty and bounded",
+        ));
+    }
+    if policy.depth >= policy.max_depth {
+        return Err(CodeModeError::new("DENIED", "subagent depth limit reached"));
+    }
+    if budget_remaining == 0 {
+        return Err(CodeModeError::new(
+            "LIMIT_EXCEEDED",
+            "parent worker budget is exhausted",
+        ));
+    }
+    Ok(())
+}
+
+/// Tools excluded from every Script catalog unless an explicit host gate opens
+/// them. `todo` stays out by default: a script must not gain bookkeeping
+/// authority implicitly.
+fn is_excluded(name: &str, gates: ScriptToolGates) -> bool {
+    EXCLUDED.contains(&name) && !(name == "todo" && gates.allow_todo)
+}
+
 pub struct CapabilityPolicy {
     capabilities: BTreeMap<String, RuntimeCapability>,
     /// Admissible tools excluded because their JS aliases collide.
@@ -132,11 +190,19 @@ impl CapabilityPolicy {
         mode: CodeModeMode,
         capabilities: Vec<RuntimeCapability>,
     ) -> Result<Self, CodeModeError> {
+        Self::new_with_gates(mode, capabilities, ScriptToolGates::default())
+    }
+
+    pub fn new_with_gates(
+        mode: CodeModeMode,
+        capabilities: Vec<RuntimeCapability>,
+        gates: ScriptToolGates,
+    ) -> Result<Self, CodeModeError> {
         let mut admitted = BTreeMap::new();
         let mut aliases: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for capability in capabilities {
             if matches!(mode, CodeModeMode::Off)
-                || EXCLUDED.contains(&capability.name.as_str())
+                || is_excluded(&capability.name, gates)
                 || (matches!(mode, CodeModeMode::ReadOnly) && !capability.read_only)
             {
                 continue;
@@ -163,7 +229,7 @@ impl CapabilityPolicy {
                 continue;
             }
             let alias = js_name(&capability.name);
-            if alias.is_empty() || EXCLUDED.contains(&alias.as_str()) {
+            if alias.is_empty() || is_excluded(&alias, gates) {
                 continue;
             }
             if capability.name.len() > 1024 || admitted.contains_key(&capability.name) {
@@ -198,7 +264,12 @@ impl CapabilityPolicy {
         // discovered tool already uses is ambiguous and stays unbound.
         let mut script_aliases = BTreeMap::new();
         let mut alias_collisions = BTreeSet::new();
-        for (alias, candidates) in SCRIPT_ALIASES {
+        let todo_alias: &[(&str, &[&str])] = if gates.allow_todo {
+            &[("TodoWrite", &["todo"])]
+        } else {
+            &[]
+        };
+        for (alias, candidates) in SCRIPT_ALIASES.iter().chain(todo_alias.iter()) {
             if aliases.contains_key(*alias) {
                 alias_collisions.insert((*alias).to_string());
                 continue;

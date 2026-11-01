@@ -171,6 +171,88 @@ fn codemode_aliases_are_policy_bounded() {
 }
 
 #[test]
+fn script_subagent_requires_user_authority_and_budget() {
+    use davinci_agent::codemode::{
+        admit_script_subagent, ScriptSubagentPolicy, ScriptSubagentRequest,
+    };
+    let request = ScriptSubagentRequest {
+        description: "search the parser for the offset bug".into(),
+    };
+    // Off by default: a script cannot fan out without explicit authority.
+    let default_policy = ScriptSubagentPolicy::default();
+    assert_eq!(
+        admit_script_subagent(&request, &default_policy, 1)
+            .unwrap_err()
+            .code,
+        "DENIED"
+    );
+    // An authorized parent still needs depth and budget.
+    let allowed = ScriptSubagentPolicy {
+        allow: true,
+        depth: 0,
+        max_depth: 2,
+        ..Default::default()
+    };
+    assert!(admit_script_subagent(&request, &allowed, 1).is_ok());
+    assert_eq!(
+        admit_script_subagent(&request, &allowed, 0)
+            .unwrap_err()
+            .code,
+        "LIMIT_EXCEEDED"
+    );
+    let too_deep = ScriptSubagentPolicy {
+        depth: 2,
+        ..allowed
+    };
+    assert_eq!(
+        admit_script_subagent(&request, &too_deep, 1)
+            .unwrap_err()
+            .code,
+        "DENIED"
+    );
+    // An empty or oversized brief is refused before any worker starts.
+    let empty = ScriptSubagentRequest {
+        description: "  ".into(),
+    };
+    assert!(admit_script_subagent(&empty, &allowed, 1).is_err());
+    let huge = ScriptSubagentRequest {
+        description: "x".repeat(8192),
+    };
+    assert!(admit_script_subagent(&huge, &allowed, 1).is_err());
+}
+
+#[test]
+fn script_todo_update_shares_work_without_extra_turn() {
+    use davinci_agent::codemode::{resolve_script_alias, CapabilityPolicy, ScriptToolGates};
+    // Off by default: the todo tool stays outside the script catalog.
+    let closed = CapabilityPolicy::new(
+        CodeModeMode::Controlled,
+        vec![capability("todo", false), capability("read", true)],
+    )
+    .unwrap();
+    let denied =
+        resolve_script_alias("tools.TodoWrite", CodeModeMode::Controlled, &closed).unwrap_err();
+    assert_eq!(denied.code, "DENIED");
+    // Explicitly enabled, the alias maps to the same host-owned todo tool and
+    // gains no new permission.
+    let open = CapabilityPolicy::new_with_gates(
+        CodeModeMode::Controlled,
+        vec![capability("todo", false), capability("read", true)],
+        ScriptToolGates {
+            allow_todo: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_script_alias("tools.TodoWrite", CodeModeMode::Controlled, &open).unwrap(),
+        "todo"
+    );
+    // Reads remain available in the same script, so the update shares a turn.
+    assert!(open.resolve("read").is_ok());
+}
+
+#[test]
 fn queued_mutation_revocation_is_denied() {
     use davinci_agent::codemode::effect_is_admitted;
     use davinci_agent::runtime::DeclaredEffect;

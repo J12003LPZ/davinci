@@ -18,7 +18,10 @@ pub(crate) use execution::mandatory_facts;
 pub(crate) use execution::CodeModeBinding;
 pub use fixtures::{droid_script_fixture_status, ScriptFixtureStatus};
 pub use history::{project_script_history, ScriptHistoryItem, SCRIPT_WIRE_KIND};
-pub use policy::{effect_is_admitted, js_name, resolve_script_alias, CapabilityPolicy};
+pub use policy::{
+    admit_script_subagent, effect_is_admitted, js_name, resolve_script_alias, CapabilityPolicy,
+    ScriptSubagentPolicy, ScriptSubagentRequest, ScriptToolGates,
+};
 pub use recovery::{reconcile_script_child_effect, resolve_script_effect, ScriptEffectResolution};
 pub use runs::{
     reconcile_script_run, ReconciledScriptRun, ScriptRunError, ScriptRunRecord, ScriptRunRegistry,
