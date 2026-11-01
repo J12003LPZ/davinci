@@ -1,4 +1,6 @@
-use davinci_agent::codemode::projection::{project_script_result, validate_json};
+use davinci_agent::codemode::projection::{
+    assemble_script_output, project_script_result, validate_json,
+};
 use davinci_agent::ToolResult;
 use serde_json::json;
 
@@ -78,6 +80,37 @@ fn tool_errors_and_oversized_structured_data_fail_explicitly() {
     .unwrap_err();
     assert_eq!(error.code, "INCOMPLETE_DATA");
     assert!(error.message.contains("no authorized artifact"));
+}
+
+#[test]
+fn script_output_is_bounded_and_marked() {
+    let items = vec![
+        json!({"type":"text","text":"a"}),
+        json!({"type":"text","text":"b"}),
+    ];
+    let output = assemble_script_output(&items, 16, 1024).unwrap();
+    assert_eq!(output.text, "ab");
+    assert!(output.complete);
+
+    let big = json!({"type":"text","text":"x".repeat(100)});
+    let output = assemble_script_output(&[big], 16, 1024).unwrap();
+    assert!(!output.complete, "{output:?}");
+    assert!(output.text.len() <= 16, "{output:?}");
+    assert!(output.text.contains("truncated"), "{output:?}");
+
+    // Image parity is an explicit OPEN gap: fail closed, never drop silently.
+    let error = assemble_script_output(
+        &[json!({"type":"image","data":"AA==","mimeType":"image/png"})],
+        16,
+        1024,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "UNSUPPORTED_OUTPUT");
+
+    // The collected aggregate is bounded independently of the visible limit.
+    let error = assemble_script_output(&[json!({"type":"text","text":"x".repeat(4096)})], 16, 1024)
+        .unwrap_err();
+    assert_eq!(error.code, "LIMIT_EXCEEDED");
 }
 
 #[test]

@@ -779,6 +779,7 @@ impl NodeCodeModeHost {
         let mut tool_calls = 0u32;
         let mut result_bytes = 0usize;
         let mut pending_broker = std::collections::BTreeSet::new();
+        let mut notifications: Vec<String> = Vec::new();
         let outcome = (|| loop {
             if context.cancellation.is_cancelled() {
                 return Err(
@@ -851,6 +852,15 @@ impl NodeCodeModeHost {
                     "host run identity mismatch",
                 ));
             }
+            // A notification is a bounded wakeup signal, not model output and
+            // not an authority grant. It never becomes a tool result.
+            if kind == "notify" {
+                let text = frame["text"].as_str().unwrap_or_default();
+                if text.len() <= 4096 && notifications.len() < 16 {
+                    notifications.push(format!("Script notification: {text}"));
+                }
+                continue;
+            }
             if kind == "finished" {
                 if !pending_broker.is_empty() {
                     context.cancellation.cancel();
@@ -863,58 +873,38 @@ impl NodeCodeModeHost {
                 let ok = result["ok"]
                     .as_bool()
                     .ok_or_else(|| CodeModeError::new("PROTOCOL_ERROR", "invalid completion"))?;
-                let mut text = String::new();
-                if let Some(items) = result["output"].as_array() {
-                    for item in items {
-                        let value = item["text"].as_str().ok_or_else(|| {
-                            CodeModeError::new("PROTOCOL_ERROR", "unsupported output")
-                        })?;
-                        if text.len() + value.len() > limits.collected_output_bytes {
-                            return Err(CodeModeError::new(
-                                "LIMIT_EXCEEDED",
-                                "collected output limit",
-                            ));
-                        }
-                        text.push_str(value);
-                    }
-                }
+                let mut items = result["output"].as_array().cloned().unwrap_or_default();
                 if let Some(value) = result.get("value") {
                     let value = serde_json::to_string(value)
                         .map_err(|_| CodeModeError::new("PROTOCOL_ERROR", "invalid return"))?;
-                    if text.len() + value.len() > limits.collected_output_bytes {
-                        return Err(CodeModeError::new(
-                            "LIMIT_EXCEEDED",
-                            "collected return limit",
-                        ));
-                    }
-                    text.push_str(&value);
+                    items.push(json!({"type":"text","text":value}));
                 }
-                let complete = text.len() <= limits.output_bytes;
-                if !complete {
-                    let mut end = limits.output_bytes;
-                    while !text.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    text.truncate(end);
+                let output = davinci_agent::codemode::projection::assemble_script_output(
+                    &items,
+                    limits.output_bytes,
+                    limits.collected_output_bytes,
+                )?;
+                let mut notes = notifications.clone();
+                if !output.complete {
+                    notes.push(format!(
+                        "Script output was truncated; {} bytes omitted.",
+                        output.omitted_bytes
+                    ));
                 }
                 return Ok(CodeModeOutcome {
                     // Truncated output is not a complete result: a caller that
                     // only checks for success must not take it as one.
-                    status: match (ok, complete) {
+                    status: match (ok, output.complete) {
                         (true, true) => CodeModeStatus::Completed,
                         (true, false) => CodeModeStatus::Partial,
                         (false, _) => CodeModeStatus::Failed,
                     },
                     script_completed: ok,
-                    output_text: text,
-                    output_complete: complete,
+                    output_text: output.text,
+                    output_complete: output.complete,
                     output_artifact: None,
                     children: vec![],
-                    host_notes: if complete {
-                        vec![]
-                    } else {
-                        vec!["Script output was truncated.".into()]
-                    },
+                    host_notes: notes,
                     operation_ref: context
                         .identity
                         .parent_operation_ref

@@ -107,11 +107,27 @@ async function execute(message) {
     return { name: tool.name, description: "", execute: (args, { signal }) => request("tool_call", tool.name, args, signal) };
   });
   const controller = new AbortController();
+  let notifications = 0;
+  let notificationBytes = 0;
   const sandbox = new CodemodeSandbox({
     workerUrl: new URL("./bounded-worker.mjs", import.meta.url),
     tools, timeoutMs: message.timeoutMs, memoryLimitBytes: message.memoryBytes,
-    globals: ["search", "describe"].map((name) => ({ name: `codemode.${name}`,
-      execute: (args, { signal }) => request("metadata_query", name, args, signal) })),
+    globals: [
+      ...["search", "describe"].map((name) => ({ name: `codemode.${name}`,
+        execute: (args, { signal }) => request("metadata_query", name, args, signal) })),
+      // `notify` is a bounded wakeup signal, never a model message or a grant.
+      { name: "notify", execute: (value) => {
+        const text = typeof value === "string" ? value : JSON.stringify(value);
+        const bytes = Buffer.byteLength(text);
+        notifications += 1;
+        notificationBytes += bytes;
+        if (notifications > 16 || bytes > 4096 || notificationBytes > 16384) {
+          return Promise.reject(new Error("LIMIT_EXCEEDED: notify budget exhausted"));
+        }
+        send({ type: "notify", runId: active?.runId, text });
+        return Promise.resolve({ ok: true });
+      } },
+    ],
   });
   active = { runId: message.runId, controller, background: source.background };
   try {

@@ -88,6 +88,80 @@ pub fn adapt_script_arguments(tool: &str, args: Value) -> Result<Value, CodeMode
     Ok(serde_json::json!({"input": patch.unwrap_or_default()}))
 }
 
+/// Visible script output assembled from the guest's explicit emit channels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptOutput {
+    pub text: String,
+    pub complete: bool,
+    pub omitted_bytes: usize,
+}
+
+/// Assemble `text()`/`console` items into the model-visible output. Text is
+/// truncated only with an explicit omitted marker and `complete: false`.
+/// Image items fail closed until a trusted image projection exists.
+pub fn assemble_script_output(
+    items: &[Value],
+    limit: usize,
+    collected_limit: usize,
+) -> Result<ScriptOutput, CodeModeError> {
+    let mut collected = String::new();
+    for item in items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                let text = item.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    CodeModeError::new("PROTOCOL_ERROR", "malformed text output item")
+                })?;
+                if collected.len() + text.len() > collected_limit {
+                    return Err(CodeModeError::new(
+                        "LIMIT_EXCEEDED",
+                        "collected output limit",
+                    ));
+                }
+                collected.push_str(text);
+            }
+            Some("image") => {
+                // No trusted bounded image projection exists yet, so claiming
+                // image output would be a false parity claim.
+                return Err(CodeModeError::new(
+                    "UNSUPPORTED_OUTPUT",
+                    "image output is not yet supported; OPEN parity gap",
+                ));
+            }
+            _ => {
+                return Err(CodeModeError::new(
+                    "PROTOCOL_ERROR",
+                    "unsupported output item",
+                ))
+            }
+        }
+    }
+    if collected.len() <= limit {
+        return Ok(ScriptOutput {
+            text: collected,
+            complete: true,
+            omitted_bytes: 0,
+        });
+    }
+    let omitted = collected.len() - limit;
+    let full_marker = format!("\n…[truncated: {omitted} bytes omitted]");
+    let mut marker_end = full_marker.len().min(limit);
+    while marker_end > 0 && !full_marker.is_char_boundary(marker_end) {
+        marker_end -= 1;
+    }
+    let marker = &full_marker[..marker_end];
+    let mut keep = limit - marker.len();
+    while keep > 0 && !collected.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let mut text = collected[..keep].to_string();
+    text.push_str(marker);
+    Ok(ScriptOutput {
+        text,
+        complete: false,
+        omitted_bytes: omitted,
+    })
+}
+
 pub fn project_script_result(
     result: crate::ToolResult,
     structured: Option<Value>,

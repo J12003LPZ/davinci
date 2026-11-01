@@ -199,6 +199,21 @@ test("a directive after the code is ordinary content", async () => {
   } finally { host.child.kill(); }
 });
 
+test("script explicit output only", async () => {
+  const host = start();
+  try {
+    await host.next();
+    host.send({ type: "execute", runId: "output", tools: [], timeoutMs: 2000, memoryBytes: 67108864,
+      code: 'const big = "x".repeat(100000); text("summary"); await notify("long job finished"); return big.length;' });
+    const notice = await host.next();
+    assert.equal(notice.type, "notify");
+    assert.equal(notice.text, "long job finished");
+    const finished = await host.next();
+    assert.equal(finished.result.value, 100000);
+    assert.deepEqual(finished.result.output, [{ type: "text", text: "summary" }]);
+  } finally { host.child.kill(); }
+});
+
 test("host runs under the Node permission model with read-only asset access", async () => {
   const root = fileURLToPath(new URL(".", import.meta.url));
   const host = start(["--permission", "--allow-worker", `--allow-fs-read=${root}`]);
