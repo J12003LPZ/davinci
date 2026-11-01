@@ -53,6 +53,37 @@ fn malformed_script_headers_are_rejected_before_dispatch() {
 }
 
 #[test]
+fn droid_profile_caps_are_hard() {
+    let limits = CodeModeLimits::default();
+    // The published safe profile. These are ceilings, not targets to raise.
+    assert_eq!(limits.script_bytes, 65536);
+    assert_eq!(limits.wall_ms, 60000);
+    assert_eq!(limits.tool_calls, 64);
+    assert_eq!(limits.parallelism, 4);
+    assert_eq!(limits.output_bytes, 16384);
+    assert_eq!(limits.output_events, 1024);
+    assert_eq!(limits.input_bytes, 1048576);
+    // A request may lower a limit but never raise one.
+    let request = CodeModeRequest {
+        code: "return 1".into(),
+        timeout_ms: Some(300000),
+        max_output_bytes: Some(65536),
+    };
+    let effective = limits.for_request(&request).unwrap();
+    assert!(effective.wall_ms <= limits.wall_ms);
+    assert!(effective.output_bytes <= limits.output_bytes);
+    assert_eq!(effective.tool_calls, limits.tool_calls);
+    assert_eq!(effective.output_events, limits.output_events);
+    assert_eq!(effective.input_bytes, limits.input_bytes);
+}
+
+#[test]
+fn no_runtime_requirement_without_codemode() {
+    // Codemode is off unless a trusted host stages it; nothing here spawns Node.
+    assert!(matches!(CodeModeMode::default(), CodeModeMode::Off));
+}
+
+#[test]
 fn script_execute_reports_exit_and_test_failures() {
     use davinci_agent::codemode::projection::adapt_script_tool_result;
     use davinci_agent::ToolResult;

@@ -86,6 +86,34 @@ fn native_truncated_output_is_partial_not_completed() {
 
 #[test]
 #[ignore = "requires the disposable admitted Node and fixture bundle"]
+fn oversized_script_fails_closed_and_preserves_tail() {
+    // A 10 MB accidental emit must be bounded by the host without crashing,
+    // and the model must still learn that the output was cut.
+    let outcome = fixture_host().execute(
+        &CodeModeRequest {
+            code: "text('x'.repeat(10485760)); return 'tail-marker';".into(),
+            timeout_ms: Some(5000),
+            max_output_bytes: Some(8192),
+        },
+        &fixture_context("oversized-fixture"),
+        std::sync::Arc::new(Catalog {
+            delay: Default::default(),
+        }),
+    );
+    assert!(!outcome.output_complete, "{outcome:?}");
+    assert!(outcome.output_text.len() <= 8192, "{outcome:?}");
+    assert!(outcome.output_text.contains("truncated"), "{outcome:?}");
+    assert!(
+        matches!(
+            outcome.status,
+            CodeModeStatus::Partial | CodeModeStatus::Failed
+        ),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires the disposable admitted Node and fixture bundle"]
 fn native_slow_catalog_discovery_counts_against_the_timeout() {
     let outcome = fixture_host().execute(
         &CodeModeRequest {

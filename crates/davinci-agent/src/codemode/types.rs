@@ -51,6 +51,8 @@ pub struct CodeModeLimits {
     pub total_result_bytes: usize,
     pub frame_bytes: usize,
     pub output_bytes: usize,
+    pub output_events: usize,
+    pub input_bytes: usize,
     pub collected_output_bytes: usize,
     pub metadata_calls: u32,
     pub metadata_bytes: usize,

@@ -879,6 +879,12 @@ impl NodeCodeModeHost {
                         .map_err(|_| CodeModeError::new("PROTOCOL_ERROR", "invalid return"))?;
                     items.push(json!({"type":"text","text":value}));
                 }
+                if items.len() > limits.output_events {
+                    return Err(CodeModeError::new(
+                        "LIMIT_EXCEEDED",
+                        "script emitted too many output events",
+                    ));
+                }
                 let output = davinci_agent::codemode::projection::assemble_script_output(
                     &items,
                     limits.output_bytes,

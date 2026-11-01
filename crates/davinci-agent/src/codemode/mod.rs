@@ -37,6 +37,8 @@ impl Default for CodeModeLimits {
             total_result_bytes: 8388608,
             frame_bytes: 2097152,
             output_bytes: 16384,
+            output_events: 1024,
+            input_bytes: 1048576,
             collected_output_bytes: 1048576,
             metadata_calls: 64,
             metadata_bytes: 524288,
@@ -48,7 +50,7 @@ impl Default for CodeModeLimits {
 /// Bounded mirror of the host's raw-source lexer. The host owns the
 /// authoritative parse; this refuses a header that cannot be well formed
 /// before any child is dispatched.
-pub fn validate_script_source(code: &str) -> Result<(), CodeModeError> {
+pub fn validate_script_source(code: &str, input_limit: usize) -> Result<(), CodeModeError> {
     fn check_name(name: &str) -> bool {
         let mut chars = name.chars();
         chars
@@ -104,7 +106,7 @@ pub fn validate_script_source(code: &str) -> Result<(), CodeModeError> {
                 .iter()
                 .map(|line| line.len() + 1)
                 .sum::<usize>();
-            if input_bytes > 65536 {
+            if input_bytes > input_limit {
                 return Err(CodeModeError::new(
                     "LIMIT_EXCEEDED",
                     "script input aggregate exceeds limit",
@@ -179,7 +181,7 @@ impl CodeModeLimits {
                 "nonempty source without option-header directives is required",
             ));
         }
-        validate_script_source(&request.code)?;
+        validate_script_source(&request.code, limits.input_bytes)?;
         if request.code.len() > self.script_bytes.min(65536) {
             return Err(CodeModeError::new(
                 "LIMIT_EXCEEDED",
