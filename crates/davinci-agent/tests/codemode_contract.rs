@@ -24,6 +24,35 @@ impl CodeModeHost for FixedHost {
 }
 
 #[test]
+fn malformed_script_headers_are_rejected_before_dispatch() {
+    let request = |code: &str| CodeModeRequest {
+        code: code.into(),
+        timeout_ms: None,
+        max_output_bytes: None,
+    };
+    for bad in [
+        "// @input: patch <<'PATCH'\nalpha\nreturn 1;",
+        "// @input: a <<'T'\nx\nT\n// @input: a <<'U'\ny\nU\nreturn 1;",
+        "// @input: a <<T\nx\nT\nreturn 1;",
+    "// @input: __proto__ <<'T'\nx\nT\nreturn 1;",
+        "// @script: {\"startInBackground\": true}\n// @script: {\"startInBackground\": true}\nreturn 1;",
+        "// @script: {\"startInBackground\": \"yes\"}\nreturn 1;",
+        "// @script: not-json\nreturn 1;",
+    ] {
+        assert!(
+            CodeModeLimits::default().for_request(&request(bad)).is_err(),
+            "{bad:?}"
+        );
+    }
+    // A well-formed header stays admissible and its trailing newline is data.
+    assert!(CodeModeLimits::default()
+        .for_request(&request(
+            "// @input: patch <<'PATCH'\nalpha\nPATCH\n// @script: {\"startInBackground\": true}\nreturn inputs.patch;"
+        ))
+        .is_ok());
+}
+
+#[test]
 fn unknown_mutation_never_auto_replays() {
     use davinci_agent::codemode::{resolve_script_effect, ScriptEffectResolution};
     use davinci_agent::runtime::operations::{EffectStatus, OperationState};

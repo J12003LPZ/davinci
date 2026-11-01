@@ -9,6 +9,58 @@ let terminal = false;
 let nextRequest = 0;
 const pending = new Map();
 
+const INPUT_MARKER = /^\/\/ @input: ([A-Za-z_][A-Za-z0-9_]*) <<'([A-Za-z0-9_]+)'$/;
+const SCRIPT_DIRECTIVE = /^\/\/ @script: (.+)$/;
+
+// Droid-compatible raw source: leading `// @input: name <<'TAG'` blocks and a
+// `// @script: {"startInBackground":true}` directive, then ordinary code.
+// Anything after the first code line is code, not header.
+function parseScriptSource(source) {
+  const lines = source.split("\n");
+  const inputs = Object.create(null);
+  let background = false;
+  let directiveSeen = false;
+  let index = 0;
+  for (; index < lines.length; index++) {
+    const line = lines[index];
+    if (line.startsWith("// @input")) {
+      const marker = INPUT_MARKER.exec(line);
+      if (!marker) throw new Error("malformed script input marker");
+      const [, name, tag] = marker;
+      if (name === "__proto__" || name === "constructor" || name === "prototype") {
+        throw new Error("reserved script input name");
+      }
+      if (name in inputs) throw new Error("duplicate script input");
+      const start = index + 1;
+      let end = start;
+      while (end < lines.length && lines[end] !== tag) end++;
+      if (end >= lines.length) throw new Error("unclosed script input");
+      inputs[name] = lines.slice(start, end).map((content) => `${content}\n`).join("");
+      index = end;
+      continue;
+    }
+    if (line.startsWith("// @script")) {
+      const directive = SCRIPT_DIRECTIVE.exec(line);
+      if (!directive) throw new Error("malformed script directive");
+      if (directiveSeen) throw new Error("duplicate script directive");
+      directiveSeen = true;
+      let options;
+      try { options = JSON.parse(directive[1]); } catch { throw new Error("malformed script directive"); }
+      if (options === null || typeof options !== "object" || Array.isArray(options)) throw new Error("malformed script directive");
+      const unknown = Object.keys(options).filter((key) => key !== "startInBackground");
+      if (unknown.length) throw new Error("unknown script directive");
+      if (options.startInBackground !== undefined && typeof options.startInBackground !== "boolean") {
+        throw new Error("malformed script directive");
+      }
+      background = options.startInBackground === true;
+      continue;
+    }
+    if (line.trim() === "" || line.startsWith("//")) continue;
+    break;
+  }
+  return { code: lines.slice(index).join("\n"), inputs, background };
+}
+
 function send(message) {
   if (!terminal) process.stdout.write(encodeFrame({ version: 1, ...message }));
 }
@@ -46,6 +98,7 @@ async function execute(message) {
     || !Number.isInteger(message.memoryBytes) || message.memoryBytes < 8388608 || message.memoryBytes > 134217728) {
     throw new Error("invalid execution");
   }
+  const source = parseScriptSource(message.code);
   const aliases = new Set();
   const tools = message.tools.map((tool) => {
     if (typeof tool.name !== "string" || tool.name.length > 1024
@@ -60,9 +113,13 @@ async function execute(message) {
     globals: ["search", "describe"].map((name) => ({ name: `codemode.${name}`,
       execute: (args, { signal }) => request("metadata_query", name, args, signal) })),
   });
-  active = { runId: message.runId, controller };
+  active = { runId: message.runId, controller, background: source.background };
   try {
-    const result = await sandbox.execute(message.code, { store: {}, signal: controller.signal });
+    // Inputs are plain data captured in the header; they are not authority.
+    const code = Object.keys(source.inputs).length
+      ? `const inputs = ${JSON.stringify(source.inputs)};\n${source.code}`
+      : source.code;
+    const result = await sandbox.execute(code, { store: {}, signal: controller.signal });
     // No persistent scratch writes or guest-authored journal state cross this boundary.
     delete result.storeWrites;
     send({ type: "finished", runId: message.runId, result });

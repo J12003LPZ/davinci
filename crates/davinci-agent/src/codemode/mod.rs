@@ -45,11 +45,118 @@ impl Default for CodeModeLimits {
     }
 }
 
+/// Bounded mirror of the host's raw-source lexer. The host owns the
+/// authoritative parse; this refuses a header that cannot be well formed
+/// before any child is dispatched.
+pub fn validate_script_source(code: &str) -> Result<(), CodeModeError> {
+    fn check_name(name: &str) -> bool {
+        let mut chars = name.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+    fn check_tag(tag: &str) -> bool {
+        !tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+    let mut inputs: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut directive = false;
+    let mut input_bytes = 0usize;
+    let lines: Vec<&str> = code.split('\n').collect();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        if let Some(spec) = line.strip_prefix("// @input: ") {
+            let (name, rest) = spec.split_once(" <<'").ok_or_else(|| {
+                CodeModeError::new("INVALID_INPUT", "malformed script input marker")
+            })?;
+            let tag = rest
+                .strip_suffix('\'')
+                .filter(|tag| check_tag(tag) && rest.matches('\'').count() == 1)
+                .ok_or_else(|| {
+                    CodeModeError::new("INVALID_INPUT", "malformed script input marker")
+                })?;
+            if !check_name(name) {
+                return Err(CodeModeError::new(
+                    "INVALID_INPUT",
+                    "malformed script input name",
+                ));
+            }
+            if matches!(name, "__proto__" | "constructor" | "prototype") {
+                return Err(CodeModeError::new(
+                    "INVALID_INPUT",
+                    "reserved script input name",
+                ));
+            }
+            if !inputs.insert(name) {
+                return Err(CodeModeError::new(
+                    "INVALID_INPUT",
+                    "duplicate script input",
+                ));
+            }
+            let start = index + 1;
+            let end = lines[start..]
+                .iter()
+                .position(|candidate| *candidate == tag)
+                .map(|offset| start + offset)
+                .ok_or_else(|| CodeModeError::new("INVALID_INPUT", "unclosed script input"))?;
+            input_bytes += lines[start..end]
+                .iter()
+                .map(|line| line.len() + 1)
+                .sum::<usize>();
+            if input_bytes > 65536 {
+                return Err(CodeModeError::new(
+                    "LIMIT_EXCEEDED",
+                    "script input aggregate exceeds limit",
+                ));
+            }
+            index = end + 1;
+            continue;
+        }
+        if line.starts_with("// @input") {
+            return Err(CodeModeError::new(
+                "INVALID_INPUT",
+                "malformed script input marker",
+            ));
+        }
+        if let Some(raw) = line.strip_prefix("// @script: ") {
+            if directive {
+                return Err(CodeModeError::new(
+                    "INVALID_INPUT",
+                    "duplicate script directive",
+                ));
+            }
+            directive = true;
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            struct ScriptDirective {
+                #[serde(default)]
+                start_in_background: Option<bool>,
+            }
+            let parsed = serde_json::from_str::<ScriptDirective>(raw)
+                .map_err(|_| CodeModeError::new("INVALID_INPUT", "malformed script directive"))?;
+            // Parsed and bounded here; the host decides when to detach.
+            let _requested_background = parsed.start_in_background;
+            index += 1;
+            continue;
+        }
+        if line.starts_with("// @script") {
+            return Err(CodeModeError::new(
+                "INVALID_INPUT",
+                "malformed script directive",
+            ));
+        }
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    Ok(())
+}
+
 /// Whether the script opens with an option-header directive. Option
-/// headers are not a supported control channel, so they are refused rather
-/// than silently ignored. Only the header counts: the leading run of blank
-/// and `//` lines. The first line of code ends it, so the same text later in
-/// the script (a comment, or a line inside a template literal) is content.
 fn has_option_header(code: &str) -> bool {
     for line in code.lines() {
         let line = line.trim_start();
@@ -72,6 +179,7 @@ impl CodeModeLimits {
                 "nonempty source without option-header directives is required",
             ));
         }
+        validate_script_source(&request.code)?;
         if request.code.len() > self.script_bytes.min(65536) {
             return Err(CodeModeError::new(
                 "LIMIT_EXCEEDED",

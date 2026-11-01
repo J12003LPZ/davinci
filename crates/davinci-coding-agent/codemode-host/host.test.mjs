@@ -140,6 +140,65 @@ test("escaped output beyond the frame limit is reported as a limit, not a protoc
   } finally { host.child.kill(); }
 });
 
+test("script input blocks are byte exact", async () => {
+  const host = start();
+  try {
+    await host.next();
+    const source = [
+      "// @input: patch <<'PATCH'",
+      "alpha",
+      "  beta",
+      "PATCH",
+      '// @script: {"startInBackground": true}',
+      "return await tools.echo({ patch: inputs.patch });",
+    ].join("\n");
+    host.send({ type: "execute", runId: "inputs", code: source, tools: [{ name: "echo" }], timeoutMs: 1000, memoryBytes: 67108864 });
+    const call = await host.next();
+    assert.equal(call.type, "tool_call");
+    assert.equal(call.arguments.patch, "alpha\n  beta\n");
+    host.send({ type: "tool_result", runId: "inputs", requestId: call.requestId, ok: true, value: { ok: true } });
+    assert.equal((await host.next()).type, "finished");
+  } finally { host.child.kill(); }
+});
+
+test("malformed input blocks run zero children", async () => {
+  const cases = [
+    // unclosed tag
+    "// @input: patch <<'PATCH'\nalpha\nreturn await tools.echo({});",
+    // duplicate key
+    "// @input: a <<'T'\nx\nT\n// @input: a <<'U'\ny\nU\nreturn 1;",
+    // hostile delimiter syntax
+    "// @input: a <<T\nx\nT\nreturn 1;",
+    // reserved prototype name
+    "// @input: __proto__ <<'T'\nx\nT\nreturn 1;",
+    // duplicate / malformed background directive
+    '// @script: {"startInBackground": true}\n// @script: {"startInBackground": true}\nreturn 1;',
+    '// @script: {"startInBackground": "yes"}\nreturn 1;',
+    "// @script: not-json\nreturn 1;",
+  ];
+  for (const source of cases) {
+    const host = start();
+    try {
+      await host.next();
+      host.send({ type: "execute", runId: "malformed", code: source, tools: [{ name: "echo" }], timeoutMs: 1000, memoryBytes: 67108864 });
+      assert.equal((await host.next()).type, "fatal");
+    } finally { host.child.kill(); }
+  }
+});
+
+test("a directive after the code is ordinary content", async () => {
+  const host = start();
+  try {
+    await host.next();
+    host.send({
+      type: "execute", runId: "content", tools: [], timeoutMs: 1000, memoryBytes: 67108864,
+      code: 'const sample = `\n// @input: evil <<\'T\'\n`;\nreturn sample.includes("evil") && typeof inputs === "undefined" ? "content" : "parsed";',
+    });
+    const finished = await host.next();
+    assert.equal(finished.result.value, "content");
+  } finally { host.child.kill(); }
+});
+
 test("host runs under the Node permission model with read-only asset access", async () => {
   const root = fileURLToPath(new URL(".", import.meta.url));
   const host = start(["--permission", "--allow-worker", `--allow-fs-read=${root}`]);
