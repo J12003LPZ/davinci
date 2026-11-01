@@ -46,8 +46,9 @@ can be inspected without re-running it. Both disappear when the mode is off.
 With controlled mode on, a script that opens with
 `// @script: {"startInBackground": true}` runs detached and returns
 `{"state": "running", "toolCallId": "<handle>"}` immediately. The run is owned
-by the session: its cancellation token is a child of the session token, so
-closing or cancelling the session stops it, and `wait_for_script` accepts
+by the session: its cancellation token is a child of the session token, and
+session replacement, RPC `create_session` and exit paths drain open runs
+(a launch during a drain is refused). `wait_for_script` accepts
 `status`, a bounded `wait`, and `kill`. A finished detached run stores a bounded
 summary (status, at most 16 scrubbed notifications of 4096 bytes, and the
 retained Script log reference) in the same write that publishes its terminal
@@ -60,6 +61,25 @@ running is reported only when the next turn begins. Polling with `status` or
 `wait` is not counted as a stalled loop by the progress watchdog; `kill` is. A run that cannot be stopped
 is recorded as `recoveryRequired`, never as completed or cancelled, and guest
 JavaScript is never resumed after a crash.
+
+`kill` cancels the run and waits a bounded grace; the worker records its own
+terminal state, and a timeout gives `recoveryRequired`. A run owned by another
+process returns `NOT_OWNER`. A dead owner's open runs are reconciled at the
+first registry open in a process. Handles are scoped to a branch navigation
+epoch: a run started on another branch does not resolve and its wakeup is not
+delivered there, and navigating back does not restore access.
+
+## Function fallback (deferred gap)
+
+The design asks to preserve a function-typed script fallback when the custom
+freeform shape is rejected. Automatic retry is not implemented. Today the
+fallback is the opt-in rollout flag (`PI_CODEX_APPLY_PATCH`, shared with
+`apply_patch`): with it off, `codemode` is a function tool.
+`script_wire_mode` and `script_wire_fallback` exist with no production caller,
+because automatic fallback touches the request retry core and no real
+rejection of the custom shape has been observed (the route accepted it,
+`docs/cache/codex-backend-probe.md`). A captured real rejection would unblock
+it.
 
 ## Rollback
 

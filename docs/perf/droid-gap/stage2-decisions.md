@@ -18,7 +18,7 @@ merged. It changes no default and claims no parity. Every number below is copied
 | Workstreams with a live step still unrun | W3 | plan, Stage 1 W3 |
 
 The gate has nothing to decide yet: no candidate default change exists, because the
-only fired workstream (W3) has not run its probe. The 900-run requirement is larger
+only fired workstream (W3) ran its probe (custom freeform accepted, hosted PTC rejected) but not its A/B. The 900-run requirement is larger
 than the 64 runs left, so a head-to-head claim cannot be produced inside this
 program's budget. That is a budget fact, not a result, and it is why the program ends
 at a measured gap rather than a parity claim.
@@ -128,7 +128,8 @@ anchors even though no default moved.
 - That any subscription allowance was saved. Token counts do not prove that, and the
   Stage 0 study recorded no usage windows (deviation 2 in `stage0-report.md`).
 - That the Codemode Script-first surface is better, cheaper, or cache-friendlier. Its
-  probe has not run.
+  probe ran on 2026-10-31 (capability only: custom freeform accepted, hosted PTC
+  rejected); the A/B has not run.
 
 ## 4. Coverage matrix status
 
@@ -193,8 +194,8 @@ covered there, not here.
 | W3 probe: `custom_freeform_non_patch` and `programmatic_tool_calling`, each with a byte-identical reuse follow-up | 4 requests | **run 2026-10-31**: custom freeform accepted 200, hosted PTC rejected 400; evidence in `docs/cache/codex-backend-probe.md` |
 | W3 step 2: project `codemode` as a custom freeform tool | 0 | delivered behind the freeform flag (`e84830a7`); enabling it still needs the probe's acceptance evidence |
 | W3 step 3: Script-first A/B | at most 24 runs | its own preregistration and approval |
-| W3 step 4: controlled mode | 0 runs, C08 gate | only if step 3 wins |
-| Cache-drop investigation (16 mid-run drops, 32.6% of uncached input) | not estimated | approval; it is the largest untriggered cost in the data |
+| W3 step 4: controlled mode | 0 runs, C08 gate | only if step 3 wins. *Note 2026-11-01:* the later design amendment (`docs/superpowers/specs/2026-10-31-droid-script-controlled-parity-design.md`, release gates) makes controlled mode available as opt-in after the recovery matrix and core CI pass; this supersedes this row for opt-in availability only. The A/B still gates any default change; the default stays off. |
+| Cache-drop investigation (16 mid-run drops, 32.6% of uncached input) | not estimated | approval; it is the largest untriggered cost in the data. *Status 2026-11-01 (K01):* `classify_cache_drop` now runs on the real turn path and emits a `cache_drop` `ProviderObservation` (it was test-only). `cache_drop_report` still has no production caller, it has not been run against a live route, and the websocket-continuation manifest case is unverified, so any conclusion about the 16 historical drops stays open. |
 | Stage 2 gate | 0 | a candidate default change to gate; none exists |
 
 None of the live steps beyond the probe was started. The program's delivered state is: Stage 0

@@ -63,9 +63,18 @@ stay in place and are never replayed; an unresolved mutation stays
 
 ## 5. Remaining blockers
 
-- No matched live pilot has produced a result yet; the Droid arm now exists in
-  this repository (`scripts/bench/droid_arm.py`, `gap_study.py`), so a bounded
-  pilot is a run, not a build.
+- No matched live pilot has run (B03 is partial). The Droid arm and the arm
+  layer exist in this repository (`scripts/bench/droid_arm.py`, `gap_study.py`,
+  `arms.py`; `bench.py` accepts `controlled` behind a preflight), and the four
+  arms run as four separate campaigns (`scripts/bench/README.md`), so launching
+  is ready. The analysis that combines those campaigns
+  (`matched_pilot_reports_unknown_values`) is not built.
 - Trusted bounded image projection before image parity can be claimed.
 - Detached runs have in-process ownership only; a killed host leaves a
-  `recoveryRequired` record rather than a resumable run.
+  `recoveryRequired` record rather than a resumable run. A dead owner's open
+  runs are reconciled at the first registry open in a process, and another
+  process's run returns `NOT_OWNER`.
+- Automatic function fallback for a rejected custom `codemode` shape is not
+  implemented (the fallback today is the opt-in rollout flag; see
+  [`docs/codemode.md`](../../codemode.md)). A captured real rejection would
+  unblock it.
