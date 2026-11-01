@@ -36,6 +36,13 @@ impl ReplayFingerprint {
         Self::for_saved_task(cwd, graph_version, briefing, expect, None, false)
     }
 
+    /// Attach the concrete worker model identity. `None` means the identity
+    /// was unresolved; a stored model must match the current one on replay.
+    pub fn with_model(mut self, model: Option<&str>) -> Self {
+        self.model_id = model.map(str::to_string);
+        self
+    }
+
     pub fn for_saved_task(
         cwd: &Path,
         graph_version: u32,
@@ -82,12 +89,24 @@ pub fn replay_compatible(stored: &ReplayFingerprint, current: &ReplayFingerprint
     ) {
         return false;
     }
-    if let (Some(s_mod), Some(c_mod)) = (&stored.model_id, &current.model_id) {
-        if s_mod != c_mod {
-            return false;
-        }
+    if !model_identity_matches(stored.model_id.as_deref(), current.model_id.as_deref()) {
+        return false;
     }
     stored.input_hash == current.input_hash
+}
+
+/// Whether two fingerprints describe the same worker model.
+///
+/// Two unresolved identities both mean the provider's default worker, so they
+/// match. A one-sided resolution cannot prove the old artifact came from the
+/// current model, and two different identities are a different execution
+/// input; both are refused.
+pub fn model_identity_matches(stored: Option<&str>, current: Option<&str>) -> bool {
+    match (stored, current) {
+        (Some(stored), Some(current)) => stored == current,
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 pub fn incompatibility_reason(
@@ -97,10 +116,11 @@ pub fn incompatibility_reason(
     if stored.simulated.unwrap_or(false) && !current.simulated.unwrap_or(false) {
         return Some("cannot replay simulated artifact from dry-run in real execution".into());
     }
-    if let (Some(s_mod), Some(c_mod)) = (&stored.model_id, &current.model_id) {
-        if s_mod != c_mod {
-            return Some(format!("model changed: stored={s_mod}, current={c_mod}"));
-        }
+    if !model_identity_matches(stored.model_id.as_deref(), current.model_id.as_deref()) {
+        return Some(format!(
+            "model changed: stored={:?}, current={:?}",
+            stored.model_id, current.model_id
+        ));
     }
     if stored.definition_digest != current.definition_digest {
         return Some(format!(
@@ -171,15 +191,17 @@ pub fn compute_config_hash(cwd: &Path) -> String {
         cwd.join(super::store::LEGACY_CONFIG_DIR).join("graph.json")
     };
     if config_path.exists() {
-        if let Ok(bytes) = std::fs::read(&config_path) {
-            return sha256_hex(&bytes);
+        match std::fs::read(&config_path) {
+            Ok(bytes) => return sha256_hex(&bytes),
+            // An existing but unreadable policy is not the same as no policy.
+            Err(_) => return sha256_hex(uuid::Uuid::new_v4().as_bytes()),
         }
     }
     sha256_hex(b"{}")
 }
 
 pub fn compute_repo_state_hash(cwd: &Path) -> String {
-    if cwd.join(".git").exists() {
+    if super::git::is_repo(cwd) {
         fn git_path(bytes: &[u8]) -> Option<&Path> {
             #[cfg(unix)]
             {
@@ -195,7 +217,18 @@ pub fn compute_repo_state_hash(cwd: &Path) -> String {
             let head = super::git::run(cwd, &["rev-parse", "--verify", "HEAD"]).unwrap_or_default(); // An unborn repository legitimately has no HEAD.
             let status = super::git::run(
                 cwd,
-                &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                &[
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=all",
+                    "--",
+                    ".",
+                    ":(exclude).davinci",
+                    ":(exclude).pi",
+                    ":(exclude)target",
+                    ":(exclude)node_modules",
+                ],
             )?;
             let index = super::git::run(cwd, &["ls-files", "--stage", "-z"])?;
             let mut manifest = b"graph-repo-state-v2\0".to_vec();
@@ -259,6 +292,8 @@ pub fn compute_repo_state_hash(cwd: &Path) -> String {
                         || file_name == "target"
                         || file_name == ".pi"
                         || file_name == ".davinci"
+                        || file_name == ".davinci-transactions"
+                        || file_name == "node_modules"
                     {
                         continue;
                     }
@@ -420,6 +455,28 @@ mod tests {
         assert!(!replay_compatible(&fp1, &fp2));
         let reason = incompatibility_reason(&fp1, &fp2).unwrap();
         assert!(reason.contains("input hash changed"));
+    }
+
+    #[test]
+    fn graph_replay_model_identity_mismatch_is_incompatible() {
+        let mut stored = sample_fingerprint();
+        stored.model_id = Some("openai/gpt-a".into());
+        let mut current = sample_fingerprint();
+        current.model_id = Some("openai/gpt-b".into());
+        assert!(!replay_compatible(&stored, &current));
+        assert!(incompatibility_reason(&stored, &current)
+            .unwrap()
+            .contains("model changed"));
+
+        // One resolved side cannot prove the artifact came from the current
+        // model, in either direction.
+        let mut unresolved = sample_fingerprint();
+        unresolved.model_id = None;
+        assert!(!replay_compatible(&stored, &unresolved));
+        assert!(!replay_compatible(&unresolved, &stored));
+
+        // Two unresolved identities both mean the provider default.
+        assert!(model_identity_matches(None, None));
     }
 
     #[test]

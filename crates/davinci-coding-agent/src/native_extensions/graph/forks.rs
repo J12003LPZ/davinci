@@ -97,7 +97,7 @@ fn selected_boundary(
 // Baselines deliberately omit links. Until their historical identities are
 // recorded, never publish a tree silently missing a tracked link/submodule.
 fn validate_tree_entries(cwd: &Path) -> Result<(), String> {
-    if cwd.join(".git").exists() {
+    if git::is_repo(cwd) {
         let index = git::run(cwd, &["ls-files", "--stage", "-z"])?;
         let head = git::run(cwd, &["ls-tree", "-r", "-z", "HEAD"])?;
         for output in [&index, &head] {
@@ -246,7 +246,7 @@ pub(super) fn execute(
     }
     std::fs::create_dir(container)
         .map_err(|error| format!("Fork destination must be new: {error}"))?;
-    let is_git = cwd.join(".git").exists();
+    let is_git = git::is_repo(cwd);
     let result = (|| -> Result<GraphRun, String> {
         if is_git {
             let path = workspace.to_str().ok_or("non-UTF-8 fork workspace")?;

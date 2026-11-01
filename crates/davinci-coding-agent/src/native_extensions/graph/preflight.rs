@@ -118,6 +118,7 @@ pub fn run_preflight(
     };
 
     // 2. DAG validation
+    let dag_valid = validate_definition(&def).is_ok();
     if let Err(e) = validate_definition(&def) {
         checks.push(PreflightCheck {
             label: "DAG invalid".into(),
@@ -132,28 +133,51 @@ pub fn run_preflight(
         });
     }
 
-    // 3. Worker nodes & max concurrency
+    // 3. Worker nodes & max concurrency. The actual ceiling is configured, not
+    // a constant; an untrusted project gets the conservative single-worker path.
     let node_count = def.nodes.len();
-    let max_concurrency = 3;
+    let max_concurrency = if project_trusted {
+        super::config::load_config(cwd)
+            .config
+            .budgets
+            .max_parallel_workers
+            .max(1)
+    } else {
+        1
+    };
     checks.push(PreflightCheck {
         label: format!("{node_count} worker nodes · max concurrency {max_concurrency}"),
         status: PreflightStatus::Permitted,
         details: None,
     });
 
-    // 4. Writer scopes disjoint & serialization
+    // 4. Writer scopes & serialization. `validate_definition` is the authority
+    // (step 9 rejects writers that can be ready concurrently); a failed DAG is
+    // not a passing writer check.
     checks.push(PreflightCheck {
         label: "All writer scopes are disjoint".into(),
-        status: PreflightStatus::Permitted,
-        details: None,
+        status: if dag_valid {
+            PreflightStatus::Permitted
+        } else {
+            PreflightStatus::Rejected
+        },
+        details: (!dag_valid).then(|| "topology validation failed".into()),
     });
 
     // 5. Reviewer cannot approve own mutation
     let has_reviewer = def.nodes.iter().any(|n| n.role == Role::Reviewer);
+    let reviewer_mutates = def
+        .nodes
+        .iter()
+        .any(|node| node.role == Role::Reviewer && node.allows_mutation);
     checks.push(PreflightCheck {
         label: "Reviewer cannot approve own mutation".into(),
-        status: PreflightStatus::Permitted,
-        details: None,
+        status: if reviewer_mutates {
+            PreflightStatus::Rejected
+        } else {
+            PreflightStatus::Permitted
+        },
+        details: reviewer_mutates.then(|| "a reviewer node has mutation privileges".into()),
     });
 
     // 6. Mode-specific gates
@@ -216,13 +240,15 @@ pub fn run_preflight(
         }
     }
 
-    let valid = checks.iter().all(|c| c.status != PreflightStatus::Rejected);
+    let valid = checks
+        .iter()
+        .all(|check| check.status == PreflightStatus::Permitted);
 
     Ok(PreflightReport {
         valid,
         target_name: resolved_target,
         node_count,
-        max_concurrency,
+        max_concurrency: max_concurrency as usize,
         checks,
         worker_spawns: 0,
         provider_calls: 0,

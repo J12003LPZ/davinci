@@ -40,7 +40,8 @@ impl WorkspaceLease {
         {
             directory.push(component);
             match std::fs::symlink_metadata(&directory) {
-                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(metadata)
+                    if metadata.is_dir() && !super::workspace_files::is_redirected(&metadata) => {}
                 Ok(_) => return Err("Graph lease directory is not an ordinary directory".into()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     match std::fs::create_dir(&directory) {
@@ -52,7 +53,7 @@ impl WorkspaceLease {
                     }
                     let metadata =
                         std::fs::symlink_metadata(&directory).map_err(|error| error.to_string())?;
-                    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    if !metadata.is_dir() || super::workspace_files::is_redirected(&metadata) {
                         return Err("Graph lease directory was redirected".into());
                     }
                 }
@@ -60,8 +61,54 @@ impl WorkspaceLease {
             }
         }
         let lock_path = parent.join("controller.lock");
+        // The lease guard must cover the child directories the controller
+        // writes, not just `.davinci/graph`; a redirected `runs`/`blobs` would
+        // otherwise let every checkpoint escape the workspace.
+        for child in [
+            "runs",
+            "blobs",
+            "logs",
+            "checkpoints",
+            "history",
+            "artifacts",
+            "definitions",
+        ] {
+            let path = parent.join(child);
+            if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+                if !metadata.is_dir() || super::workspace_files::is_redirected(&metadata) {
+                    return Err(format!(
+                        "Graph state directory '{}' is redirected or is not a directory",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        // The legacy root is still a write target for migrated runs.
+        let legacy_root = cwd.join(super::store::LEGACY_CONFIG_DIR);
+        let legacy_graph = legacy_root.join("graph");
+        for path in [&legacy_root, &legacy_graph] {
+            if let Ok(metadata) = std::fs::symlink_metadata(path) {
+                if !metadata.is_dir() || super::workspace_files::is_redirected(&metadata) {
+                    return Err(format!(
+                        "Graph state directory '{}' is redirected or is not a directory",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        for child in ["runs", "blobs", "history", "checkpoints", "artifacts"] {
+            let path = legacy_graph.join(child);
+            if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+                if !metadata.is_dir() || super::workspace_files::is_redirected(&metadata) {
+                    return Err(format!(
+                        "Graph state directory '{}' is redirected or is not a directory",
+                        path.display()
+                    ));
+                }
+            }
+        }
         if let Ok(metadata) = std::fs::symlink_metadata(&lock_path) {
-            if !metadata.is_file() || metadata.file_type().is_symlink() {
+            if !metadata.is_file() || super::workspace_files::is_redirected(&metadata) {
                 return Err("Graph lease file is not an ordinary file".into());
             }
         }
@@ -85,6 +132,13 @@ impl WorkspaceLease {
         let file = options.open(lock_path).map_err(unavailable)?;
         if !file.metadata().map_err(unavailable)?.is_file() {
             return Err("Graph lease file is not an ordinary file".into());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if file.metadata().map_err(unavailable)?.file_attributes() & 0x400 != 0 {
+                return Err("Graph lease file is a reparse point".into());
+            }
         }
         #[cfg(unix)]
         {

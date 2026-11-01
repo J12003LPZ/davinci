@@ -305,6 +305,13 @@ pub fn reduce_control(
         request: control.clone(),
         receipt: receipt.clone(),
     });
+    // Receipts are replay data, not an unbounded audit log. Keep the most
+    // recent entries; old operation IDs are no longer actionable.
+    const MAX_CONTROL_HISTORY: usize = 256;
+    if run.control_history.len() > MAX_CONTROL_HISTORY {
+        let excess = run.control_history.len() - MAX_CONTROL_HISTORY;
+        run.control_history.drain(0..excess);
+    }
     receipt
 }
 

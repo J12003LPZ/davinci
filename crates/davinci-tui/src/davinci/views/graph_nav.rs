@@ -36,6 +36,21 @@ pub fn refresh(model: &mut crate::davinci::model::Model, mut next: GraphRunSheet
         }
     }
     model.graph_run = Some(next);
+    // A filter tab that no longer exists must not remain active (it would
+    // dim every card while showing no selected tab).
+    {
+        let run = model.graph_run.as_ref().unwrap();
+        if model.graph_canvas.filter
+            == crate::davinci::model::GraphFilter::Only(
+                crate::davinci::model::GraphBucket::Attention,
+            )
+            && run.bucket_count(crate::davinci::model::GraphFilter::Only(
+                crate::davinci::model::GraphBucket::Attention,
+            )) == 0
+        {
+            model.graph_canvas.filter = crate::davinci::model::GraphFilter::All;
+        }
+    }
     // A summary can disappear when a member becomes attention-requiring. Never
     // keep an invisible synthetic selection or infer a controller target.
     if let Some(group) = &model.graph_canvas.selected_group {

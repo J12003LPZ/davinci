@@ -92,11 +92,20 @@ fn checkpoint_failure_prevents_dispatch_and_preserves_last_durable_state() {
         );
         assert_eq!(run.phase, Phase::Blocked);
         assert_eq!(run.current_lifecycle(), GraphLifecycle::Stopped);
-        assert!(run
-            .blocked_reason
-            .as_deref()
-            .unwrap()
-            .contains("checkpoint persistence failed"));
+        let blocked = run.blocked_reason.as_deref().unwrap();
+        if stage == 0 {
+            // The initial state directory is a file; the lease rejects it before
+            // the first checkpoint instead of writing through it.
+            assert!(
+                blocked.contains("Graph state directory") || blocked.contains("redirected"),
+                "{blocked}"
+            );
+        } else {
+            assert!(
+                blocked.contains("checkpoint persistence failed"),
+                "{blocked}"
+            );
+        }
         let updates = updates.lock().unwrap();
         assert_eq!(updates.last().unwrap().0, Phase::Blocked);
         assert!(updates

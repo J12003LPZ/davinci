@@ -253,8 +253,13 @@ pub fn build_briefing_for_stage(
             ))
         }
         SupportedStage::Review => {
-            let empty_diff = String::new();
-            let effective_diff = diff.unwrap_or(&empty_diff);
+            let artifacts = bound_artifacts(binding, run, cwd)?;
+            let plan = artifacts.iter().find_map(|artifact| artifact.as_plan());
+            let security = run
+                .continuation
+                .as_ref()
+                .and_then(|cursor| cursor.saved_security.values().last());
+            let effective_diff = bounded_review_diff(diff.unwrap_or(""));
             let mut changed_files = Vec::new();
             for task in &run.tasks {
                 if let Some(ref m) = task.mutation {
@@ -274,19 +279,29 @@ pub fn build_briefing_for_stage(
             Ok(super::briefings::review_briefing(
                 &super::briefings::ReviewInput {
                     goal,
-                    plan: None,
-                    diff: effective_diff,
+                    plan,
+                    diff: &effective_diff,
                     changed_files: &changed_files,
                     verification: effective_ver,
                     chunk: None,
                     chunk_summaries: None,
                     required_chunk_ids: None,
-                    security: None,
+                    security,
                 },
             ))
         }
         SupportedStage::Verify | SupportedStage::Security => Ok(String::new()),
     }
+}
+
+fn bounded_review_diff(diff: &str) -> String {
+    const MAX_REVIEW_DIFF_CHARS: usize = 60_000;
+    if diff.chars().count() <= MAX_REVIEW_DIFF_CHARS {
+        return diff.to_string();
+    }
+    let mut bounded: String = diff.chars().take(MAX_REVIEW_DIFF_CHARS).collect();
+    bounded.push_str("\n[... diff truncated at 60000 characters ...]\n");
+    bounded
 }
 
 fn bound_artifacts(

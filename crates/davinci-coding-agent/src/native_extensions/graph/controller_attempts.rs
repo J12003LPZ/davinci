@@ -126,14 +126,17 @@ impl GraphExecution {
                 usage: WorkerUsage::default(),
                 started_at: Some(now_ms()),
                 ended_at: None,
-                fingerprint: Some(ReplayFingerprint::for_saved_task(
-                    &spec.cwd,
-                    run.definition.as_ref().map_or(run.version, |d| d.version),
-                    &spec.briefing,
-                    spec.expect,
-                    run.definition_digest.as_deref(),
-                    run.dry_run,
-                )),
+                fingerprint: Some(
+                    ReplayFingerprint::for_saved_task(
+                        &spec.cwd,
+                        run.definition.as_ref().map_or(run.version, |d| d.version),
+                        &spec.briefing,
+                        spec.expect,
+                        run.definition_digest.as_deref(),
+                        run.dry_run,
+                    )
+                    .with_model(spec.model.as_deref()),
+                ),
                 worker_session: None,
                 operation_binding: None,
                 retry_recovery: None,

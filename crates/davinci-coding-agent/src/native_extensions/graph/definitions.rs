@@ -264,18 +264,7 @@ pub fn parse_saved_definition(
             continue;
         }
 
-        let without_comment = if let Some(pos) = line_raw.find('#') {
-            let before = &line_raw[..pos];
-            let in_quotes = before.chars().filter(|&c| c == '"').count() % 2 != 0
-                || before.chars().filter(|&c| c == '\'').count() % 2 != 0;
-            if in_quotes {
-                line_raw
-            } else {
-                before
-            }
-        } else {
-            line_raw
-        };
+        let without_comment = strip_yaml_comment(line_raw);
 
         let content_trimmed = without_comment.trim_end();
         if content_trimmed.trim().is_empty() {
@@ -674,15 +663,61 @@ fn parse_block_val(
     Ok(YamlVal::Map(map_entries))
 }
 
+/// Strip a YAML line comment without being confused by quoted `#` or by an
+/// apostrophe in prose. Double-quoted escapes and YAML's doubled single quote
+/// are tracked; only a `#` outside a scalar starts a comment.
+fn strip_yaml_comment(line: &str) -> &str {
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut chars = line.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '\\' if in_double => {
+                chars.next();
+            }
+            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => {
+                if in_single && chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                    chars.next();
+                } else {
+                    in_single = !in_single;
+                }
+            }
+            '#' if !in_double && !in_single => {
+                // YAML starts a comment only at line start or after
+                // whitespace; `issue#42` inside a plain scalar is content.
+                if line[..index]
+                    .chars()
+                    .next_back()
+                    .is_none_or(char::is_whitespace)
+                {
+                    return &line[..index];
+                }
+            }
+            _ => {}
+        }
+    }
+    line
+}
+
 fn split_map_entry(
     s: &str,
     line_num: usize,
 ) -> Result<Option<(String, &str)>, DefinitionParseError> {
     let mut in_dquote = false;
     let mut in_squote = false;
+    let mut escaped = false;
     let chars: Vec<(usize, char)> = s.char_indices().collect();
 
     for (i, &(byte_idx, c)) in chars.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' && in_dquote {
+            escaped = true;
+            continue;
+        }
         if c == '"' && !in_squote {
             in_dquote = !in_dquote;
         } else if c == '\'' && !in_dquote {
@@ -1412,7 +1447,7 @@ pub fn validate_param_value(
         ));
     }
     match param_type {
-        "path" | "scope" => {
+        "path" | "scope" | "paths" | "path_list" | "relative_paths" => {
             if val.contains("..")
                 || val.starts_with('/')
                 || val.starts_with('\\')

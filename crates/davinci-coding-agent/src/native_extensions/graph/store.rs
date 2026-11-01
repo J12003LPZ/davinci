@@ -13,7 +13,7 @@ use super::validate::validate_artifact;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,6 +23,62 @@ pub use history::*;
 
 pub const CONFIG_DIR: &str = ".davinci";
 pub const LEGACY_CONFIG_DIR: &str = ".pi";
+
+/// Open an ordinary file without following a symlink/reparse point in the
+/// final component. Run directories are repository data; a hostile checkout
+/// must not be able to redirect state, artifacts, or transcripts.
+fn open_regular(path: &Path) -> io::Result<fs::File> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not an ordinary file",
+        ));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if file.metadata()?.file_attributes() & 0x400 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file is a reparse point",
+            ));
+        }
+    }
+    Ok(file)
+}
+
+fn read_regular_string(path: &Path) -> io::Result<String> {
+    let mut file = open_regular(path)?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// Reject a path whose ancestors (including the run directory) are redirected.
+fn check_run_path(cwd: &Path, path: &Path) -> io::Result<()> {
+    let relative = path.strip_prefix(cwd).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "graph state path escapes the workspace",
+        )
+    })?;
+    super::workspace_files::checked_path(cwd, relative)?;
+    Ok(())
+}
 
 fn modern_runs_root_dir(cwd: &Path) -> PathBuf {
     cwd.join(CONFIG_DIR).join("graph").join("runs")
@@ -307,23 +363,24 @@ fn run_has_operation_references(cwd: &Path, run_id: &str) -> bool {
     let root = run_dir(cwd, run_id);
     let mut candidates = vec![root.join("state.json")];
     let artifacts = root.join("artifacts");
-    let entries = match fs::read_dir(&artifacts) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
-        Err(_) => return true,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "json")
-        {
-            candidates.push(path);
+    match fs::read_dir(&artifacts) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                {
+                    candidates.push(path);
+                }
+            }
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return true,
     }
 
     candidates.into_iter().any(|path| {
-        let mut file = match fs::File::open(&path) {
+        let mut file = match open_regular(&path) {
             Ok(file) => file,
             Err(_) => return true,
         };
@@ -416,7 +473,9 @@ pub fn load_graph_definition(cwd: &Path, run_id: &str) -> Option<super::topology
     if !is_safe_run_id(run_id) {
         return None;
     }
-    let raw = fs::read_to_string(run_dir(cwd, run_id).join("graph.json")).ok()?;
+    let path = run_dir(cwd, run_id).join("graph.json");
+    check_run_path(cwd, &path).ok()?;
+    let raw = read_regular_string(&path).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
@@ -424,12 +483,22 @@ fn migrate_baseline(
     baseline: &mut super::mutation::MutationBaseline,
     blob_dir: &Path,
 ) -> std::io::Result<()> {
-    for (path, bytes) in std::mem::take(&mut baseline.contents) {
-        if let Some(fingerprint) = baseline.files.get(&path) {
-            super::blobs::put(blob_dir, &fingerprint.hash, &bytes)?;
+    let contents = std::mem::take(&mut baseline.contents);
+    let mut result = Ok(());
+    for (path, bytes) in &contents {
+        if let Some(fingerprint) = baseline.files.get(path) {
+            if let Err(error) = super::blobs::put(blob_dir, &fingerprint.hash, bytes) {
+                result = Err(error);
+                break;
+            }
         }
     }
-    Ok(())
+    if result.is_err() {
+        // A failed migration must leave the only copy in memory; the caller
+        // may retry the save.
+        baseline.contents = contents;
+    }
+    result
 }
 
 fn migrate_inline_baselines(run: &mut GraphRun, blob_dir: &Path) -> std::io::Result<()> {
@@ -619,7 +688,8 @@ pub fn read_task_fingerprint(
     let path = run_dir(cwd, run_id)
         .join("artifacts")
         .join(format!("{task_id}.fingerprint.json"));
-    let raw = fs::read_to_string(path).ok()?;
+    check_run_path(cwd, &path).ok()?;
+    let raw = read_regular_string(&path).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
@@ -689,7 +759,8 @@ pub fn read_task_attempt(
     let path = run_dir(cwd, run_id)
         .join("artifacts")
         .join(format!("{task_id}.attempt_{attempt}.json"));
-    let raw = fs::read_to_string(path).ok()?;
+    check_run_path(cwd, &path).ok()?;
+    let raw = read_regular_string(&path).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
@@ -718,7 +789,8 @@ pub fn read_task_mutation(
     let path = run_dir(cwd, run_id)
         .join("artifacts")
         .join(format!("{task_id}.mutation.json"));
-    let raw = fs::read_to_string(path).ok()?;
+    check_run_path(cwd, &path).ok()?;
+    let raw = read_regular_string(&path).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
@@ -760,7 +832,10 @@ pub fn load_run_checked(cwd: &Path, run_id: &str) -> Result<GraphRun, String> {
             ));
         }
     }
-    let raw = fs::read_to_string(run_dir(cwd, run_id).join("state.json"))
+    let state_path = run_dir(cwd, run_id).join("state.json");
+    check_run_path(cwd, &state_path)
+        .map_err(|error| format!("Cannot read checkpoint for run '{run_id}': {error}"))?;
+    let raw = read_regular_string(&state_path)
         .map_err(|error| format!("Cannot read checkpoint for run '{run_id}': {error}"))?;
     let mut run: GraphRun = serde_json::from_str(&raw)
         .map_err(|error| format!("Invalid checkpoint for run '{run_id}': {error}"))?;
@@ -773,6 +848,11 @@ pub fn load_run_checked(cwd: &Path, run_id: &str) -> Result<GraphRun, String> {
     if run.run_id != run_id {
         return Err(format!(
             "Checkpoint run identity does not match requested run '{run_id}'."
+        ));
+    }
+    if !Path::new(&run.cwd).is_absolute() {
+        return Err(format!(
+            "Checkpoint for run '{run_id}' has a non-absolute workspace; refusing to resolve it against the process directory."
         ));
     }
     let expected_cwd = cwd
@@ -790,7 +870,13 @@ pub fn load_run_checked(cwd: &Path, run_id: &str) -> Result<GraphRun, String> {
     if run.saved_definition.is_none() {
         let saved_path = run_dir(cwd, run_id).join("saved_definition.yaml");
         if saved_path.exists() {
-            let raw_yaml = fs::read_to_string(&saved_path).map_err(|error| {
+            check_run_path(cwd, &saved_path).map_err(|error| {
+                format!(
+                    "Saved graph definition '{}' is redirected: {error}",
+                    saved_path.display()
+                )
+            })?;
+            let raw_yaml = read_regular_string(&saved_path).map_err(|error| {
                 format!(
                     "Cannot read saved graph definition '{}': {error}",
                     saved_path.display()
@@ -986,8 +1072,16 @@ pub fn read_artifact(
     task_id: &str,
     expect: ArtifactKind,
 ) -> Result<Artifact, Vec<String>> {
+    if !is_safe_run_id(run_id) {
+        return Err(vec!["artifact path has an unsafe run identity".to_string()]);
+    }
     let path = artifact_path(cwd, run_id, task_id);
-    let raw = fs::read_to_string(&path).map_err(|_| {
+    check_run_path(cwd, &path).map_err(|error| {
+        vec![format!(
+            "artifact path for task \"{task_id}\" is redirected: {error}"
+        )]
+    })?;
+    let raw = read_regular_string(&path).map_err(|_| {
         vec![format!(
             "artifact file for task \"{task_id}\" does not exist"
         )]
@@ -1023,9 +1117,9 @@ pub fn write_log(cwd: &Path, run_id: &str, task_id: &str, attempt: u32, content:
 /// The tail of a worker's live transcript, for `/graph-view`.
 /// The live inspector must not reread an entire growing log every second.
 pub fn read_transcript_tail(path: &Path) -> Vec<String> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::{Seek, SeekFrom};
     let read = || -> std::io::Result<Vec<String>> {
-        let mut file = fs::File::open(path)?;
+        let mut file = open_regular(path)?;
         let start = file.metadata()?.len().saturating_sub(64 * 1024);
         file.seek(SeekFrom::Start(start))?;
         let mut bytes = Vec::new();
@@ -1042,6 +1136,15 @@ pub fn read_transcript_tail(path: &Path) -> Vec<String> {
             .collect())
     };
     read().unwrap_or_default()
+}
+
+/// Tailing a checkpoint transcript must also reject a redirected ancestor
+/// (`logs` or the run directory itself), not just a symlinked leaf.
+pub fn read_transcript_tail_checked(cwd: &Path, path: &Path) -> Vec<String> {
+    if check_run_path(cwd, path).is_err() {
+        return Vec::new();
+    }
+    read_transcript_tail(path)
 }
 
 #[cfg(test)]

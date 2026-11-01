@@ -76,7 +76,10 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let selected = model.graph_resume_index.min(visible.len() - 1);
     for (position, index) in visible.into_iter().enumerate() {
         let run = &model.graph_resume_runs[index];
-        let goal = run.goal.split_whitespace().collect::<Vec<_>>().join(" ");
+        let goal = crate::davinci::sanitize::terminal_safe(&run.goal)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         let goal = if goal.is_empty() {
             "(untitled graph)".to_owned()
         } else {

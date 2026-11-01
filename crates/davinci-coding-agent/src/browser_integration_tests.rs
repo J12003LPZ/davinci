@@ -1579,8 +1579,10 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
         "bash",
         "build_command",
         "browser_open",
+        "browser_click",
         "browser_snapshot",
         "browser_console",
+        "browser_network",
         "workspace_diff",
         "verification_plan",
     ];
