@@ -189,6 +189,13 @@ class FeatureUseTests(unittest.TestCase):
         self.assertTrue(use["codemode"]["by_mode"]["read-only"]["configured_but_unused"])
         self.assertEqual(use["codemode"]["by_mode"]["controlled"]["status"], "used")
 
+    def test_controlled_run_with_no_codemode_events_is_not_a_success_of_the_arm(self):
+        rows = [feature_row(cm="controlled", cm_seen="controlled", calls=0, events=0)]
+        use = campaign.feature_use(rows)["codemode"]
+        self.assertEqual(use["status"], "no_calls_observed")
+        self.assertTrue(use["configured_but_unused"])
+        self.assertEqual(use["runs_with_activity"], 0)
+
     def test_unavailable_codemode_is_observed_off_even_when_mode_is_read_only(self):
         row_ = feature_row(cm="read-only", cm_seen="read-only", calls=0)
         row_["codemode_available"] = False
