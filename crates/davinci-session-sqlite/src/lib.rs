@@ -321,16 +321,28 @@ impl SqliteSessionStore {
 
     pub fn insert_entry(&self, session_id: &str, entry: &SessionEntry) -> Result<(), SessionError> {
         transaction::atomic(&self.conn, || {
+            let seq = sqlite_i64(entry.seq, "seq")?;
             self.insert_entry_row(session_id, entry)?;
             append_entry_to_branch_cache(
                 &self.conn,
                 session_id,
                 &entry.id,
-                sqlite_i64(entry.seq, "seq")?,
+                seq,
                 &entry.entry_type,
                 entry.custom_type.as_deref(),
                 entry.parent_id.as_deref(),
-            )
+            )?;
+            self.conn
+                .execute(
+                    "INSERT INTO session_sequences (session_id, next_seq) VALUES (?1, ?2)
+                     ON CONFLICT(session_id) DO UPDATE SET
+                        next_seq = MAX(next_seq, excluded.next_seq)",
+                    params![session_id, seq.saturating_add(1)],
+                )
+                .map_err(|err| {
+                    SessionError::storage(format!("Unable to update session sequence: {err}"))
+                })?;
+            Ok(())
         })
     }
 
@@ -1236,6 +1248,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.search("alpha").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn insert_entry_advances_the_session_sequence() {
+        let dir = tempdir().unwrap();
+        let store = SqliteSessionStore::open(&dir.path().join("sequence.db")).unwrap();
+        store.create_repo_session("sequence").unwrap();
+        let first = SessionEntry {
+            id: "e1".into(),
+            seq: 1,
+            ..SessionEntry::message("user", serde_json::json!("one"))
+        };
+        store
+            .append_entry_once("sequence", "e1", None, first)
+            .unwrap();
+        let imported = SessionEntry {
+            id: "e2".into(),
+            seq: 5,
+            parent_id: Some("e1".into()),
+            ..SessionEntry::message("assistant", serde_json::json!("two"))
+        };
+        store.insert_entry("sequence", &imported).unwrap();
+        let next: i64 = store
+            .conn
+            .query_row(
+                "SELECT next_seq FROM session_sequences WHERE session_id = 'sequence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(next, 6);
     }
 
     #[test]

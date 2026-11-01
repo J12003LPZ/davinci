@@ -3666,7 +3666,7 @@ impl Matcher {
     fn new(pattern: &str, ignore_case: bool, literal: bool) -> Self {
         if literal {
             return if ignore_case {
-                Self::LiteralIgnoreCase(pattern.to_ascii_lowercase())
+                Self::LiteralIgnoreCase(pattern.to_lowercase())
             } else {
                 Self::Literal(pattern.to_string())
             };
@@ -3684,10 +3684,7 @@ impl Matcher {
     fn is_match(&self, line: &str) -> bool {
         match self {
             Self::Literal(needle) => line.contains(needle.as_str()),
-            Self::LiteralIgnoreCase(needle) => {
-                // Only lower-case a line that could match at all.
-                line.len() >= needle.len() && line.to_ascii_lowercase().contains(needle.as_str())
-            }
+            Self::LiteralIgnoreCase(needle) => line.to_lowercase().contains(needle.as_str()),
             Self::Regex(regex) => regex.is_match(line),
         }
     }
@@ -8594,5 +8591,13 @@ mod audit_wp01_review_regressions {
                 "{name}: the read must stop one byte past the limit"
             );
         }
+    }
+
+    #[test]
+    fn literal_ignore_case_folds_unicode() {
+        let matcher = Matcher::new("café", true, true);
+        assert!(matcher.is_match("CAFÉ"));
+        assert!(matcher.is_match("le CAFÉ noir"));
+        assert!(!matcher.is_match("cafe"));
     }
 }
