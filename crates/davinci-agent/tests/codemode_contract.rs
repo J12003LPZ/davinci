@@ -748,8 +748,15 @@ fn hold_exclusively(path: &std::path::Path) -> std::fs::File {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        // LOCK_EX | LOCK_NB
-        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), 2 | 4) }, 0);
+        // LOCK_EX | LOCK_NB. A sweep probing the same file can briefly hold it,
+        // so retry before failing.
+        let locked = (0..10).any(|attempt| {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            unsafe { libc::flock(file.as_raw_fd(), 2 | 4) == 0 }
+        });
+        assert!(locked, "the lock is free to take");
     }
     file
 }

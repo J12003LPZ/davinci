@@ -2268,8 +2268,14 @@ fn wait_for_script_scoped_handle_and_terminal_status() {
     let owners = davinci_session::default_agent_dir().join("script-owners");
     std::fs::create_dir_all(&owners).unwrap();
     let foreign_path = owners.join(format!("{foreign_id}.lock"));
-    let foreign_lock = crate::runtime::capacity::lock_file_exclusive(&foreign_path, true)
-        .unwrap()
+    // A sweep probing the fresh file can briefly hold it; retry before failing.
+    let foreign_lock = (0..10)
+        .find_map(|attempt| {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            crate::runtime::capacity::lock_file_exclusive(&foreign_path, true).unwrap()
+        })
         .expect("the foreign lock is free to take");
     registry
         .transition("run-other-host", ScriptRunState::Running)

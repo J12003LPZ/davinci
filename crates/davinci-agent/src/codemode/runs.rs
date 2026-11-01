@@ -43,9 +43,24 @@ fn hold_owner_lock() -> Result<(), ScriptRunError> {
     let owners = owner_locks_dir();
     std::fs::create_dir_all(&owners).map_err(|_| unavailable())?;
     let mine = format!("{}.lock", process_owner());
-    let lock = crate::runtime::capacity::lock_file_exclusive(&owners.join(&mine), true)
-        .map_err(|_| unavailable())?
-        .ok_or_else(unavailable)?;
+    let path = owners.join(&mine);
+    // A sweep that probed the file just before this open may unlink it after
+    // the lock is taken; the lock then guards a file no path leads to. Take it
+    // again on a fresh file.
+    let mut taken = None;
+    for attempt in 0..LOCK_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(LOCK_RETRY_DELAY);
+        }
+        let lock = crate::runtime::capacity::lock_file_exclusive(&path, true)
+            .map_err(|_| unavailable())?
+            .ok_or_else(unavailable)?;
+        if lock_is_linked(&lock, &path) {
+            taken = Some(lock);
+            break;
+        }
+    }
+    let lock = taken.ok_or_else(unavailable)?;
     let _ = HELD.set(lock);
     remove_stale_owner_locks(&owners, &mine);
     Ok(())
@@ -72,15 +87,56 @@ fn remove_stale_owner_locks(owners: &Path, mine: &str) {
         }
         let path = entry.path();
         if let Ok(Some(lock)) = crate::runtime::capacity::lock_file_exclusive(&path, false) {
-            drop(lock);
-            let _ = std::fs::remove_file(&path);
+            remove_stale_lock(&path, lock);
         }
     }
+}
+
+/// Probes and takes of an owner lock: how many, and how far apart.
+const LOCK_ATTEMPTS: u32 = 5;
+const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Remove a lock file whose lock this caller holds. On Unix the file goes while
+/// the lock is still held, so a process that opened it meanwhile cannot take the
+/// lock and then lose its file. Windows opens with no delete sharing, so the
+/// handle closes first; a new holder makes the removal fail harmlessly.
+fn remove_stale_lock(path: &Path, lock: std::fs::File) {
+    #[cfg(unix)]
+    {
+        let _ = std::fs::remove_file(path);
+        drop(lock);
+    }
+    #[cfg(not(unix))]
+    {
+        drop(lock);
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// True when `path` still names the file `lock` is held on. A sweep can unlink
+/// the file between this process's open and its lock.
+#[cfg(unix)]
+fn lock_is_linked(lock: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (lock.metadata(), std::fs::symlink_metadata(path)) {
+        (Ok(held), Ok(linked)) => held.dev() == linked.dev() && held.ino() == linked.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_is_linked(_lock: &std::fs::File, _path: &Path) -> bool {
+    true
 }
 
 /// True when `owner`'s lock can be taken, which means its process is gone. No
 /// lock file (a record from before locks) counts as dead; any other failure
 /// counts as alive, the conservative answer. The stale lock file is removed.
+///
+/// `flock` belongs to the open file description, so a holder that just exited
+/// can still appear to hold the lock through another probe of the file or a
+/// forked child that has not yet exec'd. One would-block is therefore retried
+/// for about 100 ms before the owner counts as alive.
 fn owner_is_dead(owner: &str) -> bool {
     if owner == process_owner() {
         return false;
@@ -89,15 +145,20 @@ fn owner_is_dead(owner: &str) -> bool {
         return true;
     }
     let path = owner_locks_dir().join(format!("{owner}.lock"));
-    match crate::runtime::capacity::lock_file_exclusive(&path, false) {
-        Ok(Some(lock)) => {
-            drop(lock);
-            let _ = std::fs::remove_file(&path);
-            true
+    for attempt in 0..LOCK_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(LOCK_RETRY_DELAY);
         }
-        Ok(None) => false,
-        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        match crate::runtime::capacity::lock_file_exclusive(&path, false) {
+            Ok(Some(lock)) => {
+                remove_stale_lock(&path, lock);
+                return true;
+            }
+            Ok(None) => {}
+            Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+        }
     }
+    false
 }
 
 /// One lock per registry directory, shared by every registry handle and every
