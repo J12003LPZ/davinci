@@ -36,6 +36,16 @@ fn sandbox_failure(result: &Value) -> CodeModeError {
             detail.as_deref().unwrap_or("script exceeded a guest limit"),
         );
     }
+    // A parse failure is the model's own input error; it can be repaired.
+    if detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("INVALID_INPUT"))
+    {
+        return CodeModeError::new(
+            "INVALID_INPUT",
+            detail.as_deref().unwrap_or("script could not be parsed"),
+        );
+    }
     match result.pointer("/error/kind").and_then(Value::as_str) {
         Some("timeout") => CodeModeError::new("TIMEOUT", "script deadline expired"),
         Some("aborted") => CodeModeError::new("CANCELLED", "script was cancelled"),

@@ -153,3 +153,46 @@ def test_rollout_gate_keeps_unsafe_mode_off() -> None:
     )
     assert mode == "controlled-opt-in"
     assert blockers == ()
+
+
+def test_recorded_promotion_decision_matches_the_gate() -> None:
+    """The checked-in decision must be the gate's own output, not a claim."""
+    import json
+
+    record_path = (
+        Path(__file__).resolve().parents[3]
+        / "docs"
+        / "perf"
+        / "droid-gap"
+        / "stage1-promotion.json"
+    )
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+
+    decision = PromotionDecision(
+        behavior_parity=record["behaviorParity"],
+        security_pass=record["securityPass"],
+        success_noninferior=record["successNoninferior"],
+        resource_benefit=record["resourceBenefit"],
+        unknowns=tuple(record["unknowns"]),
+    )
+    mode, blockers = rollout_gate(decision)
+    assert record["decision"] == mode == "off"
+    # Every recorded unknown is a blocker, and the missing evidence is named.
+    for unknown in record["unknowns"]:
+        assert unknown in blockers, unknown
+    assert any("behavior parity" in blocker for blocker in blockers)
+    assert any("resource benefit" in blocker for blocker in blockers)
+
+    # The gap record and the Stage 0 addendum both carry the same decision and
+    # never claim a re-measurement.
+    docs = Path(__file__).resolve().parents[3] / "docs"
+    gap = (docs / "superpowers/plans/2026-10-31-droid-gap.md").read_text(
+        encoding="utf-8"
+    )
+    stage0 = (docs / "perf/droid-gap/stage0-report.md").read_text(encoding="utf-8")
+    for text in (gap, stage0):
+        assert "off" in text
+    for text in (gap,):
+        assert "rollback" in text.lower()
+    assert "does not re-measure" in stage0
+    assert "No new performance measurement" in stage0

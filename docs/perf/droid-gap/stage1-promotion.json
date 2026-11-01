@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "recordedBy": "stage1-promotion",
+  "deterministicFixtures": "12/12 BEHAVIOR_PARITY",
+  "behaviorParity": false,
+  "securityPass": true,
+  "successNoninferior": false,
+  "resourceBenefit": false,
+  "unknowns": [
+    "detached background Scripts are not approved (C08 exception required)",
+    "image output is an OPEN parity gap (UNSUPPORTED_OUTPUT)",
+    "no matched performance suite (>=150 scenarios x 3 repetitions)",
+    "no observed subscription allowance delta",
+    "transport confound: native WebSocket vs proxy"
+  ],
+  "decision": "off",
+  "evidence": [
+    "crates/davinci-agent/tests/common/codemode.rs::reference_script_fixture_suite_passes",
+    "crates/davinci-coding-agent/tests/codemode_reference_fixtures.rs",
+    "crates/davinci-agent/tests/codemode_contract.rs",
+    "crates/davinci-ai/tests/openai_cache_diagnostics.rs",
+    "crates/davinci-ai/tests/openai_cache_accounting.rs",
+    "crates/davinci-agent/tests/lean_tool_surface.rs"
+  ]
+}

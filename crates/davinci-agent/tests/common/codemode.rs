@@ -2195,6 +2195,14 @@ fn reference_script_fixture_suite_passes() {
             "{fixture:?}"
         );
     }
+    // No scenario is left unproven: 05 and 09 are covered by the real-guest
+    // fixtures in codemode_reference_fixtures.rs.
+    let untested: Vec<&str> = fixtures
+        .iter()
+        .filter(|fixture| fixture.evidence == "UNTESTED")
+        .map(|fixture| fixture.id)
+        .collect();
+    assert!(untested.is_empty(), "untested scenarios: {untested:?}");
 
     let (mut agent, workspace, _) = configured_agent();
     agent.tools = vec![

@@ -1,7 +1,13 @@
 //! Deterministic fixture coverage for Droid Script behavior, labelled
-//! honestly. `BEHAVIOR_PARITY` means an offline test proves the described
-//! behavior; `UNTESTED` means no offline oracle exists on this host and no
-//! parity is claimed.
+//! honestly. `BEHAVIOR_PARITY` means a test in this repository proves the
+//! described behavior; `UNTESTED` means no oracle exists and no parity is
+//! claimed.
+//!
+//! Broker-level fixtures live in `tests/common/codemode.rs`
+//! (`reference_script_fixture_suite_passes`). The two that need the real guest
+//! runtime live in `crates/davinci-coding-agent/tests/codemode_reference_fixtures.rs`
+//! and are `#[ignore]`d until `DAVINCI_CODEMODE_FIXTURE_*` points at an admitted
+//! Node 24.21.0 bundle.
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -38,7 +44,7 @@ pub fn droid_script_fixture_status() -> Vec<ScriptFixtureStatus> {
         S {
             id: "05",
             scenario: "syntax error",
-            evidence: "UNTESTED",
+            evidence: "BEHAVIOR_PARITY",
         },
         S {
             id: "06",
@@ -58,7 +64,7 @@ pub fn droid_script_fixture_status() -> Vec<ScriptFixtureStatus> {
         S {
             id: "09",
             scenario: "long job",
-            evidence: "UNTESTED",
+            evidence: "BEHAVIOR_PARITY",
         },
         S {
             id: "10",
