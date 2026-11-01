@@ -1,3 +1,4 @@
+use davinci_agent::codemode::CodeModeMode;
 use davinci_coding_agent::{
     args::parse_args,
     codemode_host::config::{managed_paths, resolve_config, ReadOnlyConfig},
@@ -71,6 +72,7 @@ fn read_only_defaults_to_the_managed_runtime_and_controlled_is_unavailable() {
         Some(ReadOnlyConfig {
             node_path: custom.into(),
             host_path: managed_paths(agent_dir()).host_path,
+            mode: CodeModeMode::ReadOnly,
         })
     );
     for bad in [json!({"nodePath":"relative"}), json!({"hostPath": 7})] {
@@ -126,6 +128,7 @@ fn a_home_workspace_admits_the_managed_node_but_not_a_project_node() {
     let project = ReadOnlyConfig {
         node_path: project_node,
         host_path: managed.host_path.clone(),
+        mode: CodeModeMode::ReadOnly,
     };
     let error = project.admit(home.path(), &agent).err().unwrap();
     assert!(

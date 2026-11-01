@@ -2555,8 +2555,9 @@ fn sync_worker_codemode_with(
     match config {
         None if child.has_staged_codemode() => child.clear_codemode(),
         Some(config) if !child.has_staged_codemode() => {
+            let mode = config.mode.clone();
             if let Ok(host) = admit(&config, &child.cwd) {
-                child.stage_read_only_codemode(host);
+                let _ = child.stage_codemode(host, mode);
             }
         }
         _ => {}
@@ -8731,13 +8732,18 @@ fn stage_startup_codemode(
     let staged = resolve_config(cli, stored, agent_dir).and_then(|config| match config {
         None => Ok(None),
         Some(_) if no_session => Err(SESSIONLESS.to_string()),
-        Some(config) => admit(&config, cwd).map(Some),
-    });
-    let staged = staged.map(|codemode| {
-        if let Some(codemode) = codemode {
-            agent.stage_read_only_codemode(codemode);
+        Some(config) => {
+            let mode = config.mode.clone();
+            admit(&config, cwd).map(|host| Some((host, mode)))
         }
     });
+    let staged = match staged {
+        Ok(Some((host, mode))) => agent
+            .stage_codemode(host, mode)
+            .map_err(|error| error.message),
+        Ok(None) => Ok(()),
+        Err(error) => Err(error),
+    };
     record_codemode_outcome(agent, requested, staged)
 }
 
@@ -8807,8 +8813,11 @@ pub(crate) fn sync_codemode_from_settings(agent: &mut Agent) -> Result<(), Strin
                 Err("Codemode needs a session journal; this run has no session".into())
             }
             Some(config) => {
+                let mode = config.mode.clone();
                 let host = admit_node(&agent_dir)(&config, &agent.cwd)?;
-                agent.stage_read_only_codemode(host);
+                agent
+                    .stage_codemode(host, mode)
+                    .map_err(|error| error.message)?;
                 Ok(())
             }
         }

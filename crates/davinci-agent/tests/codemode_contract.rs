@@ -1,4 +1,27 @@
-use davinci_agent::codemode::{CodeModeLimits, CodeModeMode, CodeModeRequest, CodeModeToolValue};
+use davinci_agent::codemode::{
+    CodeModeHost, CodeModeLimits, CodeModeMode, CodeModeOutcome, CodeModeRequest, CodeModeToolValue,
+};
+use davinci_agent::Agent;
+use std::sync::Arc;
+
+struct FixedHost {
+    controlled: bool,
+}
+
+impl CodeModeHost for FixedHost {
+    fn execute(
+        &self,
+        _: &CodeModeRequest,
+        _: &davinci_agent::codemode::CodeModeRunContext,
+        _: Arc<dyn davinci_agent::codemode::CodeModeBroker>,
+    ) -> CodeModeOutcome {
+        unreachable!("no runtime reaches the host in this fixture")
+    }
+
+    fn admits_controlled_mode(&self) -> bool {
+        self.controlled
+    }
+}
 
 #[test]
 fn mode_is_default_off_and_labels_are_stable() {
@@ -6,6 +29,55 @@ fn mode_is_default_off_and_labels_are_stable() {
     assert_eq!(
         serde_json::to_value(CodeModeMode::ReadOnly).unwrap(),
         "read-only"
+    );
+}
+
+#[test]
+fn controlled_mode_is_opt_in_and_host_owned() {
+    let mut agent = Agent::new("codemode mode fixture");
+    // Off is the only implicit state and never stages a host.
+    assert!(agent
+        .enable_codemode(Arc::new(FixedHost { controlled: true }), CodeModeMode::Off)
+        .is_ok());
+    assert!(!agent.has_staged_codemode());
+
+    // A host that does not admit controlled may not be escalated into it.
+    let error = agent
+        .enable_codemode(
+            Arc::new(FixedHost { controlled: false }),
+            CodeModeMode::Controlled,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "DENIED");
+    assert!(error.message.contains("controlled"), "{error:?}");
+
+    // Read-only keeps its existing admission requirement unchanged.
+    let error = agent
+        .enable_codemode(
+            Arc::new(FixedHost { controlled: false }),
+            CodeModeMode::ReadOnly,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "UNAVAILABLE");
+    assert!(error.message.contains("journal"), "{error:?}");
+
+    // Even with an admitting host, controlled needs the trusted session
+    // journal; a missing trusted host denies instead of defaulting.
+    let error = agent
+        .enable_codemode(
+            Arc::new(FixedHost { controlled: true }),
+            CodeModeMode::Controlled,
+        )
+        .unwrap_err();
+    assert!(error.message.contains("journal"), "{error:?}");
+
+    // A JavaScript header is never a control channel.
+    assert!(
+        serde_json::from_value::<CodeModeRequest>(serde_json::json!({
+            "code": "// @mode: controlled\nreturn 1",
+            "mode": "controlled"
+        }))
+        .is_err()
     );
 }
 

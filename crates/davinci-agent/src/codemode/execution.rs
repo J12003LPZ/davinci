@@ -24,11 +24,12 @@ pub(crate) fn mandatory_facts(result: &ToolResult) -> Option<Value> {
 #[derive(Clone)]
 pub(crate) struct CodeModeBinding {
     pub host: Arc<dyn CodeModeHost>,
+    pub mode: CodeModeMode,
 }
 
 impl std::fmt::Debug for CodeModeBinding {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("CodeModeBinding(read-only)")
+        write!(formatter, "CodeModeBinding({:?})", self.mode)
     }
 }
 
@@ -37,11 +38,56 @@ impl Agent {
     /// journal per turn, after startup, so enabling at startup always failed
     /// with "Codemode requires the parent operation journal".
     pub fn stage_read_only_codemode(&mut self, host: Arc<dyn CodeModeHost>) {
-        self.staged_codemode = Some(CodeModeBinding { host });
+        self.staged_codemode = Some(CodeModeBinding {
+            host,
+            mode: CodeModeMode::ReadOnly,
+        });
     }
 
     pub fn has_staged_codemode(&self) -> bool {
         self.staged_codemode.is_some()
+    }
+
+    /// Host-owned opt-in for `off | read-only | controlled`. The mode is
+    /// resolved from trusted settings only, never from script source.
+    pub fn enable_codemode(
+        &mut self,
+        host: Arc<dyn CodeModeHost>,
+        mode: CodeModeMode,
+    ) -> Result<(), CodeModeError> {
+        match mode {
+            CodeModeMode::Off => {
+                self.clear_codemode();
+                Ok(())
+            }
+            CodeModeMode::Controlled if !host.admits_controlled_mode() => Err(CodeModeError::new(
+                "DENIED",
+                "controlled Codemode is not admitted by this host",
+            )),
+            _ => self.register_codemode(host, mode),
+        }
+    }
+
+    /// Stage a host for the turns to come without a runtime yet.
+    pub fn stage_codemode(
+        &mut self,
+        host: Arc<dyn CodeModeHost>,
+        mode: CodeModeMode,
+    ) -> Result<(), CodeModeError> {
+        match mode {
+            CodeModeMode::Off => {
+                self.clear_codemode();
+                Ok(())
+            }
+            CodeModeMode::Controlled if !host.admits_controlled_mode() => Err(CodeModeError::new(
+                "DENIED",
+                "controlled Codemode is not admitted by this host",
+            )),
+            _ => {
+                self.staged_codemode = Some(CodeModeBinding { host, mode });
+                Ok(())
+            }
+        }
     }
 
     /// Turn Codemode off: later turns no longer register, advertise, or run it.
@@ -74,19 +120,31 @@ impl Agent {
         {
             // The capability survives on this runtime; the binding must still
             // point at the staged host, not a cleared or replaced one.
-            self.bind_codemode(binding.host);
+            self.bind_codemode(binding.host, binding.mode);
             return Ok(());
         }
-        self.enable_read_only_codemode(binding.host)
+        self.register_codemode(binding.host, binding.mode)
     }
 
     /// Explicit host-side opt-in. This never resolves or probes a runtime itself.
-    /// Controlled mode is deliberately unavailable until its recovery gates pass.
+    /// Controlled mode is admitted only when the host declares it and the
+    /// recovery gates have passed.
     pub fn enable_read_only_codemode(
         &mut self,
         host: Arc<dyn CodeModeHost>,
     ) -> Result<(), CodeModeError> {
+        self.enable_codemode(host, CodeModeMode::ReadOnly)
+    }
+
+    fn register_codemode(
+        &mut self,
+        host: Arc<dyn CodeModeHost>,
+        mode: CodeModeMode,
+    ) -> Result<(), CodeModeError> {
         use crate::runtime::capabilities::{CapabilitySource, ReplayPolicy, RuntimeCapability};
+        if matches!(mode, CodeModeMode::Off) {
+            return Err(CodeModeError::new("DENIED", "Codemode mode is off"));
+        }
         let runtime = self
             .runtime
             .as_ref()
@@ -110,19 +168,34 @@ impl Agent {
             "properties":{"code":{"type":"string","minLength":1,"maxLength":defaults.script_bytes},
             "timeoutMs":{"type":"integer","minimum":1,"maximum":defaults.wall_ms},
             "maxOutputBytes":{"type":"integer","minimum":4096,"maximum":defaults.output_bytes}}});
+        let controlled = matches!(mode, CodeModeMode::Controlled);
         let mut capability = RuntimeCapability::new(
             "codemode",
             CapabilitySource::Builtin,
-            crate::permission::ToolClass::Read,
-            true,
+            if controlled {
+                crate::permission::ToolClass::Shell
+            } else {
+                crate::permission::ToolClass::Read
+            },
+            !controlled,
             &schema,
             Some("1".into()),
         );
-        capability.description = "Run one sandboxed JavaScript program over authorized read-only tools and return a small result. Prefer it to several separate read, grep, find or ls calls: one script can list, read, grep, filter and count, and only its return value enters your context. Example: `const [a, b] = await Promise.all([tools.read({path: 'Cargo.toml'}), tools.read({path: 'README.md'})]); return {cargo: a.text.slice(0, 300), readme: b.text.slice(0, 300)};`. Use tools.<name>({...}) to call a tool, codemode.search and codemode.describe to find tools and their schemas. Every tool call resolves to {text, structuredContent, complete}: parse `.text` (find, ls and grep give one match per line) rather than guessing other field names, and if a lookup finds nothing say so instead of returning an empty list. Await every tool call and return plain JSON only: strings, numbers, booleans, null, arrays and plain objects, with no undefined fields (use null), Map, Set, Date or functions. Output past 16 KB is cut, so extract the lines you need instead of returning whole files. Not for a single lookup, edits, or shell commands. Each child result has a `complete` flag: incomplete data must not be treated as complete.".into();
+        capability.description = if controlled {
+            "Run one sandboxed JavaScript program over authorized tools, including guarded file edits and shell commands. Prefer it to several separate calls: list, read, grep, patch, run the tests and filter the output inside one program, so only its return value enters your context. Use tools.<name>({...}) to call a tool, codemode.search and codemode.describe to find tools and their schemas. Every tool call resolves to {text, structuredContent, complete}: parse `.text` rather than guessing other field names. Await every tool call and return plain JSON only. A successful edit is durable even if the script later throws. Output past 16 KB is cut, so extract the lines you need instead of returning whole files.".into()
+        } else {
+            "Run one sandboxed JavaScript program over authorized read-only tools and return a small result. Prefer it to several separate read, grep, find or ls calls: one script can list, read, grep, filter and count, and only its return value enters your context. Example: `const [a, b] = await Promise.all([tools.read({path: 'Cargo.toml'}), tools.read({path: 'README.md'})]); return {cargo: a.text.slice(0, 300), readme: b.text.slice(0, 300)};`. Use tools.<name>({...}) to call a tool, codemode.search and codemode.describe to find tools and their schemas. Every tool call resolves to {text, structuredContent, complete}: parse `.text` (find, ls and grep give one match per line) rather than guessing other field names, and if a lookup finds nothing say so instead of returning an empty list. Await every tool call and return plain JSON only: strings, numbers, booleans, null, arrays and plain objects, with no undefined fields (use null), Map, Set, Date or functions. Output past 16 KB is cut, so extract the lines you need instead of returning whole files. Not for a single lookup, edits, or shell commands. Each child result has a `complete` flag: incomplete data must not be treated as complete.".into()
+        };
         capability.declared_effects.clear();
+        if controlled {
+            capability.declared_effects = vec![
+                crate::runtime::DeclaredEffect::FileSystemWrite,
+                crate::runtime::DeclaredEffect::ProcessExecution,
+            ];
+        }
         capability.replay_policy = ReplayPolicy::NeverAutoReplay;
         runtime.capability_registry.register(capability);
-        self.bind_codemode(host);
+        self.bind_codemode(host, mode);
         Ok(())
     }
 
@@ -140,8 +213,8 @@ impl Agent {
                     .contains("codemode"))
     }
 
-    fn bind_codemode(&mut self, host: Arc<dyn CodeModeHost>) {
-        self.codemode = Some(CodeModeBinding { host });
+    fn bind_codemode(&mut self, host: Arc<dyn CodeModeHost>, mode: CodeModeMode) {
+        self.codemode = Some(CodeModeBinding { host, mode });
         self.apply_extension_tools(&["codemode".into()]);
         let authorized = self
             .tool_context
@@ -193,7 +266,7 @@ impl Agent {
                     runtime_run_id: runtime.run_id.to_string(),
                     parent_operation_ref: Some(parent.to_string()),
                 },
-                mode: CodeModeMode::ReadOnly,
+                mode: binding.mode.clone(),
                 limits,
                 capability_revision: runtime
                     .capability_registry

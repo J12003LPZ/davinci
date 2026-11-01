@@ -1,6 +1,6 @@
 //! Shared Codemode contracts. Authority-bearing context is host-created only.
 use serde::{Deserialize, Serialize};
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum CodeModeMode {
     #[serde(rename = "off")]
@@ -200,6 +200,11 @@ pub trait CodeModeBroker: Send + Sync {
     }
 }
 pub trait CodeModeHost: Send + Sync {
+    /// Trusted host statement that this host's configuration admits mutating
+    /// script children. Defaults to no: a host must opt in explicitly.
+    fn admits_controlled_mode(&self) -> bool {
+        false
+    }
     fn execute(
         &self,
         request: &CodeModeRequest,
