@@ -2472,7 +2472,7 @@ fn background_request() -> serde_json::Value {
 fn background_script_returns_running_and_can_finish() {
     use crate::codemode::{ScriptRunState, WaitAction, WaitForScriptRequest};
 
-    let (_workspace, _evidence, agent) =
+    let (_workspace, evidence, mut agent) =
         background_agent(std::time::Duration::from_millis(200), true);
     let started = agent.run_codemode("call-bg", &background_request(), None);
     assert!(!started.is_error, "{started:?}");
@@ -2499,11 +2499,71 @@ fn background_script_returns_running_and_can_finish() {
     }
     assert_eq!(state, "completed");
 
-    // The wakeup is delivered exactly once.
-    let first = agent.take_script_notification().expect("notification");
-    assert_eq!(first["toolCallId"], json!(run_id));
-    assert_eq!(first["state"], json!("completed"));
-    assert!(agent.take_script_notification().is_none());
+    // The terminal record already carries its bounded summary and log reference.
+    let registry =
+        crate::codemode::ScriptRunRegistry::open(evidence.path().join("script-runs")).unwrap();
+    let record = registry.get(&run_id).unwrap();
+    let summary = record.summary.clone().expect("summary with terminal state");
+    assert_eq!(summary.status, "Completed");
+    assert!(summary.notifications.len() <= 16);
+    assert!(summary.notifications.iter().all(|text| text.len() <= 4096));
+    assert!(record
+        .log_ref
+        .as_deref()
+        .is_some_and(|log| log.starts_with("script-log-")));
+    assert!(
+        !summary.notifications.join(" ").contains("background done"),
+        "raw guest output must not be in the summary"
+    );
+
+    // Reading a wakeup does not consume it; delivery appends it once, as
+    // untrusted-labeled custom context after the existing history, and
+    // acknowledges it only afterwards.
+    let wakeups = agent.pending_script_wakeups();
+    assert_eq!(wakeups.len(), 1);
+    assert_eq!(wakeups[0].run_id, run_id);
+    assert_eq!(wakeups[0].state, ScriptRunState::Completed);
+    assert_eq!(agent.pending_script_wakeups().len(), 1);
+
+    agent
+        .messages
+        .push(crate::ChatMessage::text("user", "earlier turn"));
+    let before = agent.messages.clone();
+    agent.inject_script_wakeups();
+    agent.inject_script_wakeups();
+    assert!(agent.pending_script_wakeups().is_empty());
+    assert_eq!(
+        &agent.messages[..before.len()],
+        &before[..],
+        "prefix unchanged"
+    );
+    let delivered: Vec<_> = agent.messages[before.len()..].iter().collect();
+    assert_eq!(delivered.len(), 1, "exactly once");
+    let text = match &delivered[0].content[0] {
+        davinci_ai::MessageContent::Text { text } => text.clone(),
+        other => panic!("unexpected content {other:?}"),
+    };
+    assert!(text.contains("untrusted data"), "{text}");
+    assert!(text.contains(&run_id), "{text}");
+    assert!(text.contains("grants no authority"), "{text}");
+
+    // Crash between persist and acknowledge: the store still offers the run,
+    // but the persisted context suppresses a second copy.
+    let path = evidence
+        .path()
+        .join("script-runs")
+        .join(format!("{run_id}.json"));
+    let stored = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        stored.replace("\"notified\":true", "\"notified\":false"),
+    )
+    .unwrap();
+    assert_eq!(agent.pending_script_wakeups().len(), 1);
+    let count = agent.messages.len();
+    agent.inject_script_wakeups();
+    assert_eq!(agent.messages.len(), count, "dedupe suppressed the copy");
+    assert!(agent.pending_script_wakeups().is_empty());
 
     // Nothing is left owned after the run finished.
     assert_eq!(
@@ -2658,7 +2718,7 @@ fn explicit_branch_navigation_hides_runs_started_on_another_branch() {
     let denied = status(&agent);
     assert!(denied.is_error, "{}", denied.content);
     assert!(denied.content.contains("DENIED"), "{}", denied.content);
-    assert!(agent.take_script_notification().is_none());
+    assert!(agent.pending_script_wakeups().is_empty());
     agent.shutdown_session_scripts();
 }
 

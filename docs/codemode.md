@@ -48,8 +48,16 @@ With controlled mode on, a script that opens with
 `{"state": "running", "toolCallId": "<handle>"}` immediately. The run is owned
 by the session: its cancellation token is a child of the session token, so
 closing or cancelling the session stops it, and `wait_for_script` accepts
-`status`, a bounded `wait`, and `kill`. A finished run wakes the next turn once
-(`take_script_notification`), never on every poll. A run that cannot be stopped
+`status`, a bounded `wait`, and `kill`. A finished detached run stores a bounded
+summary (status, at most 16 scrubbed notifications of 4096 bytes, and the
+retained Script log reference) in the same write that publishes its terminal
+state. The next turn that starts after the run finishes is told once, as
+persisted context appended after the existing history and labeled as untrusted
+Script data that grants no authority; it is acknowledged only after it is
+persisted, and a wakeup already in the session is not added again. An idle
+session does not start a turn by itself, so a run that finishes while nothing is
+running is reported only when the next turn begins. Polling with `status` or
+`wait` is not counted as a stalled loop by the progress watchdog; `kill` is. A run that cannot be stopped
 is recorded as `recoveryRequired`, never as completed or cancelled, and guest
 JavaScript is never resumed after a crash.
 

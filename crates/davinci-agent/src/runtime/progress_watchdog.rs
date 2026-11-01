@@ -100,6 +100,17 @@ pub fn normalize_output_noise(text: &str) -> String {
     normalized.trim_end().to_string()
 }
 
+/// A call that only inspects background work: polling it is not a loop.
+/// `wait_for_script` counts for `status` and `wait`; `kill` does not.
+pub fn is_poll_call(name: &str, args: &serde_json::Value) -> bool {
+    name == "job_output"
+        || (name == "wait_for_script"
+            && matches!(
+                args.get("action").and_then(serde_json::Value::as_str),
+                Some("status" | "wait")
+            ))
+}
+
 /// A structured observation recorded for watchdog loop detection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgressObservation {
@@ -677,6 +688,36 @@ mod tests {
             });
             assert_eq!(signal, None);
         }
+    }
+
+    #[test]
+    fn repeated_polls_of_a_running_script_do_not_nudge_or_stop() {
+        use serde_json::json;
+        let mut watchdog = ProgressWatchdog::new();
+        for action in ["status", "wait"] {
+            let args = json!({"toolCallId": "bg-1", "action": action});
+            assert!(is_poll_call("wait_for_script", &args));
+            for _ in 0..8 {
+                let signal = watchdog.observe(ProgressObservation {
+                    tool_name: "wait_for_script".into(),
+                    input_fingerprint: args.to_string(),
+                    output_digest: "running".into(),
+                    hypothesis_id: None,
+                    hypothesis_evidence_refs: vec![],
+                    target_path: None,
+                    edit_content_hash: None,
+                    test_failure_signature: None,
+                    is_pruning_recovery: false,
+                    is_job_poll: is_poll_call("wait_for_script", &args),
+                    has_new_evidence: false,
+                });
+                assert_eq!(signal, None);
+            }
+        }
+        assert!(!is_poll_call(
+            "wait_for_script",
+            &json!({"toolCallId": "bg-1", "action": "kill"})
+        ));
     }
 
     #[test]

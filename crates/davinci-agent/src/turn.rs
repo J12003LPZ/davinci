@@ -14,6 +14,8 @@ use crate::ToolExecutionMode;
 
 /// Corrective turns allowed per run after a tool call is cut off by the
 /// output token limit.
+/// `customType` of the persisted context that tells the model a detached Script run finished.
+pub(crate) const SCRIPT_WAKEUP_CUSTOM_TYPE: &str = "davinci.script_wakeup";
 const MAX_TRUNCATED_CALL_RETRIES: u32 = 2;
 
 /// What stage one decided about a call.
@@ -741,6 +743,7 @@ Issue the call again if it is still needed.";
 
             self.inject_queued(&mut events, &mut new_messages, true);
             self.inject_job_notices(&mut events, &mut new_messages)?;
+            self.inject_script_wakeups();
 
             let repair = self.runtime.as_ref().and_then(|runtime| {
                 runtime
@@ -1483,6 +1486,38 @@ Issue the call again if it is still needed.";
             self.push_event(events, AgentEvent::MessageEnd { message: notice });
         }
         Ok(())
+    }
+
+    /// Offer each finished detached Script run to the model once, as persisted
+    /// custom context appended after the existing history (never in the stable
+    /// prefix). The run is acknowledged only after the context is persisted,
+    /// and a wakeup already present in the session is not appended again, so a
+    /// crash between the two steps cannot duplicate it.
+    pub(crate) fn inject_script_wakeups(&mut self) {
+        for wakeup in self.pending_script_wakeups() {
+            let present = self.messages.iter().any(|message| {
+                message.extra_str("customType") == Some(SCRIPT_WAKEUP_CUSTOM_TYPE)
+                    && message
+                        .extra
+                        .get("details")
+                        .and_then(|details| details.get("runId"))
+                        .and_then(Value::as_str)
+                        == Some(wakeup.run_id.as_str())
+            });
+            if !present {
+                self.record_custom_message(&serde_json::json!({
+                    "customType": SCRIPT_WAKEUP_CUSTOM_TYPE,
+                    "content": wakeup.render(),
+                    "display": false,
+                    "details": {"runId": wakeup.run_id},
+                }));
+            }
+            // An unpersisted wakeup stays pending rather than being lost.
+            if self.persistence_failure.is_some() {
+                return;
+            }
+            self.acknowledge_script_wakeup(&wakeup.run_id);
+        }
     }
 
     /// What a finished tool owes the session beyond its result: the `todo`
@@ -4558,7 +4593,7 @@ Issue the call again if it is still needed.";
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
 
-            let is_job_poll = name == "job_output";
+            let is_job_poll = crate::runtime::progress_watchdog::is_poll_call(name, args);
 
             let observation = crate::runtime::progress_watchdog::ProgressObservation {
                 tool_name: name.to_string(),

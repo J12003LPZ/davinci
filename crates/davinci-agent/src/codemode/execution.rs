@@ -451,124 +451,125 @@ impl Agent {
         outer_call_id: &str,
         request: &CodeModeRequest,
     ) -> ToolResult {
-        let start =
-            || -> Result<serde_json::Value, CodeModeError> {
-                let binding = self.codemode.as_ref().ok_or_else(|| {
-                    CodeModeError::new("UNAVAILABLE", "Codemode host unavailable")
-                })?;
-                if !binding.host.admits_background_scripts() {
-                    return Err(CodeModeError::new(
-                        "BACKGROUND_UNAVAILABLE",
-                        "background Scripts are not admitted by this host",
-                    ));
-                }
-                // Reject an impossible request before a run id exists.
-                CodeModeLimits::default().for_request(request)?;
-                let evidence = self.evidence.as_ref().ok_or_else(|| {
-                    CodeModeError::new(
-                        "UNAVAILABLE",
-                        "background Scripts need the durable run store",
-                    )
-                })?;
-                let runtime = self.runtime.as_ref().ok_or_else(|| {
-                    CodeModeError::new("UNAVAILABLE", "parent runtime unavailable")
-                })?;
-                let workspace = self
-                    .cwd
-                    .canonicalize()
-                    .map_err(|_| CodeModeError::new("UNAVAILABLE", "workspace unavailable"))?
-                    .to_string_lossy()
-                    .into_owned();
-                let registry_dir = evidence.dir().join("script-runs");
-                let registry = super::ScriptRunRegistry::open(&registry_dir)
-                    .map_err(|error| CodeModeError::new(&error.code, &error.message))?;
-                let outer: String = outer_call_id
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                            c
-                        } else {
-                            '_'
+        let start = || -> Result<serde_json::Value, CodeModeError> {
+            let binding = self
+                .codemode
+                .as_ref()
+                .ok_or_else(|| CodeModeError::new("UNAVAILABLE", "Codemode host unavailable"))?;
+            if !binding.host.admits_background_scripts() {
+                return Err(CodeModeError::new(
+                    "BACKGROUND_UNAVAILABLE",
+                    "background Scripts are not admitted by this host",
+                ));
+            }
+            // Reject an impossible request before a run id exists.
+            CodeModeLimits::default().for_request(request)?;
+            let evidence = self.evidence.as_ref().ok_or_else(|| {
+                CodeModeError::new(
+                    "UNAVAILABLE",
+                    "background Scripts need the durable run store",
+                )
+            })?;
+            let runtime = self
+                .runtime
+                .as_ref()
+                .ok_or_else(|| CodeModeError::new("UNAVAILABLE", "parent runtime unavailable"))?;
+            let workspace = self
+                .cwd
+                .canonicalize()
+                .map_err(|_| CodeModeError::new("UNAVAILABLE", "workspace unavailable"))?
+                .to_string_lossy()
+                .into_owned();
+            let registry_dir = evidence.dir().join("script-runs");
+            let registry = super::ScriptRunRegistry::open(&registry_dir)
+                .map_err(|error| CodeModeError::new(&error.code, &error.message))?;
+            let outer: String = outer_call_id
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .take(40)
+                .collect();
+            let run_id = format!(
+                "bg-{outer}-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
+            );
+            let mut record = super::ScriptRunRecord::new(
+                &run_id,
+                outer_call_id,
+                runtime.session_id.as_deref(),
+                &workspace,
+                &runtime
+                    .capability_registry
+                    .hash_tool_capabilities(&self.tools),
+            );
+            record.branch_epoch = self.branch_epoch.load(std::sync::atomic::Ordering::SeqCst);
+            // The run token is a child of the session's: closing or cancelling
+            // the session stops every detached Script it owns. The run is
+            // admitted before anything is written or spawned, so a shutdown
+            // either refuses it here or sees and cancels it.
+            let token = runtime.cancellation_token.child_token();
+            if !self.background_runs.reserve(&run_id, token.clone()) {
+                return Err(CodeModeError::new(
+                    "BACKGROUND_UNAVAILABLE",
+                    "the session is closing; no new background Script was started",
+                ));
+            }
+            self.background_runs.track(&registry_dir);
+            let admitted = registry
+                .create(&record)
+                .and_then(|()| {
+                    // The handle is visible as running before the thread works.
+                    registry
+                        .transition(&run_id, super::ScriptRunState::Running)
+                        .map(|_| ())
+                })
+                .map_err(|error| {
+                    self.background_runs.release(&run_id);
+                    CodeModeError::new(&error.code, &error.message)
+                });
+            admitted?;
+            let agent = self.clone();
+            let request = request.clone();
+            let spawned_run = run_id.clone();
+            let thread_token = token.clone();
+            let registry_dir = registry_dir.clone();
+            let handle = std::thread::Builder::new()
+                .name(format!(
+                    "codemode-{}",
+                    &spawned_run[spawned_run.len().saturating_sub(8)..]
+                ))
+                .spawn(move || {
+                    // The run's own counters and terminal state are recorded by
+                    // `run_script`; a detached failure never escapes the thread.
+                    let result = agent.run_script(&spawned_run, &request, None, thread_token, true);
+                    let _ = agent.finish_script_run(|| result, None);
+                    if let Ok(registry) = super::ScriptRunRegistry::open(&registry_dir) {
+                        // `run_script` already set the terminal state; this is a
+                        // no-op unless it failed to, in which case the run must
+                        // not look like it finished successfully.
+                        if registry
+                            .get(&spawned_run)
+                            .is_ok_and(|record| !record.state.terminal())
+                        {
+                            let _ =
+                                registry.transition(&spawned_run, super::ScriptRunState::Stalled);
                         }
-                    })
-                    .take(40)
-                    .collect();
-                let run_id = format!(
-                    "bg-{outer}-{}",
-                    &uuid::Uuid::new_v4().simple().to_string()[..12]
-                );
-                let mut record = super::ScriptRunRecord::new(
-                    &run_id,
-                    outer_call_id,
-                    runtime.session_id.as_deref(),
-                    &workspace,
-                    &runtime
-                        .capability_registry
-                        .hash_tool_capabilities(&self.tools),
-                );
-                record.branch_epoch = self.branch_epoch.load(std::sync::atomic::Ordering::SeqCst);
-                // The run token is a child of the session's: closing or cancelling
-                // the session stops every detached Script it owns. The run is
-                // admitted before anything is written or spawned, so a shutdown
-                // either refuses it here or sees and cancels it.
-                let token = runtime.cancellation_token.child_token();
-                if !self.background_runs.reserve(&run_id, token.clone()) {
-                    return Err(CodeModeError::new(
-                        "BACKGROUND_UNAVAILABLE",
-                        "the session is closing; no new background Script was started",
-                    ));
-                }
-                self.background_runs.track(&registry_dir);
-                let admitted = registry
-                    .create(&record)
-                    .and_then(|()| {
-                        // The handle is visible as running before the thread works.
-                        registry
-                            .transition(&run_id, super::ScriptRunState::Running)
-                            .map(|_| ())
-                    })
-                    .map_err(|error| {
-                        self.background_runs.release(&run_id);
-                        CodeModeError::new(&error.code, &error.message)
-                    });
-                admitted?;
-                let agent = self.clone();
-                let request = request.clone();
-                let spawned_run = run_id.clone();
-                let thread_token = token.clone();
-                let registry_dir = registry_dir.clone();
-                let handle = std::thread::Builder::new()
-                    .name(format!(
-                        "codemode-{}",
-                        &spawned_run[spawned_run.len().saturating_sub(8)..]
-                    ))
-                    .spawn(move || {
-                        // The run's own counters and terminal state are recorded by
-                        // `run_script`; a detached failure never escapes the thread.
-                        let result = agent.run_script(&spawned_run, &request, None, thread_token);
-                        let _ = agent.finish_script_run(|| result, None);
-                        if let Ok(registry) = super::ScriptRunRegistry::open(&registry_dir) {
-                            // `run_script` already set the terminal state; this is a
-                            // no-op unless it failed to, in which case the run must
-                            // not look like it finished successfully.
-                            if registry
-                                .get(&spawned_run)
-                                .is_ok_and(|record| !record.state.terminal())
-                            {
-                                let _ = registry
-                                    .transition(&spawned_run, super::ScriptRunState::Stalled);
-                            }
-                        }
-                    })
-                    .map_err(|_| {
-                        self.background_runs.release(&run_id);
-                        // No worker ever ran, so the visible handle must not stay open.
-                        let _ = registry.transition(&run_id, super::ScriptRunState::Failed);
-                        CodeModeError::new("UNAVAILABLE", "background Script worker unavailable")
-                    })?;
-                self.background_runs.attach(&run_id, handle);
-                Ok(json!({"toolCallId": run_id, "state": "running"}))
-            };
+                    }
+                })
+                .map_err(|_| {
+                    self.background_runs.release(&run_id);
+                    // No worker ever ran, so the visible handle must not stay open.
+                    let _ = registry.transition(&run_id, super::ScriptRunState::Failed);
+                    CodeModeError::new("UNAVAILABLE", "background Script worker unavailable")
+                })?;
+            self.background_runs.attach(&run_id, handle);
+            Ok(json!({"toolCallId": run_id, "state": "running"}))
+        };
         match start() {
             Ok(value) => ToolResult {
                 content: value.to_string(),
@@ -606,28 +607,39 @@ impl Agent {
         ))
     }
 
-    /// The oldest finished run whose wakeup has not been delivered, marked
-    /// delivered exactly once.
-    pub fn take_script_notification(&self) -> Option<serde_json::Value> {
+    fn script_wakeup_registry(&self) -> Option<(super::ScriptRunRegistry, String)> {
         let evidence = self.evidence.as_ref()?;
-        let runtime = self.runtime.as_ref()?;
         let workspace = self.cwd.canonicalize().ok()?.to_string_lossy().into_owned();
         let registry = super::ScriptRunRegistry::open(evidence.dir().join("script-runs")).ok()?;
-        let pending = registry
+        Some((registry, workspace))
+    }
+
+    /// Finished runs whose wakeup has not been delivered, oldest first. Reading
+    /// does not mark anything delivered: call `acknowledge_script_wakeup` after
+    /// the wakeup is durable in the session.
+    pub fn pending_script_wakeups(&self) -> Vec<super::ScriptWakeup> {
+        let (Some((registry, workspace)), Some(runtime)) =
+            (self.script_wakeup_registry(), self.runtime.as_ref())
+        else {
+            return Vec::new();
+        };
+        registry
             .pending_notifications(
                 runtime.session_id.as_deref(),
                 &workspace,
                 self.branch_epoch.load(std::sync::atomic::Ordering::SeqCst),
             )
-            .ok()?
-            .into_iter()
-            .next()?;
-        registry.mark_notified(&pending.run_id).ok()?;
-        Some(json!({
-            "toolCallId": pending.run_id,
-            "state": pending.state,
-            "logRef": pending.log_ref,
-        }))
+            .unwrap_or_default()
+            .iter()
+            .map(super::ScriptWakeup::from_record)
+            .collect()
+    }
+
+    /// Mark one wakeup delivered. Returns false when the store refused, so the
+    /// caller knows the wakeup may be offered again.
+    pub fn acknowledge_script_wakeup(&self, run_id: &str) -> bool {
+        self.script_wakeup_registry()
+            .is_some_and(|(registry, _)| registry.mark_notified(run_id).is_ok())
     }
 
     pub(crate) fn run_codemode(
@@ -653,19 +665,21 @@ impl Agent {
             .map(|runtime| runtime.cancellation_token.child_token())
             .unwrap_or_default();
         let run = || -> Result<(CodeModeOutcome, String), CodeModeError> {
-            self.run_script(id, &request, parent, cancellation)
+            self.run_script(id, &request, parent, cancellation, false)
         };
         self.finish_script_run(run, parent)
     }
 
     /// Run one script to completion with the given cancellation authority.
     /// `parent` stays optional so a detached run needs no turn operation.
+    /// A `detached` run publishes a bounded summary with its terminal state.
     fn run_script(
         &self,
         id: &str,
         request: &CodeModeRequest,
         parent: Option<OperationId>,
         cancellation: crate::runtime::CancellationToken,
+        detached: bool,
     ) -> Result<(CodeModeOutcome, String), CodeModeError> {
         {
             let mut limits = CodeModeLimits::default().for_request(request)?;
@@ -734,6 +748,7 @@ impl Agent {
                     let _ = registry.transition(&record.run_id, super::ScriptRunState::Running);
                 }
             }
+            let mut log_ref = None;
             let mut outcome = binding.host.execute(request, &context, broker.clone());
             let drained = broker.close(std::time::Duration::from_millis(
                 context.limits.cleanup_grace_ms,
@@ -750,6 +765,7 @@ impl Agent {
                 if let Ok(log) = super::ScriptLogStore::new(evidence.dir(), session)
                     .persist_script_log(&context.identity.invocation_id, &events)
                 {
+                    log_ref = Some(log.id.clone());
                     outcome.host_notes.push(format!(
                         "Script log {} retained {} event(s), {} bytes{}.",
                         log.id,
@@ -837,7 +853,18 @@ impl Agent {
                     CodeModeStatus::Cancelled => super::ScriptRunState::Cancelled,
                     CodeModeStatus::RecoveryRequired => super::ScriptRunState::RecoveryRequired,
                 };
-                let _ = registry.transition(&context.identity.invocation_id, state);
+                // A detached run's summary is written in the same locked
+                // operation, so a terminal record always has it.
+                let summary = detached.then(|| {
+                    (
+                        super::ScriptRunSummary::bounded(
+                            &format!("{:?}", outcome.status),
+                            &outcome.host_notes,
+                        ),
+                        log_ref,
+                    )
+                });
+                let _ = registry.finish(&context.identity.invocation_id, state, summary);
             }
             Ok((outcome, authority))
         }
