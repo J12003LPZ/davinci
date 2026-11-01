@@ -226,6 +226,12 @@ pub trait CodeModeHost: Send + Sync {
     fn admits_controlled_mode(&self) -> bool {
         false
     }
+    /// Trusted host statement that detached Script runs are admitted. The
+    /// C08 resident-service prohibition stands until an owner approves it, so
+    /// the default refuses.
+    fn admits_background_scripts(&self) -> bool {
+        false
+    }
     fn execute(
         &self,
         request: &CodeModeRequest,

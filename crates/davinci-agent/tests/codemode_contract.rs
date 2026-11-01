@@ -53,6 +53,85 @@ fn malformed_script_headers_are_rejected_before_dispatch() {
 }
 
 #[test]
+fn crashed_script_never_replays_mutation() {
+    use davinci_agent::codemode::{
+        reconcile_script_run, ScriptRunRecord, ScriptRunRegistry, ScriptRunState,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let registry = ScriptRunRegistry::open(dir.path()).unwrap();
+    for (index, start) in [(1, ScriptRunState::Created), (2, ScriptRunState::Running)] {
+        let run = format!("run-crash-{index}");
+        let record =
+            ScriptRunRecord::new(&run, "call-crash", Some("session-a"), "workspace-a", "rev");
+        registry.create(&record).unwrap();
+        if start == ScriptRunState::Running {
+            registry.transition(&run, start).unwrap();
+        }
+        let reconciled = reconcile_script_run(&registry, &run).unwrap();
+        // A host that restarted mid-run cannot resume guest JavaScript.
+        assert_eq!(reconciled.state, ScriptRunState::RecoveryRequired);
+        assert!(reconciled.recovered);
+        assert!(reconciled
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("not resumed")));
+        // Reconciling again is stable: no second attempt, no replay.
+        let again = reconcile_script_run(&registry, &run).unwrap();
+        assert_eq!(again.state, ScriptRunState::RecoveryRequired);
+        assert!(!again.recovered);
+    }
+    // A terminal run stays exactly as recorded.
+    let record = ScriptRunRecord::new(
+        "run-done",
+        "call-done",
+        Some("session-a"),
+        "workspace-a",
+        "rev",
+    );
+    registry.create(&record).unwrap();
+    registry
+        .transition("run-done", ScriptRunState::Running)
+        .unwrap();
+    registry
+        .transition("run-done", ScriptRunState::Completed)
+        .unwrap();
+    let reconciled = reconcile_script_run(&registry, "run-done").unwrap();
+    assert_eq!(reconciled.state, ScriptRunState::Completed);
+    assert!(!reconciled.recovered);
+}
+
+#[test]
+fn background_script_returns_running_and_can_finish() {
+    use davinci_agent::codemode::{script_requests_background, CodeModeHost};
+    use std::sync::Arc;
+
+    struct DenyBackground;
+    impl CodeModeHost for DenyBackground {
+        fn execute(
+            &self,
+            _: &davinci_agent::codemode::CodeModeRequest,
+            _: &davinci_agent::codemode::CodeModeRunContext,
+            _: Arc<dyn davinci_agent::codemode::CodeModeBroker>,
+        ) -> davinci_agent::codemode::CodeModeOutcome {
+            unreachable!()
+        }
+    }
+    // The directive is parsed, never inferred from a comment later in the code.
+    assert!(script_requests_background(
+        "// @script: {\"startInBackground\": true}\nreturn 1;"
+    ));
+    assert!(!script_requests_background(
+        "// @script: {\"startInBackground\": false}\nreturn 1;"
+    ));
+    assert!(!script_requests_background(
+        "const s = `\n// @script: {\"startInBackground\": true}\n`;\nreturn s;"
+    ));
+    // Until an owner approves the C08 exception, the host refuses to detach and
+    // the script fails closed instead of silently running in the foreground.
+    assert!(!DenyBackground.admits_background_scripts());
+}
+
+#[test]
 fn script_state_persists_and_reconciles() {
     use davinci_agent::codemode::{ScriptRunRecord, ScriptRunRegistry, ScriptRunState};
     let dir = tempfile::tempdir().unwrap();

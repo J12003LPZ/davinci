@@ -16,7 +16,10 @@ pub(crate) use execution::mandatory_facts;
 pub(crate) use execution::CodeModeBinding;
 pub use policy::{effect_is_admitted, js_name, resolve_script_alias, CapabilityPolicy};
 pub use recovery::{reconcile_script_child_effect, resolve_script_effect, ScriptEffectResolution};
-pub use runs::{ScriptRunError, ScriptRunRecord, ScriptRunRegistry, ScriptRunState};
+pub use runs::{
+    reconcile_script_run, ReconciledScriptRun, ScriptRunError, ScriptRunRecord, ScriptRunRegistry,
+    ScriptRunState,
+};
 pub use script_log::{
     ScriptLogError, ScriptLogEvent, ScriptLogRef, ScriptLogSlice, ScriptLogStore,
 };
@@ -173,6 +176,30 @@ fn has_option_header(code: &str) -> bool {
         }
         if !line.is_empty() && !line.starts_with("//") {
             return false;
+        }
+    }
+    false
+}
+
+/// True when the raw source asks the host to detach. The directive is parsed
+/// by the same bounded lexer that validates the rest of the header.
+pub fn script_requests_background(code: &str) -> bool {
+    for line in code.lines() {
+        let line = line.trim_start();
+        if let Some(raw) = line.strip_prefix("// @script: ") {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            struct Directive {
+                #[serde(default)]
+                start_in_background: Option<bool>,
+            }
+            return serde_json::from_str::<Directive>(raw)
+                .ok()
+                .and_then(|directive| directive.start_in_background)
+                .unwrap_or(false);
+        }
+        if !line.is_empty() && !line.starts_with("//") {
+            break;
         }
     }
     false

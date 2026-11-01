@@ -50,6 +50,14 @@ pub(crate) fn mandatory_facts(result: &ToolResult) -> Option<Value> {
     )
 }
 
+/// Whether the bound host admits detached runs. A missing binding fails closed.
+fn binding_host_admits_background(agent: &Agent) -> Result<bool, CodeModeError> {
+    Ok(agent
+        .codemode
+        .as_ref()
+        .is_some_and(|binding| binding.host.admits_background_scripts()))
+}
+
 #[derive(Clone)]
 pub(crate) struct CodeModeBinding {
     pub host: Arc<dyn CodeModeHost>,
@@ -343,6 +351,17 @@ impl Agent {
         let run = || -> Result<(CodeModeOutcome, String), CodeModeError> {
             let request: CodeModeRequest = serde_json::from_value(args.clone())
                 .map_err(|_| CodeModeError::new("INVALID_INPUT", "invalid Codemode request"))?;
+            // Detached runs change the C08 resident-service contract; until an
+            // owner approves it and the recovery gates pass, refuse rather than
+            // silently run in the foreground.
+            if super::script_requests_background(&request.code)
+                && !binding_host_admits_background(self)?
+            {
+                return Err(CodeModeError::new(
+                    "BACKGROUND_UNAVAILABLE",
+                    "background Scripts require explicit owner approval and the C08 recovery gates",
+                ));
+            }
             let mut limits = CodeModeLimits::default().for_request(&request)?;
             let binding = self
                 .codemode

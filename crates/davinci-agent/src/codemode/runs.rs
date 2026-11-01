@@ -169,6 +169,52 @@ impl ScriptRunRegistry {
     }
 }
 
+/// Result of reconciling one durable run after a host restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconciledScriptRun {
+    pub run_id: String,
+    pub state: ScriptRunState,
+    /// True when this call changed the stored state.
+    pub recovered: bool,
+    pub reason: Option<String>,
+}
+
+/// Reconcile a run against the fact that this host process is new. Guest
+/// JavaScript is never resumed: a run that was still open becomes
+/// `RecoveryRequired`, and a terminal run is left exactly as recorded.
+pub fn reconcile_script_run(
+    registry: &ScriptRunRegistry,
+    run_id: &str,
+) -> Result<ReconciledScriptRun, ScriptRunError> {
+    let mut record = registry.get(run_id)?;
+    if record.state.terminal() {
+        // RecoveryRequired may resolve through the operation journal, but this
+        // function never invents an outcome.
+        return Ok(ReconciledScriptRun {
+            run_id: record.run_id,
+            state: record.state,
+            recovered: false,
+            reason: None,
+        });
+    }
+    record.state = ScriptRunState::RecoveryRequired;
+    registry.write_record(&record)?;
+    Ok(ReconciledScriptRun {
+        run_id: record.run_id,
+        state: record.state,
+        recovered: true,
+        reason: Some(
+            "host restarted while the script was open; guest JavaScript is not resumed".into(),
+        ),
+    })
+}
+
+impl ScriptRunRegistry {
+    fn write_record(&self, record: &ScriptRunRecord) -> Result<(), ScriptRunError> {
+        self.write(&self.path(&record.run_id)?, record)
+    }
+}
+
 impl ScriptRunError {
     fn new(code: &str, message: &str) -> Self {
         Self {
