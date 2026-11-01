@@ -2,9 +2,9 @@
 
 Offline, $0. No provider request was made and nothing was spent. Every DaVinci byte below is
 produced by an offline Rust test that builds the first provider request for the prompt `hi` and
-reads its `WireManifest`; every Droid cell is either `not re-checked` (the mock capture it
-needs is forbidden by R3 — the live CLIProxyAPI holds port 8317) or `no byte source` (Droid's
-offline surface does not expose the value).
+reads its `WireManifest`; every Droid cell comes from the Task 11 mock capture (a local mock on
+port 18317, no provider request) or is `no byte source` (the value is not split out of Droid's
+request).
 
 ## 1. The table
 
@@ -13,8 +13,8 @@ offline surface does not expose the value).
 | DaVinci Full | 40 | 25,906 | 9,747 | 5,650 | 426 | 36,447 | this test (`first_request_anatomy`) |
 | DaVinci Lean | 16 | 12,830 | 9,747 | 5,650 | 426 | 23,371 | this test (`first_request_anatomy`) |
 | DaVinci Full+Codemode | 41 | 27,444 | 9,747 | 5,650 | 1,176 | 38,736 | this test (`first_request_anatomy`) |
-| Droid direct | not re-checked | not re-checked | no byte source | no byte source | no byte source | no byte source | `droid-1.1.0-identity.md` fact 5 |
-| Droid script | not re-checked | not re-checked | no byte source | no byte source | no byte source | no byte source | `droid-1.1.0-identity.md` fact 4 |
+| Droid direct | 23 | 69,711 | 6,150 | no byte source | no byte source | 94,606 | mock capture, `direct_reads` request 1 |
+| Droid script | 5 | 29,746 | 6,075 | no byte source | no byte source | 54,780 | mock capture, `script_reads` request 1 |
 
 Units, so the columns are not misread:
 
@@ -31,19 +31,30 @@ Units, so the columns are not misread:
   block is the text of the turn-context message, so its bytes are already inside the
   `conversation B` figure (section 2). Do not add either column to anything.
 
-### Droid `not re-checked` — why
+### 1b. Droid capture (Task 11)
 
-Task 3 (`droid-1.1.0-identity.md`) re-checked what it could offline, but the only source for
-Droid's *request* tool count and tool-schema bytes is the scripted mock capture, which binds port
-8317 where the live CLIProxyAPI runs (rule R3 forbids stopping it). The 1.0.0 reference recorded
-**direct: 23 tools / 69,689 B** and **script: 5 tools / 29,728 B** (reference ch. 19 §2.1); those
-are 1.0.0 figures and are **not** restated as current. The only re-checked Droid number is
-`--list-tools` = **30** base-catalog tools for every mode, which is the available-tool listing,
-not the request tool-schema count, and cannot distinguish direct from script.
+Source: the first `POST /v1/responses` the 1.1.0 binary sent to a local mock on `127.0.0.1:18317`
+(per-process `--settings`, alias `custom:mock-probe-0`, dead-proxy env; CLIProxyAPI untouched),
+prompt `read three files`, empty temp cwd, `--auto high`. Request body keys: `include`, `input`,
+`instructions`, `model`, `parallel_tool_calls`, `prompt_cache_key`, `reasoning`, `safety_identifier`,
+`store`, `stream`, `text`, `tool_choice`, `tools`. Bytes are the UTF-8 length of each field's compact
+JSON substring of the raw body (found verbatim in it), so they are wire bytes like the DaVinci columns.
 
-Droid has no offline byte source for instruction, project-instruction, turn-context or total
-request bytes: its `--list-tools` JSON dump (79,558 B) is a serialization of the listing output,
-not a request capture, and no request is ever built without a live provider or the mock.
+| Droid request | Tools | `tools` B | `instructions` B | `input` B (2 items) | Total body B |
+|---|---:|---:|---:|---:|---:|
+| script-only | 5 (`Script`, `WaitForScript`, `TaskOutput`, `TaskStop`, `Task`) | 29,746 | 6,075 | 18,593 | 54,780 |
+| direct-only | 23 | 69,711 | 6,150 | 18,379 | 94,606 |
+
+- The 1.0.0 reference gave 5 / 29,728 B and 23 / 69,689 B, so the tool sets are unchanged and the
+  schema bytes grew by 18 B and 22 B.
+- `input` is one `<system-reminder>` item (headed "Unified tool catalog ...") plus the 52 B user message. Project instructions and turn context
+  are not split out of it, so those two columns stay `no byte source`. This probe cwd held no
+  `AGENTS.md`, so a real workspace adds its project text on top.
+- The prompt differs from DaVinci's `hi` (`read three files` adds a few bytes), and DaVinci's
+  figures use `gpt-5.6-luna` while the Droid request used `model: gpt-6.1-sol`. The columns are
+  therefore comparable by category, not byte for byte.
+- `--list-tools` (30 tools, 79,558 B as JSON) is still only the available-tool listing, not the
+  request tool array.
 
 ## 2. DaVinci numbers (test output, `--nocapture`)
 
