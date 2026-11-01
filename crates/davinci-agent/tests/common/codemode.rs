@@ -1982,3 +1982,66 @@ fn controlled_script_applies_patch_once() {
         applied
     );
 }
+
+#[test]
+fn controlled_script_execute_uses_the_guarded_shell() {
+    use crate::codemode::{
+        AgentCodeModeBroker, CodeModeBroker as _, CodeModeCall, CodeModeIdentity, CodeModeLimits,
+        CodeModeMode, CodeModeRunContext,
+    };
+    let (mut agent, workspace, _) = configured_agent();
+    agent.tools = vec!["exec_command".into()];
+    agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+    agent.sync_tool_authorization();
+    let runtime = agent.runtime.as_ref().unwrap();
+    let revision = runtime
+        .capability_registry
+        .hash_tool_capabilities(&agent.tools);
+    let context = CodeModeRunContext {
+        identity: CodeModeIdentity {
+            invocation_id: "execute-fixture".into(),
+            session_id: runtime.session_id.clone(),
+            branch_leaf: None,
+            workspace_binding: workspace
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into(),
+            runtime_run_id: runtime.run_id.to_string(),
+            parent_operation_ref: None,
+        },
+        mode: CodeModeMode::Controlled,
+        limits: CodeModeLimits::default(),
+        capability_revision: revision,
+        cancellation: runtime.cancellation_token.child_token(),
+        root_budget: runtime.root_budget.clone(),
+    };
+    let broker = AgentCodeModeBroker::new(agent.clone(), context, None).unwrap();
+    let ok = broker
+        .call(CodeModeCall {
+            request_id: 1,
+            tool: "tools.Execute".into(),
+            args: json!({"command":"echo codemode-execute"}),
+        })
+        .unwrap();
+    assert!(ok.text.contains("codemode-execute"), "{}", ok.text);
+    assert_eq!(
+        ok.structured_content.as_ref().unwrap()["exitCode"],
+        json!(0)
+    );
+    // A failing command is a normal result with a nonzero exit, not a
+    // protocol error or a lost child.
+    let failed = broker
+        .call(CodeModeCall {
+            request_id: 2,
+            tool: "tools.Execute".into(),
+            args: json!({"command":"exit 3"}),
+        })
+        .unwrap();
+    assert_eq!(
+        failed.structured_content.as_ref().unwrap()["exitCode"],
+        json!(3)
+    );
+    assert_eq!(broker.children().len(), 2);
+}

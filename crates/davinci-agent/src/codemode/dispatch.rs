@@ -510,7 +510,10 @@ impl CodeModeBroker for AgentCodeModeBroker {
             self.parent,
             ordinal,
         );
-        let unresolved_effect = if mutating {
+        let failed_command = command_status(&admitted.canonical, &result);
+        // A delivered result proves the effect outcome; only a lost or failed
+        // reply can leave a mutation ambiguous.
+        let unresolved_effect = if mutating && result.is_error && !failed_command {
             // The journal is the authority: an ambiguous effect stays
             // unresolved and closes admission instead of replaying.
             self.agent
@@ -528,7 +531,7 @@ impl CodeModeBroker for AgentCodeModeBroker {
         } else {
             false
         };
-        let mut error = (result.is_error || unresolved_effect).then(|| {
+        let mut error = ((result.is_error && !failed_command) || unresolved_effect).then(|| {
             let recovery = unresolved_effect
                 || result.details.as_ref().is_some_and(|details| {
                     [
@@ -563,7 +566,8 @@ impl CodeModeBroker for AgentCodeModeBroker {
             error
         });
         let value = if error.is_none() {
-            match super::projection::project_script_result(
+            match super::projection::adapt_script_tool_result(
+                &admitted.canonical,
                 result,
                 structured,
                 operation_ref.clone(),
@@ -631,6 +635,17 @@ impl CodeModeBroker for AgentCodeModeBroker {
         }
         value.ok_or_else(|| CodeModeError::new("TOOL_FAILED", "child projection unavailable"))
     }
+}
+
+/// A command that ran and exited non-zero is a result with a status, not a
+/// delivered tool error.
+fn command_status(tool: &str, result: &crate::ToolResult) -> bool {
+    matches!(tool, "exec_command" | "bash" | "powershell")
+        && result.details.as_ref().is_some_and(|details| {
+            details
+                .get("exitCode")
+                .is_some_and(|code| code.as_i64() != Some(0))
+        })
 }
 
 /// How a child call shares the dispatch lane: `Some(limit)` runs beside other

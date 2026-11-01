@@ -162,6 +162,49 @@ pub fn assemble_script_output(
     })
 }
 
+/// Script-visible shape of a child result. Command tools keep their structured
+/// exit metadata instead of flattening it into text.
+pub fn adapt_script_tool_result(
+    tool: &str,
+    result: crate::ToolResult,
+    structured: Option<Value>,
+    operation_ref: String,
+    maximum: usize,
+) -> Result<CodeModeToolValue, CodeModeError> {
+    let command = matches!(tool, "exec_command" | "bash" | "powershell");
+    let structured = structured.or_else(|| {
+        // Command tools already report their exit status; hoist it instead of
+        // making the script parse prose.
+        if !command {
+            return None;
+        }
+        let details = result.details.as_ref()?;
+        let exit_code = details.get("exitCode")?;
+        let mut value = serde_json::Map::new();
+        value.insert("exitCode".into(), exit_code.clone());
+        if let Some(duration) = details.get("durationMs") {
+            value.insert("durationMs".into(), duration.clone());
+        }
+        if let Some(cancelled) = details.get("cancelled") {
+            value.insert("cancelled".into(), cancelled.clone());
+        }
+        Some(Value::Object(value))
+    });
+    // A command that ran and exited non-zero is a value with its status, not a
+    // delivered tool error: a failing test run must stay inspectable.
+    let failed_command = command
+        && result.details.as_ref().is_some_and(|details| {
+            details
+                .get("exitCode")
+                .is_some_and(|code| code.as_i64() != Some(0))
+        });
+    let mut result = result;
+    if failed_command {
+        result.is_error = false;
+    }
+    project_script_result(result, structured, operation_ref, maximum)
+}
+
 pub fn project_script_result(
     result: crate::ToolResult,
     structured: Option<Value>,

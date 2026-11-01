@@ -38,6 +38,9 @@ pub fn resolve_script_effect(
         (_, EffectStatus::KnownNoEffect) | (_, EffectStatus::Compensated) => {
             ScriptEffectResolution::NoEffect { operation_ref }
         }
+        // An observed effect is committed even when the tool reported failure:
+        // the command ran and its exit status is the result, not ambiguity.
+        (_, EffectStatus::EffectsObserved) => ScriptEffectResolution::Succeeded { operation_ref },
         (
             OperationState::Failed
             | OperationState::Cancelled

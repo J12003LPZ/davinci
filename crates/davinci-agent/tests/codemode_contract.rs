@@ -53,17 +53,62 @@ fn malformed_script_headers_are_rejected_before_dispatch() {
 }
 
 #[test]
+fn script_execute_reports_exit_and_test_failures() {
+    use davinci_agent::codemode::projection::adapt_script_tool_result;
+    use davinci_agent::ToolResult;
+
+    // A failing `cargo test` is a normal tool result, not a protocol failure:
+    // the guest must see the exit code and the error lines.
+    let failed = ToolResult {
+        content: "test result: FAILED. 1 passed; 1 failed\n  left: 1\n right: 2".into(),
+        is_error: false,
+        details: Some(serde_json::json!({"exitCode":101})),
+    };
+    let value =
+        adapt_script_tool_result("exec_command", failed, None, "op-fixture".into(), 1 << 20)
+            .unwrap();
+    assert_eq!(
+        value.structured_content.as_ref().unwrap()["exitCode"],
+        serde_json::json!(101)
+    );
+    assert!(value.text.contains("test result: FAILED"));
+    assert_eq!(value.operation_ref, "op-fixture");
+    assert!(value.complete);
+
+    // A spawn or policy failure stays an error, with its text preserved.
+    let error = adapt_script_tool_result(
+        "exec_command",
+        ToolResult {
+            content: "Permission denied: disallowed command".into(),
+            is_error: true,
+            details: None,
+        },
+        None,
+        "op-denied".into(),
+        1 << 20,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "TOOL_FAILED");
+    assert!(error.message.contains("disallowed command"));
+
+    // A read tool keeps its text-only shape; no invented command metadata.
+    let read = ToolResult {
+        content: "contents".into(),
+        is_error: false,
+        details: Some(serde_json::json!({"exitCode":101})),
+    };
+    let value = adapt_script_tool_result("read", read, None, "op-read".into(), 1 << 20).unwrap();
+    assert!(value.structured_content.is_none());
+}
+
+#[test]
 fn unknown_mutation_never_auto_replays() {
     use davinci_agent::codemode::{resolve_script_effect, ScriptEffectResolution};
     use davinci_agent::runtime::operations::{EffectStatus, OperationState};
 
     // An ambiguous effect is never success and never a retry, whatever the
     // operation state claims.
-    for effect in [
-        EffectStatus::Possible,
-        EffectStatus::Unknown,
-        EffectStatus::EffectsObserved,
-    ] {
+    for effect in [EffectStatus::Possible, EffectStatus::Unknown] {
         for state in [
             OperationState::Running,
             OperationState::EffectPossible,
@@ -87,6 +132,11 @@ fn unknown_mutation_never_auto_replays() {
         ScriptEffectResolution::Succeeded { .. }
     ));
     assert!(!committed.may_retry());
+    // An observed effect whose command failed is still committed: the exit
+    // status is the result, not ambiguity.
+    let observed = resolve_script_effect(OperationState::Failed, EffectStatus::EffectsObserved);
+    assert!(matches!(observed, ScriptEffectResolution::Succeeded { .. }));
+    assert!(!observed.requires_postcondition());
     // Only a proven no-effect may be issued again.
     for (state, effect) in [
         (OperationState::Failed, EffectStatus::NotStarted),
