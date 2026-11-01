@@ -1447,6 +1447,7 @@ impl Agent {
             environment: self.runtime_environment.clone(),
             additional_directories: self.additional_directories(),
             codemode_available: self.codemode_exposed(),
+            codemode_controlled: self.codemode_controlled(),
         }
     }
 
@@ -2719,11 +2720,12 @@ impl Agent {
             plan_active: permission_mode == PermissionMode::ReadOnly,
         };
 
-        let composed = prompt::turn::compose_turn_prompt(
+        let composed = prompt::turn::compose_turn_prompt_with(
             &self.prompt_session,
             &ctx,
             &capabilities,
             &runtime_state,
+            self.script_mode_prompt(),
         )?;
         self.reset_capability_run_state(&capabilities, runtime_state.visual_verification_available);
 
@@ -2798,8 +2800,13 @@ impl Agent {
             permission_mode,
             plan_active: permission_mode == PermissionMode::ReadOnly,
         };
-        let composed =
-            prompt::turn::compose_turn_prompt(&self.prompt_session, &ctx, &union, &runtime_state)?;
+        let composed = prompt::turn::compose_turn_prompt_with(
+            &self.prompt_session,
+            &ctx,
+            &union,
+            &runtime_state,
+            self.script_mode_prompt(),
+        )?;
         self.reset_capability_run_state(&union, runtime_state.visual_verification_available);
         self.apply_composed_turn_prompt(&composed);
         self.prompt_manifest = Some(composed.manifest.clone());

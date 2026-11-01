@@ -25,12 +25,23 @@ pub struct NodeCodeModeHost {
 /// deadline can fire before the host watchdog; that is still a timeout, not a
 /// sandbox fault, so its kind decides the code.
 fn sandbox_failure(result: &Value) -> CodeModeError {
+    let detail = script_error_detail(result);
+    // A guest limit is a bounded refusal, not an unexplained sandbox fault.
+    if detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("LIMIT_EXCEEDED"))
+    {
+        return CodeModeError::new(
+            "LIMIT_EXCEEDED",
+            detail.as_deref().unwrap_or("script exceeded a guest limit"),
+        );
+    }
     match result.pointer("/error/kind").and_then(Value::as_str) {
         Some("timeout") => CodeModeError::new("TIMEOUT", "script deadline expired"),
         Some("aborted") => CodeModeError::new("CANCELLED", "script was cancelled"),
         _ => CodeModeError::new(
             "SANDBOX_FAILED",
-            &match script_error_detail(result) {
+            &match detail {
                 Some(detail) => format!("script failed in the sandbox: {detail}"),
                 None => "script failed in the sandbox".into(),
             },

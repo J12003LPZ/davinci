@@ -35,6 +35,10 @@ arrive as `inputs.name` from leading `// @input: name <<'TAG'` blocks;
 `text()` and `await notify()` are the explicit output channels. Image output is
 not yet supported (an OPEN parity gap) and fails with `UNSUPPORTED_OUTPUT`.
 
+While controlled mode is on, the prompt carries a versioned Script reference
+built from the aliases actually bound, and `wait_for_script` is offered so a run
+can be inspected without re-running it. Both disappear when the mode is off.
+
 ## Rollback
 
 Set the mode to `off` (or remove the `codemode` key). Later turns no longer
@@ -51,6 +55,9 @@ operation journal. Evaluating controlled mode's performance is tracked in
 - **The admitted runtime:** Node.js **24.21.0** exactly, plus the Codemode host
   bundle whose files match the manifest built into DaVinci
   (`crates/davinci-coding-agent/src/codemode_host/assets-manifest.json`).
+  Rebuilding the bundle requires regenerating that manifest:
+  `node crates/davinci-coding-agent/codemode-host/package-bundle.mjs NEW_DIR MANIFEST`,
+  then copying `MANIFEST` over `assets-manifest.json` and rebuilding DaVinci.
 
 ## Runtime layout
 

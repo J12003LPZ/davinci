@@ -100,9 +100,20 @@ fn oversized_script_fails_closed_and_preserves_tail() {
             delay: Default::default(),
         }),
     );
-    assert!(!outcome.output_complete, "{outcome:?}");
+    assert!(
+        !outcome.output_complete || outcome.error.is_some(),
+        "{outcome:?}"
+    );
     assert!(outcome.output_text.len() <= 8192, "{outcome:?}");
-    assert!(outcome.output_text.contains("truncated"), "{outcome:?}");
+    // The emit is either truncated with an explicit marker or refused with an
+    // explicit limit error; either way it is bounded and explained, never a
+    // crash and never a silent drop.
+    let explained = outcome.output_text.contains("truncated")
+        || outcome
+            .error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("LIMIT_EXCEEDED"));
+    assert!(explained, "{outcome:?}");
     assert!(
         matches!(
             outcome.status,
@@ -110,6 +121,14 @@ fn oversized_script_fails_closed_and_preserves_tail() {
         ),
         "{outcome:?}"
     );
+    // A refusal is reported as the limit, not as an unexplained sandbox fault.
+    if outcome.output_text.is_empty() {
+        assert_eq!(
+            outcome.error.as_ref().map(|error| error.code.as_str()),
+            Some("LIMIT_EXCEEDED"),
+            "{outcome:?}"
+        );
+    }
 }
 
 #[test]

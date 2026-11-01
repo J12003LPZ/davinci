@@ -63,6 +63,7 @@ impl PromptBundle {
                 environment: None,
                 additional_directories: Vec::new(),
                 codemode_available: false,
+                codemode_controlled: false,
             },
         ));
         let mut composed = compose_modules(&modules);

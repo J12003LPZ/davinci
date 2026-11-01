@@ -168,6 +168,7 @@ pub fn compose_with_mutations(
             environment: None,
             additional_directories: Vec::new(),
             codemode_available: false,
+            codemode_controlled: false,
         },
     ));
 

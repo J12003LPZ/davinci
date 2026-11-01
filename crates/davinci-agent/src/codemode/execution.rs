@@ -133,14 +133,22 @@ impl Agent {
         self.codemode = None;
         if let Some(runtime) = &self.runtime {
             runtime.capability_registry.unregister("codemode");
+            runtime.capability_registry.unregister("wait_for_script");
         }
-        self.tools.retain(|name| name != "codemode");
-        self.tool_registry.retain(|name| name != "codemode");
+        self.tools
+            .retain(|name| name != "codemode" && name != "wait_for_script");
+        self.tool_registry
+            .retain(|name| name != "codemode" && name != "wait_for_script");
         self.tool_context
             .tool_exposure
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .activate_authorized("codemode", false);
+        self.tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .activate_authorized("wait_for_script", false);
         self.sync_tool_authorization();
     }
 
@@ -232,6 +240,26 @@ impl Agent {
         }
         capability.replay_policy = ReplayPolicy::NeverAutoReplay;
         runtime.capability_registry.register(capability);
+        if controlled {
+            // `wait_for_script` is the only way the model polls a durable run.
+            // It is host-owned, session-scoped and only offered in controlled
+            // mode; it grants no authority over the run itself.
+            let mut wait = RuntimeCapability::new(
+                "wait_for_script",
+                CapabilitySource::Builtin,
+                crate::permission::ToolClass::Read,
+                false,
+                &json!({"type":"object","additionalProperties":false,
+                    "required":["toolCallId","action"],
+                    "properties":{"toolCallId":{"type":"string","minLength":1,"maxLength":128},
+                    "action":{"type":"string","enum":["status","wait","kill"]}}}),
+                Some("1".into()),
+            );
+            wait.description = "Check, wait for or stop a Script run started earlier in this session. `status` is nonblocking and idempotent, `wait` is bounded and cancellation-aware, and `kill` reports the observed state or RECOVERY_REQUIRED when ownership is not confirmed. Handles are scoped to this session and workspace.".into();
+            wait.declared_effects.clear();
+            wait.replay_policy = ReplayPolicy::NeverAutoReplay;
+            runtime.capability_registry.register(wait);
+        }
         self.bind_codemode(host, mode);
         Ok(())
     }
@@ -251,19 +279,29 @@ impl Agent {
     }
 
     fn bind_codemode(&mut self, host: Arc<dyn CodeModeHost>, mode: CodeModeMode) {
+        let controlled = matches!(mode, CodeModeMode::Controlled);
         self.codemode = Some(CodeModeBinding { host, mode });
-        self.apply_extension_tools(&["codemode".into()]);
+        let mut names = vec!["codemode".to_string()];
+        if controlled {
+            names.push("wait_for_script".into());
+        }
+        self.apply_extension_tools(&names);
         let authorized = self
             .tool_context
             .authorized_tools
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .contains("codemode");
-        self.tool_context
+            .clone();
+        let mut exposure = self
+            .tool_context
             .tool_exposure
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .activate_authorized("codemode", authorized);
+            .unwrap_or_else(|error| error.into_inner());
+        exposure.activate_authorized("codemode", authorized.contains("codemode"));
+        if controlled {
+            exposure.activate_authorized("wait_for_script", authorized.contains("wait_for_script"));
+        }
+        drop(exposure);
     }
 
     /// Host-resolved status/wait/kill for a durable Script run. The handle is
@@ -340,6 +378,45 @@ impl Agent {
                 details: None,
             },
         }
+    }
+
+    /// Controlled Script is bound for this run.
+    pub fn codemode_controlled(&self) -> bool {
+        self.codemode.as_ref().is_some_and(|binding| {
+            matches!(binding.mode, crate::codemode::CodeModeMode::Controlled)
+        }) || self.staged_codemode.as_ref().is_some_and(|binding| {
+            matches!(binding.mode, crate::codemode::CodeModeMode::Controlled)
+        })
+    }
+
+    /// Public, mode-gated Script reference for hosts and tests. It is `None`
+    /// unless controlled Script is the selected mode and an alias is bound.
+    pub fn script_mode_prompt_text(&self) -> Option<String> {
+        self.script_mode_prompt().map(|module| module.body)
+    }
+
+    /// The Script prompt module for this run, built from the same alias
+    /// snapshot the broker dispatches against.
+    pub(crate) fn script_mode_prompt(&self) -> Option<crate::prompt::PromptModule> {
+        let binding = self.codemode.as_ref()?;
+        if !matches!(binding.mode, CodeModeMode::Controlled) {
+            return None;
+        }
+        let runtime = self.runtime.as_ref()?;
+        let authorized = self
+            .tool_context
+            .authorized_tools
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let capabilities = runtime
+            .capability_registry
+            .list()
+            .into_iter()
+            .filter(|capability| authorized.contains(&capability.name))
+            .collect();
+        let policy = super::CapabilityPolicy::new(binding.mode.clone(), capabilities).ok()?;
+        crate::prompt::script_mode_module(&binding.mode, &policy.script_aliases())
     }
 
     pub(crate) fn run_codemode(

@@ -2280,3 +2280,72 @@ fn reference_script_fixture_suite_passes() {
         .iter()
         .any(|child| !matches!(child.status, CodeModeChildStatus::Succeeded)));
 }
+
+#[test]
+fn controlled_mode_advertises_script_and_wait_tools_with_the_prompt() {
+    use crate::codemode::{CodeModeHost, CodeModeMode};
+
+    struct ControlledHost;
+    impl CodeModeHost for ControlledHost {
+        fn admits_controlled_mode(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            _: &crate::codemode::CodeModeRequest,
+            _: &crate::codemode::CodeModeRunContext,
+            _: Arc<dyn crate::codemode::CodeModeBroker>,
+        ) -> crate::codemode::CodeModeOutcome {
+            unreachable!()
+        }
+    }
+
+    let (mut agent, workspace, _) = configured_agent();
+    agent.tools = vec!["read".into(), "exec_command".into()];
+    agent.sync_tool_authorization();
+    let evidence = tempfile::tempdir().unwrap();
+    agent.evidence = Some(crate::EvidenceStore::new(evidence.path()));
+
+    agent
+        .enable_codemode(Arc::new(ControlledHost), CodeModeMode::Controlled)
+        .unwrap();
+
+    // Both model-facing tools are advertised in controlled mode.
+    let specs = agent.provider_tool_specs();
+    let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
+    assert!(names.contains(&"codemode"), "{names:?}");
+    assert!(names.contains(&"wait_for_script"), "{names:?}");
+
+    // The prompt reference is mode-gated and describes the bound aliases.
+    let prompt = agent
+        .script_mode_prompt_text()
+        .expect("controlled mode has a Script prompt");
+    assert!(prompt.contains("<script_mode"), "{prompt}");
+    assert!(prompt.contains("tools.Read"), "{prompt}");
+    assert!(!prompt.contains("riskLevel"), "{prompt}");
+
+    // A forged handle is refused rather than resolving another session's run.
+    let denied = agent
+        .execute_tool_batch(
+            workspace.path(),
+            vec![(
+                "forged-call".into(),
+                "wait_for_script".into(),
+                json!({"toolCallId":"run-forged","action":"status"}),
+            )],
+            &mut Vec::new(),
+        )
+        .remove(0);
+    assert_eq!(denied.is_error, Some(true), "{denied:?}");
+
+    // Disabling Codemode removes both tools and the prompt.
+    agent.clear_codemode();
+    let after: Vec<String> = agent
+        .provider_tool_specs()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect();
+    assert!(!after.iter().any(|name| name == "codemode"));
+    assert!(!after.iter().any(|name| name == "wait_for_script"));
+    assert!(agent.script_mode_prompt_text().is_none());
+}

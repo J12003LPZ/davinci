@@ -24,6 +24,10 @@ pub struct RuntimePromptState {
     /// nothing, so a session without Codemode keeps its prompt bytes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub codemode_available: bool,
+    /// Controlled Script is the selected mode: the Script module carries the
+    /// guidance, so the read-only hint must not claim the surface is read-only.
+    #[serde(default)]
+    pub codemode_controlled: bool,
 }
 
 /// Why and when to reach for `codemode`. Without this the model never chooses
@@ -97,7 +101,7 @@ pub fn runtime_state_text(state: &RuntimePromptState) -> String {
         ));
     }
 
-    if state.codemode_available {
+    if state.codemode_available && !state.codemode_controlled {
         lines.push(CODEMODE_GUIDANCE.to_string());
     }
 
@@ -130,6 +134,7 @@ mod tests {
             environment: None,
             additional_directories: Vec::new(),
             codemode_available: false,
+            codemode_controlled: false,
         };
         let off = runtime_state_text(&state);
         assert!(!off.contains("codemode"), "{off}");
@@ -167,6 +172,7 @@ mod tests {
             environment: None,
             additional_directories: Vec::new(),
             codemode_available: false,
+            codemode_controlled: false,
         });
 
         assert!(text.contains("Plan Mode"));
@@ -196,6 +202,7 @@ mod tests {
                 environment: None,
                 additional_directories: Vec::new(),
                 codemode_available: false,
+                codemode_controlled: false,
             };
             let text1 = runtime_state_text(&state);
             let text2 = runtime_state_text(&state);
@@ -224,6 +231,7 @@ mod tests {
             environment: None,
             additional_directories: Vec::new(),
             codemode_available: false,
+            codemode_controlled: false,
         };
         let default_text = runtime_state_text(&state);
         assert!(!default_text.contains("Additional writable"));
@@ -261,6 +269,7 @@ mod tests {
             environment: None,
             additional_directories: Vec::new(),
             codemode_available: false,
+            codemode_controlled: false,
         };
         let text = runtime_state_text(&state);
         assert!(estimate_tokens_from_str(&text) <= 500);

@@ -1,7 +1,7 @@
 //! Per-turn prompt preparation and capability composition.
 
 use crate::prompt::capabilities::{capability_module, CapabilityDecision};
-use crate::prompt::composer::{compose_modules, ComposedPrompt, PromptContext};
+use crate::prompt::composer::{compose_modules, ComposedPrompt, PromptContext, PromptModule};
 use crate::prompt::manifest::{estimate_tokens_from_str, hash_text};
 use crate::prompt::runtime_state::{runtime_state_module, RuntimePromptState};
 use crate::prompt::session::PromptSessionState;
@@ -67,6 +67,19 @@ pub fn compose_turn_prompt(
     capabilities: &CapabilityDecision,
     runtime_state: &RuntimePromptState,
 ) -> Result<ComposedPrompt, String> {
+    compose_turn_prompt_with(session, ctx, capabilities, runtime_state, None)
+}
+
+/// Compose with the mode-gated Script reference, when controlled Script is
+/// selected. The module joins the stable prefix so it is cached, not repeated
+/// per turn, and it is absent when the mode is off.
+pub fn compose_turn_prompt_with(
+    session: &PromptSessionState,
+    ctx: &PromptContext<'_>,
+    capabilities: &CapabilityDecision,
+    runtime_state: &RuntimePromptState,
+    script_module: Option<PromptModule>,
+) -> Result<ComposedPrompt, String> {
     let profile = session.profile().ok_or_else(|| {
         "Cannot compose turn prompt: session is not a builtin profile".to_string()
     })?;
@@ -77,6 +90,9 @@ pub fn compose_turn_prompt(
         crate::prompt::model_policy::apply_model_policy(policy, profile, bundle.modules.clone());
     let mut modules =
         crate::prompt::tool_strategy::apply_subscription_strategy(ctx.provider, modules);
+    if let Some(script_module) = script_module {
+        modules.push(script_module);
+    }
 
     // 1. Dynamic provider adapter
     // A GPT-6 policy carries its own tool and reporting rules.
@@ -163,6 +179,7 @@ mod tests {
             environment: None,
             additional_directories: Vec::new(),
             codemode_available: false,
+            codemode_controlled: false,
         };
 
         let composed = compose_turn_prompt(&session, &ctx, &capabilities, &state).unwrap();
@@ -215,6 +232,7 @@ mod tests {
             environment: None,
             additional_directories: Vec::new(),
             codemode_available: false,
+            codemode_controlled: false,
         };
 
         let result = compose_turn_prompt(&session, &ctx, &capabilities, &state);
@@ -249,6 +267,7 @@ mod tests {
             environment: None,
             additional_directories: Vec::new(),
             codemode_available: false,
+            codemode_controlled: false,
         };
 
         let composed = compose_turn_prompt(&session, &ctx, &capabilities, &state).unwrap();
@@ -261,5 +280,51 @@ mod tests {
             append_pos > debug_pos,
             "User appends must appear after capability modules"
         );
+    }
+
+    #[test]
+    fn script_reference_reaches_the_stable_prefix_only_when_supplied() {
+        let session = PromptSessionState::builtin(PromptProfile::Stable);
+        let ctx = PromptContext {
+            provider: "openai-codex",
+            model_id: "gpt-6.1-sol",
+            permission_mode: PermissionMode::Edits,
+            plan_active: false,
+        };
+        let capabilities = CapabilityDecision {
+            capabilities: Vec::new(),
+            reasons: Vec::new(),
+            evidence: Vec::new(),
+        };
+        let state = RuntimePromptState {
+            permission_mode: PermissionMode::Edits,
+            plan_revision: None,
+            plan_approved: false,
+            active_contract: false,
+            visual_verification_available: false,
+            visual_verification_relevant: false,
+            environment: None,
+            additional_directories: Vec::new(),
+            codemode_available: true,
+            codemode_controlled: false,
+        };
+        let aliases =
+            std::collections::BTreeMap::from([("tools.Read".to_string(), "read".to_string())]);
+        let module =
+            crate::prompt::script_mode_module(&crate::codemode::CodeModeMode::Controlled, &aliases)
+                .expect("controlled mode builds a reference");
+
+        let composed =
+            compose_turn_prompt_with(&session, &ctx, &capabilities, &state, Some(module)).unwrap();
+        // The reference is stable content, so it is cached rather than repeated
+        // in the per-turn suffix.
+        assert!(composed.stable_text.contains("<script_mode"));
+        assert!(composed.stable_text.contains("tools.Read"));
+        assert!(!composed.dynamic_text.contains("<script_mode"));
+
+        // Without the module (off or read-only) the prompt is unchanged.
+        let plain = compose_turn_prompt_with(&session, &ctx, &capabilities, &state, None).unwrap();
+        assert!(!plain.stable_text.contains("<script_mode"));
+        assert!(!plain.text.contains("<script_mode"));
     }
 }
