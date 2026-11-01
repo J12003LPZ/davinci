@@ -96,6 +96,66 @@ pub struct ScriptOutput {
     pub omitted_bytes: usize,
 }
 
+/// Fixed bytes of the omission marker, excluding the digits of `N`.
+const OMISSION_MARKER_FIXED_BYTES: usize = "\n[...  bytes omitted ...]\n".len();
+
+fn omission_marker(omitted: usize) -> String {
+    format!("\n[... {omitted} bytes omitted ...]\n")
+}
+
+/// Keep the head and the tail of an over-budget text, separated by an explicit
+/// marker naming the bytes dropped in between.
+///
+/// Guarantees, in order:
+/// - the result is at most `limit` bytes (the marker counts against it);
+/// - both cuts land on a `char` boundary, so the result is valid UTF-8;
+/// - the head is a prefix and the tail a suffix of the input;
+/// - short input is returned unchanged with `0` omitted.
+pub fn truncate_head_and_tail(text: &str, limit: usize) -> (String, usize) {
+    if text.len() <= limit {
+        return (text.to_owned(), 0);
+    }
+    // The marker's length depends on the digits of N, and N depends on how much
+    // room the marker leaves, so iterate to a fixed point.
+    let mut digits = 1usize;
+    loop {
+        let marker_len = OMISSION_MARKER_FIXED_BYTES + digits;
+        if marker_len >= limit {
+            // The marker cannot fit; keep a bare head cut rather than panic.
+            let mut end = limit.min(text.len());
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            return (text[..end].to_owned(), text.len() - end);
+        }
+        let remaining = limit - marker_len;
+        // Head keeps two thirds of the remaining budget, the tail one third.
+        let head_budget = remaining * 2 / 3;
+        let tail_budget = remaining - head_budget;
+        let mut head_end = head_budget.min(text.len());
+        while !text.is_char_boundary(head_end) {
+            head_end -= 1;
+        }
+        let mut tail_start = text.len().saturating_sub(tail_budget);
+        while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+            tail_start += 1;
+        }
+        let omitted = tail_start - head_end;
+        if omitted.to_string().len() == digits {
+            return (
+                format!(
+                    "{}{}{}",
+                    &text[..head_end],
+                    omission_marker(omitted),
+                    &text[tail_start..]
+                ),
+                omitted,
+            );
+        }
+        digits = omitted.to_string().len();
+    }
+}
+
 /// Assemble `text()`/`console` items into the model-visible output. Text is
 /// truncated only with an explicit omitted marker and `complete: false`.
 /// Image items fail closed until a trusted image projection exists.
@@ -142,19 +202,9 @@ pub fn assemble_script_output(
             omitted_bytes: 0,
         });
     }
-    let omitted = collected.len() - limit;
-    let full_marker = format!("\n…[truncated: {omitted} bytes omitted]");
-    let mut marker_end = full_marker.len().min(limit);
-    while marker_end > 0 && !full_marker.is_char_boundary(marker_end) {
-        marker_end -= 1;
-    }
-    let marker = &full_marker[..marker_end];
-    let mut keep = limit - marker.len();
-    while keep > 0 && !collected.is_char_boundary(keep) {
-        keep -= 1;
-    }
-    let mut text = collected[..keep].to_string();
-    text.push_str(marker);
+    // Keep the head and the tail, separated by an explicit marker naming the
+    // bytes dropped in between (Stage 0 behavior).
+    let (text, omitted) = truncate_head_and_tail(&collected, limit);
     Ok(ScriptOutput {
         text,
         complete: false,

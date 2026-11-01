@@ -6891,6 +6891,56 @@ mod openai_cache_wire_tests {
     }
 
     #[test]
+    fn direct_and_script_codemode_history_keeps_its_recorded_wire_kind() {
+        // A codemode call recorded on one surface must replay unchanged when
+        // the current request projects the other surface. Only the persisted
+        // kind decides the item and output types.
+        for (recorded, arguments, item, output, current_custom) in [
+            (
+                crate::ResponsesToolWireKind::Function,
+                serde_json::json!({"code": "return 1;"}),
+                "function_call",
+                "function_call_output",
+                &["codemode"][..],
+            ),
+            (
+                crate::ResponsesToolWireKind::Custom,
+                serde_json::json!({"input": "return 1;"}),
+                "custom_tool_call",
+                "custom_tool_call_output",
+                &[][..],
+            ),
+        ] {
+            let id = "call-code|item-code";
+            let mut assistant = ChatMessage::text("assistant", "");
+            assistant.content = vec![MessageContent::ToolCall {
+                id: id.into(),
+                name: "codemode".into(),
+                arguments: arguments.clone(),
+            }];
+            crate::set_wire_kind(&mut assistant.extra, id, recorded);
+            let input = openai_responses_input_with(
+                &[
+                    assistant,
+                    ChatMessage::tool_result(id, "codemode", "ok", false),
+                ],
+                &ResponsesInputOptions {
+                    custom_tools: current_custom,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(input[0]["type"], item, "{recorded:?}");
+            assert_eq!(input[1]["type"], output, "{recorded:?}");
+            match recorded {
+                crate::ResponsesToolWireKind::Custom => assert_eq!(input[0]["input"], "return 1;"),
+                crate::ResponsesToolWireKind::Function => {
+                    assert_eq!(input[0]["arguments"], arguments.to_string())
+                }
+            }
+        }
+    }
+
+    #[test]
     fn native_resume_result_only_suffix_uses_preserved_call_type() {
         for custom in [false, true] {
             let prefix = vec![serde_json::json!({

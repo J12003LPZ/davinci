@@ -1275,6 +1275,10 @@ pub fn load_merged_settings_with_override(
         if let Some(value) = global_value.get("serviceTier") {
             object.insert("serviceTier".into(), value.clone());
         }
+        object.remove("hookPolicy");
+        if let Some(value) = global_value.get("hookPolicy") {
+            object.insert("hookPolicy".into(), value.clone());
+        }
     }
     serde_json::from_value(migrate_settings(merged)).unwrap_or_default()
 }
@@ -3142,6 +3146,29 @@ mod tests {
             .expect_err("an invalid selected setting must be reported");
         assert!(error.contains("experimental"));
         assert!(error.contains("stable, preview, legacy-v1"));
+    }
+
+    #[test]
+    fn project_cannot_override_the_global_hook_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(project.join(".davinci")).unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            r#"{"hookPolicy":{"enabled":true,"maxDepth":2}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".davinci").join("settings.json"),
+            r#"{"hookPolicy":{"enabled":false,"maxDepth":5}}"#,
+        )
+        .unwrap();
+        let merged = load_merged_settings_with_override(&agent, &project, Some(true));
+        let policy = merged.hook_policy.unwrap();
+        assert!(policy.enabled);
+        assert_eq!(policy.max_depth, 2);
     }
 
     #[test]

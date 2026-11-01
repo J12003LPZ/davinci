@@ -708,7 +708,7 @@ impl ManagedOwner {
     /// Host resource attachment requires this caller's active lease. Historical
     /// status access remains available after release through `snapshot`.
     pub fn active_snapshot(&self, id: u32) -> Result<ProcessSnapshot, String> {
-        let (_, record) = self.owned(id)?;
+        let (shared, record) = self.owned(id)?;
         if !record
             .owners
             .lock()
@@ -720,7 +720,7 @@ impl ManagedOwner {
         }
         let snapshot = self.snapshot(id)?;
         if snapshot.state != "running" {
-            return Err("managed process is not running".into());
+            return Err(not_running(&shared, &snapshot));
         }
         Ok(snapshot)
     }
@@ -819,7 +819,8 @@ impl ManagedOwner {
     ) -> Result<usize, String> {
         let snapshot = self.control_snapshot(id, expected_lifetime)?;
         if snapshot.state != "running" {
-            return Err("managed process is not running".into());
+            let (shared, _) = self.owned(id)?;
+            return Err(not_running(&shared, &snapshot));
         }
         self.write(id, bytes)
     }
@@ -877,6 +878,61 @@ impl ManagedOwner {
             .ok_or("process lifetime missing")?;
         Ok(supervisor.wait(timeout.saturating_sub(started.elapsed())))
     }
+}
+
+/// A caller asking for new work on a dead process needs the reason, not a
+/// verdict: "not running" cannot tell a server that exited on its own from one
+/// another owner stopped. The record already knows which; the output tail often
+/// carries the child's own last words (the p12 fixture prints `NODE_EXIT`).
+///
+/// The tail is untrusted: it is stripped of control characters and passed
+/// through `redact_secrets` before it can reach a tool result or receipt.
+fn not_running(shared: &Shared, snapshot: &ProcessSnapshot) -> String {
+    let mut detail = format!("managed process is not running (state: {}", snapshot.state);
+    if let Some(code) = snapshot.exit_code {
+        detail.push_str(&format!(", exit code {code}"));
+    }
+    if let Some(error) = snapshot.error.as_deref().filter(|error| !error.is_empty()) {
+        detail.push_str(&format!(", error: {}", diagnostic_line(error)));
+    }
+    if let Some(line) = last_output_line(shared) {
+        detail.push_str(&format!(", last output: {}", diagnostic_line(&line)));
+    }
+    detail.push(')');
+    detail
+}
+
+/// How much of the output tail is copied while the output mutex is held. The
+/// retained ring can reach 4 MiB; decoding all of it for one line is wasteful.
+const DIAGNOSTIC_OUTPUT_TAIL: usize = 4096;
+
+/// Bounded, single-line diagnostic text: drop control characters (terminal
+/// escapes and carriage returns cannot rewrite the receipt), redact credential
+/// patterns, then cap at 200 characters.
+fn diagnostic_line(text: &str) -> String {
+    let sanitized: String = text.chars().filter(|ch| !ch.is_control()).collect();
+    let redacted = crate::runtime::contracts::redact_secrets(&sanitized);
+    let mut chars = redacted.chars();
+    let mut bounded: String = chars.by_ref().take(200).collect();
+    if chars.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn last_output_line(shared: &Shared) -> Option<String> {
+    let tail = {
+        let buffer = shared.output.lock().unwrap_or_else(|e| e.into_inner());
+        let bytes = &buffer.bytes;
+        let start = bytes.len().saturating_sub(DIAGNOSTIC_OUTPUT_TAIL);
+        bytes[start..].to_vec()
+    };
+    String::from_utf8_lossy(&tail)
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
 }
 
 fn acquire(record: &Record, owner: Uuid) -> Result<(), String> {
@@ -953,5 +1009,33 @@ impl Drop for Owner {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::diagnostic_line;
+
+    #[test]
+    fn diagnostic_text_drops_control_characters() {
+        let line = diagnostic_line("node failed\r\u{1b}[31m loading\u{7} config");
+        assert_eq!(line, "node failed[31m loading config");
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+    }
+
+    #[test]
+    fn diagnostic_text_redacts_credentials() {
+        let line = diagnostic_line("auth failed: token sk-live-abcdef1234567890");
+        assert!(!line.contains("abcdef1234567890"), "{line}");
+        assert!(line.contains("[REDACTED]"), "{line}");
+    }
+
+    #[test]
+    fn diagnostic_text_is_bounded_and_marks_truncation() {
+        let long = "a".repeat(250);
+        let line = diagnostic_line(&long);
+        assert_eq!(line.chars().count(), 201, "{line}");
+        assert!(line.ends_with('…'), "{line}");
+        assert_eq!(diagnostic_line(&"a".repeat(200)), "a".repeat(200));
     }
 }

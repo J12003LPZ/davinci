@@ -905,6 +905,7 @@ impl SecurityScanController {
             .current
             .clone()
             .ok_or_else(|| ToolError::Failed("no security scan is active".into()))?;
+        ensure_draft(&scan)?;
         scan.manifest.status = ScanStatus::Completed;
         scan.manifest.completed_at = Some(now_ms());
         if let Some(artifact) = &self.artifact {
@@ -922,6 +923,7 @@ impl SecurityScanController {
             .current
             .clone()
             .ok_or_else(|| ToolError::Failed("no security scan is active".into()))?;
+        ensure_draft(&scan)?;
         scan.manifest.status = ScanStatus::Cancelled;
         scan.manifest.completed_at = Some(now_ms());
         if let Some(artifact) = &self.artifact {
@@ -2161,6 +2163,23 @@ mod tests {
             .manifest
             .artifact_digest
             .is_some());
+    }
+
+    #[test]
+    fn terminal_scan_states_reject_complete_and_cancel() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("sample.txt"), "no secrets here\n").unwrap();
+        let mut cancelled = SecurityScanController::new(dir.path().to_path_buf());
+        let _agent = test_agent(&mut cancelled);
+        cancelled.start(None).unwrap();
+        cancelled.cancel().unwrap();
+        assert!(cancelled.complete().is_err());
+
+        let mut completed = SecurityScanController::new(dir.path().to_path_buf());
+        let _agent = test_agent(&mut completed);
+        completed.start(None).unwrap();
+        completed.complete().unwrap();
+        assert!(completed.cancel().is_err());
     }
 
     #[test]

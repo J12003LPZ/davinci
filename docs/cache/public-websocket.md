@@ -1,6 +1,10 @@
 # Public Responses WebSocket transport
 
-Status: the default on the "Sign in with ChatGPT" route (`https://api.openai.com/v1`, provider `openai-codex`).
+Status: the default only for credentials that resolve to the public "Sign in with ChatGPT" route (`https://api.openai.com/v1`,
+provider `openai-codex`). A credential created by a current `/login openai-codex` carries the ChatGPT backend route marker
+and resolves to the backend route, so it does not use this transport (`crates/davinci-ai/src/codex_ws.rs:1230-1233`
+`public_websocket_selected` requires the public route; `crates/davinci-ai/src/stream.rs:941` `codex_backend::route_model`
+moves the routed model before that check at `stream.rs:1144`; marker at `crates/davinci-ai/src/codex_backend.rs:24-25`).
 Set `"transport": "sse"` (or `"http"`) to force plain HTTP. Every other route and provider is unchanged. A failure
 before any output falls back to HTTP for that request, so a network that blocks WebSocket costs one failed connect.
 

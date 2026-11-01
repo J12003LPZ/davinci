@@ -578,9 +578,9 @@ impl Agent {
         args: &Value,
         parent: Option<OperationId>,
     ) -> ToolResult {
-        let request: CodeModeRequest = match serde_json::from_value(args.clone()) {
-            Ok(request) => request,
-            Err(_) => {
+        let request: CodeModeRequest = match CodeModeRequest::from_tool_arguments(args) {
+            Some(request) => request,
+            None => {
                 let error = CodeModeError::new("INVALID_INPUT", "invalid Codemode request");
                 return self.script_error_result(parent, error);
             }

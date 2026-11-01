@@ -146,7 +146,7 @@ impl StdioTransport {
                         break;
                     }
                 };
-                let Ok(frame) = serde_json::from_str::<Value>(line.trim()) else {
+                let Some(frame) = parse_stdout_frame(&line) else {
                     continue;
                 };
                 // A line is one message or, per 2025-03-26, a JSON-RPC batch.
@@ -534,6 +534,11 @@ fn stdout_channel() -> (mpsc::SyncSender<StdoutLine>, Receiver<StdoutLine>) {
     mpsc::sync_channel(MAX_QUEUED_STDOUT_LINES)
 }
 
+fn parse_stdout_frame(line: &str) -> Option<Value> {
+    let line = line.trim_start_matches('\u{feff}');
+    serde_json::from_str::<Value>(line.trim()).ok()
+}
+
 fn read_stdout_line(reader: &mut impl BufRead, limit: usize) -> std::io::Result<Option<String>> {
     let mut bytes = Vec::new();
     if reader
@@ -543,17 +548,25 @@ fn read_stdout_line(reader: &mut impl BufRead, limit: usize) -> std::io::Result<
     {
         return Ok(None);
     }
-    if bytes.len() > limit {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("MCP stdout line exceeds {limit} bytes"),
-        ));
-    }
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
         if bytes.last() == Some(&b'\r') {
             bytes.pop();
         }
+    } else if bytes.len() == limit.saturating_add(1) && bytes.last() == Some(&b'\r') {
+        // A CRLF line whose content is exactly `limit` bytes: the take window
+        // stopped on the CR. Consume the LF (bounded by one byte) so the line
+        // is accepted at its advertised limit.
+        let mut lf = [0u8; 1];
+        if reader.read(&mut lf)? == 1 && lf[0] == b'\n' {
+            bytes.pop();
+        }
+    }
+    if bytes.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("MCP stdout line exceeds {limit} bytes"),
+        ));
     }
     String::from_utf8(bytes)
         .map(Some)
@@ -987,5 +1000,29 @@ mod tests {
             resolve_command_in("./npx", &[second], &exts),
             Some(PathBuf::from("./npx"))
         );
+    }
+
+    #[test]
+    fn bom_prefixed_stdout_frame_is_parsed() {
+        assert_eq!(
+            parse_stdout_frame("\u{feff}{\"ok\":true}"),
+            Some(json!({"ok": true}))
+        );
+    }
+
+    #[test]
+    fn read_stdout_line_accepts_a_line_at_the_exact_limit() {
+        let mut lf = std::io::Cursor::new(b"12345678\n".to_vec());
+        assert_eq!(
+            read_stdout_line(&mut lf, 8).unwrap().as_deref(),
+            Some("12345678")
+        );
+        let mut crlf = std::io::Cursor::new(b"12345678\r\n".to_vec());
+        assert_eq!(
+            read_stdout_line(&mut crlf, 8).unwrap().as_deref(),
+            Some("12345678")
+        );
+        let mut too_long = std::io::Cursor::new(b"123456789\n".to_vec());
+        assert!(read_stdout_line(&mut too_long, 8).is_err());
     }
 }

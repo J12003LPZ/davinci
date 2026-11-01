@@ -189,10 +189,53 @@ pub fn expand_local(path: &str, cwd: &Path) -> PathBuf {
     }
 }
 
+fn npm_component_is_safe(component: &str) -> bool {
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && !component.starts_with('-')
+        && !component.contains("..")
+}
+
+pub fn npm_name_is_safe(name: &str) -> bool {
+    if name.is_empty()
+        || name.starts_with('-')
+        || name.contains('\\')
+        || name.contains(':')
+        || name.contains("..")
+    {
+        return false;
+    }
+    match name.strip_prefix('@') {
+        Some(rest) => {
+            let mut parts = rest.split('/');
+            matches!(
+                (parts.next(), parts.next(), parts.next()),
+                (Some(scope), Some(package), None)
+                    if npm_component_is_safe(scope) && npm_component_is_safe(package)
+            )
+        }
+        None => !name.contains('/') && npm_component_is_safe(name),
+    }
+}
+
+/// The package directory strictly below `node_modules` for a validated name.
+pub fn npm_package_dir(root: &Path, name: &str) -> Result<PathBuf, String> {
+    if !npm_name_is_safe(name) {
+        return Err(format!("Invalid npm package name: {name}"));
+    }
+    let node_modules = root.join("node_modules");
+    let path = node_modules.join(name);
+    if path == node_modules || !path.starts_with(&node_modules) {
+        return Err(format!("Invalid npm package path: {name}"));
+    }
+    Ok(path)
+}
+
 pub fn installed_root(source: &str, agent_dir: &Path, cwd: &Path) -> Option<PathBuf> {
     let candidates: Vec<PathBuf> = match parse_package_source(source) {
         ParsedSource::Local(path) => vec![expand_local(&path, cwd)],
-        ParsedSource::Npm { name, .. } => [false, true]
+        ParsedSource::Npm { name, .. } if npm_name_is_safe(&name) => [false, true]
             .into_iter()
             .map(|local| {
                 npm_install_root(agent_dir, local, cwd)
@@ -200,6 +243,7 @@ pub fn installed_root(source: &str, agent_dir: &Path, cwd: &Path) -> Option<Path
                     .join(&name)
             })
             .collect(),
+        ParsedSource::Npm { .. } => Vec::new(),
         ParsedSource::Git(_) => [false, true]
             .into_iter()
             .filter_map(|local| git_checkout_path(agent_dir, local, cwd, source).ok())
@@ -235,6 +279,23 @@ mod tests {
         std::fs::create_dir_all(&local).unwrap();
         assert_eq!(installed_root("npm:other", &agent, &cwd), Some(local));
         assert_eq!(installed_root("npm:missing", &agent, &cwd), None);
+    }
+
+    #[test]
+    fn npm_names_reject_traversal_and_option_like_values() {
+        assert!(npm_name_is_safe("@scope/tool"));
+        assert!(npm_name_is_safe("tool"));
+        assert!(npm_name_is_safe("some.tool"));
+        assert!(!npm_name_is_safe("../evil"));
+        assert!(!npm_name_is_safe("..\\evil"));
+        assert!(!npm_name_is_safe("@scope/../evil"));
+        assert!(!npm_name_is_safe("--global"));
+        assert!(!npm_name_is_safe("a/b"));
+        assert!(!npm_name_is_safe("C:evil"));
+        assert!(!npm_name_is_safe("."));
+        assert!(!npm_name_is_safe("@scope/."));
+        assert!(!npm_name_is_safe("a/./b"));
+        assert!(!npm_name_is_safe("a//b"));
     }
 
     #[test]

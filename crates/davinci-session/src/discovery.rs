@@ -38,6 +38,12 @@ pub fn expand_tilde(path: &str) -> PathBuf {
             return home.join(rest);
         }
     }
+    #[cfg(windows)]
+    if let Some(rest) = path.strip_prefix("~\\") {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
+        }
+    }
     if path == "~" {
         if let Some(home) = home_dir() {
             return home;
@@ -860,6 +866,13 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].all_messages_text, "kept");
         assert_eq!(discover_session_headers(dir.path(), None).unwrap().len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn backslash_tilde_expands_to_home_on_windows() {
+        let home = home_dir().unwrap();
+        assert_eq!(expand_tilde("~\\sessions"), home.join("sessions"));
     }
 
     #[test]

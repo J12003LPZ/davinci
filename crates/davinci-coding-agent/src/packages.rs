@@ -124,7 +124,11 @@ fn parse_update_flags(args: &[String]) -> Result<UpdateFlags, String> {
             "--force" => flags.force = true,
             "--extension" => {
                 index += 1;
-                flags.extension = args.get(index).cloned();
+                let value = args
+                    .get(index)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or("update --extension requires a value")?;
+                flags.extension = Some(value.clone());
             }
             "-h" | "--help" => {}
             other if other.starts_with('-') => {}
@@ -419,8 +423,8 @@ fn render_list(settings: &Settings) -> String {
 }
 
 pub use crate::package_source::{
-    git_checkout_path, npm_install_args, npm_install_root, parse_git_source, parse_package_source,
-    ParsedSource,
+    git_checkout_path, npm_install_args, npm_install_root, npm_name_is_safe, npm_package_dir,
+    parse_git_source, parse_package_source, ParsedSource,
 };
 
 fn settings_dir_for(local: bool, agent_dir: &Path, cwd: &Path) -> PathBuf {
@@ -504,12 +508,15 @@ fn remove_installed_package(
             Ok(())
         }
         ParsedSource::Npm { name, .. } => {
+            if !npm_name_is_safe(&name) {
+                return Err(format!("Invalid npm package name: {name}"));
+            }
             let root = npm_install_root(agent_dir, local, cwd);
             if !root.exists() {
                 return Ok(());
             }
             if cfg!(test) || std::env::var("PI_INSTALL_DRY_RUN").is_ok() {
-                let path = root.join("node_modules").join(name);
+                let path = npm_package_dir(&root, &name)?;
                 if path.exists() {
                     fs::remove_dir_all(path).map_err(|err| err.to_string())?;
                 }
@@ -536,6 +543,9 @@ fn install_remote_package(
     local: bool,
 ) -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    if kind == "npm" && !npm_name_is_safe(name) {
+        return Err(format!("Invalid npm package name: {name}"));
+    }
     if kind == "git" {
         git_checkout_path(agent_dir, local, &cwd, spec)?;
     }
@@ -551,9 +561,7 @@ fn install_remote_package(
             return Err(format!("Path does not exist: {}", fixture.display()));
         }
         let dest = if kind == "npm" {
-            npm_install_root(agent_dir, local, &cwd)
-                .join("node_modules")
-                .join(name)
+            npm_package_dir(&npm_install_root(agent_dir, local, &cwd), name)?
         } else {
             git_checkout_path(agent_dir, local, &cwd, spec)?
         };
@@ -1170,6 +1178,34 @@ mod tests {
                 "{flag} rejected by parser"
             );
         }
+    }
+
+    #[test]
+    fn removing_a_dot_npm_name_keeps_sibling_packages() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let cwd = dir.path().join("project");
+        let node_modules = npm_install_root(&agent, false, &cwd).join("node_modules");
+        let sibling = node_modules.join("sibling");
+        let scoped_sibling = node_modules.join("@scope").join("sibling");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::create_dir_all(&scoped_sibling).unwrap();
+
+        assert!(remove_installed_package("npm:.", false, &agent, &cwd).is_err());
+        assert!(sibling.exists());
+        assert!(scoped_sibling.exists());
+
+        assert!(remove_installed_package("npm:@scope/.", false, &agent, &cwd).is_err());
+        assert!(sibling.exists());
+        assert!(scoped_sibling.exists());
+    }
+
+    #[test]
+    fn update_extension_requires_a_value() {
+        assert!(parse_update_flags(&["--extension".into()]).is_err());
+        assert!(parse_update_flags(&["--extension".into(), "--force".into()]).is_err());
+        let flags = parse_update_flags(&["--extension".into(), "demo".into()]).unwrap();
+        assert_eq!(flags.extension.as_deref(), Some("demo"));
     }
 
     #[test]

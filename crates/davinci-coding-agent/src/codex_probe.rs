@@ -1,7 +1,7 @@
 //! Explicit maintainer probe for the ChatGPT Codex Responses backend.
 //! Tests never call this module's network runner.
 
-use davinci_ai::RawProviderReply;
+use davinci_ai::{Model, RawProviderReply, ResolvedAuth};
 use serde_json::{json, Value};
 
 pub(crate) struct ProbeCase {
@@ -160,6 +160,62 @@ pub(crate) fn probe_cases(model_id: &str, bootstrap: &str) -> Vec<ProbeCase> {
         body: custom,
     });
 
+    let mut freeform = base(
+        model_id,
+        json!([user(&format!("case=custom-freeform {bootstrap}"))]),
+    );
+    freeform["tools"] = json!([{
+        "type": "custom",
+        "name": "codemode",
+        "description": "Run JavaScript source in a sandbox to orchestrate tools. The input is the JavaScript source itself, not JSON."
+    }]);
+    cases.push(ProbeCase {
+        name: "custom_freeform_non_patch",
+        path_suffix: "",
+        body: freeform.clone(),
+    });
+    cases.push(ProbeCase {
+        name: "custom_freeform_non_patch_reuse",
+        path_suffix: "",
+        body: freeform,
+    });
+
+    let mut programmatic = base(
+        model_id,
+        json!([user(&format!("case=programmatic {bootstrap}"))]),
+    );
+    programmatic["tools"] = json!([
+        {
+            "type": "function",
+            "name": "read",
+            "description": "Read a UTF-8 file and return its contents.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": false
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {"content": {"type": "string"}},
+                "required": ["content"],
+                "additionalProperties": false
+            },
+            "allowed_callers": ["programmatic"]
+        },
+        {"type": "programmatic_tool_calling"}
+    ]);
+    cases.push(ProbeCase {
+        name: "programmatic_tool_calling",
+        path_suffix: "",
+        body: programmatic.clone(),
+    });
+    cases.push(ProbeCase {
+        name: "programmatic_tool_calling_reuse",
+        path_suffix: "",
+        body: programmatic,
+    });
+
     let phase = base(
         model_id,
         json!([
@@ -228,42 +284,117 @@ pub(crate) fn classify(reply: &RawProviderReply) -> ProbeOutcome {
     }
 }
 
+fn reuse_base(case: &str) -> Option<&'static str> {
+    match case {
+        "cache_reuse" => Some("cache_warm"),
+        "custom_freeform_non_patch_reuse" => Some("custom_freeform_non_patch"),
+        "programmatic_tool_calling_reuse" => Some("programmatic_tool_calling"),
+        _ => None,
+    }
+}
+
+fn probe_row(case: &ProbeCase, reply: &Result<RawProviderReply, String>) -> Value {
+    let mut row = match reply {
+        Ok(reply) => {
+            let codex_headers: Vec<_> = reply
+                .headers
+                .iter()
+                .filter(|(name, _)| name.to_ascii_lowercase().starts_with("x-codex"))
+                .cloned()
+                .collect();
+            let outcome = classify(reply);
+            let (accepted, cached_tokens, cache_write_tokens) = match &outcome {
+                ProbeOutcome::Accepted {
+                    cached_tokens,
+                    cache_write_tokens,
+                } => (true, *cached_tokens, *cache_write_tokens),
+                ProbeOutcome::Rejected { .. } => (false, None, None),
+            };
+            json!({
+                "case": case.name,
+                "accepted": accepted,
+                "status": reply.status,
+                "cached_tokens": cached_tokens,
+                "cache_write_tokens": cache_write_tokens,
+                "outcome": format!("{outcome:?}"),
+                "codexHeaders": codex_headers
+            })
+        }
+        Err(error) => json!({
+            "case": case.name,
+            "accepted": false,
+            "status": null,
+            "cached_tokens": null,
+            "cache_write_tokens": null,
+            "outcome": format!("transport error: {error}")
+        }),
+    };
+    if let Some(base) = reuse_base(case.name) {
+        row["reuses"] = json!(base);
+    }
+    row
+}
+
+fn select_case_names(
+    all: &[&'static str],
+    requested: &[String],
+) -> Result<Vec<&'static str>, String> {
+    if requested.is_empty() {
+        return Ok(all.to_vec());
+    }
+    let mut selected = Vec::new();
+    for name in requested {
+        let Some(known) = all
+            .iter()
+            .copied()
+            .find(|candidate| *candidate == name.as_str())
+        else {
+            return Err(format!(
+                "unknown --codex-probe-case \"{name}\"; valid cases: {}",
+                all.join(", ")
+            ));
+        };
+        if !selected.contains(&known) {
+            selected.push(known);
+        }
+    }
+    Ok(selected)
+}
+
+/// The probe must follow the same route as a live turn: a ChatGPT backend login
+/// moves the model to the backend, and every other credential keeps the
+/// documented public route. Without this the probe sent the subscription token
+/// to `api.openai.com` and recorded a 401 instead of a capability result.
+fn probe_target(model: &Model, auth: &ResolvedAuth) -> (Model, String) {
+    let routed = davinci_ai::codex_backend::route_model(model, auth).into_owned();
+    let url = davinci_ai::request_url(&routed, auth);
+    (routed, url)
+}
+
 pub(crate) fn run(parsed: &crate::Args, report_path: &std::path::Path) -> Result<(), String> {
     let model_id = parsed
         .model
         .clone()
         .unwrap_or_else(|| "gpt-5.6-luna".into());
     let (model, auth) = crate::resolve_model_and_auth(parsed, "openai-codex", &model_id)?;
-    let url = davinci_ai::request_url(&model, &auth);
+    let (model, url) = probe_target(&model, &auth);
     let bootstrap = "DaVinci probe stable text. ".repeat(260);
+    let cases = probe_cases(&model.id, &bootstrap);
+    let names: Vec<&'static str> = cases.iter().map(|case| case.name).collect();
+    let selected = select_case_names(&names, &parsed.codex_probe_case)?;
     let mut rows = Vec::new();
 
-    for case in probe_cases(&model.id, &bootstrap) {
+    for case in selected
+        .iter()
+        .filter_map(|name| cases.iter().find(|case| case.name == *name))
+    {
         let reply = davinci_ai::raw_provider_post(
             &model,
             &auth,
             &format!("{url}{}", case.path_suffix),
             &case.body,
         );
-        let row = match reply {
-            Ok(reply) => {
-                let codex_headers: Vec<_> = reply
-                    .headers
-                    .iter()
-                    .filter(|(name, _)| name.to_ascii_lowercase().starts_with("x-codex"))
-                    .cloned()
-                    .collect();
-                json!({
-                    "case": case.name,
-                    "outcome": format!("{:?}", classify(&reply)),
-                    "codexHeaders": codex_headers
-                })
-            }
-            Err(error) => json!({
-                "case": case.name,
-                "outcome": format!("transport error: {error}")
-            }),
-        };
+        let row = probe_row(case, &reply);
         eprintln!("{row}");
         rows.push(row);
     }
@@ -321,5 +452,170 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), cases.len());
+    }
+
+    fn codex_model() -> Model {
+        serde_json::from_value(json!({
+            "id":"gpt-5.6-luna", "name":"fixture", "api":"openai-codex-responses",
+            "provider":"openai-codex", "baseUrl":"https://api.openai.com/v1", "reasoning":true,
+            "input":["text"], "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},
+            "contextWindow":1000,"maxTokens":100
+        }))
+        .expect("model fixture")
+    }
+
+    fn auth(source: &str) -> ResolvedAuth {
+        ResolvedAuth {
+            api_key: Some("tok".into()),
+            headers: std::collections::HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer tok".to_string(),
+            )]),
+            source: source.into(),
+        }
+    }
+
+    #[test]
+    fn probe_follows_the_same_route_as_a_live_turn() {
+        let model = codex_model();
+        let (routed, url) = probe_target(&model, &auth(davinci_ai::codex_backend::AUTH_SOURCE));
+        assert_eq!(url, "https://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(
+            routed.base_url.as_deref(),
+            Some(davinci_ai::codex_backend::BACKEND_BASE_URL)
+        );
+
+        let (kept, public) = probe_target(&model, &auth("api-key"));
+        assert_eq!(public, "https://api.openai.com/v1/responses");
+        assert_eq!(kept.base_url.as_deref(), Some("https://api.openai.com/v1"));
+    }
+
+    fn find_case(name: &str) -> ProbeCase {
+        probe_cases("gpt-5.6-luna", "x")
+            .into_iter()
+            .find(|case| case.name == name)
+            .expect("probe case exists")
+    }
+
+    #[test]
+    fn custom_freeform_case_is_a_non_patch_freeform_custom_tool() {
+        let case = find_case("custom_freeform_non_patch");
+        let tool = &case.body["tools"][0];
+        assert_eq!(tool["type"], "custom");
+        assert_eq!(tool["name"], "codemode");
+        assert_ne!(tool["name"], "apply_patch");
+        assert!(tool.get("format").is_none());
+        assert!(tool.get("parameters").is_none());
+        assert!(tool.get("strict").is_none());
+    }
+
+    #[test]
+    fn base_pairs_have_diverging_prefixes() {
+        let freeform = find_case("custom_freeform_non_patch");
+        let programmatic = find_case("programmatic_tool_calling");
+        assert_ne!(
+            serde_json::to_vec(&freeform.body).unwrap(),
+            serde_json::to_vec(&programmatic.body).unwrap()
+        );
+        let first_text = |case: &ProbeCase| {
+            case.body["input"][0]["content"][0]["text"]
+                .as_str()
+                .expect("first input text")
+                .to_string()
+        };
+        let (a, b) = (first_text(&freeform), first_text(&programmatic));
+        assert!(!a.starts_with(&b));
+        assert!(!b.starts_with(&a));
+    }
+
+    #[test]
+    fn programmatic_tool_calling_case_sends_hosted_tool_and_allowed_callers() {
+        let case = find_case("programmatic_tool_calling");
+        let tools = case.body["tools"].as_array().expect("tools array");
+        assert!(tools
+            .iter()
+            .any(|tool| tool["type"] == "programmatic_tool_calling"));
+        let function = tools
+            .iter()
+            .find(|tool| tool["type"] == "function")
+            .expect("function tool");
+        assert_eq!(function["allowed_callers"], json!(["programmatic"]));
+        assert!(function.get("parameters").is_some());
+        assert!(function.get("output_schema").is_some());
+        assert_eq!(function["parameters"]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn reuse_cases_repeat_their_base_body() {
+        for (base_name, reuse_name) in [
+            ("cache_warm", "cache_reuse"),
+            (
+                "custom_freeform_non_patch",
+                "custom_freeform_non_patch_reuse",
+            ),
+            (
+                "programmatic_tool_calling",
+                "programmatic_tool_calling_reuse",
+            ),
+        ] {
+            let base = find_case(base_name);
+            let reuse = find_case(reuse_name);
+            assert_eq!(
+                serde_json::to_vec(&base.body).unwrap(),
+                serde_json::to_vec(&reuse.body).unwrap()
+            );
+            assert_eq!(reuse_base(reuse_name), Some(base_name));
+            let row = probe_row(&reuse, &Err("offline".into()));
+            assert_eq!(row["reuses"], base_name);
+        }
+    }
+
+    #[test]
+    fn row_separates_accepted_status_and_cached_tokens() {
+        let case = find_case("cache_reuse");
+        let body = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1300,\"input_tokens_details\":{\"cached_tokens\":1280,\"cache_write_tokens\":0}}}}\n";
+        let accepted = probe_row(&case, &Ok(reply(200, body)));
+        assert_eq!(accepted["accepted"], true);
+        assert_eq!(accepted["status"], 200);
+        assert_eq!(accepted["cached_tokens"], 1280);
+        assert_eq!(accepted["cache_write_tokens"], 0);
+
+        let rejected = probe_row(
+            &case,
+            &Ok(reply(400, "{\"detail\":\"Unsupported parameter\"}")),
+        );
+        assert_eq!(rejected["accepted"], false);
+        assert_eq!(rejected["status"], 400);
+        assert!(rejected["cached_tokens"].is_null());
+
+        let transport = probe_row(&case, &Err("connection reset".into()));
+        assert_eq!(transport["accepted"], false);
+        assert!(transport["status"].is_null());
+    }
+
+    #[test]
+    fn case_filter_runs_only_named_cases_in_order() {
+        let all: Vec<&'static str> = probe_cases("gpt-5.6-luna", "x")
+            .iter()
+            .map(|case| case.name)
+            .collect();
+        let requested = [
+            "programmatic_tool_calling".to_string(),
+            "custom_freeform_non_patch".to_string(),
+        ];
+        assert_eq!(
+            select_case_names(&all, &requested).unwrap(),
+            vec!["programmatic_tool_calling", "custom_freeform_non_patch"]
+        );
+        let repeated = ["baseline".to_string(), "baseline".to_string()];
+        assert_eq!(
+            select_case_names(&all, &repeated).unwrap(),
+            vec!["baseline"]
+        );
+        assert_eq!(select_case_names(&all, &[]).unwrap(), all);
+
+        let error = select_case_names(&all, &["nope".to_string()]).unwrap_err();
+        assert!(error.contains("nope"));
+        assert!(error.contains("baseline"));
     }
 }

@@ -92,11 +92,15 @@ fn script_output_is_bounded_and_marked() {
     assert_eq!(output.text, "ab");
     assert!(output.complete);
 
-    let big = json!({"type":"text","text":"x".repeat(100)});
-    let output = assemble_script_output(&[big], 16, 1024).unwrap();
+    let big = json!({"type":"text","text":format!("HEAD{}TAIL", "x".repeat(400))});
+    let output = assemble_script_output(&[big], 200, 1024).unwrap();
     assert!(!output.complete, "{output:?}");
-    assert!(output.text.len() <= 16, "{output:?}");
-    assert!(output.text.contains("truncated"), "{output:?}");
+    assert!(output.text.len() <= 200, "{output:?}");
+    // Head and tail survive, with an explicit marker naming the omitted bytes.
+    assert!(output.text.starts_with("HEAD"), "{output:?}");
+    assert!(output.text.ends_with("TAIL"), "{output:?}");
+    assert!(output.text.contains("bytes omitted"), "{output:?}");
+    assert!(output.omitted_bytes > 0, "{output:?}");
 
     // Image parity is an explicit OPEN gap: fail closed, never drop silently.
     let error = assemble_script_output(

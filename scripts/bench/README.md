@@ -259,6 +259,152 @@ before hidden tests are overlaid. Fixture validation uses separate
 paths and test output; keep them with the local campaign evidence and review
 them before sharing. A receipt does not establish independent grader isolation.
 
+## Droid arm
+
+A `droid` arm runs Droid 1.1.0 through the same harness, schedule and grading as
+DaVinci and Codex. Select it with `--harness davinci droid` (or
+`--harness davinci codex droid`); `BENCH_DROID` selects the executable (default
+`droid` on PATH). `BENCH_SERVICE_TIER` is shared with the other arms as today.
+
+**Arm identity.** `droid` takes its tool-execution mode from
+`BENCH_DROID_TOOL_EXECUTION_MODE`. For the Stage 0 study use the two pinned
+arm names instead, `droid-direct` (`direct-only`) and `droid-script`
+(`script-only`): they are separate harnesses for scheduling, identities, the
+gate and campaign integrity, both run the binary named by `BENCH_DROID`, and
+every Droid-family row records `droid_tool_execution_mode`. For example
+`--harness davinci droid-direct droid-script`.
+
+**Model and effort.** The Droid model is `BENCH_DROID_MODEL` (the proxy alias,
+for example `custom:Codex-via-ChatGPT-(gpt-6.1-sol)-0`), falling back to
+`BENCH_MODEL`. `--auto` is Droid's autonomy level, not reasoning effort, so it
+comes from `BENCH_DROID_AUTO` (`low|medium|high`, default `high`) and
+`BENCH_EFFORT` is no longer passed to it. Droid 1.1.0 documents no
+reasoning-effort flag for `droid exec`; effort comes from the proxy model
+configuration, which the bench must not write. So reasoning effort is NOT
+forced on the Droid arm, and rows say so: `droid_model`, `droid_auto` and
+`droid_reasoning_effort: "not forced"`.
+
+The arm builds an argv list, never a shell string:
+
+```sh
+droid exec --model <BENCH_DROID_MODEL or BENCH_MODEL> --auto <BENCH_DROID_AUTO> \
+  --tool-execution-mode <direct-only|script-only> \
+  --output-format stream-json --settings <workspace>.droid-settings.json \
+  --cwd <workspace> <prompt>
+```
+
+`--tool-execution-mode` is the hidden flag Droid 1.1.0 still accepts
+(`docs/perf/droid-gap/droid-1.1.0-identity.md` §2). The mode is selected by
+`BENCH_DROID_TOOL_EXECUTION_MODE` (default `script-only`; the other value is
+`direct-only`) for the plain `droid` harness; `droid-direct` and `droid-script`
+fix it by name.
+
+**Settings file.** The mode is also forced through a per-process `--settings`
+file written beside the run directory (`<workspace>.droid-settings.json`),
+never the user's `~/.factory/settings.json` or any CLIProxyAPI config. Its path
+and content SHA-256 are recorded in the result row (`droid_settings.path`,
+`droid_settings.sha256`) so the arm is reproducible.
+
+**Usage.** Droid usage is read from its own artifacts, not the stream. Totals
+(`input`, `cached`, `output`, `reasoning`) come from the session settings file
+`~/.factory/sessions/*/<id>.settings.json` `tokenUsage`, where `input` is total
+input (`inputTokens + cached`), `cached` is `cacheReadTokens`, `output` is
+`outputTokens` and `reasoning` is `thinkingTokens`; these are the names observed
+in a real 1.1.0 session file, and the 1.0.0 names (`cacheReadInputTokens`,
+`reasoningTokens`) are still accepted as a fallback
+(`scripts/bench/droid_usage.py`). A live 1.1.0 session confirmed that the log's
+summed `count` equals `inputTokens`, i.e. `count` is the uncached prompt size. Request count comes
+from `Streaming result` log lines (`~/.factory/logs/droid-log-single.log` and its
+dated rotations) matching the session id exactly; one line is one request, and
+each line's `count` is the uncached prompt size (their sum is kept as
+`droid_log_uncached_input`, a cross-check only). The stream
+(`--output-format stream-json`) supplies tool-call counts only.
+
+The session is discovered per run: the harness snapshots the `*.settings.json`
+files under the sessions root right before the process starts and diffs after
+it. Exactly one new file gives the session id (its stem); zero or several leave
+the usage fields `None` and record the reason in `droid_usage_error`. The only
+override is `BENCH_DROID_HOME`, which names the Droid data root (default
+`~/.factory`, holding `sessions/` and `logs/`) and exists for tests. This rule
+is not re-checked against a live 1.1.0 run (ruling R3), and concurrent Droid
+runs on the machine make the diff ambiguous and the row INCOMPLETE. Droid
+exposes no retry visibility, so `logical_requests` equals `requests` and
+`provider_attempts` is `None`.
+
+**Resolved mode.** After the run, `toolExecutionMode` is read from the discovered
+session settings file into `droid_resolved_tool_execution_mode` as recorded
+(`None` when the key is absent). A real 1.1.0 file spells it with underscores
+(`script_only`, `direct_only`); the comparison normalises `_` to `-`, so
+`droid_mode_mismatch` is `False` when it equals the requested mode in either
+spelling, `True` when it differs, `None` when unknown. The gap analysis excludes
+rows with `droid_mode_mismatch: true`. The session file's `reasoningEffort` and
+`model` are recorded as `droid_session_reasoning_effort` and
+`droid_session_model` (plus `droid_session_id` and `droid_session_settings`):
+effort is observed, still not forced.
+
+**Re-deriving usage.** `python scripts/bench/droid_usage.py rederive RUNS_DIR
+[--home DIR]` recomputes the Droid usage fields for the Droid rows of
+`results.jsonl` from the preserved session files and prints one JSON line per
+row, next to the values the row holds. A row's session is its recorded
+`droid_session_id`, or else the one session id under the sessions root that
+appears in the run's saved `<harness>/<task>-r<rep>.stdout.jsonl`; zero or
+several matches print an `error`. It is read-only and never rewrites
+`results.jsonl`.
+
+**INCOMPLETE rule.** Any absent usage field stays `None`, never zero, and the
+row is marked incomplete via `usage_available: false`. A Droid row cannot pass
+request-reduction or per-success cost rules on missing usage.
+
+## Stage 0 gap study
+
+The 17-task study set is selected with `--tasks study`; `--tasks all` still means
+the public tasks only. Beyond the generated public tasks (`scripts/bench/tasks`,
+built by `make_tasks.py`) two task sources are wired in
+(`scripts/bench/task_sources.py`), and they go through the same `run_one` path:
+
+- `verified-range|slice|parser|dedupe|errors|path`: from
+  `crates/davinci-evals/fixtures/behavior/verified-core.json`. The prompt is the
+  scenario `request`; the workspace is a copy of its `fixtures/repos/<repo_fixture>`
+  with the same one-commit git baseline as public tasks; grading runs each
+  `verification_commands` entry (`cargo test --quiet`, its own timeout and
+  expected exit). Allowed changes are the scenario's `file_changed` paths
+  (`src/lib.rs`), matching its own `max_unrelated_files_changed: 0`; `target/`
+  and `Cargo.lock` are excluded through `.git/info/exclude`.
+- `research-01|02|03`: the external research fixtures at
+  `BENCH_RESEARCH_FIXTURES` (default
+  `C:\Users\sergi\Desktop\lean-droid-1.0\droid-re-research\fixtures`). The prompt
+  is the `## Instruction (give this verbatim)` section; `pwsh setup.ps1` builds
+  the fixture and `pwsh grade.ps1 -Json` grades it (`BENCH_PWSH` overrides
+  `pwsh`). A missing root or `pwsh`, grader exit 2 or a missing verdict stops the
+  run with an error, never a pass.
+  **Layout.** The verbatim instruction says "Write workspace/answer.json" and
+  names `workspace/notes`, so the fixture is materialised at
+  `<run dir>/workspace` and the agent runs with cwd `<run dir>`, where those
+  paths resolve. Git baseline, changed-files and unrelated checks use
+  `<run dir>` (paths read `workspace/...`); the grader gets
+  `-Workspace <run dir>/workspace`, which contains `notes/` and no `.git`. The
+  fixture's `.pre/` files are committed into the baseline, so they never count as
+  changes. Allowed new or edited paths are only the task's outputs
+  (`workspace/answer.json`; `workspace/edit-report.json` with
+  `workspace/pkg/m*.ts` and `workspace/pkg/__tests__/*`; `workspace/results.json`
+  with `workspace/jobs/out/*.txt`). `workspace/pkg/other/*` is deliberately not
+  allowed (the grader asserts it untouched). Earlier, the fixture sat at the run
+  dir root and every research task failed for that reason (Stage 0 report).
+
+**Warm-up.** `run --warmup` runs the first selected task once (rep 0) per harness
+and writes rows to `warmup.jsonl` with `scored: false`, never `results.jsonl`.
+Campaign directories are created exclusively, so a warm-up needs its own
+`BENCH_RUNS`. Integrity, `gate`, `report`, `compare` and the analysis read only
+`results.jsonl`.
+
+**Analysis.** `python scripts/bench/gap_study.py RUNS_DIR --seed N` implements
+preregistration sections 4 to 6 (pure stdlib): 15 pair-by-metric estimates with
+a geometric mean, 90% percentile bootstrap over tasks (10,000 resamples), the
+GAP / AHEAD / NO_CLEAR_GAP label, and the pass guard. `--seed` is required and
+must be the seed written into the approval block; `--json` prints the full
+report; `--causes` takes the human-read discordant-task causes;
+`--droid-reasoning-excluded` applies the smoke-row result for gap G3.
+
 ## Metric definitions and acceptance
 
 ### Codex subscription acceptance

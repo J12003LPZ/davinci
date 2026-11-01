@@ -499,7 +499,10 @@ pub(crate) fn prepare_patch(
         let target = sanitize_relative_path(workspace_root, path)?;
         let source = snapshot(&target)?;
         let bytes = match action {
-            FileAction::Add { content, .. } => {
+            FileAction::Add { path, content } => {
+                if source.bytes().is_some() {
+                    return Err(format!("File to add already exists: {path}"));
+                }
                 added += 1;
                 Some(content.as_bytes().to_vec())
             }
@@ -632,6 +635,18 @@ mod tests {
         );
         assert!(!dir.path().join("requested.txt").exists());
         assert!(journal.exists());
+    }
+
+    #[test]
+    fn add_file_refuses_to_overwrite_an_existing_file() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("existing.txt"), "old").unwrap();
+        let patch = "*** Begin Patch\n*** Add File: existing.txt\n+new\n*** End Patch";
+        assert!(execute_apply_patch(dir.path(), patch).is_err());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("existing.txt")).unwrap(),
+            "old"
+        );
     }
 
     #[test]

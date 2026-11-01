@@ -83,13 +83,23 @@ def task_success(row):
             and row.get("artifact_leak") is False)
 
 
-def integrity_errors(rows, tasks, repetitions, harnesses=("davinci", "codex")):
-    """Validate a complete single-variant campaign without dropping failed runs."""
+def integrity_errors(rows, tasks, repetitions, harnesses=None):
+    """Validate a complete single-variant campaign without dropping failed runs.
+
+    ``harnesses`` defaults to the arms present in the rows, so a campaign that
+    adds an arm beyond the standard DaVinci/Codex pair (for example Droid) is
+    validated without the caller repeating the full list. DaVinci and Codex are
+    always expected, matching the function's original two-arm default.
+    """
     errors, seen = [], set()
     if not rows:
         return ["empty campaign"]
     if any(not isinstance(row, dict) for row in rows):
         return ["campaign rows must be objects"]
+    if harnesses is None:
+        harnesses = tuple(sorted({row["harness"] for row in rows
+                                  if isinstance(row, dict) and isinstance(row.get("harness"), str)}
+                                 | {"davinci", "codex"}))
     campaign, variant = rows[0].get("campaign"), rows[0].get("variant")
     if not campaign or not variant:
         errors.append("missing campaign or variant identity")
