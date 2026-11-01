@@ -12,43 +12,83 @@ fn process_owner() -> &'static str {
     OWNER.get_or_init(|| format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()))
 }
 
-/// Hold this process's owner lock for `dir` for the life of the process. The
-/// OS releases it on any exit, so another process can tell a dead owner from a
-/// live one even if the dead one's pid has been reused.
-fn hold_owner_lock(dir: &Path) -> Result<(), ScriptRunError> {
-    static HELD: OnceLock<Mutex<HashMap<PathBuf, std::fs::File>>> = OnceLock::new();
-    let key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    let mut held = HELD
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if held.contains_key(&key) {
+/// Directory of every host process's owner lock. It sits in the agent
+/// directory, outside any registry directory, so deleting a registry directory
+/// never meets a held lock file and a recreated one still has a live owner.
+/// The path is never stored in a run record: a record is data and must not
+/// choose which file gets locked or deleted.
+fn owner_locks_dir() -> PathBuf {
+    davinci_session::default_agent_dir().join("script-owners")
+}
+
+fn is_owner_id(owner: &str) -> bool {
+    owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Hold this process's single owner lock for the life of the process. The OS
+/// releases it on any exit, so another process can tell a dead owner from a
+/// live one even if the dead one's pid has been reused. A failure is not
+/// remembered: the next call tries again.
+fn hold_owner_lock() -> Result<(), ScriptRunError> {
+    static HELD: OnceLock<std::fs::File> = OnceLock::new();
+    static TAKING: Mutex<()> = Mutex::new(());
+    if HELD.get().is_some() {
+        return Ok(());
+    }
+    let _taking = TAKING.lock().unwrap_or_else(|e| e.into_inner());
+    if HELD.get().is_some() {
         return Ok(());
     }
     let unavailable = || ScriptRunError::new("UNAVAILABLE", "script run owner lock unavailable");
-    let owners = dir.join("owners");
+    let owners = owner_locks_dir();
     std::fs::create_dir_all(&owners).map_err(|_| unavailable())?;
-    let lock = crate::runtime::capacity::lock_file_exclusive(
-        &owners.join(format!("{}.lock", process_owner())),
-        true,
-    )
-    .map_err(|_| unavailable())?
-    .ok_or_else(unavailable)?;
-    held.insert(key, lock);
+    let mine = format!("{}.lock", process_owner());
+    let lock = crate::runtime::capacity::lock_file_exclusive(&owners.join(&mine), true)
+        .map_err(|_| unavailable())?
+        .ok_or_else(unavailable)?;
+    let _ = HELD.set(lock);
+    remove_stale_owner_locks(&owners, &mine);
     Ok(())
+}
+
+/// Best-effort sweep, run once when this process takes its lock: remove every
+/// other owner lock nobody holds. Links and anything that is not a regular
+/// file are left alone.
+fn remove_stale_owner_locks(owners: &Path, mine: &str) {
+    let Ok(entries) = std::fs::read_dir(owners) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let is_other_owner = name
+            .strip_suffix(".lock")
+            .is_some_and(|owner| is_owner_id(owner) && name != mine);
+        // `DirEntry::file_type` does not follow links.
+        if !is_other_owner || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok(Some(lock)) = crate::runtime::capacity::lock_file_exclusive(&path, false) {
+            drop(lock);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// True when `owner`'s lock can be taken, which means its process is gone. No
 /// lock file (a record from before locks) counts as dead; any other failure
 /// counts as alive, the conservative answer. The stale lock file is removed.
-fn owner_is_dead(dir: &Path, owner: &str) -> bool {
+fn owner_is_dead(owner: &str) -> bool {
     if owner == process_owner() {
         return false;
     }
-    if !owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+    if !is_owner_id(owner) {
         return true;
     }
-    let path = dir.join("owners").join(format!("{owner}.lock"));
+    let path = owner_locks_dir().join(format!("{owner}.lock"));
     match crate::runtime::capacity::lock_file_exclusive(&path, false) {
         Ok(Some(lock)) => {
             drop(lock);
@@ -311,10 +351,7 @@ impl ScriptRunRegistry {
     /// Recover one open record whose owner process is gone. Records owned by
     /// this process or by a live one are never touched.
     pub fn reconcile_if_owner_dead(&self, record: &ScriptRunRecord) {
-        let owner_dead = record
-            .owner
-            .as_deref()
-            .is_none_or(|owner| owner_is_dead(&self.dir, owner));
+        let owner_dead = record.owner.as_deref().is_none_or(owner_is_dead);
         if !record.state.terminal() && owner_dead {
             let _ = reconcile_script_run(self, &record.run_id);
         }
@@ -323,7 +360,7 @@ impl ScriptRunRegistry {
     /// Write-ahead creation: the record is durable before the script runs.
     pub fn create(&self, record: &ScriptRunRecord) -> Result<(), ScriptRunError> {
         let path = self.path(&record.run_id)?;
-        hold_owner_lock(&self.dir)?;
+        hold_owner_lock()?;
         let _guard = self.guard();
         if path.exists() {
             return Err(ScriptRunError::new("DENIED", "script run already exists"));

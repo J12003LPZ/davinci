@@ -2260,15 +2260,17 @@ fn wait_for_script_scoped_handle_and_terminal_status() {
         &binding,
         "rev",
     );
-    foreign_owned.owner = Some("1-another-host".into());
+    // Unique per run: owner locks live in the shared agent directory.
+    let foreign_id = format!("1-another-host-{}", uuid::Uuid::new_v4().simple());
+    foreign_owned.owner = Some(foreign_id.clone());
     registry.create(&foreign_owned).unwrap();
     // A live owner holds its lock through a handle of its own.
-    let owners = evidence_dir.join("script-runs").join("owners");
+    let owners = davinci_session::default_agent_dir().join("script-owners");
     std::fs::create_dir_all(&owners).unwrap();
-    let foreign_lock =
-        crate::runtime::capacity::lock_file_exclusive(&owners.join("1-another-host.lock"), true)
-            .unwrap()
-            .expect("the foreign lock is free to take");
+    let foreign_path = owners.join(format!("{foreign_id}.lock"));
+    let foreign_lock = crate::runtime::capacity::lock_file_exclusive(&foreign_path, true)
+        .unwrap()
+        .expect("the foreign lock is free to take");
     registry
         .transition("run-other-host", ScriptRunState::Running)
         .unwrap();
@@ -2298,6 +2300,8 @@ fn wait_for_script_scoped_handle_and_terminal_status() {
         registry.get("run-other-host").unwrap().state,
         ScriptRunState::RecoveryRequired
     );
+    // Resolving a dead owner already removed it; this is only a safety net.
+    let _ = std::fs::remove_file(&foreign_path);
 
     // A handle from another session never resolves.
     let foreign = ScriptRunRegistry::open(evidence_dir.join("script-runs")).unwrap();

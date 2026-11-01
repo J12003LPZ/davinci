@@ -295,7 +295,6 @@ fn run_with_an_uncertain_child_is_stored_as_recovery_required() {
     let stored: Vec<_> = std::fs::read_dir(evidence.path().join("script-runs"))
         .unwrap()
         .flatten()
-        .filter(|entry| entry.path().is_file())
         .filter_map(|entry| entry.path().file_stem()?.to_str().map(str::to_owned))
         .filter(|id| !id.contains('.'))
         .collect();

@@ -770,13 +770,16 @@ fn first_open_recovers_only_runs_a_dead_process_left_open() {
     };
     // Owner liveness is a held lock, not a pid: a stale lock file with nobody
     // holding it is dead, and so is an owner with no lock file at all.
-    let owners = dir.path().join("owners");
-    std::fs::create_dir_all(&owners).unwrap();
-    std::fs::write(owners.join("1-dead.lock"), b"").unwrap();
-    let dead = Some("1-dead".to_string());
+    // Owner locks live in the shared agent directory, so ids are unique per run.
+    let owners = owner_locks_dir();
+    let tag = uuid::Uuid::new_v4().simple();
+    let dead_path = owners.join(format!("1-dead-{tag}.lock"));
+    let live_path = owners.join(format!("2-live-{tag}.lock"));
+    std::fs::write(&dead_path, b"").unwrap();
+    let dead = Some(format!("1-dead-{tag}"));
     // Another host that is alive: a different handle holds its owner lock.
-    let live_lock = hold_exclusively(&owners.join("2-live.lock"));
-    let live = Some("2-live".to_string());
+    let live_lock = hold_exclusively(&live_path);
+    let live = Some(format!("2-live-{tag}"));
     write("dead-running", dead.clone(), ScriptRunState::Running);
     write("legacy-running", None, ScriptRunState::Running);
     write("live-running", live, ScriptRunState::Running);
@@ -788,7 +791,7 @@ fn first_open_recovers_only_runs_a_dead_process_left_open() {
     assert_eq!(state("legacy-running"), ScriptRunState::RecoveryRequired);
     assert_eq!(state("live-running"), ScriptRunState::Running);
     assert_eq!(state("dead-done"), ScriptRunState::Completed);
-    assert!(!owners.join("1-dead.lock").exists(), "stale lock removed");
+    assert!(!dead_path.exists(), "stale lock removed");
 
     // The live owner dies later: resolving the single record recovers it, and
     // does not wait for another first open.
@@ -808,4 +811,48 @@ fn first_open_recovers_only_runs_a_dead_process_left_open() {
         .unwrap();
     let again = ScriptRunRegistry::open(dir.path()).unwrap();
     assert_eq!(again.get("mine").unwrap().state, ScriptRunState::Running);
+    let _ = std::fs::remove_file(&live_path);
+}
+
+fn owner_locks_dir() -> std::path::PathBuf {
+    let owners = davinci_session::default_agent_dir().join("script-owners");
+    std::fs::create_dir_all(&owners).unwrap();
+    owners
+}
+
+#[test]
+fn a_registry_directory_can_be_deleted_after_a_record_is_created() {
+    use davinci_agent::codemode::{ScriptRunRecord, ScriptRunRegistry};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("script-runs");
+    let registry = ScriptRunRegistry::open(&root).unwrap();
+    registry
+        .create(&ScriptRunRecord::new("run", "call", Some("s"), "w", "rev"))
+        .unwrap();
+    // No lock file is held inside the directory, so Windows can delete it.
+    std::fs::remove_dir_all(&root).unwrap();
+    assert!(!root.exists());
+}
+
+#[test]
+fn a_stale_owner_lock_counts_as_dead_and_is_removed() {
+    use davinci_agent::codemode::{ScriptRunRecord, ScriptRunRegistry, ScriptRunState};
+    let dir = tempfile::tempdir().unwrap();
+    let owner = format!("1-stale-{}", uuid::Uuid::new_v4().simple());
+    let lock = owner_locks_dir().join(format!("{owner}.lock"));
+    std::fs::write(&lock, b"").unwrap();
+    let mut record = ScriptRunRecord::new("stale", "call", Some("s"), "w", "rev");
+    record.owner = Some(owner);
+    record.state = ScriptRunState::Running;
+    std::fs::write(
+        dir.path().join("stale.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let registry = ScriptRunRegistry::open(dir.path()).unwrap();
+    assert_eq!(
+        registry.get("stale").unwrap().state,
+        ScriptRunState::RecoveryRequired
+    );
+    assert!(!lock.exists(), "stale lock removed");
 }

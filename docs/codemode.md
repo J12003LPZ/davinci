@@ -64,7 +64,8 @@ JavaScript is never resumed after a crash.
 
 `kill` cancels the run and waits a bounded grace; the worker records its own
 terminal state, and a timeout gives `recoveryRequired`. A run owned by another
-process returns `NOT_OWNER`. A dead owner's open runs are reconciled at the
+process returns `NOT_OWNER`. Liveness is a lock each process holds at
+`<agent dir>/script-owners/<owner>.lock`, outside any run directory. A dead owner's open runs are reconciled at the
 first registry open in a process. Handles are scoped to a session
 branch: a run records the leaf it started from, and resolves only while that
 entry is on the path to the current leaf. A run from another branch does not
