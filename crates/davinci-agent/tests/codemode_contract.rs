@@ -24,6 +24,57 @@ impl CodeModeHost for FixedHost {
 }
 
 #[test]
+fn unknown_mutation_never_auto_replays() {
+    use davinci_agent::codemode::{resolve_script_effect, ScriptEffectResolution};
+    use davinci_agent::runtime::operations::{EffectStatus, OperationState};
+
+    // An ambiguous effect is never success and never a retry, whatever the
+    // operation state claims.
+    for effect in [
+        EffectStatus::Possible,
+        EffectStatus::Unknown,
+        EffectStatus::EffectsObserved,
+    ] {
+        for state in [
+            OperationState::Running,
+            OperationState::EffectPossible,
+            OperationState::Interrupted,
+            OperationState::RecoveryRequired,
+            OperationState::Failed,
+        ] {
+            let resolution = resolve_script_effect(state.clone(), effect.clone());
+            assert!(
+                matches!(resolution, ScriptEffectResolution::RecoveryRequired { .. }),
+                "{state:?}/{effect:?} -> {resolution:?}"
+            );
+            assert!(!resolution.may_retry(), "{resolution:?}");
+            assert!(resolution.requires_postcondition(), "{resolution:?}");
+        }
+    }
+    // A committed effect is a success, not a replay.
+    let committed = resolve_script_effect(OperationState::Succeeded, EffectStatus::EffectsObserved);
+    assert!(matches!(
+        committed,
+        ScriptEffectResolution::Succeeded { .. }
+    ));
+    assert!(!committed.may_retry());
+    // Only a proven no-effect may be issued again.
+    for (state, effect) in [
+        (OperationState::Failed, EffectStatus::NotStarted),
+        (OperationState::Cancelled, EffectStatus::NotStarted),
+        (OperationState::Failed, EffectStatus::KnownNoEffect),
+    ] {
+        let resolution = resolve_script_effect(state, effect);
+        assert!(matches!(
+            resolution,
+            ScriptEffectResolution::NoEffect { .. }
+        ));
+        assert!(resolution.may_retry());
+        assert!(!resolution.requires_postcondition());
+    }
+}
+
+#[test]
 fn mode_is_default_off_and_labels_are_stable() {
     assert!(matches!(CodeModeMode::default(), CodeModeMode::Off));
     assert_eq!(

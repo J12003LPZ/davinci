@@ -511,27 +511,18 @@ impl CodeModeBroker for AgentCodeModeBroker {
             ordinal,
         );
         let unresolved_effect = if mutating {
-            use crate::runtime::operations::{EffectStatus, OperationState};
+            // The journal is the authority: an ambiguous effect stays
+            // unresolved and closes admission instead of replaying.
             self.agent
                 .runtime
                 .as_ref()
                 .and_then(|runtime| runtime.operations.as_ref())
-                .and_then(|operations| operations.dispatcher().journal().snapshot().ok())
-                .map(|snapshot| {
-                    snapshot
-                        .attempts
-                        .iter()
-                        .find(|attempt| attempt.operation_id().to_string() == operation_ref)
-                        .map(|attempt| {
-                            attempt.state() != OperationState::Succeeded
-                                && matches!(
-                                    attempt.effect_status(),
-                                    EffectStatus::Possible
-                                        | EffectStatus::Unknown
-                                        | EffectStatus::EffectsObserved
-                                )
-                        })
-                        .unwrap_or(true)
+                .map(|operations| {
+                    super::reconcile_script_child_effect(
+                        operations.dispatcher().journal(),
+                        &operation_ref,
+                    )
+                    .requires_postcondition()
                 })
                 .unwrap_or(true)
         } else {
