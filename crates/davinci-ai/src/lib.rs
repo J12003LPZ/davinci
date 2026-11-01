@@ -168,10 +168,11 @@ pub use oauth_providers::{
     AuthorizationCallbackInput, AuthorizeRequest, OauthTokens, Pkce, TokenExchangeRequest,
 };
 pub use openai_cache_diagnostics::{
-    configured_comparison_response_id, diagnostics_every_n_from_env, latest_applied_policy,
-    latest_diagnostic, sampled_comparison_response_id, should_sample_comparison,
-    AppliedPromptCachePolicy, ProviderCacheUsageBreakdown, ProviderPromptCacheDiagnostics,
-    OPENAI_CACHE_DIAGNOSTICS_EVERY_N_ENV,
+    cache_drop_report, classify_cache_drop, configured_comparison_response_id,
+    diagnostics_every_n_from_env, latest_applied_policy, latest_diagnostic,
+    sampled_comparison_response_id, should_sample_comparison, AppliedPromptCachePolicy,
+    CacheDropReason, CacheDropRecord, CacheRequestSample, ProviderCacheUsageBreakdown,
+    ProviderPromptCacheDiagnostics, OPENAI_CACHE_DIAGNOSTICS_EVERY_N_ENV,
 };
 pub use openai_cache_policy::{
     BoundaryStrategy, CacheCapabilitySource, CacheControlFamily, CacheIntent,
@@ -201,8 +202,8 @@ pub use responses_ledger::{
     NativeResponsesTurn, NATIVE_RESPONSES_TURN_ENTRY_TYPE,
 };
 pub use responses_request::{
-    PreparedProviderRequest, WireManifest, WireSegmentCategory, WireSegmentManifest,
-    WireTrustClass, WIRE_MANIFEST_VERSION,
+    PreparedProviderRequest, WireManifest, WireSegmentCategory, WireSegmentDigest,
+    WireSegmentManifest, WireTrustClass, WIRE_MANIFEST_VERSION,
 };
 pub use responses_tools::{
     message_tool_wire_kind, originating_tool_wire_kind, resolve_responses_tools,
@@ -286,7 +287,7 @@ pub struct ChatMessage {
     pub tool_name: Option<String>,
     #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
-    /// TS custom fields (`command`, `output`, `excludeFromContext`, `customType`, …).
+    /// TS custom fields (`command`, `output`, `excludeFromContext`, `customType`, Ã¢â‚¬Â¦).
     #[serde(flatten, default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }

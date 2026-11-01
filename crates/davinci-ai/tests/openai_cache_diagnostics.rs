@@ -154,3 +154,94 @@ fn duplicate_terminal_events_use_the_last_provider_diagnostic_once() {
     assert_eq!(diag.reported_hit(), Some(true));
     assert_eq!(diag.comparison_reusable_tokens, Some(2048));
 }
+
+#[test]
+fn cache_drop_classification_requires_evidence() {
+    use davinci_ai::{cache_drop_report, classify_cache_drop, CacheDropReason, CacheRequestSample};
+
+    // Identical prefix bytes and fewer cache-read tokens: the cause is not
+    // local, and nothing is invented.
+    let drop = classify_cache_drop(
+        7,
+        CacheRequestSample {
+            cache_read: Some(10_000),
+            wire_prefix_digest: "abc",
+        },
+        CacheRequestSample {
+            cache_read: Some(2_000),
+            wire_prefix_digest: "abc",
+        },
+        "openai-codex",
+    )
+    .unwrap();
+    assert_eq!(drop.reason, CacheDropReason::ProviderOrUnknown);
+    assert_eq!(drop.request_index, 7);
+    assert_eq!(drop.prev_cache_read, 10_000);
+    assert_eq!(drop.next_cache_read, 2_000);
+    assert_eq!(drop.route, "openai-codex");
+    assert_eq!(drop.wire_prefix_digest, "abc");
+
+    // A real local prefix change is attributable.
+    let local = classify_cache_drop(
+        8,
+        CacheRequestSample {
+            cache_read: Some(10_000),
+            wire_prefix_digest: "abc",
+        },
+        CacheRequestSample {
+            cache_read: Some(1),
+            wire_prefix_digest: "def",
+        },
+        "openai-codex",
+    )
+    .unwrap();
+    assert_eq!(local.reason, CacheDropReason::LocalPrefixChange);
+
+    // No drop, or missing usage, produces no record at all.
+    assert!(classify_cache_drop(
+        9,
+        CacheRequestSample {
+            cache_read: Some(10),
+            wire_prefix_digest: "a"
+        },
+        CacheRequestSample {
+            cache_read: Some(10),
+            wire_prefix_digest: "a"
+        },
+        "openai-codex",
+    )
+    .is_none());
+    assert!(classify_cache_drop(
+        10,
+        CacheRequestSample {
+            cache_read: None,
+            wire_prefix_digest: "a"
+        },
+        CacheRequestSample {
+            cache_read: Some(1),
+            wire_prefix_digest: "a"
+        },
+        "openai-codex",
+    )
+    .is_none());
+    assert!(classify_cache_drop(
+        11,
+        CacheRequestSample {
+            cache_read: Some(10),
+            wire_prefix_digest: "a"
+        },
+        CacheRequestSample {
+            cache_read: None,
+            wire_prefix_digest: "a"
+        },
+        "openai-codex",
+    )
+    .is_none());
+
+    // The artifact holds classification evidence only: no prompts or secrets.
+    let report = cache_drop_report(&[drop]).to_string();
+    assert!(report.contains("providerOrUnknown"));
+    for forbidden in ["RAW-PROMPT", "Bearer", "sk-"] {
+        assert!(!report.contains(forbidden), "{forbidden}");
+    }
+}
