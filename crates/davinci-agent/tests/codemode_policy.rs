@@ -202,7 +202,8 @@ fn script_subagent_requires_user_authority_and_budget() {
     );
     let too_deep = ScriptSubagentPolicy {
         depth: 2,
-        ..allowed
+        max_depth: 2,
+        allow: true,
     };
     assert_eq!(
         admit_script_subagent(&request, &too_deep, 1)
