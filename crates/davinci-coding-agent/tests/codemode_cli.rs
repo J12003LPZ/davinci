@@ -95,3 +95,58 @@ fn controlled_codemode_reports_the_release_gate() {
         "{text}"
     );
 }
+
+/// Rolling back to `off` leaves a valid, startable configuration and never
+/// touches durable run state.
+#[test]
+fn controlled_script_rollout_can_disable_without_history_loss() {
+    let home = tempfile::tempdir().unwrap();
+    let agent_dir = home.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let workspace = home.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let write_settings = |mode: &str| {
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::json!({"codemode": {"mode": mode}}).to_string(),
+        )
+        .unwrap();
+    };
+    let run = |extra: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_davinci"))
+            .current_dir(&workspace)
+            .env("DAVINCI_CODING_AGENT_DIR", &agent_dir)
+            .env("PI_CODING_AGENT_DIR", &agent_dir)
+            .env("PI_OFFLINE", "1")
+            .args(["--no-extensions", "--offline"])
+            .args(extra)
+            .args(["-p", "hi"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (output.status.success(), text)
+    };
+    write_settings("controlled");
+    let (ok, text) = run(&[]);
+    assert!(ok, "{text}");
+    assert!(text.contains("recovery acceptance gates"), "{text}");
+
+    // Roll back to off: still a valid run, and no Codemode surface is offered.
+    write_settings("off");
+    let (ok, text) = run(&[]);
+    assert!(ok, "{text}");
+    assert!(!text.contains("Codemode is on in /config"), "{text}");
+    // The CLI override still wins over a stored mode.
+    let (ok, _) = run(&["--codemode", "off"]);
+    assert!(ok);
+    // The stored file round-trips every admitted mode unchanged.
+    let stored: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(agent_dir.join("settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(stored["codemode"]["mode"], serde_json::json!("off"));
+}

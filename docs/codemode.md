@@ -2,9 +2,11 @@
 
 Codemode lets the model run a short, sandboxed JavaScript program that calls
 your tools (`tools.<name>({...})`) and returns one small result, instead of
-making many separate tool calls. It is **read-only**: scripts can only use
-read-class tools, and every call still goes through the normal permission
-checks and is recorded in the session's operation journal.
+making many separate tool calls. It has two enabled modes: **read-only** (default when on) and **controlled**
+(opt-in, currently behind its recovery release gate). A read-only script can
+only use read-class tools; a controlled script may also edit files and run the
+guarded shell. Every call still goes through the normal permission checks and
+is recorded in the session's operation journal.
 
 It is off by default.
 
@@ -17,6 +19,30 @@ It is off by default.
 `/config` stores `"codemode": {"mode": "read-only"}` (or `"off"`) in your user
 settings (`<agent dir>/settings.json`). Project settings cannot turn Codemode
 on or change its runtime.
+
+## Controlled mode
+
+`"codemode": {"mode": "controlled"}` selects controlled mode from trusted user
+settings or `davinci --codemode controlled`. Until the S05/S15 crash-recovery
+matrix is accepted it is refused with "Controlled Codemode is unavailable until
+its recovery acceptance gates pass". A script header can never select the mode,
+and project settings cannot turn Codemode on.
+
+Controlled scripts get the Droid spellings `tools.Read`, `tools.Grep`,
+`tools.Glob`, `tools.LS`, `tools.Execute`, `tools.ApplyPatch`, `tools.Edit` and
+`tools.Write`, each mapped onto an already-authorized tool. Raw multiline inputs
+arrive as `inputs.name` from leading `// @input: name <<'TAG'` blocks;
+`text()` and `await notify()` are the explicit output channels. Image output is
+not yet supported (an OPEN parity gap) and fails with `UNSUPPORTED_OUTPUT`.
+
+## Rollback
+
+Set the mode to `off` (or remove the `codemode` key). Later turns no longer
+offer or run Codemode. Durable run records under
+`<evidence dir>/script-runs` are left in place and are never replayed: an
+unresolved mutation stays `recoveryRequired` and must be reconciled from the
+operation journal. Evaluating controlled mode's performance is tracked in
+`docs/superpowers/plans/2026-10-31-droid-parity-benchmark-implementation.md`.
 
 ## Requirements
 
