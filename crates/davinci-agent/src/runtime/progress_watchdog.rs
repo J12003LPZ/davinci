@@ -6,6 +6,11 @@ use serde::{Deserialize, Serialize};
 /// Maximum observations kept in the watchdog history per task.
 pub const MAX_WATCHDOG_HISTORY: usize = 128;
 
+/// The first occurrence of a repeated-progress signal nudges for one bounded
+/// recovery attempt; a second occurrence equal to the stored escalation stops.
+pub const REPEATED_SIGNAL_NUDGE_AT: usize = 1;
+pub const REPEATED_SIGNAL_STOP_AT: usize = 2;
+
 /// Contract helper: detects repeated observations without progress.
 pub fn repeat_without_progress(observations: &[(&str, &str, &str)], new_evidence: bool) -> bool {
     !new_evidence
@@ -164,6 +169,46 @@ impl LoopSignal {
     }
 }
 
+/// Two loop signals are the same escalation when their stable identity matches.
+/// `OscillatingEdits` carries a `cycle_sequence` that rotates as the 3-wide
+/// sliding window advances (A->B->A vs B->A->B), so it is compared by `path`
+/// rather than the exact cycle; the other variants compare their stable fields.
+fn same_escalation(a: &LoopSignal, b: &LoopSignal) -> bool {
+    match (a, b) {
+        (
+            LoopSignal::RepeatedCommandWithoutNewOutput {
+                tool: tool_a,
+                command_or_input: command_a,
+                ..
+            },
+            LoopSignal::RepeatedCommandWithoutNewOutput {
+                tool: tool_b,
+                command_or_input: command_b,
+                ..
+            },
+        ) => tool_a == tool_b && command_a == command_b,
+        (
+            LoopSignal::RepeatedUnchangedReads { path: path_a, .. },
+            LoopSignal::RepeatedUnchangedReads { path: path_b, .. },
+        )
+        | (
+            LoopSignal::OscillatingEdits { path: path_a, .. },
+            LoopSignal::OscillatingEdits { path: path_b, .. },
+        ) => path_a == path_b,
+        (
+            LoopSignal::RepeatedTestFailureWithoutNewDiagnosis {
+                signature: signature_a,
+                ..
+            },
+            LoopSignal::RepeatedTestFailureWithoutNewDiagnosis {
+                signature: signature_b,
+                ..
+            },
+        ) => signature_a == signature_b,
+        _ => false,
+    }
+}
+
 /// Lifecycle state of the progress watchdog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum WatchdogState {
@@ -243,11 +288,21 @@ impl ProgressWatchdog {
             return RepairAction::Continue;
         }
         match &self.state {
-            WatchdogState::Paused(
-                signal @ LoopSignal::RepeatedTestFailureWithoutNewDiagnosis { .. },
-            ) => {
+            WatchdogState::Paused(signal) => {
                 let signal = signal.clone();
-                if self.last_escalation.as_ref() == Some(&signal) {
+                // Every loop signal shares one escalation path: the first
+                // occurrence nudges for a bounded recovery attempt, a second
+                // occurrence equal to the stored escalation stops.
+                let occurrence = if self
+                    .last_escalation
+                    .as_ref()
+                    .is_some_and(|last| same_escalation(last, &signal))
+                {
+                    REPEATED_SIGNAL_STOP_AT
+                } else {
+                    REPEATED_SIGNAL_NUDGE_AT
+                };
+                if occurrence >= REPEATED_SIGNAL_STOP_AT {
                     self.state = WatchdogState::Stopped;
                     RepairAction::Blocked(signal)
                 } else {
@@ -747,5 +802,189 @@ mod tests {
         // In-flight transaction may finish, but further dispatch is halted
         assert!(!watchdog.can_dispatch());
         assert!(matches!(watchdog.state(), WatchdogState::Paused(_)));
+    }
+
+    #[test]
+    fn repeated_unchanged_reads_nudge_then_stop() {
+        let mut watchdog = ProgressWatchdog::new();
+        let signal = LoopSignal::RepeatedUnchangedReads {
+            path: "src/lib.rs".into(),
+            count: 3,
+        };
+        watchdog.pause(signal.clone());
+        assert!(matches!(
+            watchdog.repair_action(),
+            RepairAction::ChangeApproach(LoopSignal::RepeatedUnchangedReads { .. })
+        ));
+        assert_eq!(*watchdog.state(), WatchdogState::Running);
+
+        watchdog.pause(signal);
+        assert!(matches!(
+            watchdog.repair_action(),
+            RepairAction::Blocked(LoopSignal::RepeatedUnchangedReads { .. })
+        ));
+        assert_eq!(*watchdog.state(), WatchdogState::Stopped);
+    }
+
+    #[test]
+    fn repeated_command_without_new_output_nudge_then_stop() {
+        let mut watchdog = ProgressWatchdog::new();
+        let signal = LoopSignal::RepeatedCommandWithoutNewOutput {
+            tool: "bash".into(),
+            command_or_input: "cargo check".into(),
+            count: 3,
+        };
+        watchdog.pause(signal.clone());
+        assert!(matches!(
+            watchdog.repair_action(),
+            RepairAction::ChangeApproach(LoopSignal::RepeatedCommandWithoutNewOutput { .. })
+        ));
+        assert_eq!(*watchdog.state(), WatchdogState::Running);
+
+        watchdog.pause(signal);
+        assert!(matches!(
+            watchdog.repair_action(),
+            RepairAction::Blocked(LoopSignal::RepeatedCommandWithoutNewOutput { .. })
+        ));
+        assert_eq!(*watchdog.state(), WatchdogState::Stopped);
+    }
+
+    #[test]
+    fn oscillating_edits_nudge_then_stop() {
+        let mut watchdog = ProgressWatchdog::new();
+        let signal = LoopSignal::OscillatingEdits {
+            path: "src/lib.rs".into(),
+            cycle_sequence: vec!["a".into(), "b".into(), "a".into()],
+        };
+        watchdog.pause(signal.clone());
+        assert!(matches!(
+            watchdog.repair_action(),
+            RepairAction::ChangeApproach(LoopSignal::OscillatingEdits { .. })
+        ));
+        assert_eq!(*watchdog.state(), WatchdogState::Running);
+
+        watchdog.pause(signal);
+        assert!(matches!(
+            watchdog.repair_action(),
+            RepairAction::Blocked(LoopSignal::OscillatingEdits { .. })
+        ));
+        assert_eq!(*watchdog.state(), WatchdogState::Stopped);
+    }
+
+    #[test]
+    fn oscillating_edits_observe_path_escalates_to_stop() {
+        let mut watchdog = ProgressWatchdog::new();
+
+        let observe_edit = |wd: &mut ProgressWatchdog, hash: &str| {
+            wd.observe(ProgressObservation {
+                tool_name: "edit".into(),
+                input_fingerprint: "edit src/lib.rs".into(),
+                output_digest: "ok".into(),
+                hypothesis_id: None,
+                hypothesis_evidence_refs: vec![],
+                target_path: Some("src/lib.rs".into()),
+                edit_content_hash: Some(hash.into()),
+                test_failure_signature: None,
+                is_pruning_recovery: false,
+                is_job_poll: false,
+                has_new_evidence: false,
+            })
+        };
+
+        assert_eq!(observe_edit(&mut watchdog, "hash_A"), None);
+        assert_eq!(observe_edit(&mut watchdog, "hash_B"), None);
+
+        // A -> B -> A: first oscillation signal.
+        assert!(matches!(
+            observe_edit(&mut watchdog, "hash_A"),
+            Some(LoopSignal::OscillatingEdits { path, .. }) if path == "src/lib.rs"
+        ));
+        assert!(matches!(
+            watchdog.repair_action(),
+            RepairAction::ChangeApproach(LoopSignal::OscillatingEdits { .. })
+        ));
+        assert_eq!(*watchdog.state(), WatchdogState::Running);
+
+        // A -> B -> A -> B: the continuing oscillation rotates the cycle
+        // sequence (B -> A -> B) but must compare equal and stop, not nudge
+        // again.
+        assert!(matches!(
+            observe_edit(&mut watchdog, "hash_B"),
+            Some(LoopSignal::OscillatingEdits { path, .. }) if path == "src/lib.rs"
+        ));
+        assert!(matches!(
+            watchdog.repair_action(),
+            RepairAction::Blocked(LoopSignal::OscillatingEdits { .. })
+        ));
+        assert_eq!(*watchdog.state(), WatchdogState::Stopped);
+    }
+
+    #[test]
+    fn different_second_signal_gets_its_own_nudge_not_a_stop() {
+        let mut watchdog = ProgressWatchdog::new();
+        watchdog.pause(LoopSignal::RepeatedUnchangedReads {
+            path: "src/lib.rs".into(),
+            count: 3,
+        });
+        assert!(matches!(
+            watchdog.repair_action(),
+            RepairAction::ChangeApproach(LoopSignal::RepeatedUnchangedReads { .. })
+        ));
+        assert_eq!(*watchdog.state(), WatchdogState::Running);
+
+        let edit = LoopSignal::OscillatingEdits {
+            path: "src/lib.rs".into(),
+            cycle_sequence: vec!["a".into(), "b".into(), "a".into()],
+        };
+        watchdog.pause(edit.clone());
+        // A different second signal compares unequal to the stored escalation,
+        // so it receives its own nudge instead of a stop.
+        assert_eq!(watchdog.repair_action(), RepairAction::ChangeApproach(edit));
+        assert_eq!(*watchdog.state(), WatchdogState::Running);
+    }
+
+    #[test]
+    fn polling_and_new_evidence_loops_never_signal() {
+        // A job poll that keeps returning the same output never pauses.
+        let mut watchdog = ProgressWatchdog::new();
+        for _ in 0..6 {
+            let signal = watchdog.observe(ProgressObservation {
+                tool_name: "bash".into(),
+                input_fingerprint: "job_42".into(),
+                output_digest: "still running...".into(),
+                hypothesis_id: None,
+                hypothesis_evidence_refs: vec![],
+                target_path: None,
+                edit_content_hash: None,
+                test_failure_signature: None,
+                is_pruning_recovery: false,
+                is_job_poll: true,
+                has_new_evidence: false,
+            });
+            assert_eq!(signal, None);
+        }
+        assert_eq!(watchdog.repair_action(), RepairAction::Continue);
+        assert_eq!(*watchdog.state(), WatchdogState::Running);
+
+        // Reads that keep bringing new evidence never pause.
+        let mut watchdog = ProgressWatchdog::new();
+        for _ in 0..6 {
+            let signal = watchdog.observe(ProgressObservation {
+                tool_name: "read".into(),
+                input_fingerprint: "src/lib.rs".into(),
+                output_digest: "same".into(),
+                hypothesis_id: None,
+                hypothesis_evidence_refs: vec!["ev".into()],
+                target_path: Some("src/lib.rs".into()),
+                edit_content_hash: None,
+                test_failure_signature: None,
+                is_pruning_recovery: false,
+                is_job_poll: false,
+                has_new_evidence: true,
+            });
+            assert_eq!(signal, None);
+        }
+        assert_eq!(watchdog.repair_action(), RepairAction::Continue);
+        assert_eq!(*watchdog.state(), WatchdogState::Running);
     }
 }

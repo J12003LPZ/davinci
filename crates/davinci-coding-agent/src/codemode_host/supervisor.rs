@@ -882,13 +882,11 @@ impl NodeCodeModeHost {
                     text.push_str(&value);
                 }
                 let complete = text.len() <= limits.output_bytes;
-                if !complete {
-                    let mut end = limits.output_bytes;
-                    while !text.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    text.truncate(end);
-                }
+                let output_text = if complete {
+                    text
+                } else {
+                    truncate_head_and_tail(&text, limits.output_bytes).0
+                };
                 return Ok(CodeModeOutcome {
                     // Truncated output is not a complete result: a caller that
                     // only checks for success must not take it as one.
@@ -898,7 +896,7 @@ impl NodeCodeModeHost {
                         (false, _) => CodeModeStatus::Failed,
                     },
                     script_completed: ok,
-                    output_text: text,
+                    output_text,
                     output_complete: complete,
                     output_artifact: None,
                     children: vec![],
@@ -1034,6 +1032,73 @@ impl NodeCodeModeHost {
         drop(receiver);
         let _ = reader.join();
         outcome
+    }
+}
+
+/// Fixed bytes of the omission marker, excluding the digits of `N`.
+const OMISSION_MARKER_FIXED_BYTES: usize = "\n[...  bytes omitted ...]\n".len();
+
+fn omission_marker(omitted: usize) -> String {
+    format!("\n[... {omitted} bytes omitted ...]\n")
+}
+
+/// Keep the head and the tail of an over-budget output, separated by an
+/// explicit marker naming the number of input bytes dropped in between.
+///
+/// Returns the composed text and the omitted byte count. Guarantees, in order:
+/// - `output_text.len() <= limit` (the marker counts against the budget);
+/// - the result is valid UTF-8, with both cuts on a `char` boundary;
+/// - the head is a prefix and the tail a suffix of the input;
+/// - short input (`text.len() <= limit`) is returned unchanged with `0` omitted.
+fn truncate_head_and_tail(text: &str, limit: usize) -> (String, usize) {
+    if text.len() <= limit {
+        return (text.to_owned(), 0);
+    }
+
+    // The marker's byte length depends on how many digits `N` has, and `N`
+    // depends on how much room the marker leaves, so iterate to a fixed point.
+    // The digit count is non-decreasing and bounded by the digits of
+    // `text.len()`, so this terminates.
+    let mut digits = 1usize;
+    loop {
+        let marker_len = OMISSION_MARKER_FIXED_BYTES + digits;
+        if marker_len >= limit {
+            // The marker itself cannot fit; keep only a bare head cut. This is
+            // unreachable for any admitted output budget but must not panic.
+            let mut end = limit.min(text.len());
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            return (text[..end].to_owned(), text.len() - end);
+        }
+
+        let remaining = limit - marker_len;
+        // Head keeps two thirds of the remaining budget, the tail one third.
+        let head_budget = remaining * 2 / 3;
+        let tail_budget = remaining - head_budget;
+
+        // Round the head cut down and the tail cut up so the composed result
+        // never exceeds `limit` once both cuts land on a `char` boundary.
+        let mut head_end = head_budget.min(text.len());
+        while !text.is_char_boundary(head_end) {
+            head_end -= 1;
+        }
+        let mut tail_start = text.len().saturating_sub(tail_budget);
+        while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+            tail_start += 1;
+        }
+
+        let omitted = tail_start - head_end;
+        if omitted.to_string().len() == digits {
+            let composed = format!(
+                "{}{}{}",
+                &text[..head_end],
+                omission_marker(omitted),
+                &text[tail_start..]
+            );
+            return (composed, omitted);
+        }
+        digits = omitted.to_string().len();
     }
 }
 
@@ -1442,5 +1507,58 @@ mod tests {
         release.send(()).unwrap();
         while replies.recv_timeout(Duration::from_secs(5)).is_ok() {}
         assert!(*slot.state.lock().unwrap() == SlotState::Released);
+    }
+
+    #[test]
+    fn short_output_is_returned_unchanged_and_omits_nothing() {
+        let text = "short output".to_string();
+        let limit = 64;
+        let complete = text.len() <= limit;
+        let (output, omitted) = truncate_head_and_tail(&text, limit);
+        assert!(complete, "the caller still sees a complete result");
+        assert_eq!(output, text);
+        assert_eq!(omitted, 0);
+        assert!(!output.contains("bytes omitted"), "{output:?}");
+    }
+
+    #[test]
+    fn truncated_output_keeps_the_tail_failure_and_marks_the_omission() {
+        let limit = 512;
+        let mut text = String::from("begin\n");
+        for i in 0..400 {
+            text.push_str(&format!("filler line {i}\n"));
+        }
+        text.push_str("ERROR: tail-failure");
+        let (output, omitted) = truncate_head_and_tail(&text, limit);
+        assert!(output.contains("ERROR: tail-failure"), "{output:?}");
+        assert!(output.contains("\n[... "), "{output:?}");
+        assert!(output.contains(" bytes omitted ...]\n"), "{output:?}");
+        assert!(output.len() <= limit, "{} > {limit}", output.len());
+        assert!(omitted > 0, "expected a non-zero omitted count");
+        assert!(
+            output.contains(&format!(" {omitted} bytes omitted ")),
+            "{output:?}"
+        );
+    }
+
+    #[test]
+    fn multibyte_output_cuts_on_char_boundaries_at_an_unaligned_limit() {
+        let text = "日本語".repeat(4000); // 36_000 bytes, three bytes per char
+        let limit = 10_000; // 10_000 % 3 != 0: a naive byte cut would split a char
+        let (output, omitted) = truncate_head_and_tail(&text, limit);
+        assert!(output.len() <= limit, "{} > {limit}", output.len());
+        assert!(omitted > 0);
+        // A String is valid UTF-8 by construction; rebuilding from its bytes
+        // proves the cuts did not slice through a multi-byte character.
+        assert_eq!(std::str::from_utf8(output.as_bytes()), Ok(output.as_str()));
+    }
+
+    #[test]
+    fn truncated_output_head_is_a_prefix_of_the_input() {
+        let text = "日本語".repeat(4000);
+        let limit = 10_000;
+        let (output, _omitted) = truncate_head_and_tail(&text, limit);
+        let marker = output.find("\n[... ").expect("omission marker present");
+        assert!(text.starts_with(&output[..marker]), "head is not a prefix");
     }
 }

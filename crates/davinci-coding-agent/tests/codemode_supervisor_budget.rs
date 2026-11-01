@@ -65,7 +65,7 @@ impl CodeModeBroker for Catalog {
 fn native_truncated_output_is_partial_not_completed() {
     let outcome = fixture_host().execute(
         &CodeModeRequest {
-            code: "return 'x'.repeat(8192)".into(),
+            code: "text('x'.repeat(8192) + '\\nERROR: tail-failure')".into(),
             timeout_ms: Some(5000),
             max_output_bytes: Some(4096),
         },
@@ -80,6 +80,12 @@ fn native_truncated_output_is_partial_not_completed() {
     assert!(outcome.output_text.len() <= 4096, "{outcome:?}");
     assert!(
         matches!(outcome.status, CodeModeStatus::Partial),
+        "{outcome:?}"
+    );
+    // The end of the log survives truncation, so a failure printed at the tail
+    // is not lost.
+    assert!(
+        outcome.output_text.ends_with("ERROR: tail-failure"),
         "{outcome:?}"
     );
 }

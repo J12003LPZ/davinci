@@ -1684,7 +1684,11 @@ fn overflowing_batch_output_goes_to_the_evidence_store() {
 fn old_tool_output_is_pruned_from_the_provider_view_but_kept_in_history() {
     let dir = tempfile::tempdir().unwrap();
     let body = "q".repeat(4_000);
-    std::fs::write(dir.path().join("f.txt"), &body).unwrap();
+    // Six distinct files read once each: repeated reads of one unchanged file
+    // would be a read loop, which the progress watchdog stops.
+    for index in 0..6 {
+        std::fs::write(dir.path().join(format!("f{index}.txt")), &body).unwrap();
+    }
     let mut agent = Agent::new(default_system_prompt());
     agent.cwd = dir.path().to_path_buf();
     agent.evidence = Some(EvidenceStore::new(dir.path().join("evidence")));
@@ -1694,7 +1698,7 @@ fn old_tool_output_is_pruned_from_the_provider_view_but_kept_in_history() {
     agent.prune_settings.keep_recent = 2;
     agent.prompt("go");
     let batches: Vec<Vec<(&'static str, serde_json::Value)>> = (0..6)
-        .map(|_| vec![("read", serde_json::json!({"path": "f.txt"}))])
+        .map(|index| vec![("read", serde_json::json!({"path": format!("f{index}.txt")}))])
         .collect();
     agent.run_loop(scripted_batches(batches)).unwrap();
     let stats = agent.run_stats();
