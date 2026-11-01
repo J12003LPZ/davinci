@@ -165,6 +165,25 @@ pub struct ToolPage {
     pub total: usize,
     pub cursor: Option<String>,
 }
+/// `WaitForScript` action, host-owned and never inferred from a script.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum WaitAction {
+    #[serde(rename = "status")]
+    Status,
+    #[serde(rename = "wait")]
+    Wait,
+    #[serde(rename = "kill")]
+    Kill,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WaitForScriptRequest {
+    pub tool_call_id: String,
+    pub action: WaitAction,
+}
+
 pub trait CodeModeBroker: Send + Sync {
     fn search(&self, query: ToolQuery) -> Result<ToolPage, CodeModeError>;
     fn describe(&self, canonical_name: &str) -> Result<serde_json::Value, CodeModeError>;

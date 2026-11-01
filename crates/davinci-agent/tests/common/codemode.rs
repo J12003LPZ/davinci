@@ -2100,3 +2100,82 @@ fn failed_sibling_keeps_successful_script_evidence() {
     ));
     assert!(children[0].ordinal < children[1].ordinal);
 }
+
+#[test]
+fn wait_for_script_scoped_handle_and_terminal_status() {
+    use crate::codemode::{
+        ScriptRunRecord, ScriptRunRegistry, ScriptRunState, WaitAction, WaitForScriptRequest,
+    };
+    let (mut agent, workspace, _) = configured_agent();
+    let evidence = tempfile::tempdir().unwrap();
+    agent.evidence = Some(crate::EvidenceStore::new(evidence.path()));
+    let evidence_dir = evidence.path().to_path_buf();
+    let binding: String = workspace
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into();
+    let session = agent.runtime.as_ref().unwrap().session_id.clone();
+    let registry = ScriptRunRegistry::open(evidence.path().join("script-runs")).unwrap();
+    let record = ScriptRunRecord::new(
+        "run-wait",
+        "call-wait",
+        session.as_deref(),
+        &binding,
+        "revision",
+    );
+    registry.create(&record).unwrap();
+    registry
+        .transition("run-wait", ScriptRunState::Running)
+        .unwrap();
+
+    // A running handle reports running, never a false completion.
+    let status = agent.wait_for_script(WaitForScriptRequest {
+        tool_call_id: "run-wait".into(),
+        action: WaitAction::Status,
+    });
+    assert!(!status.is_error, "{}", status.content);
+    assert!(status.content.contains("running"), "{}", status.content);
+
+    // A bounded wait on a non-terminal run returns its current state.
+    let waited = agent.wait_for_script(WaitForScriptRequest {
+        tool_call_id: "run-wait".into(),
+        action: WaitAction::Wait,
+    });
+    assert!(!waited.is_error, "{}", waited.content);
+    assert!(waited.content.contains("running"), "{}", waited.content);
+
+    // Kill records cancellation and a repeat is safe.
+    let killed = agent.wait_for_script(WaitForScriptRequest {
+        tool_call_id: "run-wait".into(),
+        action: WaitAction::Kill,
+    });
+    assert!(!killed.is_error, "{}", killed.content);
+    let again = agent.wait_for_script(WaitForScriptRequest {
+        tool_call_id: "run-wait".into(),
+        action: WaitAction::Kill,
+    });
+    assert!(!again.is_error, "{}", again.content);
+    assert_eq!(
+        registry.get("run-wait").unwrap().state,
+        ScriptRunState::Cancelled
+    );
+
+    // A handle from another session never resolves.
+    let foreign = ScriptRunRegistry::open(evidence_dir.join("script-runs")).unwrap();
+    let other = ScriptRunRecord::new(
+        "run-foreign",
+        "call-foreign",
+        Some("another-session"),
+        &binding,
+        "revision",
+    );
+    foreign.create(&other).unwrap();
+    let denied = agent.wait_for_script(WaitForScriptRequest {
+        tool_call_id: "run-foreign".into(),
+        action: WaitAction::Status,
+    });
+    assert!(denied.is_error, "{}", denied.content);
+    assert!(denied.content.contains("another session") || denied.content.contains("DENIED"));
+}

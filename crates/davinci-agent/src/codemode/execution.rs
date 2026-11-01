@@ -258,6 +258,82 @@ impl Agent {
             .activate_authorized("codemode", authorized);
     }
 
+    /// Host-resolved status/wait/kill for a durable Script run. The handle is
+    /// opaque and only resolves for the session and workspace that own it.
+    pub fn wait_for_script(&self, request: WaitForScriptRequest) -> ToolResult {
+        let result = (|| -> Result<serde_json::Value, CodeModeError> {
+            let evidence = self
+                .evidence
+                .as_ref()
+                .ok_or_else(|| CodeModeError::new("UNAVAILABLE", "script run store unavailable"))?;
+            let runtime = self
+                .runtime
+                .as_ref()
+                .ok_or_else(|| CodeModeError::new("UNAVAILABLE", "runtime unavailable"))?;
+            let registry = super::ScriptRunRegistry::open(evidence.dir().join("script-runs"))
+                .map_err(|error| CodeModeError::new("UNAVAILABLE", &error.message))?;
+            let binding = self
+                .cwd
+                .canonicalize()
+                .map_err(|_| CodeModeError::new("UNAVAILABLE", "workspace unavailable"))?
+                .to_string_lossy()
+                .into_owned();
+            let lookup = |run_id: &str| {
+                registry
+                    .get_for(run_id, runtime.session_id.as_deref(), &binding)
+                    .map_err(|error| CodeModeError::new(&error.code, &error.message))
+            };
+            let mut record = lookup(&request.tool_call_id)?;
+            match request.action {
+                super::WaitAction::Status => {}
+                super::WaitAction::Wait => {
+                    // Bounded and cancellation-aware: never block past the root
+                    // deadline, and never claim a state the record does not have.
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(250);
+                    while !record.state.terminal() && std::time::Instant::now() < deadline {
+                        if self.abort_requested() {
+                            return Err(CodeModeError::new("CANCELLED", "wait cancelled"));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        record = lookup(&request.tool_call_id)?;
+                    }
+                }
+                super::WaitAction::Kill => {
+                    if record.state == super::ScriptRunState::RecoveryRequired {
+                        return Err(CodeModeError::new(
+                            "RECOVERY_REQUIRED",
+                            "script run has an unresolved effect; ownership is not confirmed",
+                        ));
+                    }
+                    if record.state == super::ScriptRunState::Running {
+                        registry
+                            .transition(&record.run_id, super::ScriptRunState::Cancelled)
+                            .map_err(|error| CodeModeError::new(&error.code, &error.message))?;
+                        record = lookup(&request.tool_call_id)?;
+                    }
+                }
+            }
+            Ok(serde_json::json!({
+                "toolCallId": record.run_id,
+                "state": record.state,
+                "terminal": record.state.terminal(),
+            }))
+        })();
+        match result {
+            Ok(value) => ToolResult {
+                content: value.to_string(),
+                is_error: false,
+                details: Some(value),
+            },
+            Err(error) => ToolResult {
+                content: serde_json::json!({"error": error}).to_string(),
+                is_error: true,
+                details: None,
+            },
+        }
+    }
+
     pub(crate) fn run_codemode(
         &self,
         id: &str,
