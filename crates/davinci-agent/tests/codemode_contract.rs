@@ -21,6 +21,35 @@ fn requests_reject_unknown_authority_fields() {
 }
 
 #[test]
+fn custom_freeform_input_maps_to_code_without_widening_unknown_fields() {
+    let custom = CodeModeRequest::from_tool_arguments(&serde_json::json!({
+        "input": "return 1"
+    }))
+    .expect("custom freeform call");
+    assert_eq!(custom.code, "return 1");
+    assert_eq!(custom.timeout_ms, None);
+
+    let function = CodeModeRequest::from_tool_arguments(&serde_json::json!({
+        "code": "return 2", "timeoutMs": 1000
+    }))
+    .expect("function call");
+    assert_eq!(function.code, "return 2");
+    assert_eq!(function.timeout_ms, Some(1000));
+
+    for rejected in [
+        serde_json::json!({"input": "return 1", "mode": "controlled"}),
+        serde_json::json!({"input": 1}),
+        serde_json::json!({"code": "return 1", "input": "return 1"}),
+        serde_json::json!("return 1"),
+    ] {
+        assert!(
+            CodeModeRequest::from_tool_arguments(&rejected).is_none(),
+            "{rejected}"
+        );
+    }
+}
+
+#[test]
 fn envelope_retains_explicit_nulls() {
     let value = CodeModeToolValue {
         text: "ok".into(),

@@ -17,6 +17,25 @@ pub struct CodeModeRequest {
     pub timeout_ms: Option<u64>,
     pub max_output_bytes: Option<usize>,
 }
+
+impl CodeModeRequest {
+    /// Decode one tool-call argument object. A Responses custom freeform call
+    /// decodes to `{"input": "<source>"}`; accept exactly that shape as `code`
+    /// so the wire projection and this contract agree. Any other object still
+    /// goes through `deny_unknown_fields`, so authority-bearing or malformed
+    /// fields are rejected rather than dropped.
+    pub fn from_tool_arguments(arguments: &serde_json::Value) -> Option<Self> {
+        let arguments = match arguments {
+            serde_json::Value::Object(map)
+                if map.len() == 1 && map.get("input").is_some_and(serde_json::Value::is_string) =>
+            {
+                serde_json::json!({"code": map["input"].clone()})
+            }
+            other => other.clone(),
+        };
+        serde_json::from_value(arguments).ok()
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum CodeModeStatus {
