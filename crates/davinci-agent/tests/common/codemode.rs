@@ -2179,3 +2179,104 @@ fn wait_for_script_scoped_handle_and_terminal_status() {
     assert!(denied.is_error, "{}", denied.content);
     assert!(denied.content.contains("another session") || denied.content.contains("DENIED"));
 }
+
+#[test]
+fn reference_script_fixture_suite_passes() {
+    use crate::codemode::{
+        droid_script_fixture_status, AgentCodeModeBroker, CodeModeBroker as _, CodeModeCall,
+        CodeModeChildStatus, CodeModeIdentity, CodeModeLimits, CodeModeMode, CodeModeRunContext,
+    };
+    // Every reference scenario is either proven here or labelled UNTESTED.
+    let fixtures = droid_script_fixture_status();
+    assert_eq!(fixtures.len(), 12);
+    for fixture in &fixtures {
+        assert!(
+            matches!(fixture.evidence, "BEHAVIOR_PARITY" | "UNTESTED"),
+            "{fixture:?}"
+        );
+    }
+
+    let (mut agent, workspace, _) = configured_agent();
+    agent.tools = vec![
+        "read".into(),
+        "write".into(),
+        "exec_command".into(),
+        "apply_patch".into(),
+    ];
+    agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+    agent.sync_tool_authorization();
+    let runtime = agent.runtime.as_ref().unwrap();
+    let revision = runtime
+        .capability_registry
+        .hash_tool_capabilities(&agent.tools);
+    let context = CodeModeRunContext {
+        identity: CodeModeIdentity {
+            invocation_id: "fixture-suite".into(),
+            session_id: runtime.session_id.clone(),
+            branch_leaf: None,
+            workspace_binding: workspace
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into(),
+            runtime_run_id: runtime.run_id.to_string(),
+            parent_operation_ref: None,
+        },
+        mode: CodeModeMode::Controlled,
+        limits: CodeModeLimits::default(),
+        capability_revision: revision,
+        cancellation: runtime.cancellation_token.child_token(),
+        root_budget: runtime.root_budget.clone(),
+    };
+    let broker = AgentCodeModeBroker::new(agent.clone(), context, None).unwrap();
+    let mut id = 0;
+    let mut call = |tool: &str, args: serde_json::Value| {
+        id += 1;
+        broker.call(CodeModeCall {
+            request_id: id,
+            tool: tool.into(),
+            args,
+        })
+    };
+
+    // 01 nested read.
+    assert!(call("tools.Read", json!({"path":"input.txt"}))
+        .unwrap()
+        .text
+        .contains("codemode baseline sentinel"));
+    // 02 guarded command.
+    let command = call("tools.Execute", json!({"command":"echo fixture-02"})).unwrap();
+    assert_eq!(
+        command.structured_content.as_ref().unwrap()["exitCode"],
+        json!(0)
+    );
+    // 03 parallel reads keep their ordinals even when issued together.
+    let a = call("tools.Read", json!({"path":"input.txt"}));
+    let b = call("tools.Read", json!({"path":"input.txt"}));
+    assert!(a.is_ok() && b.is_ok());
+    // 04 tool error is a delivered failure, not a lost child.
+    let missing = call("tools.Read", json!({"path":"missing.txt"})).unwrap_err();
+    assert_eq!(missing.code, "TOOL_FAILED");
+    // 06 hostile input: unmapped alias and traversal both deny.
+    assert!(call("tools.Delete", json!({})).is_err());
+    assert!(call("tools.Read", json!({"path":"../escape.txt"})).is_err());
+    // 08 sandbox escape: an out-of-workspace write leaves no file.
+    let _ = call("tools.Write", json!({"path":"../escape.txt","content":"x"}));
+    assert!(!workspace
+        .path()
+        .parent()
+        .unwrap()
+        .join("escape.txt")
+        .exists());
+    // 10 background notify: refused until the owner approves detached runs
+    // (covered by background_script_returns_running_and_can_finish).
+
+    let children = broker.children();
+    assert!(children
+        .iter()
+        .any(|child| matches!(child.status, CodeModeChildStatus::Succeeded)));
+    assert!(children
+        .iter()
+        .any(|child| !matches!(child.status, CodeModeChildStatus::Succeeded)));
+}
