@@ -66,7 +66,10 @@ JavaScript is never resumed after a crash.
 terminal state, and a timeout gives `recoveryRequired`. A run owned by another
 process returns `NOT_OWNER`. Liveness is a lock each process holds at
 `<agent dir>/script-owners/<owner>.lock`, outside any run directory. A dead owner's open runs are reconciled at the
-first registry open in a process. Handles are scoped to a session
+first registry open in a process, and again whenever a run in scope is looked up
+or checked for a wakeup. A worker that panics leaves its run `recoveryRequired`
+with a fixed summary, and a worker result that arrives after `recoveryRequired`
+keeps that state and only adds its summary if none is stored. Handles are scoped to a session
 branch: a run records the leaf it started from, and resolves only while that
 entry is on the path to the current leaf. A run from another branch does not
 resolve and its wakeup is not delivered there; navigating back to the branch

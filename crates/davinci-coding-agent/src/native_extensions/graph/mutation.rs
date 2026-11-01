@@ -795,6 +795,57 @@ mod tests {
         }
     }
 
+    /// A workspace without Git holding a directory link to a folder outside it
+    /// and a link back to its own root: each link is listed once and nothing
+    /// behind either is.
+    fn assert_walk_lists_directory_links_without_entering(
+        link_dir: impl Fn(&Path, &Path) -> std::io::Result<()>,
+    ) {
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"outside").unwrap();
+        std::fs::write(workspace.path().join("plain.txt"), b"plain").unwrap();
+        link_dir(&workspace.path().join("out-link"), outside.path())
+            .expect("directory link to the outside folder");
+        link_dir(&workspace.path().join("loop-link"), workspace.path())
+            .expect("directory link back to the workspace root");
+        assert_eq!(
+            walk_dir_files(workspace.path()),
+            ["loop-link", "out-link", "plain.txt"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_lists_directory_symlinks_without_entering_them() {
+        assert_walk_lists_directory_links_without_entering(|link, target| {
+            std::os::unix::fs::symlink(target, link)
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn walk_lists_directory_junctions_without_entering_them() {
+        assert_walk_lists_directory_links_without_entering(|link, target| {
+            let output = Command::new("cmd")
+                .arg("/c")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .output()?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!(
+                    "mklink /J failed: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )))
+            }
+        });
+    }
+
     #[cfg(unix)]
     #[test]
     fn graph_integrity_baseline_does_not_follow_symlinks() {

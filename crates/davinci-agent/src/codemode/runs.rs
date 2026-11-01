@@ -475,13 +475,31 @@ impl ScriptRunRegistry {
         next: ScriptRunState,
         detached: Option<(ScriptRunSummary, Option<String>)>,
     ) -> Result<bool, ScriptRunError> {
-        self.advance(run_id, next, |record| match detached {
+        let _guard = self.guard();
+        let late = detached.clone();
+        let result = self.advance_locked(run_id, next, |record| match detached {
             Some((summary, log_ref)) => {
                 record.summary = Some(summary);
                 record.log_ref = log_ref;
             }
             None => record.notified = true,
-        })
+        });
+        // A worker may report after the controller already settled the run
+        // (for example `RecoveryRequired` once Kill outlasted its grace). The
+        // state stays as recorded, but a summary that was never stored is kept.
+        let unchanged = match &result {
+            Ok(changed) => !changed,
+            Err(error) => error.code == "DENIED",
+        };
+        if let (true, Some((summary, log_ref))) = (unchanged, late) {
+            let mut record = self.get(run_id)?;
+            if record.state.terminal() && record.summary.is_none() {
+                record.summary = Some(summary);
+                record.log_ref = log_ref;
+                self.write(&self.path(run_id)?, &record)?;
+            }
+        }
+        result
     }
 
     fn advance(
@@ -491,6 +509,16 @@ impl ScriptRunRegistry {
         apply: impl FnOnce(&mut ScriptRunRecord),
     ) -> Result<bool, ScriptRunError> {
         let _guard = self.guard();
+        self.advance_locked(run_id, next, apply)
+    }
+
+    /// `advance` for a caller that already holds the registry guard.
+    fn advance_locked(
+        &self,
+        run_id: &str,
+        next: ScriptRunState,
+        apply: impl FnOnce(&mut ScriptRunRecord),
+    ) -> Result<bool, ScriptRunError> {
         let mut record = self.get(run_id)?;
         if record.state == next && next.terminal() {
             return Ok(false);
@@ -621,12 +649,21 @@ impl ScriptRunRegistry {
             let Ok(record) = serde_json::from_slice::<ScriptRunRecord>(&bytes) else {
                 continue;
             };
-            if record.state.terminal()
-                && !record.notified
-                && record.session_id.as_deref() == session_id
+            let mut record = record;
+            let in_scope = record.session_id.as_deref() == session_id
                 && record.workspace_binding == workspace_binding
-                && record.on_branch(branch)
-            {
+                && record.on_branch(branch);
+            // An owner that died after this process opened the store is only
+            // noticed here. Only in-scope records are probed: a live foreign
+            // owner costs about 100 ms. No registry guard is held.
+            if in_scope && !record.state.terminal() && !record.owned_by_this_process() {
+                self.reconcile_if_owner_dead(&record);
+                match self.get(&record.run_id) {
+                    Ok(fresh) => record = fresh,
+                    Err(_) => continue,
+                }
+            }
+            if in_scope && record.state.terminal() && !record.notified {
                 pending.push(record);
             }
         }

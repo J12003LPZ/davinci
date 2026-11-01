@@ -821,6 +821,77 @@ fn first_open_recovers_only_runs_a_dead_process_left_open() {
     let _ = std::fs::remove_file(&live_path);
 }
 
+#[test]
+fn an_owner_that_dies_after_the_open_is_offered_as_a_wakeup() {
+    use davinci_agent::codemode::{ScriptRunRecord, ScriptRunRegistry, ScriptRunState};
+    use std::collections::HashSet;
+    let dir = tempfile::tempdir().unwrap();
+    // Opened first: the first-open sweep has already run when the owner dies.
+    let registry = ScriptRunRegistry::open(dir.path()).unwrap();
+    let tag = uuid::Uuid::new_v4().simple();
+    let owner = format!("3-late-{tag}");
+    let lock_path = owner_locks_dir().join(format!("{owner}.lock"));
+    let lock = hold_exclusively(&lock_path);
+    let mut record = ScriptRunRecord::new("late", "call", Some("s"), "w", "rev");
+    record.owner = Some(owner);
+    record.state = ScriptRunState::Running;
+    std::fs::write(
+        dir.path().join("late.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let branch = HashSet::new();
+    let pending = || {
+        registry
+            .pending_notifications(Some("s"), "w", &branch)
+            .unwrap()
+    };
+
+    assert!(pending().is_empty());
+    drop(lock);
+    let offered = pending();
+    assert_eq!(offered.len(), 1);
+    assert_eq!(offered[0].state, ScriptRunState::RecoveryRequired);
+    registry.mark_notified("late").unwrap();
+    assert!(pending().is_empty());
+    let _ = std::fs::remove_file(&lock_path);
+}
+
+#[test]
+fn a_late_worker_summary_is_kept_without_changing_the_state() {
+    use davinci_agent::codemode::{
+        ScriptRunRecord, ScriptRunRegistry, ScriptRunState, ScriptRunSummary,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let registry = ScriptRunRegistry::open(dir.path()).unwrap();
+    let summary = |text: &str| ScriptRunSummary::bounded("late", &[text.to_string()]);
+    for (run, late_state) in [
+        ("same", ScriptRunState::RecoveryRequired),
+        ("refused", ScriptRunState::Cancelled),
+    ] {
+        registry
+            .create(&ScriptRunRecord::new(run, "call", Some("s"), "w", "rev"))
+            .unwrap();
+        registry.transition(run, ScriptRunState::Running).unwrap();
+        registry
+            .transition(run, ScriptRunState::RecoveryRequired)
+            .unwrap();
+        let _ = registry.finish(
+            run,
+            late_state,
+            Some((summary("first"), Some("log".into()))),
+        );
+        let record = registry.get(run).unwrap();
+        assert_eq!(record.state, ScriptRunState::RecoveryRequired, "{run}");
+        assert_eq!(record.summary, Some(summary("first")), "{run}");
+        assert_eq!(record.log_ref.as_deref(), Some("log"), "{run}");
+        assert!(!record.notified, "{run}");
+        // A stored summary is never replaced.
+        let _ = registry.finish(run, late_state, Some((summary("second"), None)));
+        assert_eq!(registry.get(run).unwrap().summary, Some(summary("first")));
+    }
+}
+
 fn owner_locks_dir() -> std::path::PathBuf {
     let owners = davinci_session::default_agent_dir().join("script-owners");
     std::fs::create_dir_all(&owners).unwrap();
