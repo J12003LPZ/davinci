@@ -53,6 +53,58 @@ fn malformed_script_headers_are_rejected_before_dispatch() {
 }
 
 #[test]
+fn codex_freeform_fallback_is_safe() {
+    use davinci_agent::codemode::{
+        script_wire_fallback, script_wire_mode, ScriptWireCapabilities, ScriptWireMode,
+    };
+    // Nothing is verified on the subscription route by default.
+    let unverified = ScriptWireCapabilities::default();
+    assert_eq!(script_wire_mode(&unverified), ScriptWireMode::FunctionJson);
+    assert_eq!(
+        script_wire_fallback(ScriptWireMode::CustomFreeform, &unverified),
+        ScriptWireMode::FunctionJson
+    );
+    assert_eq!(
+        script_wire_fallback(ScriptWireMode::HostedProgrammatic, &unverified),
+        ScriptWireMode::FunctionJson
+    );
+
+    // Freeform needs an observed acceptance, and hosted PTC needs both.
+    let freeform = ScriptWireCapabilities {
+        custom_script: true,
+        ..Default::default()
+    };
+    assert_eq!(script_wire_mode(&freeform), ScriptWireMode::CustomFreeform);
+    assert_eq!(
+        script_wire_fallback(ScriptWireMode::CustomFreeform, &freeform),
+        ScriptWireMode::CustomFreeform
+    );
+    let hosted = ScriptWireCapabilities {
+        custom_script: true,
+        programmatic_tool_calling: true,
+    };
+    assert_eq!(
+        script_wire_mode(&hosted),
+        ScriptWireMode::HostedProgrammatic
+    );
+    // Hosted PTC without freeform support is still not admitted.
+    let ptc_only = ScriptWireCapabilities {
+        programmatic_tool_calling: true,
+        ..Default::default()
+    };
+    assert_eq!(script_wire_mode(&ptc_only), ScriptWireMode::FunctionJson);
+
+    // The fallback is a retry shape, never a second effect: the JSON function
+    // legacy shape stays representable in every configuration.
+    for caps in [unverified, freeform, hosted, ptc_only] {
+        assert_eq!(
+            script_wire_fallback(ScriptWireMode::FunctionJson, &caps),
+            ScriptWireMode::FunctionJson
+        );
+    }
+}
+
+#[test]
 fn script_to_direct_switch_preserves_history_and_wire_kind() {
     use davinci_agent::codemode::{
         project_script_history, CodeModeOutcome, CodeModeStatus, SCRIPT_WIRE_KIND,

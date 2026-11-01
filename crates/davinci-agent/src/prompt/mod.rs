@@ -55,7 +55,7 @@ pub use session::{
     prompt_transition_diagnostic, resolve_resume_prompt_session, PromptSessionRecord,
     PromptSessionState, PromptSource,
 };
-pub use tool_strategy::tool_strategy_module;
+pub use tool_strategy::{script_mode_module, tool_strategy_module};
 pub use turn::{compose_turn_prompt, PreparedTurnPrompt};
 pub use verification::{verification_completion_module, verification_requirement_checks_module};
 pub use version::{

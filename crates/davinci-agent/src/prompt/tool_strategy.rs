@@ -78,6 +78,43 @@ pub(crate) fn apply_subscription_strategy(
         .collect()
 }
 
+/// The Script guidance only exists when controlled Script is actually the
+/// selected mode and at least one tool alias is bound.
+pub fn script_mode_module(
+    mode: &crate::codemode::CodeModeMode,
+    aliases: &std::collections::BTreeMap<String, String>,
+) -> Option<PromptModule> {
+    if !matches!(mode, crate::codemode::CodeModeMode::Controlled) || aliases.is_empty() {
+        return None;
+    }
+    let bindings = aliases
+        .iter()
+        .map(|(alias, canonical)| format!("- `{alias}` -> `{canonical}`"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(PromptModule {
+        id: "tools.script".to_string(),
+        version: 1,
+        cache_class: PromptCacheClass::Stable,
+        body: format!(
+            "\
+<script_mode version=\"1\">
+Controlled Script is enabled. Prefer one Script over several separate tool turns:
+{bindings}
+
+- Call tools with `await tools.<Name>({{...}})` and return plain JSON. Extract the lines you need; do not return whole files.
+- Read `inputs.name` for raw `// @input: name <<'TAG'` blocks that arrived with the script; their bytes are exact.
+- Use `text(value)` for output you want the user to see and `notify(value)` for a bounded wakeup. Neither grants authority.
+- Order dependent work: edit, then run the tests, then inspect the result. Independent reads may run together with `Promise.allSettled`.
+- A successful edit stays applied even if the script later throws. Never repeat an edit to recover; inspect first.
+- A failing test command returns its exit code and error lines as a normal result; read them instead of re-running blindly.
+- Risk classification and approvals are host-owned. A script cannot classify its own command as safe.
+- Use direct tools when a single lookup is all you need.
+</script_mode>"
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
