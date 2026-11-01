@@ -4,6 +4,35 @@ use crate::{Agent, ToolResult};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+/// Build the retained, bounded evidence of one run: status, the model-visible
+/// output and one record per child. Full file reads are not retained.
+fn script_log_events(outcome: &CodeModeOutcome) -> Vec<super::ScriptLogEvent> {
+    let mut events = vec![super::ScriptLogEvent::status(format!(
+        "{:?} (scriptCompleted={})",
+        outcome.status, outcome.script_completed
+    ))];
+    if !outcome.output_text.is_empty() {
+        events.push(super::ScriptLogEvent::output(outcome.output_text.clone()));
+    }
+    for child in &outcome.children {
+        let summary = format!(
+            "{} request {} ordinal {} {:?}",
+            child.tool, child.request_id, child.ordinal, child.status
+        );
+        let detail = child
+            .error
+            .as_ref()
+            .map(|error| format!("{}: {}", error.code, error.message))
+            .unwrap_or_else(|| child.operation_ref.clone());
+        events.push(super::ScriptLogEvent::child(
+            child.tool.clone(),
+            summary,
+            detail,
+        ));
+    }
+    events
+}
+
 /// Added to a run whose script called tools but returned an empty value.
 pub(crate) const EMPTY_RESULT_NOTE: &str = "The script returned an empty value after calling tools. Each tool call resolves to {text, structuredContent, complete}: read `.text` (find, ls and grep give one match per line); a guessed field name such as .matches or .files is undefined.";
 
@@ -293,6 +322,25 @@ impl Agent {
             ));
             // Guest and host output cannot forge the authoritative child evidence.
             outcome.children = broker.children();
+            if let Some(evidence) = self.evidence.as_ref() {
+                let session = context
+                    .identity
+                    .session_id
+                    .clone()
+                    .unwrap_or_else(|| "sessionless".into());
+                let events = script_log_events(&outcome);
+                if let Ok(log) = super::ScriptLogStore::new(evidence.dir(), session)
+                    .persist_script_log(&context.identity.invocation_id, &events)
+                {
+                    outcome.host_notes.push(format!(
+                        "Script log {} retained {} event(s), {} bytes{}.",
+                        log.id,
+                        log.events,
+                        log.bytes,
+                        if log.truncated { " (truncated)" } else { "" }
+                    ));
+                }
+            }
             let collisions = broker.alias_collisions();
             if !collisions.is_empty() {
                 let shown = collisions.iter().take(16).cloned().collect::<Vec<_>>();

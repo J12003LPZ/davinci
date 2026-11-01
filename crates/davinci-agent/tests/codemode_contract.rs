@@ -53,6 +53,48 @@ fn malformed_script_headers_are_rejected_before_dispatch() {
 }
 
 #[test]
+fn script_log_is_readable_without_reexecuting_commands() {
+    use davinci_agent::codemode::{ScriptLogEvent, ScriptLogStore};
+    let dir = tempfile::tempdir().unwrap();
+    let store = ScriptLogStore::new(dir.path(), "session-a");
+    let events = vec![
+        ScriptLogEvent::status("run started"),
+        ScriptLogEvent::child("exec_command", "cargo test", "last 200 lines\nall failed"),
+    ];
+    let log = store.persist_script_log("run-1", &events).unwrap();
+    let slice = store.read_script_log(&log.id, 0, 4096).unwrap();
+    assert!(slice.text.contains("last 200 lines"), "{slice:?}");
+    assert!(slice.text.contains("cargo test"), "{slice:?}");
+
+    // A log handle is session-bound: another session cannot read it.
+    let other = ScriptLogStore::new(dir.path(), "session-b");
+    assert!(other.read_script_log(&log.id, 0, 64).is_err());
+
+    // Read slices are bounded and offset-addressable.
+    let slice = store.read_script_log(&log.id, 0, 8).unwrap();
+    assert!(slice.text.len() <= 8, "{slice:?}");
+    assert!(!slice.complete, "{slice:?}");
+
+    // Secrets are scrubbed before retention.
+    let log = store
+        .persist_script_log(
+            "run-2",
+            &[ScriptLogEvent::output(
+                "token sk-abcdef1234567890 and password=hunter2",
+            )],
+        )
+        .unwrap();
+    let text = store.read_script_log(&log.id, 0, 4096).unwrap().text;
+    assert!(!text.contains("sk-abcdef"), "{text}");
+    assert!(!text.contains("hunter2"), "{text}");
+
+    // Retention is capped regardless of what the script emitted.
+    let huge = ScriptLogEvent::output("x".repeat(2 * 1024 * 1024));
+    let log = store.persist_script_log("run-3", &[huge]).unwrap();
+    assert!(log.bytes <= 1024 * 1024, "{log:?}");
+}
+
+#[test]
 fn droid_profile_caps_are_hard() {
     let limits = CodeModeLimits::default();
     // The published safe profile. These are ceilings, not targets to raise.

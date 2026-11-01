@@ -6,6 +6,7 @@ mod execution;
 mod policy;
 pub mod projection;
 mod recovery;
+mod script_log;
 mod types;
 pub(crate) use authority::fingerprint as authority_fingerprint;
 pub(crate) use deadline::remaining_root_wall_ms;
@@ -14,6 +15,9 @@ pub(crate) use execution::mandatory_facts;
 pub(crate) use execution::CodeModeBinding;
 pub use policy::{effect_is_admitted, js_name, resolve_script_alias, CapabilityPolicy};
 pub use recovery::{reconcile_script_child_effect, resolve_script_effect, ScriptEffectResolution};
+pub use script_log::{
+    ScriptLogError, ScriptLogEvent, ScriptLogRef, ScriptLogSlice, ScriptLogStore,
+};
 pub use types::*;
 
 impl Default for CodeModeMode {
