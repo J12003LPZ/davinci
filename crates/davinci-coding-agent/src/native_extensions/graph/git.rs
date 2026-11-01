@@ -6,6 +6,14 @@ use std::time::Duration;
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_OUTPUT_CAP: usize = 32 * 1024 * 1024;
 
+/// True when `cwd` is inside a work tree, including a subdirectory of one.
+/// Checking only `cwd/.git` misses the common case where the session starts in
+/// a repository subdirectory.
+pub fn is_repo(cwd: &Path) -> bool {
+    run(cwd, &["rev-parse", "--is-inside-work-tree"])
+        .is_ok_and(|output| String::from_utf8_lossy(&output).trim() == "true")
+}
+
 pub fn run(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let mut command = Command::new(davinci_sys::process::resolve_program("git"));
     for (name, _) in std::env::vars_os() {

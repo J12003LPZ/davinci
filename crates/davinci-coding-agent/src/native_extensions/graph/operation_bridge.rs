@@ -440,6 +440,13 @@ pub fn complete_worker(
         ));
     }
     if attempt.state().is_terminal() {
+        if let Ok(raw) = std::fs::read(result_path(cwd, binding)) {
+            if let Ok(existing) = serde_json::from_slice::<GraphOperationResult>(&raw) {
+                if existing.binding == *binding && existing.state == attempt.state() {
+                    return Ok(existing);
+                }
+            }
+        }
         let stored = journal.load_result_for_attempt(attempt.attempt_id())?;
         let receipt = GraphOperationResult {
             schema_version: GRAPH_OPERATION_BRIDGE_SCHEMA_VERSION,
@@ -449,7 +456,9 @@ pub fn complete_worker(
             payload_digest: stored
                 .as_ref()
                 .map(|result| result.reference.payload_digest),
-            artifact_digest: artifact_digest(result)?,
+            // A repeated delivery must not attach a new artifact digest to a
+            // terminal journal result; the durable receipt is the authority.
+            artifact_digest: None,
             published_to_outbox: spec.context().wire_tool_call_id.is_some(),
             completed_at: attempt
                 .finished_at()

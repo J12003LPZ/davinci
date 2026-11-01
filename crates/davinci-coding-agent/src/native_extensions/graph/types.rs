@@ -494,16 +494,20 @@ impl WorkerUsage {
     }
 
     pub fn add(&mut self, other: &WorkerUsage) {
-        self.input += other.input;
-        self.output += other.output;
-        self.cache_read += other.cache_read;
-        self.cache_write += other.cache_write;
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.cache_write = self.cache_write.saturating_add(other.cache_write);
         self.cost_usd += other.cost_usd;
-        self.turns += other.turns;
-        self.governor_bytes_omitted += other.governor_bytes_omitted;
-        self.governor_compressed_outputs += other.governor_compressed_outputs;
-        self.governor_retrievals += other.governor_retrievals;
-        self.governor_prunings += other.governor_prunings;
+        self.turns = self.turns.saturating_add(other.turns);
+        self.governor_bytes_omitted = self
+            .governor_bytes_omitted
+            .saturating_add(other.governor_bytes_omitted);
+        self.governor_compressed_outputs = self
+            .governor_compressed_outputs
+            .saturating_add(other.governor_compressed_outputs);
+        self.governor_retrievals = self.governor_retrievals.saturating_add(other.governor_retrievals);
+        self.governor_prunings = self.governor_prunings.saturating_add(other.governor_prunings);
     }
 
     /// Governor counters summed over `tasks`, the run's own governor totals.

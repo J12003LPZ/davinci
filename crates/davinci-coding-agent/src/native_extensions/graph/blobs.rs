@@ -23,8 +23,10 @@ pub fn put(dir: &Path, hash: &str, bytes: &[u8]) -> std::io::Result<()> {
             "invalid blob hash",
         ));
     };
-    if target.exists() {
-        return Ok(());
+    if let Ok(existing) = std::fs::read(&target) {
+        if super::replay::sha256_hex(&existing) == hash {
+            return Ok(());
+        }
     }
     davinci_sys::fs::atomic_write(&target, bytes)
 }

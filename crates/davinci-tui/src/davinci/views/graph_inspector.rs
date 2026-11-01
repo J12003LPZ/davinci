@@ -23,10 +23,9 @@ pub fn public_text(value: &str) -> String {
     {
         return "[private content omitted]".into();
     }
-    value
-        .chars()
-        .filter(|c| !c.is_control() || *c == '\n')
-        .collect()
+    // Strip escape sequences and Unicode bidi/format controls as well; a
+    // repository-controlled goal or error must not be terminal control data.
+    crate::davinci::sanitize::terminal_safe(value).into_owned()
 }
 
 /// Width of the label column: `Revisions:` plus two cells of air.

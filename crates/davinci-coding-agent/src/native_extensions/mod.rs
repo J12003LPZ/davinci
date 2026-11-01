@@ -1646,6 +1646,9 @@ mod tests {
         assert!(host
             .execute_tool(root.path(), "retrieve_output", &json!({"id":id}))
             .is_err());
+        // Process-wide shutdown aborts every registered graph run. Serialize
+        // with graph tests that keep a run live, or this aborts theirs too.
+        let _registry = crate::native_extensions::graph::registry_guard();
         host.session_shutdown();
     }
 

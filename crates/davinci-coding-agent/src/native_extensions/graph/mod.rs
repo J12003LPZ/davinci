@@ -223,6 +223,20 @@ fn is_running(cwd: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The active-run registry and `abort_all_runs` are process-wide by design
+/// (one process is one session), so tests that touch them run one at a time
+/// rather than racing each other's runs. `session_shutdown` aborts every
+/// registered run, including one another test is still executing.
+#[cfg(test)]
+static TEST_REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn registry_guard() -> std::sync::MutexGuard<'static, ()> {
+    TEST_REGISTRY_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
 /// `/graph <goal>` and `graph_run` refuse while a run is live. One
 /// that is stopping is still live: starting another would put two runs on
 /// the same working tree.
@@ -275,10 +289,10 @@ pub fn abort_all_runs() {
     for run in &runs {
         run.abort.store(true, Ordering::Relaxed);
     }
-    // Bounded wait for the run threads (whose child processes watch the abort
-    // flag) to leave, so exiting the CLI does not strand live workers.
-    let deadline = Instant::now() + SHUTDOWN_WAIT;
+    // Bounded wait per run, so one stubborn run cannot consume the shutdown
+    // budget owed to the others.
     for run in &runs {
+        let deadline = Instant::now() + SHUTDOWN_WAIT;
         while !run.finished.load(Ordering::Relaxed) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(25));
         }
@@ -300,6 +314,25 @@ fn is_live(run: &GraphRun) -> bool {
         run.phase,
         types::Phase::Done | types::Phase::Blocked | types::Phase::Cancelled
     )
+}
+
+fn saved_stage_for_node(
+    node: &crate::native_extensions::graph::topology::NodeDefinition,
+) -> &'static str {
+    match node.role {
+        Role::Classifier => "classify",
+        Role::Planner => "plan",
+        Role::Writer => "implement",
+        Role::Reviewer => "review",
+        Role::Researcher | Role::Historian => "research",
+        Role::TestAnalyzer => {
+            if node.id.starts_with("security") {
+                "security"
+            } else {
+                "research"
+            }
+        }
+    }
 }
 
 fn saved_definition_from_run(
@@ -912,9 +945,17 @@ impl GraphController {
 
     fn status(&self, run_id: Option<&str>) -> Value {
         let active = active_run(&self.cwd).and_then(|run| run.snapshot());
-        let explicit = run_id
-            .filter(|id| !id.is_empty())
-            .and_then(|id| load_run(&self.cwd, id));
+        let requested = run_id.filter(|id| !id.is_empty());
+        let explicit = requested.and_then(|id| load_run(&self.cwd, id));
+        if requested.is_some() && explicit.is_none() {
+            return json!({
+                "error": format!(
+                    "Run '{}' was not found or its checkpoint is unreadable; refusing to show a different run.",
+                    requested.unwrap_or_default()
+                ),
+                "active": active.is_some() && is_running(&self.cwd),
+            });
+        }
         let current = explicit.or_else(|| {
             active.clone().or_else(|| {
                 list_runs(&self.cwd)
@@ -991,8 +1032,12 @@ impl GraphController {
             return json!({"runId": run.run_id, "tasks": tasks,
                            "error": format!("No task \"{task_id}\" in run {}", run.run_id)});
         };
+        if !store::is_safe_run_id(&chosen.id) {
+            return json!({"runId": run.run_id, "tasks": tasks,
+                           "error": format!("Task \"{}\" has an unsafe identity", chosen.id)});
+        }
         let path = transcript_path(Path::new(&run.cwd), &run.run_id, &chosen.id);
-        let tail = store::read_transcript_tail(&path);
+        let tail = store::read_transcript_tail_checked(Path::new(&run.cwd), &path);
         json!({
             "runId": run.run_id,
             "taskId": chosen.id,
@@ -1118,7 +1163,7 @@ impl GraphController {
                 .iter()
                 .map(|n| definitions::SavedStageBinding {
                     node_id: n.id.clone(),
-                    stage: n.role.to_string(),
+                    stage: saved_stage_for_node(n).to_string(),
                     input_artifacts: vec![],
                 })
                 .collect();
@@ -1180,6 +1225,16 @@ impl GraphController {
             .map_err(|e| format!("Could not load graph definition '{name}': {e}"))?;
         definitions::validate_saved_definition(&def)
             .map_err(|e| format!("Graph definition '{name}' failed validation: {e}"))?;
+        if def
+            .budgets
+            .as_ref()
+            .is_some_and(|budgets| budgets.max_tokens.is_some())
+        {
+            return Err(
+                "saved graph maxTokens is not supported by this runtime; remove it or use a run deadline/cost ceiling"
+                    .into(),
+            );
+        }
         let bound_params = definitions::bind_parameters(&def, &params)?;
         self.start_saved_background(def, bound_params, dry_run)
     }
@@ -1348,11 +1403,22 @@ impl GraphController {
             }
             None => None,
         };
+        let owned: std::collections::BTreeSet<String> = current
+            .tasks
+            .iter()
+            .filter_map(|task| task.mutation.as_ref())
+            .flat_map(|mutation| mutation.files.iter())
+            .map(|file| file.path.clone())
+            .collect();
+        let dirty: Vec<String> = unrelated_dirty_files(&self.cwd)
+            .into_iter()
+            .filter(|path| !owned.contains(path))
+            .collect();
         Ok(operations::generate_graph_diff(
             &current,
             prior.as_ref(),
             Some(&self.cwd),
-            &[],
+            &dirty,
         ))
     }
 
@@ -1464,8 +1530,20 @@ impl GraphController {
         let mut current = load_run(&self.cwd, &latest.run_id)
             .ok_or_else(|| format!("Could not load run {}", latest.run_id))?;
 
-        let commands =
+        // The canonical run commands are the configured ones (when trusted)
+        // plus project detection; use the same collector as the controller.
+        let loaded = if self.project_trusted {
+            load_config(&self.cwd)
+        } else {
+            config::LoadedConfig::default()
+        };
+        let detected =
             controller::trusted_detected_verify_commands(self.project_trusted, &self.cwd);
+        let commands = verify::collect_verify_commands(&verify::CollectInput {
+            config_commands: &loaded.config.verify_commands,
+            detected: &detected,
+            plan: None,
+        });
         let abort = Arc::new(AtomicBool::new(false));
         let exec = verify::default_verify_exec;
         let source_before = operations::source_manifest_for_run(&current, &self.cwd)?;
@@ -1475,11 +1553,7 @@ impl GraphController {
             .map(|bundle| operations::verification_source_current(bundle, source_before.as_ref()))
             .unwrap_or(source_before.is_none());
 
-        let policy_mode = if self.project_trusted {
-            load_config(&self.cwd).config.security_verification
-        } else {
-            Default::default()
-        };
+        let policy_mode = loaded.config.security_verification;
         let security_available = match policy_mode {
             SecurityPolicyMode::Off => true,
             SecurityPolicyMode::Risk | SecurityPolicyMode::Always => {
@@ -1817,6 +1891,45 @@ fn strip_continuation(mut value: Value) -> Value {
     value
 }
 
+/// Working-tree changes that are not graph-owned, for `/graph diff`.
+fn unrelated_dirty_files(cwd: &Path) -> Vec<String> {
+    let Ok(raw) = git::run(
+        cwd,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ],
+    ) else {
+        return Vec::new();
+    };
+    let mut records = raw.split(|byte| *byte == 0);
+    let mut files = Vec::new();
+    while let Some(record) = records.next() {
+        if record.len() < 4 {
+            continue;
+        }
+        let status = record[0];
+        let path = String::from_utf8_lossy(&record[3..]).replace('\\', "/");
+        if matches!(status, b'R' | b'C') {
+            // A rename record is followed by the original path.
+            records.next();
+        }
+        if path.starts_with(".davinci/")
+            || path.starts_with(".pi/")
+            || path.starts_with("target/")
+            || path.starts_with("node_modules/")
+        {
+            continue;
+        }
+        files.push(path);
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1862,17 +1975,6 @@ mod tests {
         assert!(shown.get("continuation").is_none());
         assert_eq!(shown["runId"], "r1");
         assert!(!shown.to_string().contains("115,107,45")); // "sk-" as bytes
-    }
-
-    /// The active-run registry and `abort_all_runs` are process-wide by
-    /// design (one process is one session), so tests that touch them run one
-    /// at a time rather than racing each other's runs.
-    static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
-
-    fn registry_guard() -> std::sync::MutexGuard<'static, ()> {
-        REGISTRY_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
     }
 
     #[test]
@@ -2690,7 +2792,18 @@ name = \"x\"
         assert_eq!(run_res["started"], true);
         assert_eq!(run_res["savedGraph"], "security-audit");
 
+        let saved_id = run_res["runId"].as_str().map(str::to_string);
         drain_active(dir.path());
+        let saved_id = saved_id
+            .or_else(|| list_runs(dir.path()).first().map(|run| run.run_id.clone()))
+            .expect("saved run id");
+        let saved_run = load_run(dir.path(), &saved_id).expect("saved run state");
+        assert_eq!(
+            saved_run.phase,
+            types::Phase::Done,
+            "saved run did not complete: {:?}",
+            saved_run.blocked_reason
+        );
     }
 
     #[test]

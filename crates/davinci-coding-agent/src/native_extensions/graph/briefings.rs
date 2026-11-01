@@ -246,41 +246,77 @@ pub fn build_evidence_digest(
         kept.push(line);
     }
 
-    let mut sections = vec![
-        "### Findings".to_string(),
-        if kept.is_empty() {
-            "- none".to_string()
-        } else {
-            kept.join("\n")
-        },
-        String::new(),
-        "### Risks".to_string(),
-        if risks.is_empty() {
-            "- none reported".to_string()
-        } else {
-            risks
-                .iter()
-                .map(|risk| format!("- {risk}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        },
-        String::new(),
-        "### Gaps (unverified areas)".to_string(),
-        if gaps.is_empty() {
-            "- none reported".to_string()
-        } else {
-            gaps.iter()
-                .map(|gap| format!("- {gap}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        },
-    ];
+    let mut sections = vec!["### Findings".to_string()];
+    let mut remaining = max_chars.saturating_sub("### Findings\n".chars().count());
+    let findings_text = if kept.is_empty() {
+        "- none".to_string()
+    } else {
+        kept.join("\n")
+    };
+    remaining = remaining.saturating_sub(findings_text.chars().count() + 1);
+    sections.push(findings_text);
+    push_bounded_section(
+        &mut sections,
+        &mut remaining,
+        "### Risks",
+        &risks,
+        "- none reported",
+        "- ",
+    );
+    push_bounded_section(
+        &mut sections,
+        &mut remaining,
+        "### Gaps (unverified areas)",
+        &gaps,
+        "- none reported",
+        "- ",
+    );
     if let Some(baseline) = test_baseline {
-        sections.push(String::new());
-        sections.push("### Test baseline".to_string());
-        sections.push(baseline);
+        let cost = baseline.chars().count() + 1;
+        if cost <= remaining {
+            sections.push(String::new());
+            sections.push("### Test baseline".to_string());
+            sections.push(baseline);
+        } else {
+            sections.push(String::new());
+            sections.push("### Test baseline".to_string());
+            sections.push("- [truncated by evidence budget]".to_string());
+        }
     }
-    sections.join("\n")
+    let mut digest = sections.join("\n");
+    if digest.chars().count() > max_chars {
+        let keep = max_chars.saturating_sub("\n[... truncated ...]".chars().count());
+        digest = digest.chars().take(keep).collect();
+        digest.push_str("\n[... truncated ...]");
+    }
+    digest
+}
+
+fn push_bounded_section(
+    sections: &mut Vec<String>,
+    remaining: &mut usize,
+    header: &str,
+    items: &[String],
+    empty: &str,
+    prefix: &str,
+) {
+    *remaining = remaining.saturating_sub(header.chars().count() + 2);
+    sections.push(String::new());
+    sections.push(header.to_string());
+    let mut lines = Vec::new();
+    for item in items {
+        let line = format!("{prefix}{item}");
+        let cost = line.chars().count() + 1;
+        if cost > *remaining {
+            continue;
+        }
+        *remaining = remaining.saturating_sub(cost);
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        lines.push(empty.to_string());
+    }
+    sections.push(lines.join("\n"));
 }
 
 pub fn plan_briefing(goal: &str, evidence_digest: &str, replan_reason: Option<&str>) -> String {
@@ -453,6 +489,18 @@ pub struct ReviewInput<'a> {
         Option<&'a crate::native_extensions::ecosystem::verification::SecurityVerification>,
 }
 
+fn bounded_patch(patch: &str) -> String {
+    const MAX_PATCH_CHARS: usize = 60_000;
+    if patch.chars().count() <= MAX_PATCH_CHARS {
+        return patch.to_string();
+    }
+    let marker = "\n[... patch truncated ...]\n";
+    let keep = MAX_PATCH_CHARS.saturating_sub(marker.chars().count());
+    let mut out: String = patch.chars().take(keep).collect();
+    out.push_str(marker);
+    out
+}
+
 pub fn review_briefing(input: &ReviewInput<'_>) -> String {
     let verification_lines = input
         .verification
@@ -495,7 +543,7 @@ pub fn review_briefing(input: &ReviewInput<'_>) -> String {
             if chunk.patch.is_empty() {
                 "(empty patch for this file)".to_string()
             } else {
-                format!("```diff\n{}\n```", chunk.patch)
+                format!("```diff\n{}\n```", bounded_patch(&chunk.patch))
             },
         ]);
     } else if let Some(summaries) = input.chunk_summaries {

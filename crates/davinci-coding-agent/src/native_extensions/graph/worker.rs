@@ -210,10 +210,10 @@ pub fn parse_worker_event(
             .and_then(Value::as_u64)
             .unwrap_or_default()
     };
-    state.usage.input += number("/usage/input");
-    state.usage.output += number("/usage/output");
-    state.usage.cache_read += number("/usage/cacheRead");
-    state.usage.cache_write += number("/usage/cacheWrite");
+    state.usage.input = state.usage.input.saturating_add(number("/usage/input"));
+    state.usage.output = state.usage.output.saturating_add(number("/usage/output"));
+    state.usage.cache_read = state.usage.cache_read.saturating_add(number("/usage/cacheRead"));
+    state.usage.cache_write = state.usage.cache_write.saturating_add(number("/usage/cacheWrite"));
     state.usage.cost_usd += message
         .pointer("/usage/cost/total")
         .and_then(Value::as_f64)
@@ -491,7 +491,18 @@ pub fn run_worker(
             ..Default::default()
         };
     }
-    let _ = fs::remove_file(&spec.artifact_path);
+    match fs::remove_file(&spec.artifact_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return WorkerResult {
+                failure_reason: Some(format!(
+                    "could not clear the previous attempt's artifact before spawning: {error}"
+                )),
+                ..WorkerResult::default()
+            }
+        }
+    }
 
     let temp_dir = temp_dir_for(&spec.task_id);
     if let Err(error) = fs::create_dir_all(&temp_dir) {
@@ -665,9 +676,20 @@ pub fn run_worker(
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
+            let stderr_tail: String = {
+                let text = stderr.text();
+                let count = text.chars().count();
+                text.chars()
+                    .skip(count.saturating_sub(STDERR_TAIL_CHARS))
+                    .collect()
+            };
             return WorkerResult {
-                stderr: format!("spawn error: {error}"),
-                failure_reason: Some(format!("worker could not be spawned: {error}")),
+                stderr: format!("worker supervisor error: {error}\n{stderr_tail}"),
+                failure_reason: Some(format!("worker supervisor failed: {error}")),
+                exit_code: -1,
+                final_text: state.final_text.clone(),
+                usage: state.usage,
+                recovery_required: state.recovery_error.is_some(),
                 ..WorkerResult::default()
             }
         }

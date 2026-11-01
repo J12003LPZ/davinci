@@ -18,6 +18,10 @@ use std::time::{Duration, Instant};
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How long the final drain will keep taking already-queued output.
 const DRAIN_GRACE: Duration = Duration::from_millis(250);
+/// Absolute wall-clock bound for draining a descendant that inherited the
+/// child's pipes. A continuously-writing grandchild must not hold the node for
+/// minutes after its owner exited.
+const DRAIN_BUDGET: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ChildOutcome {
@@ -112,6 +116,27 @@ pub fn is_pid_alive(pid: u32) -> bool {
     #[cfg(not(windows))]
     {
         unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+}
+
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn fallback_exit_code(
+    status: &std::process::ExitStatus,
+    aborted: bool,
+    run_deadline_exceeded: bool,
+) -> i32 {
+    if aborted || run_deadline_exceeded {
+        130
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal().map_or(1, |signal| 128 + signal)
+        }
+        #[cfg(not(unix))]
+        {
+            1
+        }
     }
 }
 
@@ -257,29 +282,30 @@ pub fn run_child_with_output_dir(
         }
     }
 
-    if !outcome.run_deadline_exceeded && !outcome.aborted {
-        // A bounded frame queue is drained directly. Waiting for inherited
-        // idle pipes is bounded independently of callback delivery time.
-        // Limit continuously writing descendants by frames, not callback wall
-        // time: a finite queue of short lines can take a slow caller seconds.
-        let mut drained = 0usize;
-        while let Ok(frame) = receiver.recv_timeout(DRAIN_GRACE) {
-            if let Err(error) = deliver(frame, &mut spools.files, &mut child) {
-                if abort.load(Ordering::Acquire) {
-                    outcome.aborted = true;
-                    terminate_process_tree(child_pid);
-                    break;
-                }
-                terminate_process_tree(child_pid);
-                return Err(error);
+    if !outcome.run_deadline_exceeded && !outcome.aborted && !outcome.timed_out {
+        // A bounded frame queue is drained directly. The bound is wall-clock:
+        // a descendant that keeps writing must not hold the supervisor after
+        // the owned child has already exited.
+        let drain_until = Instant::now() + DRAIN_BUDGET;
+        loop {
+            let remaining = drain_until.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
             }
-            drained += 1;
-            if drained >= 4096 {
-                terminate_process_tree(child_pid);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "descendant output did not settle; capture incomplete",
-                ));
+            let wait = remaining.min(DRAIN_GRACE);
+            match receiver.recv_timeout(wait) {
+                Ok(frame) => {
+                    if let Err(error) = deliver(frame, &mut spools.files, &mut child) {
+                        if abort.load(Ordering::Acquire) {
+                            outcome.aborted = true;
+                            terminate_process_tree(child_pid);
+                            break;
+                        }
+                        terminate_process_tree(child_pid);
+                        return Err(error);
+                    }
+                }
+                Err(_) => break,
             }
         }
     }
@@ -301,15 +327,11 @@ pub fn run_child_with_output_dir(
     )?;
     outcome.stdout_spooled = stdout.spooled;
     outcome.exit_code = match child.wait() {
-        Ok(status) => {
-            status
-                .code()
-                .unwrap_or(if outcome.aborted || outcome.run_deadline_exceeded {
-                    130
-                } else {
-                    1
-                })
-        }
+        Ok(status) => status.code().unwrap_or(fallback_exit_code(
+            &status,
+            outcome.aborted,
+            outcome.run_deadline_exceeded,
+        )),
         Err(_) => 1,
     };
     outcome.output_spools = spools.commit();

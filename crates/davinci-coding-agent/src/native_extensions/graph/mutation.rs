@@ -201,19 +201,24 @@ pub fn capture_baseline(cwd: &Path) -> Result<MutationBaseline, String> {
         if is_transaction_journal(&rel_path) {
             continue;
         }
-        if let Ok(bytes) = super::workspace_files::read(cwd, Path::new(&rel_path)) {
-            let hash = sha256_hex(&bytes);
-            if bytes.len() <= 512 * 1024 {
-                super::blobs::put(&blob_dir, &hash, &bytes).map_err(|error| error.to_string())?;
+        let bytes = match super::workspace_files::read(cwd, Path::new(&rel_path)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!("Cannot read baseline file {rel_path}: {error}"));
             }
-            files.insert(
-                rel_path,
-                FileFingerprint {
-                    hash,
-                    len: bytes.len() as u64,
-                },
-            );
+        };
+        let hash = sha256_hex(&bytes);
+        if bytes.len() <= 512 * 1024 {
+            super::blobs::put(&blob_dir, &hash, &bytes).map_err(|error| error.to_string())?;
         }
+        files.insert(
+            rel_path,
+            FileFingerprint {
+                hash,
+                len: bytes.len() as u64,
+            },
+        );
     }
 
     Ok(MutationBaseline {
@@ -235,16 +240,21 @@ pub fn capture_graph_delta(
         if is_transaction_journal(&rel_path) {
             continue;
         }
-        if let Ok(bytes) = super::workspace_files::read(cwd, Path::new(&rel_path)) {
-            let hash = sha256_hex(&bytes);
-            current_map.insert(
-                rel_path,
-                FileFingerprint {
-                    hash,
-                    len: bytes.len() as u64,
-                },
-            );
-        }
+        let bytes = match super::workspace_files::read(cwd, Path::new(&rel_path)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!("Cannot read mutation file {rel_path}: {error}"));
+            }
+        };
+        let hash = sha256_hex(&bytes);
+        current_map.insert(
+            rel_path,
+            FileFingerprint {
+                hash,
+                len: bytes.len() as u64,
+            },
+        );
     }
 
     let mut changed_files = Vec::new();
@@ -419,6 +429,75 @@ fn format_deleted_file_diff(file: &str, bytes: &[u8]) -> String {
     diff
 }
 
+/// For a large file, avoid the O(n*m) LCS matrix. Trim the common prefix and
+/// suffix, then emit an index-aligned edit script for the changed middle. It
+/// is not minimal, but it carries every changed line and can be chunked by the
+/// review pipeline; the old path returned a synthetic header with no content.
+fn format_large_modified_file_diff(file: &str, old: &[&str], new: &[&str]) -> String {
+    let mut prefix = 0usize;
+    while prefix < old.len() && prefix < new.len() && old[prefix] == new[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0usize;
+    while suffix < old.len().saturating_sub(prefix)
+        && suffix < new.len().saturating_sub(prefix)
+        && old[old.len() - 1 - suffix] == new[new.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let old_mid = &old[prefix..old.len() - suffix];
+    let new_mid = &new[prefix..new.len() - suffix];
+    let mut diff = format!(
+        "diff --git a/{file} b/{file}\n--- a/{file}\n+++ b/{file}\n@@ -{},{} +{},{} @@\n",
+        prefix + 1,
+        old_mid.len(),
+        prefix + 1,
+        new_mid.len()
+    );
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < old_mid.len() || j < new_mid.len() {
+        if i < old_mid.len() && j < new_mid.len() && old_mid[i] == new_mid[j] {
+            diff.push(' ');
+            diff.push_str(old_mid[i]);
+            diff.push('\n');
+            i += 1;
+            j += 1;
+        } else if i < old_mid.len() && j < new_mid.len() {
+            if i + 1 < old_mid.len() && old_mid[i + 1] == new_mid[j] {
+                diff.push('-');
+                diff.push_str(old_mid[i]);
+                diff.push('\n');
+                i += 1;
+            } else if j + 1 < new_mid.len() && old_mid[i] == new_mid[j + 1] {
+                diff.push('+');
+                diff.push_str(new_mid[j]);
+                diff.push('\n');
+                j += 1;
+            } else {
+                diff.push('-');
+                diff.push_str(old_mid[i]);
+                diff.push('\n');
+                diff.push('+');
+                diff.push_str(new_mid[j]);
+                diff.push('\n');
+                i += 1;
+                j += 1;
+            }
+        } else if i < old_mid.len() {
+            diff.push('-');
+            diff.push_str(old_mid[i]);
+            diff.push('\n');
+            i += 1;
+        } else {
+            diff.push('+');
+            diff.push_str(new_mid[j]);
+            diff.push('\n');
+            j += 1;
+        }
+    }
+    diff
+}
+
 fn format_modified_file_diff(file: &str, old_bytes: &[u8], new_bytes: &[u8]) -> String {
     if old_bytes.contains(&0) || new_bytes.contains(&0) {
         return format!(
@@ -436,9 +515,7 @@ fn format_modified_file_diff(file: &str, old_bytes: &[u8], new_bytes: &[u8]) -> 
     let m = new_lines.len();
 
     if n > 2000 || m > 2000 {
-        return format!(
-            "diff --git a/{file} b/{file}\n--- a/{file}\n+++ b/{file}\n@@ -1,{n} +1,{m} @@\n@@ large file modified @@\n"
-        );
+        return format_large_modified_file_diff(file, &old_lines, &new_lines);
     }
 
     let mut dp = vec![vec![0u32; m + 1]; n + 1];
@@ -761,6 +838,15 @@ mod tests {
         let diff = delta.diff();
         assert!(diff.contains("+line 2 modified"));
         assert!(diff.contains("-temporary"));
+    }
+
+    #[test]
+    fn a_large_modified_file_still_carries_changed_lines() {
+        let old: String = (0..2500).map(|index| format!("line {index}\n")).collect();
+        let new = old.replace("line 1250\n", "line 1250 changed\n");
+        let diff = format_modified_file_diff("big.rs", old.as_bytes(), new.as_bytes());
+        assert!(diff.contains("-line 1250\n"), "{diff}");
+        assert!(diff.contains("+line 1250 changed\n"), "{diff}");
     }
 
     #[test]

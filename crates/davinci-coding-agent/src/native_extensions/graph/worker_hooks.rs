@@ -77,6 +77,7 @@ impl GraphWorkerContext {
     /// broken worker cannot silently succeed.
     pub fn from_env() -> Option<Self> {
         let has_coordinator = std::env::var_os("DAVINCI_TASK_COORDINATOR_ADDR").is_some();
+        let authorized = std::env::var("PI_GRAPH_AUTHORIZED_TOOLS").ok();
         let raw_contract = std::env::var("DAVINCI_TASK_CONTRACT_JSON").ok();
         let expected_digest = std::env::var("PI_CONTRACT_DIGEST").ok();
         let task_contract = match (raw_contract, expected_digest) {
@@ -93,17 +94,30 @@ impl GraphWorkerContext {
             // legacy uncontracted worker. Returning None prevents graph hooks from admitting it.
             _ => return None,
         };
+        let legacy_extras = std::env::var("PI_GRAPH_EXTRA_TOOLS").ok();
+        let extra_tools = authorized.as_deref().or(legacy_extras.as_deref());
         let mut context = Self::from_parts_full(
             std::env::var("PI_GRAPH_ROLE").ok().as_deref(),
             std::env::var("PI_GRAPH_EXPECT").ok().as_deref(),
             std::env::var("PI_GRAPH_ARTIFACT_PATH").ok().as_deref(),
-            std::env::var("PI_GRAPH_AUTHORIZED_TOOLS")
-                .ok()
-                .or_else(|| std::env::var("PI_GRAPH_EXTRA_TOOLS").ok())
-                .as_deref(),
+            extra_tools,
             has_coordinator,
             task_contract,
         )?;
+        // The parent's authorization surface is authoritative. Role defaults
+        // must not re-add language/process tools the parent removed.
+        if let Some(authorized) = &authorized {
+            let allowed: BTreeSet<&str> = authorized
+                .split(',')
+                .map(str::trim)
+                .filter(|tool| !tool.is_empty())
+                .collect();
+            // An explicitly empty authorization list means no tools, not
+            // "fall back to the role defaults".
+            context
+                .allowed_tools
+                .retain(|tool| allowed.contains(tool.as_str()));
+        }
         if let Ok(node_id) = std::env::var("PI_GRAPH_NODE_ID") {
             if node_id.is_empty() || node_id.len() > 256 || node_id.chars().any(char::is_control) {
                 return None;
@@ -218,6 +232,16 @@ impl GraphWorkerContext {
             })?,
             other => other.clone(),
         };
+        const MAX_ARTIFACT_BYTES: usize = 64 * 1024;
+        if serde_json::to_vec(&candidate)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX)
+            > MAX_ARTIFACT_BYTES
+        {
+            return Err(format!(
+                "artifact exceeds the {MAX_ARTIFACT_BYTES}-byte limit; shorten plan/summary/notes fields"
+            ));
+        }
         let artifact = validate_artifact(self.expect, &candidate).map_err(|errors| {
             format!(
                 "artifact does not match the \"{}\" contract:\n- {}\nFix these fields and call {GRAPH_SUBMIT_TOOL} again.",

@@ -157,15 +157,10 @@ pub fn find_before_writer_checkpoint(
     run_id: &str,
     writer_task_id: &str,
 ) -> Option<String> {
-    get_task_checkpoint(cwd, run_id, writer_task_id).or_else(|| {
-        let entries = list_history_entries(cwd, run_id);
-        for entry in entries.iter().rev() {
-            if let Some(cp) = &entry.task_checkpoint {
-                return Some(cp.clone());
-            }
-        }
-        None
-    })
+    // Only the writer's own pre-mutation checkpoint is a proven boundary.
+    // Falling back to the newest history entry could restore a *later* fork
+    // boundary; refusing is safer, and fork/rewind can then ask for a writer.
+    get_task_checkpoint(cwd, run_id, writer_task_id)
 }
 
 #[cfg(test)]

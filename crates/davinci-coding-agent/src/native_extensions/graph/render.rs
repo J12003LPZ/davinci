@@ -103,7 +103,12 @@ pub fn parse_explain_args(args: &str) -> Result<Option<String>, String> {
 #[allow(dead_code)]
 pub fn parse_advanced_graph_command(args: &str) -> Result<Option<GraphAdvancedCommand>, String> {
     let trimmed = args.trim();
-    let command = tokenize_args(trimmed)?;
+    // Goal text is not required to be quote-balanced ("fix the parser's bug").
+    // If tokenization fails, let the caller treat the text as a goal; save/run
+    // still tokenize (and report malformed options) in `parse_graph_command`.
+    let Ok(command) = tokenize_args(trimmed) else {
+        return Ok(None);
+    };
     let Some(first) = command.first().cloned() else {
         return Ok(None);
     };
@@ -124,6 +129,9 @@ pub fn parse_advanced_graph_command(args: &str) -> Result<Option<GraphAdvancedCo
         let mut name = None;
         for token in tokens.into_iter().skip(1) {
             if name.is_none() {
+                if !super::definitions::safe_graph_name(&token) {
+                    return Err(format!("invalid graph name '{token}'"));
+                }
                 name = Some(token);
             } else {
                 return Err(format!("unexpected argument for /graph dry-run: '{token}'"));
@@ -429,23 +437,59 @@ pub fn parse_graph_command(args: &str) -> Result<GraphCommand, String> {
 
 /// Strip flags as whole tokens but keep the goal text verbatim otherwise:
 /// a multi-line pasted brief must reach the classifier with its line structure
-/// intact, because the classifier looks for numbered, separable deliverables.
+/// and indentation intact, because the classifier looks for numbered,
+/// separable deliverables. A flag is only recognized as a standalone token,
+/// so `--simple` embedded in prose is still removed (the CLI contract), but
+/// spaces, tabs, and line breaks around the remaining text are preserved.
 pub fn parse_graph_args(args: &str) -> ParsedGraphArgs {
     let mut parsed = ParsedGraphArgs::default();
-    let mut lines: Vec<String> = Vec::new();
-    for line in args.lines() {
-        let mut kept: Vec<&str> = Vec::new();
-        for token in line.split_whitespace() {
-            match token {
+    let mut goal = String::with_capacity(args.len());
+    let bytes = args.as_bytes();
+    let mut index = 0usize;
+    while index < args.len() {
+        let rest = &args[index..];
+        let at_boundary = args[..index]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace);
+        let matched = if at_boundary {
+            ["--simple", "--complex", "--dry-run"]
+                .into_iter()
+                .find_map(|flag| {
+                    if !rest.starts_with(flag) {
+                        return None;
+                    }
+                    let end = index + flag.len();
+                    let after_ok = end == args.len() || bytes[end].is_ascii_whitespace();
+                    after_ok.then_some((flag, end))
+                })
+        } else {
+            None
+        };
+        if let Some((flag, end)) = matched {
+            match flag {
                 "--simple" => parsed.forced = Some(Complexity::Trivial),
                 "--complex" => parsed.forced = Some(Complexity::Complex),
                 "--dry-run" => parsed.dry_run = true,
-                _ => kept.push(token),
+                _ => {}
             }
+            let mut next = end;
+            // Consume one following space/tab, or one preceding space when the
+            // flag ends the text, so the remaining words do not get a double
+            // gap. Newlines are preserved.
+            if next < args.len() && matches!(bytes[next], b' ' | b'\t') {
+                next += 1;
+            } else if goal.ends_with(' ') || goal.ends_with('\t') {
+                goal.pop();
+            }
+            index = next;
+            continue;
         }
-        lines.push(kept.join(" ").trim_end().to_string());
+        let ch = rest.chars().next().unwrap();
+        goal.push(ch);
+        index += ch.len_utf8();
     }
-    parsed.goal = lines.join("\n").trim().to_string();
+    parsed.goal = goal.trim().to_string();
     parsed
 }
 
@@ -741,6 +785,23 @@ mod tests {
     }
 
     #[test]
+    fn an_unbalanced_apostrophe_is_goal_text_not_a_parse_error() {
+        assert!(parse_advanced_graph_command("fix the parser's bug")
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            parse_graph_command("fix the parser's bug"),
+            Ok(GraphCommand::Goal(_))
+        ));
+    }
+
+    #[test]
+    fn dry_run_rejects_a_path_shaped_name() {
+        assert!(parse_advanced_graph_command("dry-run ../../etc/passwd").is_err());
+        assert!(parse_advanced_graph_command("dry-run safe-name").is_ok());
+    }
+
+    #[test]
     fn simple_forces_the_trivial_path() {
         let parsed = parse_graph_args("--simple rename a field");
         assert_eq!(parsed.forced, Some(Complexity::Trivial));
@@ -751,20 +812,18 @@ mod tests {
     #[test]
     fn a_goal_without_flags_survives_verbatim() {
         let parsed = parse_graph_args("  make   it faster  ");
-        assert_eq!(parsed.goal, "make it faster");
+        assert_eq!(parsed.goal, "make   it faster");
         assert_eq!(parsed.forced, None);
     }
 
     #[test]
     fn a_pasted_multi_line_brief_keeps_its_line_structure() {
         let parsed = parse_graph_args(
-            "Bring the port to parity. --complex\n\
-             1. fix the parser\n\
-             2. fix the writer\n",
+            "Bring the port to parity. --complex\n    1. fix the parser\n\t2. fix the writer\n",
         );
         assert_eq!(
             parsed.goal,
-            "Bring the port to parity.\n1. fix the parser\n2. fix the writer"
+            "Bring the port to parity.\n    1. fix the parser\n\t2. fix the writer"
         );
         assert_eq!(parsed.forced, Some(Complexity::Complex));
     }

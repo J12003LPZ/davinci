@@ -78,6 +78,12 @@ pub fn source_manifest_for_run(
     if paths.is_empty() {
         return Ok(None);
     }
+    // Legacy/model-authored artifacts may predate the schema check; never turn
+    // a persisted path into a read outside the workspace.
+    paths.retain(|path| super::validate::is_safe_workspace_relative_path(path));
+    if paths.is_empty() {
+        return Ok(None);
+    }
     davinci_agent::runtime::SourceManifestBuilder::new(cwd)
         .target_paths(paths)
         .build()
@@ -135,8 +141,8 @@ pub fn graph_budget_report(run: &GraphRun) -> GraphBudgetReport {
 }
 
 /// Apply one typed ceiling update after checking authorization and revision.
-/// A value of zero retains the legacy graph meaning of "unlimited" for the
-/// integer ceilings; a nonzero value must cover committed work.
+/// Zero means unlimited for spend/time ceilings; loop ceilings and researcher
+/// counts must be positive so a stopped run cannot be made unresumable.
 pub fn apply_budget_update(
     run: &mut GraphRun,
     resource: &str,
@@ -213,26 +219,35 @@ pub fn apply_budget_update(
         }
         "max-researchers" => {
             let value = parse_u32_budget(raw_value, resource)?;
+            if value == 0 {
+                return Err("max-researchers must be positive; zero is not a researcher ceiling".into());
+            }
             let running = run
                 .tasks
                 .iter()
                 .filter(|task| task.role == Role::Researcher && task.status == TaskStatus::Running)
                 .count() as u32;
-            if value != 0 && value < running {
+            if value < running {
                 return Err("max-researchers cannot be below active researchers".into());
             }
             run.budgets.max_researchers = value;
         }
         "max-revision-cycles" => {
             let value = parse_u32_budget(raw_value, resource)?;
-            if value != 0 && value < run.counters.revision_cycles {
+            if value == 0 {
+                return Err("max-revision-cycles must be positive; zero is not a revision ceiling".into());
+            }
+            if value < run.counters.revision_cycles {
                 return Err("max-revision-cycles cannot be below completed revision cycles".into());
             }
             run.budgets.max_revision_cycles = value;
         }
         "max-replans" => {
             let value = parse_u32_budget(raw_value, resource)?;
-            if value != 0 && value < run.counters.replans {
+            if value == 0 {
+                return Err("max-replans must be positive; zero is not a replan ceiling".into());
+            }
+            if value < run.counters.replans {
                 return Err("max-replans cannot be below completed replans".into());
             }
             run.budgets.max_replans = value;

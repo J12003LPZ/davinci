@@ -262,8 +262,12 @@ pub fn default_verify_exec(
         Ok(outcome) => {
             if outcome.timed_out {
                 output.push_str("\n[graph] verification command timed out");
+                // A command that exceeded its deadline is never verified, even
+                // if the kill raced a clean exit.
+                (124, output, duration_ms)
+            } else {
+                (outcome.exit_code, output, duration_ms)
             }
-            (outcome.exit_code, output, duration_ms)
         }
         Err(error) => {
             output.push_str(&format!("\nspawn error: {error}"));

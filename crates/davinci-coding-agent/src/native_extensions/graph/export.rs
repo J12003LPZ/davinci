@@ -169,18 +169,34 @@ fn sanitize_parameter(parameter: &SavedParameter) -> ExportParameter {
 
 fn redact_text(value: &str) -> String {
     let lower = value.to_ascii_lowercase();
+    // Normalize quotes/spacing so JSON (`"password": "x"`), YAML
+    // (`token: x`), CLI (`--token x`) and `key = value` all match.
+    let compact: String = lower
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '"' && *ch != '\'')
+        .collect();
     let markers = [
         "api_key=",
         "apikey=",
+        "api-key=",
         "token=",
         "password=",
         "secret=",
+        "api_key:",
+        "apikey:",
         "api-key:",
         "token:",
         "password:",
         "secret:",
+        "authorization:",
+        "authorization=",
+        "bearer ",
     ];
-    if markers.iter().any(|marker| lower.contains(marker)) {
+    if markers.iter().any(|marker| compact.contains(marker))
+        || lower.contains("--token ")
+        || lower.contains("--password ")
+        || lower.contains("--secret ")
+    {
         "[REDACTED]".into()
     } else {
         value.to_string()

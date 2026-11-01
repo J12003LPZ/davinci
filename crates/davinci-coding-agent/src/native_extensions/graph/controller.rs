@@ -19,7 +19,7 @@ use super::recovery::{
     RetryDecision, RetryRecoveryInput, WorkerFailureClass,
 };
 use super::replay::{incompatibility_reason, replay_compatible, ReplayFingerprint};
-use super::review_coverage::{chunk_graph_mutation, coverage_complete, ReviewCoverage};
+use super::review_coverage::{chunk_graph_mutation, coverage_complete, ReviewChunk, ReviewCoverage};
 use super::roles::{
     ensure_governor_recovery_tool, initial_worker_tools, requires_task_coordinator,
     role_for_research_kind, role_tools,
@@ -29,8 +29,8 @@ use super::store::{
     write_log, write_task_fingerprint, write_task_mutation,
 };
 use super::topology::{
-    build_definition, ready_nodes, validate_definition, EdgeCondition, EdgeDefinition, GraphMode,
-    GraphRunState, NodeDefinition,
+    build_definition, ready_nodes, validate_definition, EdgeCondition, EdgeDefinition,
+    GraphDefinition, GraphMode, GraphRunState, NodeDefinition,
 };
 use super::types::{
     Artifact, ArtifactKind, Complexity, EvidenceArtifact, GraphBudgets, GraphCounters,
@@ -169,11 +169,14 @@ pub struct RunOptions {
 }
 
 pub fn default_is_git_repo(cwd: &Path) -> bool {
-    cwd.join(".git").exists()
+    super::git::is_repo(cwd)
 }
 
 /// An untracked file larger than this is listed, not shown.
 const UNTRACKED_FILE_MAX_BYTES: usize = 64 * 1024;
+
+pub(crate) const DIFF_UNAVAILABLE_PREFIX: &str =
+    "[graph] git diff failed; review evidence is incomplete";
 
 /// What the reviewer reads: every change against HEAD, plus the files the
 /// writer created. The writer may not `git add`, so a plain `git diff` never
@@ -184,15 +187,50 @@ pub fn default_get_diff(cwd: &Path) -> String {
             .ok()
             .map(|output| String::from_utf8_lossy(&output).into_owned())
     };
-    // `HEAD` includes staged changes; a repository without a commit has none.
-    let mut diff = git(&["diff", "HEAD"])
-        .or_else(|| git(&["diff"]))
-        .unwrap_or_default();
-    let untracked = git(&["ls-files", "--others", "--exclude-standard"]).unwrap_or_default();
+    let exclusions = [
+        "--",
+        ".",
+        ":(exclude).davinci",
+        ":(exclude).pi",
+        ":(exclude)target",
+        ":(exclude)node_modules",
+    ];
+    let mut head_args = vec![
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "HEAD",
+    ];
+    head_args.extend(exclusions);
+    let mut work_args = vec!["diff", "--no-ext-diff", "--no-textconv"];
+    work_args.extend(exclusions);
+    let head = git(&head_args);
+    let work = if head.is_none() {
+        git(&work_args)
+    } else {
+        None
+    };
+    let mut diff = match (head, work) {
+        (Some(diff), _) => diff,
+        (None, Some(diff)) => diff,
+        (None, None) if default_is_git_repo(cwd) => {
+            return DIFF_UNAVAILABLE_PREFIX.to_string()
+        }
+        (None, None) => String::new(),
+    };
+    let mut untracked_args = vec!["ls-files", "-z", "--others", "--exclude-standard"];
+    untracked_args.extend(exclusions);
+    let untracked = git(&untracked_args).unwrap_or_default();
     for file in untracked
-        .lines()
+        .split('\0')
         .map(str::trim)
         .filter(|file| !file.is_empty())
+        .filter(|file| {
+            !file.starts_with(".davinci/")
+                && !file.starts_with(".pi/")
+                && !file.starts_with("target/")
+                && !file.starts_with("node_modules/")
+        })
     {
         let path = cwd.join(file);
         let Ok(metadata) = std::fs::metadata(&path) else {
@@ -245,6 +283,17 @@ fn truncate(text: &str, max_chars: usize) -> String {
         return text.to_string();
     }
     text.chars().take(max_chars).collect()
+}
+
+fn truncate_diff(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let marker = "\n[... diff truncated ...]\n";
+    let keep = max_chars.saturating_sub(marker.chars().count());
+    let mut out: String = text.chars().take(keep).collect();
+    out.push_str(marker);
+    out
 }
 
 /// Upper bound on the assistant text kept on a task for the live view. The
@@ -651,7 +700,12 @@ impl GraphExecution {
         if let Some(task) = run.tasks.iter_mut().find(|task| task.id == task_id) {
             task.usage.add(usage);
         }
-        run.counters.cost_usd += usage.cost_usd;
+        let cost = if usage.cost_usd.is_finite() && usage.cost_usd >= 0.0 {
+            usage.cost_usd
+        } else {
+            0.0
+        };
+        run.counters.cost_usd += cost;
         if let Some(reason) = Self::cost_budget_exceeded(&run) {
             drop(run);
             self.budget_abort(reason);
@@ -773,27 +827,43 @@ impl GraphExecution {
             return None;
         }
 
-        if self
-            .snapshot()
-            .task(&task_id)
+        let existing = self.snapshot().task(&task_id).cloned();
+        if existing
+            .as_ref()
             .is_some_and(|existing| existing.status == TaskStatus::Succeeded)
         {
-            let run = self.snapshot();
-            return match super::store::read_artifact(
-                &self.options.cwd,
-                &run.run_id,
-                &task_id,
-                task.expect,
+            // A different worker model is a different execution input; do not
+            // hand a new model the old model's artifact.
+            let model_changed = match (
+                existing
+                    .as_ref()
+                    .and_then(|task| task.fingerprint.as_ref())
+                    .and_then(|fingerprint| fingerprint.model_id.as_deref()),
+                existing
+                    .as_ref()
+                    .and_then(|task| task.model.as_deref()),
             ) {
-                Ok(artifact) => Some(artifact),
-                Err(errors) => {
-                    self.blocked(format!(
-                        "Completed task '{task_id}' cannot be restored: {}",
-                        errors.join("; ")
-                    ));
-                    None
-                }
+                (Some(stored), Some(current)) => stored != current,
+                _ => false,
             };
+            if !model_changed {
+                let run = self.snapshot();
+                return match super::store::read_artifact(
+                    &self.options.cwd,
+                    &run.run_id,
+                    &task_id,
+                    task.expect,
+                ) {
+                    Ok(artifact) => Some(artifact),
+                    Err(errors) => {
+                        self.blocked(format!(
+                            "Completed task '{task_id}' cannot be restored: {}",
+                            errors.join("; ")
+                        ));
+                        None
+                    }
+                };
+            }
         }
 
         // A worker that was stopped (operator, graph stop, deadline) never
@@ -902,7 +972,8 @@ impl GraphExecution {
                 task.expect,
                 definition_digest.as_deref(),
                 dry_run,
-            );
+            )
+            .with_model(task.model.as_deref());
 
             let is_compatible = match stored_fingerprint {
                 Some(stored) => {
@@ -1057,6 +1128,47 @@ impl GraphExecution {
                 );
                 self.end_task(&task_id, TaskStatus::Failed, Some(reason));
                 self.checkpoint(Some("stopped worker not cleared for a replacement"));
+                return None;
+            }
+        }
+
+        // A controller that died mid-worker leaves a Failed attempt without a
+        // durable retry decision. Before starting a replacement, prove from
+        // the operation journal that the prior effect is reconciled. This is
+        // the same gate used after a normal failure; it cannot be skipped just
+        // because the controller restarted.
+        let reconciled_attempt = self
+            .snapshot()
+            .continuation
+            .as_ref()
+            .and_then(|cursor| cursor.attempt_history.get(&task_id))
+            .and_then(|history| history.last())
+            .filter(|record| {
+                record.status == TaskStatus::Failed
+                    && record.retry_recovery.is_none()
+                    && record.operation_binding.is_some()
+            })
+            .cloned();
+        if let Some(reconciled) = &reconciled_attempt {
+            let recovery = retry_recovery_gate(self.retry_recovery_input(
+                &task_id,
+                reconciled.attempt,
+                1,
+                RetryDecision::RetrySameBudget,
+                reconciled.worker_session.as_ref(),
+            ));
+            if !self.record_retry_recovery(&task_id, reconciled.attempt, recovery.clone()) {
+                return None;
+            }
+            if !recovery.allowed
+                && recovery.status != super::recovery::RetryRecoveryStatus::BudgetExhausted
+            {
+                let reason = format!(
+                    "reconciliation required before replacing interrupted worker: {} ({:?})",
+                    recovery.reason, recovery.status
+                );
+                self.end_task(&task_id, TaskStatus::Failed, Some(reason));
+                self.checkpoint(Some("interrupted worker not cleared for a replacement"));
                 return None;
             }
         }
@@ -1438,7 +1550,8 @@ impl GraphExecution {
                             task.expect,
                             definition_digest.as_deref(),
                             dry_run,
-                        );
+                        )
+                        .with_model(spec.model.as_deref());
                         if let Some(task_entry) =
                             run.tasks.iter_mut().find(|entry| entry.id == task_id)
                         {
@@ -1454,7 +1567,8 @@ impl GraphExecution {
                         task.expect,
                         definition_digest.as_deref(),
                         dry_run,
-                    );
+                    )
+                    .with_model(spec.model.as_deref());
                     self.end_task(&task_id, TaskStatus::Succeeded, None);
                     if !self.checkpoint_with(Some(&format!("{task_id}: succeeded")), |_| {
                         write_artifact(&artifact_path(&cwd, &run_id, &task_id), &artifact)?;
@@ -1486,12 +1600,12 @@ impl GraphExecution {
                 }
             }
             let failure_class = classify_worker_failure(&result, Some(&error));
-            let decision = retry_decision(failure_class, local_attempt as usize);
+            let decision = retry_decision(failure_class, attempt as usize);
             last_failure_class = Some(failure_class);
             let recovery = retry_recovery_gate(self.retry_recovery_input(
                 &task_id,
                 attempt,
-                local_attempt as usize,
+                attempt as usize,
                 decision,
                 spec.worker_session.as_ref(),
             ));
@@ -2112,6 +2226,36 @@ fn saved_review_approves(artifact: &Artifact) -> bool {
     })
 }
 
+/// A required node whose OnFailure branch completed is recovered: the fallback
+/// did the work the failed node was required to do. Without this, any
+/// `required: true` node with a failure edge made the whole saved graph
+/// unsatisfiable.
+fn failure_branch_succeeded(
+    definition: &GraphDefinition,
+    state: &GraphRunState,
+    node_id: &str,
+) -> bool {
+    let mut queue = std::collections::VecDeque::new();
+    for edge in definition.outgoing_edges(node_id) {
+        if edge.condition == EdgeCondition::OnFailure {
+            queue.push_back(edge.to.as_str());
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    while let Some(current) = queue.pop_front() {
+        if !seen.insert(current) {
+            continue;
+        }
+        if state.succeeded_tasks.contains(current) {
+            return true;
+        }
+        for edge in definition.outgoing_edges(current) {
+            queue.push_back(edge.to.as_str());
+        }
+    }
+    false
+}
+
 fn saved_stage_inputs_unchanged(execution: &GraphExecution, task_id: &str) -> bool {
     let actual = execution.completion_inputs();
     let expected = execution
@@ -2490,6 +2634,17 @@ fn drive_compiled_saved_graph(
                     run.tasks.push(task_state);
                 }
             }
+            if !verification.passed
+                && compiled
+                    .verification_policy
+                    .as_ref()
+                    .is_some_and(|policy| policy.required)
+            {
+                execution.blocked(
+                    "saved graph verification failed and verificationPolicy.required is true".into(),
+                );
+                return execution.snapshot();
+            }
             if !saved_stage_inputs_unchanged(execution, &task_id) {
                 return execution.snapshot();
             }
@@ -2700,7 +2855,11 @@ fn drive_compiled_saved_graph(
 
     let mut failed_required = false;
     for node in &compiled.topology.nodes {
-        if node.required && !final_state.succeeded_tasks.contains(&node.id) {
+        if node.required
+            && !final_state.succeeded_tasks.contains(&node.id)
+            && !(final_state.failed_tasks.contains(&node.id)
+                && failure_branch_succeeded(&compiled.topology, &final_state, &node.id))
+        {
             failed_required = true;
             break;
         }
@@ -3776,12 +3935,27 @@ fn deliver_goal(
             Some(final_review)
         } else {
             // Single chunk or no graph diff
+            let fallback_diff = graph_diff.is_empty().then(|| default_get_diff(&cwd));
+            if let Some(diff) = &fallback_diff {
+                if diff.starts_with(DIFF_UNAVAILABLE_PREFIX) {
+                    execution.blocked(diff.clone());
+                    return Delivery::Stop;
+                }
+            }
             let diff = if !graph_diff.is_empty() {
-                truncate(&graph_diff, DIFF_MAX_CHARS)
+                truncate_diff(&graph_diff, DIFF_MAX_CHARS)
             } else {
-                truncate(&default_get_diff(&cwd), DIFF_MAX_CHARS)
+                truncate_diff(fallback_diff.as_deref().unwrap_or(""), DIFF_MAX_CHARS)
             };
-            let single_chunk = chunks.first();
+            // A no-mutation run still has working-tree evidence to review. Make
+            // it a required chunk so coverage cannot report "complete" after
+            // showing only a truncated prefix.
+            let fallback_chunk = chunks.is_empty().then(|| ReviewChunk {
+                id: "workspace#chunk-0".into(),
+                file: "(working tree)".into(),
+                patch: diff.clone(),
+            });
+            let single_chunk = chunks.first().or(fallback_chunk.as_ref());
             let req_ids = single_chunk.map(|c| vec![c.id.clone()]);
             let task = GraphTaskState::new(
                 format!("review-{}", indices.review),

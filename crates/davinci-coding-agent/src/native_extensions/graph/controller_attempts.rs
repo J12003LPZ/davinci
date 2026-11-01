@@ -133,7 +133,7 @@ impl GraphExecution {
                     spec.expect,
                     run.definition_digest.as_deref(),
                     run.dry_run,
-                )),
+                ).with_model(spec.model.as_deref())),
                 worker_session: None,
                 operation_binding: None,
                 retry_recovery: None,

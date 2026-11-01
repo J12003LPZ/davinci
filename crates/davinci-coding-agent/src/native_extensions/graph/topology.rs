@@ -242,18 +242,24 @@ pub fn validate_definition(definition: &GraphDefinition) -> Result<(), GraphTopo
         node_requirements.insert(node_id, reqs);
     }
 
-    // 6. Reachability of required nodes from entry node
-    let entry_node = definition.nodes.first().map(|n| n.id.as_str());
+    // 6. Reachability of required nodes from every source (in-degree zero).
+    // The node list is not required to be topologically sorted, and a valid
+    // graph may have more than one root; anchoring the walk at nodes[0] would
+    // reject such a graph as "unreachable".
+    let roots: Vec<&str> = definition
+        .nodes
+        .iter()
+        .filter(|node| !definition.edges.iter().any(|edge| edge.to == node.id))
+        .map(|node| node.id.as_str())
+        .collect();
 
     let mut reachable = HashSet::new();
-    if let Some(entry) = entry_node {
-        let mut reachable_queue = VecDeque::from([entry]);
-        while let Some(curr) = reachable_queue.pop_front() {
-            if reachable.insert(curr) {
-                for edge in definition.outgoing_edges(curr) {
-                    if !reachable.contains(edge.to.as_str()) {
-                        reachable_queue.push_back(edge.to.as_str());
-                    }
+    let mut reachable_queue: VecDeque<&str> = roots.into();
+    while let Some(curr) = reachable_queue.pop_front() {
+        if reachable.insert(curr) {
+            for edge in definition.outgoing_edges(curr) {
+                if !reachable.contains(edge.to.as_str()) {
+                    reachable_queue.push_back(edge.to.as_str());
                 }
             }
         }
@@ -350,12 +356,10 @@ pub fn validate_definition(definition: &GraphDefinition) -> Result<(), GraphTopo
         }
     }
 
-    // 8. Verify-success edge without verification node:
-    for edge in &definition.edges {
-        if edge.from.starts_with("verify") && !definition.nodes.iter().any(|n| n.id == edge.from) {
-            return Err(GraphTopologyError::MissingVerificationNode);
-        }
-    }
+    // 8. Verification is an execution-stage concern, not a topology role:
+    // `validate_definition` has no stage bindings to inspect. The old loop here
+    // was unreachable (step 3 already rejects an edge from an unknown node)
+    // and checked only an id prefix, so it provided no guarantee.
 
     // 9. Two mutation-capable writers that can be ready concurrently:
     let mutation_nodes: Vec<&NodeDefinition> = definition
@@ -787,20 +791,17 @@ mod tests {
     }
 
     #[test]
-    fn graph_topology_rejection_of_unreachable_required_node() {
+    fn graph_topology_accepts_an_additional_required_root() {
         let mut def = build_definition(GraphMode::Simple, &test_classification());
         def.nodes.push(NodeDefinition {
-            id: "orphaned".into(),
+            id: "additional-root".into(),
             role: Role::Researcher,
             expect: ArtifactKind::Evidence,
             required: true,
             allows_mutation: false,
         });
-        let err = validate_definition(&def).unwrap_err();
-        assert_eq!(
-            err,
-            GraphTopologyError::UnreachableRequiredNode("orphaned".into())
-        );
+        // A node with no incoming edge is a source, not an unreachable node.
+        assert!(validate_definition(&def).is_ok());
     }
 
     #[test]
