@@ -2,8 +2,8 @@
 //!
 //! The provider wire kind is part of the request contract.  This module keeps
 //! the decision in one place so request construction, history replay, and
-//! ledger migration cannot independently decide whether `apply_patch` was a
-//! function or a freeform custom tool.
+//! ledger migration cannot independently decide whether `apply_patch` or
+//! `codemode` was a function or a freeform custom tool.
 
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -102,11 +102,17 @@ pub fn resolve_responses_tools_with_preference(
     let wire_tools = sorted_tools
         .iter()
         .map(|tool| {
-            if custom_enabled && tool.name == "apply_patch" {
-                custom_tool_names.push(tool.name.clone());
-                custom_tool_value(tool)
+            let format = if custom_enabled {
+                custom_tool_format(&tool.name)
             } else {
-                function_tool_value(tool)
+                None
+            };
+            match format {
+                Some(format) => {
+                    custom_tool_names.push(tool.name.clone());
+                    custom_tool_value(tool, format)
+                }
+                None => function_tool_value(tool),
             }
         })
         .collect::<Vec<_>>();
@@ -145,16 +151,28 @@ pub fn function_tool_value(tool: &ToolSpec) -> Value {
     })
 }
 
-fn custom_tool_value(tool: &ToolSpec) -> Value {
+/// Custom tools carry their own input contract. `apply_patch` is constrained
+/// by the patch grammar; `codemode` takes arbitrary JavaScript, so the provider
+/// receives it as unconstrained text and the decoded `{"input": …}` shape is
+/// mapped back to `code` before the Codemode contract is parsed.
+fn custom_tool_format(name: &str) -> Option<Value> {
+    match name {
+        "apply_patch" => Some(json!({
+            "type": "grammar",
+            "syntax": "lark",
+            "definition": crate::apply_patch_grammar::APPLY_PATCH_LARK,
+        })),
+        "codemode" => Some(json!({"type": "text"})),
+        _ => None,
+    }
+}
+
+fn custom_tool_value(tool: &ToolSpec, format: Value) -> Value {
     json!({
         "type": "custom",
         "name": tool.name,
         "description": tool.description,
-        "format": {
-            "type": "grammar",
-            "syntax": "lark",
-            "definition": crate::apply_patch_grammar::APPLY_PATCH_LARK,
-        }
+        "format": format,
     })
 }
 
@@ -493,6 +511,48 @@ mod tests {
                 .unwrap()["type"],
             "function"
         );
+    }
+
+    #[test]
+    fn supported_codex_projects_codemode_as_custom_text() {
+        let mut tools = tools();
+        tools.push(ToolSpec {
+            name: "codemode".into(),
+            description: "Run a script".into(),
+            parameters: serde_json::json!({"type":"object"}),
+            constrained_sampling: None,
+        });
+        let resolved = resolve_responses_tools_with_preference(
+            &model("openai-codex-responses", "openai-codex", None),
+            Some("https://chatgpt.com/backend-api"),
+            true,
+            &tools,
+            true,
+        );
+        assert_eq!(resolved.custom_tool_names, vec!["apply_patch", "codemode"]);
+        let codemode = resolved
+            .tools
+            .iter()
+            .find(|tool| tool["name"] == "codemode")
+            .unwrap();
+        assert_eq!(codemode["type"], "custom");
+        assert_eq!(codemode["format"], json!({"type": "text"}));
+        let apply_patch = resolved
+            .tools
+            .iter()
+            .find(|tool| tool["name"] == "apply_patch")
+            .unwrap();
+        assert_eq!(apply_patch["format"]["type"], "grammar");
+
+        let disabled = resolve_responses_tools_with_preference(
+            &model("openai-codex-responses", "openai-codex", None),
+            Some("https://chatgpt.com/backend-api"),
+            true,
+            &tools,
+            false,
+        );
+        assert!(disabled.custom_tool_names.is_empty());
+        assert!(disabled.tools.iter().all(|tool| tool["type"] == "function"));
     }
 
     #[test]

@@ -163,8 +163,8 @@ impl Agent {
         parent: Option<OperationId>,
     ) -> ToolResult {
         let run = || -> Result<(CodeModeOutcome, String), CodeModeError> {
-            let request: CodeModeRequest = serde_json::from_value(args.clone())
-                .map_err(|_| CodeModeError::new("INVALID_INPUT", "invalid Codemode request"))?;
+            let request: CodeModeRequest = CodeModeRequest::from_tool_arguments(args)
+                .ok_or_else(|| CodeModeError::new("INVALID_INPUT", "invalid Codemode request"))?;
             let mut limits = CodeModeLimits::default().for_request(&request)?;
             let binding = self
                 .codemode
