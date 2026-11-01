@@ -1,6 +1,6 @@
 # Droid 1.0 → DaVinci OpenAI Runtime Parity — Design Specification
 
-> **2026-10-31 amendment.** Plan v2 (`docs/superpowers/plans/2026-10-31-droid-openai-runtime-parity.md`) supersedes the following parts of this spec. The original spec is preserved in `v1-backup/`.
+> **2026-10-31 amendment.** Plan v2 (`docs/superpowers/plans/2026-10-31-droid-gap.md`; landed under that name from the planning bundle's `2026-10-31-droid-openai-runtime-parity.md`) supersedes the following parts of this spec. The original spec is preserved in `v1-backup/`.
 >
 > - **Intent.** "Behavioral parity with every evidenced Droid feature" is replaced by verified tasks per unit of ChatGPT subscription usage, measured against Droid 1.1.0. Droid 1.0.0 is no longer installed.
 > - **A. Script execution.** Now conditional on a measured Script gap: v2 W3, owned by the 2026-10-04 Codemode plan.
