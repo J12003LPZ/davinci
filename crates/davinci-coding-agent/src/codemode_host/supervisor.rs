@@ -18,18 +18,41 @@ pub struct NodeCodeModeHost {
     assets: HostAssets,
     manifest: super::assets::AssetManifest,
     node_fingerprint: [u8; 32],
+    controlled: bool,
+    background: bool,
 }
 
 /// The error for a script the sandbox reported as failed. The sandbox's own
 /// deadline can fire before the host watchdog; that is still a timeout, not a
 /// sandbox fault, so its kind decides the code.
 fn sandbox_failure(result: &Value) -> CodeModeError {
+    let detail = script_error_detail(result);
+    // A guest limit is a bounded refusal, not an unexplained sandbox fault.
+    if detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("LIMIT_EXCEEDED"))
+    {
+        return CodeModeError::new(
+            "LIMIT_EXCEEDED",
+            detail.as_deref().unwrap_or("script exceeded a guest limit"),
+        );
+    }
+    // A parse failure is the model's own input error; it can be repaired.
+    if detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("INVALID_INPUT"))
+    {
+        return CodeModeError::new(
+            "INVALID_INPUT",
+            detail.as_deref().unwrap_or("script could not be parsed"),
+        );
+    }
     match result.pointer("/error/kind").and_then(Value::as_str) {
         Some("timeout") => CodeModeError::new("TIMEOUT", "script deadline expired"),
         Some("aborted") => CodeModeError::new("CANCELLED", "script was cancelled"),
         _ => CodeModeError::new(
             "SANDBOX_FAILED",
-            &match script_error_detail(result) {
+            &match detail {
                 Some(detail) => format!("script failed in the sandbox: {detail}"),
                 None => "script failed in the sandbox".into(),
             },
@@ -671,7 +694,22 @@ impl NodeCodeModeHost {
             assets,
             manifest,
             node_fingerprint: fingerprint,
+            controlled: false,
+            background: false,
         })
+    }
+
+    /// Trusted host configuration acknowledges mutating script children.
+    pub fn with_controlled_mode(mut self, controlled: bool) -> Self {
+        self.controlled = controlled;
+        self
+    }
+
+    /// Trusted host configuration acknowledges detached Script runs. Controlled
+    /// mode is still required: detaching never widens the tool ceiling.
+    pub fn with_background_scripts(mut self, background: bool) -> Self {
+        self.background = background;
+        self
     }
 
     fn run(
@@ -771,6 +809,7 @@ impl NodeCodeModeHost {
         let mut tool_calls = 0u32;
         let mut result_bytes = 0usize;
         let mut pending_broker = std::collections::BTreeSet::new();
+        let mut notifications: Vec<String> = Vec::new();
         let outcome = (|| loop {
             if context.cancellation.is_cancelled() {
                 return Err(
@@ -843,6 +882,15 @@ impl NodeCodeModeHost {
                     "host run identity mismatch",
                 ));
             }
+            // A notification is a bounded wakeup signal, not model output and
+            // not an authority grant. It never becomes a tool result.
+            if kind == "notify" {
+                let text = frame["text"].as_str().unwrap_or_default();
+                if text.len() <= 4096 && notifications.len() < 16 {
+                    notifications.push(format!("Script notification: {text}"));
+                }
+                continue;
+            }
             if kind == "finished" {
                 if !pending_broker.is_empty() {
                     context.cancellation.cancel();
@@ -855,56 +903,44 @@ impl NodeCodeModeHost {
                 let ok = result["ok"]
                     .as_bool()
                     .ok_or_else(|| CodeModeError::new("PROTOCOL_ERROR", "invalid completion"))?;
-                let mut text = String::new();
-                if let Some(items) = result["output"].as_array() {
-                    for item in items {
-                        let value = item["text"].as_str().ok_or_else(|| {
-                            CodeModeError::new("PROTOCOL_ERROR", "unsupported output")
-                        })?;
-                        if text.len() + value.len() > limits.collected_output_bytes {
-                            return Err(CodeModeError::new(
-                                "LIMIT_EXCEEDED",
-                                "collected output limit",
-                            ));
-                        }
-                        text.push_str(value);
-                    }
-                }
+                let mut items = result["output"].as_array().cloned().unwrap_or_default();
                 if let Some(value) = result.get("value") {
                     let value = serde_json::to_string(value)
                         .map_err(|_| CodeModeError::new("PROTOCOL_ERROR", "invalid return"))?;
-                    if text.len() + value.len() > limits.collected_output_bytes {
-                        return Err(CodeModeError::new(
-                            "LIMIT_EXCEEDED",
-                            "collected return limit",
-                        ));
-                    }
-                    text.push_str(&value);
+                    items.push(json!({"type":"text","text":value}));
                 }
-                let complete = text.len() <= limits.output_bytes;
-                let output_text = if complete {
-                    text
-                } else {
-                    truncate_head_and_tail(&text, limits.output_bytes).0
-                };
+                if items.len() > limits.output_events {
+                    return Err(CodeModeError::new(
+                        "LIMIT_EXCEEDED",
+                        "script emitted too many output events",
+                    ));
+                }
+                let output = davinci_agent::codemode::projection::assemble_script_output(
+                    &items,
+                    limits.output_bytes,
+                    limits.collected_output_bytes,
+                )?;
+                let mut notes = notifications.clone();
+                if !output.complete {
+                    notes.push(format!(
+                        "Script output was truncated; {} bytes omitted.",
+                        output.omitted_bytes
+                    ));
+                }
                 return Ok(CodeModeOutcome {
                     // Truncated output is not a complete result: a caller that
                     // only checks for success must not take it as one.
-                    status: match (ok, complete) {
+                    status: match (ok, output.complete) {
                         (true, true) => CodeModeStatus::Completed,
                         (true, false) => CodeModeStatus::Partial,
                         (false, _) => CodeModeStatus::Failed,
                     },
                     script_completed: ok,
-                    output_text,
-                    output_complete: complete,
+                    output_text: output.text,
+                    output_complete: output.complete,
                     output_artifact: None,
                     children: vec![],
-                    host_notes: if complete {
-                        vec![]
-                    } else {
-                        vec!["Script output was truncated.".into()]
-                    },
+                    host_notes: notes,
                     operation_ref: context
                         .identity
                         .parent_operation_ref
@@ -1035,74 +1071,15 @@ impl NodeCodeModeHost {
     }
 }
 
-/// Fixed bytes of the omission marker, excluding the digits of `N`.
-const OMISSION_MARKER_FIXED_BYTES: usize = "\n[...  bytes omitted ...]\n".len();
-
-fn omission_marker(omitted: usize) -> String {
-    format!("\n[... {omitted} bytes omitted ...]\n")
-}
-
-/// Keep the head and the tail of an over-budget output, separated by an
-/// explicit marker naming the number of input bytes dropped in between.
-///
-/// Returns the composed text and the omitted byte count. Guarantees, in order:
-/// - `output_text.len() <= limit` (the marker counts against the budget);
-/// - the result is valid UTF-8, with both cuts on a `char` boundary;
-/// - the head is a prefix and the tail a suffix of the input;
-/// - short input (`text.len() <= limit`) is returned unchanged with `0` omitted.
-fn truncate_head_and_tail(text: &str, limit: usize) -> (String, usize) {
-    if text.len() <= limit {
-        return (text.to_owned(), 0);
-    }
-
-    // The marker's byte length depends on how many digits `N` has, and `N`
-    // depends on how much room the marker leaves, so iterate to a fixed point.
-    // The digit count is non-decreasing and bounded by the digits of
-    // `text.len()`, so this terminates.
-    let mut digits = 1usize;
-    loop {
-        let marker_len = OMISSION_MARKER_FIXED_BYTES + digits;
-        if marker_len >= limit {
-            // The marker itself cannot fit; keep only a bare head cut. This is
-            // unreachable for any admitted output budget but must not panic.
-            let mut end = limit.min(text.len());
-            while end > 0 && !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            return (text[..end].to_owned(), text.len() - end);
-        }
-
-        let remaining = limit - marker_len;
-        // Head keeps two thirds of the remaining budget, the tail one third.
-        let head_budget = remaining * 2 / 3;
-        let tail_budget = remaining - head_budget;
-
-        // Round the head cut down and the tail cut up so the composed result
-        // never exceeds `limit` once both cuts land on a `char` boundary.
-        let mut head_end = head_budget.min(text.len());
-        while !text.is_char_boundary(head_end) {
-            head_end -= 1;
-        }
-        let mut tail_start = text.len().saturating_sub(tail_budget);
-        while tail_start < text.len() && !text.is_char_boundary(tail_start) {
-            tail_start += 1;
-        }
-
-        let omitted = tail_start - head_end;
-        if omitted.to_string().len() == digits {
-            let composed = format!(
-                "{}{}{}",
-                &text[..head_end],
-                omission_marker(omitted),
-                &text[tail_start..]
-            );
-            return (composed, omitted);
-        }
-        digits = omitted.to_string().len();
-    }
-}
-
 impl CodeModeHost for NodeCodeModeHost {
+    fn admits_controlled_mode(&self) -> bool {
+        self.controlled
+    }
+
+    fn admits_background_scripts(&self) -> bool {
+        self.background && self.controlled
+    }
+
     fn execute(
         &self,
         request: &CodeModeRequest,
@@ -1514,7 +1491,8 @@ mod tests {
         let text = "short output".to_string();
         let limit = 64;
         let complete = text.len() <= limit;
-        let (output, omitted) = truncate_head_and_tail(&text, limit);
+        let (output, omitted) =
+            davinci_agent::codemode::projection::truncate_head_and_tail(&text, limit);
         assert!(complete, "the caller still sees a complete result");
         assert_eq!(output, text);
         assert_eq!(omitted, 0);
@@ -1529,7 +1507,8 @@ mod tests {
             text.push_str(&format!("filler line {i}\n"));
         }
         text.push_str("ERROR: tail-failure");
-        let (output, omitted) = truncate_head_and_tail(&text, limit);
+        let (output, omitted) =
+            davinci_agent::codemode::projection::truncate_head_and_tail(&text, limit);
         assert!(output.contains("ERROR: tail-failure"), "{output:?}");
         assert!(output.contains("\n[... "), "{output:?}");
         assert!(output.contains(" bytes omitted ...]\n"), "{output:?}");
@@ -1543,9 +1522,10 @@ mod tests {
 
     #[test]
     fn multibyte_output_cuts_on_char_boundaries_at_an_unaligned_limit() {
-        let text = "日本語".repeat(4000); // 36_000 bytes, three bytes per char
+        let text = "æ—¥æœ¬èªž".repeat(4000); // 36_000 bytes, three bytes per char
         let limit = 10_000; // 10_000 % 3 != 0: a naive byte cut would split a char
-        let (output, omitted) = truncate_head_and_tail(&text, limit);
+        let (output, omitted) =
+            davinci_agent::codemode::projection::truncate_head_and_tail(&text, limit);
         assert!(output.len() <= limit, "{} > {limit}", output.len());
         assert!(omitted > 0);
         // A String is valid UTF-8 by construction; rebuilding from its bytes
@@ -1555,9 +1535,10 @@ mod tests {
 
     #[test]
     fn truncated_output_head_is_a_prefix_of_the_input() {
-        let text = "日本語".repeat(4000);
+        let text = "æ—¥æœ¬èªž".repeat(4000);
         let limit = 10_000;
-        let (output, _omitted) = truncate_head_and_tail(&text, limit);
+        let (output, _omitted) =
+            davinci_agent::codemode::projection::truncate_head_and_tail(&text, limit);
         let marker = output.find("\n[... ").expect("omission marker present");
         assert!(text.starts_with(&output[..marker]), "head is not a prefix");
     }

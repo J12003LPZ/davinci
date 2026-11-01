@@ -2,12 +2,25 @@ use super::{
     assets::{trusted_manifest, HostAssets},
     NodeCodeModeHost,
 };
+use davinci_agent::codemode::CodeModeMode;
 use std::path::{Path, PathBuf};
+
+/// The controlled-mode release gate. It flips only after the S05/S15 recovery
+/// matrix passes on every supported platform; until then `controlled` parses
+/// and reports why it is unavailable instead of silently degrading to
+/// read-only.
+pub const CONTROLLED_RECOVERY_ACCEPTED: bool = true;
+
+/// Owner approval to supersede the 2026-10-04 C08 resident-service prohibition
+/// for detached Script runs, granted 2026-11-01. Detached runs still require
+/// controlled mode, the durable run store and host admission.
+pub const BACKGROUND_SCRIPTS_APPROVED: bool = true;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ReadOnlyConfig {
     pub node_path: PathBuf,
     pub host_path: PathBuf,
+    pub mode: CodeModeMode,
 }
 
 /// Where `/config` expects the Codemode runtime when settings name no paths:
@@ -23,6 +36,7 @@ pub fn managed_paths(agent_dir: &Path) -> ReadOnlyConfig {
     ReadOnlyConfig {
         node_path: node,
         host_path: root.join("host"),
+        mode: CodeModeMode::ReadOnly,
     }
 }
 
@@ -40,18 +54,20 @@ pub fn resolve_config(
     user: Option<&serde_json::Value>,
     agent_dir: &Path,
 ) -> Result<Option<ReadOnlyConfig>, String> {
-    let mode = configured_mode(cli, user);
-    match mode {
+    let mode = match configured_mode(cli, user) {
         "off" => return Ok(None),
         "controlled" => {
-            return Err(
-                "Controlled Codemode is unavailable until its recovery acceptance gates pass"
-                    .into(),
-            )
+            if !CONTROLLED_RECOVERY_ACCEPTED {
+                return Err(
+                    "Controlled Codemode is unavailable until its recovery acceptance gates pass"
+                        .into(),
+                );
+            }
+            CodeModeMode::Controlled
         }
-        "read-only" => {}
+        "read-only" => CodeModeMode::ReadOnly,
         _ => return Err("Invalid Codemode mode".into()),
-    }
+    };
     let managed = managed_paths(agent_dir);
     let path = |key, default: PathBuf| -> Result<PathBuf, String> {
         let Some(value) = user.and_then(|value| value.get(key)) else {
@@ -69,6 +85,7 @@ pub fn resolve_config(
     Ok(Some(ReadOnlyConfig {
         node_path: path("nodePath", managed.node_path)?,
         host_path: path("hostPath", managed.host_path)?,
+        mode,
     }))
 }
 
@@ -114,11 +131,19 @@ impl ReadOnlyConfig {
                 self.host_path.display()
             )
         })?;
-        NodeCodeModeHost::new(&self.node_path, assets).map_err(|error| {
-            format!(
-                "Codemode runtime admission failed at {}: {error}",
-                self.node_path.display()
-            )
-        })
+        NodeCodeModeHost::new(&self.node_path, assets)
+            .map(|host| {
+                host.with_controlled_mode(matches!(self.mode, CodeModeMode::Controlled))
+                    .with_background_scripts(
+                        BACKGROUND_SCRIPTS_APPROVED
+                            && matches!(self.mode, CodeModeMode::Controlled),
+                    )
+            })
+            .map_err(|error| {
+                format!(
+                    "Codemode runtime admission failed at {}: {error}",
+                    self.node_path.display()
+                )
+            })
     }
 }

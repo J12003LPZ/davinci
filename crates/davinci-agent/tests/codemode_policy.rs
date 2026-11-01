@@ -1,4 +1,4 @@
-use davinci_agent::codemode::{CapabilityPolicy, CodeModeMode};
+use davinci_agent::codemode::{resolve_script_alias, CapabilityPolicy, CodeModeMode};
 use davinci_agent::runtime::{CapabilitySource, RuntimeCapability};
 use davinci_agent::ToolClass;
 
@@ -87,6 +87,216 @@ fn duplicate_canonical_names_fail_before_discovery() {
         vec![capability("read", true), capability("read", true)]
     )
     .is_err());
+}
+
+#[test]
+fn codemode_aliases_are_policy_bounded() {
+    let full = CapabilityPolicy::new(
+        CodeModeMode::Controlled,
+        vec![
+            capability("read", true),
+            capability("grep", true),
+            capability("find", true),
+            capability("ls", true),
+            capability("exec_command", false),
+            capability("apply_patch", false),
+        ],
+    )
+    .unwrap();
+    for (alias, canonical) in [
+        ("tools.Read", "read"),
+        ("tools.Grep", "grep"),
+        ("tools.Glob", "find"),
+        ("tools.LS", "ls"),
+        ("tools.Execute", "exec_command"),
+        ("tools.ApplyPatch", "apply_patch"),
+    ] {
+        assert_eq!(
+            resolve_script_alias(alias, CodeModeMode::Controlled, &full).unwrap(),
+            canonical,
+            "{alias}"
+        );
+    }
+    // Read-only admits reads but never an effectful alias.
+    let read_only = CapabilityPolicy::new(
+        CodeModeMode::ReadOnly,
+        vec![
+            capability("read", true),
+            capability("exec_command", false),
+            capability("apply_patch", false),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_script_alias("tools.Read", CodeModeMode::ReadOnly, &read_only).unwrap(),
+        "read"
+    );
+    assert!(resolve_script_alias("tools.ApplyPatch", CodeModeMode::ReadOnly, &read_only).is_err());
+    assert!(resolve_script_alias("tools.Execute", CodeModeMode::ReadOnly, &read_only).is_err());
+
+    // Revoking the shell capability revokes `tools.Execute`; the alias never
+    // synthesizes a grant.
+    let no_shell = CapabilityPolicy::new(
+        CodeModeMode::Controlled,
+        vec![capability("read", true), capability("apply_patch", false)],
+    )
+    .unwrap();
+    assert!(resolve_script_alias("tools.Execute", CodeModeMode::Controlled, &no_shell).is_err());
+
+    // Unknown and unmapped names deny.
+    assert!(resolve_script_alias("tools.Delete", CodeModeMode::Controlled, &full).is_err());
+    assert!(resolve_script_alias("Read", CodeModeMode::Controlled, &full).is_err());
+    assert!(resolve_script_alias("tools.Read", CodeModeMode::Off, &full).is_err());
+
+    // A discovered tool whose script name is exactly the alias makes the
+    // alias ambiguous, so it denies instead of silently binding one meaning.
+    let ambiguous = CapabilityPolicy::new(
+        CodeModeMode::Controlled,
+        vec![capability("Read", true), capability("read", true)],
+    )
+    .unwrap();
+    let error =
+        resolve_script_alias("tools.Read", CodeModeMode::Controlled, &ambiguous).unwrap_err();
+    assert_eq!(error.code, "DENIED");
+    assert!(error.message.contains("collides"));
+
+    // The alias snapshot is frozen for the Script's lifetime: a later policy
+    // change cannot retarget it.
+    let snapshot = full.script_aliases();
+    assert_eq!(
+        snapshot.get("tools.Execute").map(String::as_str),
+        Some("exec_command")
+    );
+    assert_eq!(full.script_aliases(), snapshot);
+}
+
+#[test]
+fn script_subagent_requires_user_authority_and_budget() {
+    use davinci_agent::codemode::{
+        admit_script_subagent, ScriptSubagentPolicy, ScriptSubagentRequest,
+    };
+    let request = ScriptSubagentRequest {
+        description: "search the parser for the offset bug".into(),
+    };
+    // Off by default: a script cannot fan out without explicit authority.
+    let default_policy = ScriptSubagentPolicy::default();
+    assert_eq!(
+        admit_script_subagent(&request, &default_policy, 1)
+            .unwrap_err()
+            .code,
+        "DENIED"
+    );
+    // An authorized parent still needs depth and budget.
+    let allowed = ScriptSubagentPolicy {
+        allow: true,
+        depth: 0,
+        max_depth: 2,
+    };
+    assert!(admit_script_subagent(&request, &allowed, 1).is_ok());
+    assert_eq!(
+        admit_script_subagent(&request, &allowed, 0)
+            .unwrap_err()
+            .code,
+        "LIMIT_EXCEEDED"
+    );
+    let too_deep = ScriptSubagentPolicy {
+        depth: 2,
+        max_depth: 2,
+        allow: true,
+    };
+    assert_eq!(
+        admit_script_subagent(&request, &too_deep, 1)
+            .unwrap_err()
+            .code,
+        "DENIED"
+    );
+    // An empty or oversized brief is refused before any worker starts.
+    let empty = ScriptSubagentRequest {
+        description: "  ".into(),
+    };
+    assert!(admit_script_subagent(&empty, &allowed, 1).is_err());
+    let huge = ScriptSubagentRequest {
+        description: "x".repeat(8192),
+    };
+    assert!(admit_script_subagent(&huge, &allowed, 1).is_err());
+}
+
+#[test]
+fn script_todo_update_shares_work_without_extra_turn() {
+    use davinci_agent::codemode::{resolve_script_alias, CapabilityPolicy, ScriptToolGates};
+    // Off by default: the todo tool stays outside the script catalog.
+    let closed = CapabilityPolicy::new(
+        CodeModeMode::Controlled,
+        vec![capability("todo", false), capability("read", true)],
+    )
+    .unwrap();
+    let denied =
+        resolve_script_alias("tools.TodoWrite", CodeModeMode::Controlled, &closed).unwrap_err();
+    assert_eq!(denied.code, "DENIED");
+    // Explicitly enabled, the alias maps to the same host-owned todo tool and
+    // gains no new permission.
+    let open = CapabilityPolicy::new_with_gates(
+        CodeModeMode::Controlled,
+        vec![capability("todo", false), capability("read", true)],
+        ScriptToolGates {
+            allow_todo: true,
+            allow_subagents: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_script_alias("tools.TodoWrite", CodeModeMode::Controlled, &open).unwrap(),
+        "todo"
+    );
+    // Reads remain available in the same script, so the update shares a turn.
+    assert!(open.resolve("read").is_ok());
+}
+
+#[test]
+fn queued_mutation_revocation_is_denied() {
+    use davinci_agent::codemode::effect_is_admitted;
+    use davinci_agent::runtime::DeclaredEffect;
+
+    let mutating = capability("write", false);
+    // Controlled admits the declared mutation classes and nothing wider.
+    assert!(effect_is_admitted(
+        &CodeModeMode::Controlled,
+        &DeclaredEffect::FileSystemWrite
+    ));
+    assert!(effect_is_admitted(
+        &CodeModeMode::Controlled,
+        &DeclaredEffect::ProcessExecution
+    ));
+    for denied in [
+        DeclaredEffect::HostInteraction,
+        DeclaredEffect::Other("other".into()),
+    ] {
+        assert!(!effect_is_admitted(&CodeModeMode::Controlled, &denied));
+    }
+    // An MCP mutation is a real, authorization-guarded effect, not a class
+    // the mode silently widens or drops.
+    assert!(effect_is_admitted(
+        &CodeModeMode::Controlled,
+        &DeclaredEffect::McpMutation
+    ));
+    assert!(!effect_is_admitted(
+        &CodeModeMode::ReadOnly,
+        &DeclaredEffect::FileSystemWrite
+    ));
+    assert!(!effect_is_admitted(
+        &CodeModeMode::Off,
+        &DeclaredEffect::FileSystemRead
+    ));
+
+    // A mutation is admitted only while the live policy still holds it. Once
+    // the capability is revoked, the queued call resolves to DENIED and the
+    // effect class is no longer admitted either.
+    let before = CapabilityPolicy::new(CodeModeMode::Controlled, vec![mutating.clone()]).unwrap();
+    assert!(before.resolve("write").is_ok());
+    let after = CapabilityPolicy::new(CodeModeMode::Controlled, vec![]).unwrap();
+    let error = after.resolve("write").unwrap_err();
+    assert_eq!(error.code, "DENIED");
+    assert!(!error.message.contains("effect"));
 }
 
 #[test]

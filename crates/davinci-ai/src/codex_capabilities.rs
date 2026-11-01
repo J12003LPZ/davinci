@@ -1,4 +1,4 @@
-//! Codex Capabilities snapshot and discovery matching §6.1.
+//! Codex Capabilities snapshot and discovery matching Ã‚Â§6.1.
 //! Immutable per-lineage snapshot derived from authenticated backend, model metadata, and conservative probes.
 
 use crate::catalog::Model;
@@ -25,6 +25,11 @@ pub struct CodexCapabilities {
     pub custom_grammar_tools: bool,
     pub tool_namespaces: bool,
     pub tool_search: ToolSearchMode,
+    /// Hosted tool shapes. Each is false until this exact route has been
+    /// observed to accept it; public API documentation is not evidence.
+    pub additional_tools: bool,
+    pub programmatic_tool_calling: bool,
+    pub custom_script: bool,
     pub explicit_cache_breakpoints: bool,
     pub server_side_compaction: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -46,6 +51,9 @@ impl Default for CodexCapabilities {
             custom_grammar_tools: false,
             tool_namespaces: false,
             tool_search: ToolSearchMode::None,
+            additional_tools: false,
+            programmatic_tool_calling: false,
+            custom_script: false,
             explicit_cache_breakpoints: false,
             server_side_compaction: false,
             service_tier: None,
@@ -54,7 +62,27 @@ impl Default for CodexCapabilities {
     }
 }
 
+/// Hosted tool shapes that only an observed route capability may admit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostedToolKind {
+    ToolSearch,
+    AdditionalTools,
+    ProgrammaticToolCalling,
+    CustomScript,
+}
+
 impl CodexCapabilities {
+    /// Fail closed: an unobserved shape is never emitted. The function-typed
+    /// fallback stays available whenever this returns false.
+    pub fn admits_hosted_tool(&self, kind: HostedToolKind) -> bool {
+        match kind {
+            HostedToolKind::ToolSearch => self.tool_search == ToolSearchMode::Native,
+            HostedToolKind::AdditionalTools => self.additional_tools,
+            HostedToolKind::ProgrammaticToolCalling => self.programmatic_tool_calling,
+            HostedToolKind::CustomScript => self.custom_script,
+        }
+    }
+
     /// Create a capabilities snapshot for ChatGPT/Codex OAuth backend.
     pub fn for_chatgpt_codex(model: &Model) -> Self {
         let grammar = model
@@ -79,6 +107,9 @@ impl CodexCapabilities {
             custom_grammar_tools: grammar,
             tool_namespaces: true,
             tool_search: ToolSearchMode::Emulated,
+            additional_tools: false,
+            programmatic_tool_calling: false,
+            custom_script: false,
             explicit_cache_breakpoints: explicit_cache,
             server_side_compaction: false,
             service_tier: None,
@@ -110,6 +141,9 @@ impl CodexCapabilities {
             custom_grammar_tools: grammar,
             tool_namespaces: false,
             tool_search: ToolSearchMode::Emulated,
+            additional_tools: false,
+            programmatic_tool_calling: false,
+            custom_script: false,
             explicit_cache_breakpoints: explicit_cache,
             server_side_compaction: false,
             service_tier: None,

@@ -187,3 +187,37 @@ class CliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_recorded_promotion_decision_matches_the_gate() -> None:
+    """The checked-in Stage 1 decision must be the gate's own output."""
+    from parity_report import PromotionDecision, rollout_gate
+
+    root = Path(__file__).resolve().parents[3]
+    record = json.loads(
+        (root / "docs/perf/droid-gap/stage1-promotion.json").read_text(encoding="utf-8")
+    )
+    decision = PromotionDecision(
+        behavior_parity=record["behaviorParity"],
+        security_pass=record["securityPass"],
+        success_noninferior=record["successNoninferior"],
+        resource_benefit=record["resourceBenefit"],
+        unknowns=tuple(record["unknowns"]),
+    )
+    mode, blockers = rollout_gate(decision)
+    assert record["decision"] == mode == "off"
+    for unknown in record["unknowns"]:
+        assert unknown in blockers, unknown
+    assert any("behavior parity" in blocker for blocker in blockers)
+    assert any("resource benefit" in blocker for blocker in blockers)
+
+    record_doc = (root / "docs/perf/droid-gap/stage1-promotion.md").read_text(
+        encoding="utf-8"
+    )
+    addendum = (root / "docs/perf/droid-gap/stage1-addendum.md").read_text(
+        encoding="utf-8"
+    )
+    assert "off" in record_doc
+    assert "rollback" in record_doc.lower()
+    assert "No new performance measurement was taken" in addendum
+    assert "unchanged" in addendum

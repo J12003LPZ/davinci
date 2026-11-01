@@ -32,3 +32,47 @@ fn cache_write_is_a_disjoint_price_bucket() {
     assert!((usage.cost.cache_read - (400.0 / 1_000_000.0 * 0.4)).abs() < 1e-12);
     assert!((usage.cost.cache_write - (500.0 / 1_000_000.0 * 5.0)).abs() < 1e-12);
 }
+
+#[test]
+fn cache_ttl_not_sent_to_unverified_codex_route() {
+    use davinci_ai::cache::CacheRetention;
+    use davinci_ai::{OpenAiCacheCapabilities, PromptCacheWirePlan};
+
+    let model = load_builtin_models()
+        .into_iter()
+        .find(|model| model.provider == "openai-codex")
+        .expect("openai-codex model");
+    let caps = OpenAiCacheCapabilities::resolve(
+        &model,
+        Some("https://chatgpt.com/backend-api/codex"),
+        true,
+    );
+    // Nothing about the subscription route's TTL support is proven.
+    assert!(!caps.supports_ttl_30m, "{caps:?}");
+    for retention in [
+        CacheRetention::None,
+        CacheRetention::Short,
+        CacheRetention::Long,
+    ] {
+        let plan = PromptCacheWirePlan::resolve(&caps, retention, true);
+        assert_eq!(
+            plan.prompt_cache_ttl, None,
+            "unverified route must not receive an explicit TTL ({retention:?})"
+        );
+    }
+
+    // A verified public-API model with explicit caching may carry the TTL;
+    // the same planner then reflects the evidence it actually has.
+    let public = load_builtin_models()
+        .into_iter()
+        .find(|model| model.provider == "openai" && model.id == "gpt-5.6-sol")
+        .expect("gpt-5.6-sol");
+    let public_caps = OpenAiCacheCapabilities::resolve(&public, public.base_url.as_deref(), false);
+    if public_caps.supports_ttl_30m {
+        assert_eq!(
+            PromptCacheWirePlan::resolve(&public_caps, CacheRetention::Short, true)
+                .prompt_cache_ttl,
+            Some("30m")
+        );
+    }
+}

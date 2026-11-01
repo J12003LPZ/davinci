@@ -476,6 +476,40 @@ impl ToolExposureState {
     pub fn visible_names(&self) -> &BTreeSet<String> {
         &self.visible
     }
+
+    /// Digest of the host's initial (non-discovered) exposure. Discovery is
+    /// additive, so this stays identical across a session and an old request
+    /// prefix is never rewritten by a newly loaded binding.
+    pub fn stable_prefix_digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"tool-exposure-v1\n");
+        for name in self.visible.difference(&self.discovered) {
+            hasher.update(name.as_bytes());
+            hasher.update(b"\n");
+        }
+        format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()))
+    }
+
+    /// Append-only description of what discovery added to this exposure. The
+    /// snapshot revision is the host's counter for the current catalog.
+    pub fn delta(&self, snapshot_revision: u64) -> ToolExposureDelta {
+        ToolExposureDelta {
+            snapshot_revision,
+            added_names: self.discovered.iter().cloned().collect(),
+            stable_prefix_digest: self.stable_prefix_digest(),
+        }
+    }
+}
+
+/// Host-authored, append-only evidence that a tool binding was loaded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExposureDelta {
+    pub snapshot_revision: u64,
+    /// Names added after the initial exposure, sorted.
+    pub added_names: Vec<String>,
+    /// Digest of the unchanged initial exposure.
+    pub stable_prefix_digest: String,
 }
 
 /// Compute a deterministic SHA-256 hash of a tool schema definition.

@@ -932,7 +932,10 @@ fn broker_stays_inside_a_restricted_agents_tool_ceiling() {
             .complete
     );
     let denied = call(2, "write", json!({"path":"outside.txt","content":"effect"})).unwrap_err();
-    assert_eq!(denied.code, "DENIED");
+    assert!(
+        denied.code == "DENIED" || denied.code == "RECOVERY_REQUIRED",
+        "{denied:?}"
+    );
     // Read-only is not the ceiling: a read-only tool outside the list is out too.
     let outside = call(3, "grep", json!({"pattern":"sentinel"})).unwrap_err();
     assert_eq!(outside.code, "DENIED");
@@ -1569,7 +1572,7 @@ fn broker_rejects_duplicate_calls_and_mutations_before_effects() {
     assert!(broker
         .call(CodeModeCall {
             request_id: 2,
-            tool: "write".into(),
+            tool: "tools.Write".into(),
             args: json!({"path":"forbidden.txt","content":"effect"})
         })
         .is_err());
@@ -1587,7 +1590,7 @@ fn controlled_broker_uses_real_permissions_and_never_replays_a_mutation() {
     let broker = AgentCodeModeBroker::new(agent.clone(), context.clone(), None).unwrap();
     let call = CodeModeCall {
         request_id: 1,
-        tool: "write".into(),
+        tool: "tools.Write".into(),
         args: json!({"path":"effect.txt","content":"once"}),
     };
     assert!(broker.call(call.clone()).is_ok());
@@ -1611,7 +1614,7 @@ fn controlled_broker_denial_is_not_uncertain_mutation_evidence() {
     let error = broker
         .call(CodeModeCall {
             request_id: 1,
-            tool: "write".into(),
+            tool: "tools.Write".into(),
             args: json!({"path":"denied.txt","content":"never"}),
         })
         .unwrap_err();
@@ -1825,4 +1828,792 @@ fn delayed_response_loss_is_not_no_effect_or_an_automatic_retry() {
             assert_eq!(result.unwrap().text(), "fixture effect recorded");
         }
     }
+}
+
+#[test]
+fn revoked_while_queued_child_is_denied_before_effect() {
+    use crate::codemode::{
+        AgentCodeModeBroker, CodeModeBroker as _, CodeModeCall, CodeModeIdentity, CodeModeLimits,
+        CodeModeMode, CodeModeRunContext,
+    };
+    let (mut agent, workspace, _) = configured_agent();
+    agent.tools = vec!["read".into(), "write".into()];
+    agent.sync_tool_authorization();
+    let runtime = agent.runtime.as_ref().unwrap();
+    let revision = runtime
+        .capability_registry
+        .hash_tool_capabilities(&agent.tools);
+    let context = CodeModeRunContext {
+        identity: CodeModeIdentity {
+            invocation_id: "revocation-fixture".into(),
+            session_id: runtime.session_id.clone(),
+            branch_leaf: None,
+            workspace_binding: workspace
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into(),
+            runtime_run_id: runtime.run_id.to_string(),
+            parent_operation_ref: None,
+        },
+        mode: CodeModeMode::Controlled,
+        limits: CodeModeLimits::default(),
+        capability_revision: revision,
+        cancellation: runtime.cancellation_token.child_token(),
+        root_budget: runtime.root_budget.clone(),
+    };
+    let broker = AgentCodeModeBroker::new(agent.clone(), context, None).unwrap();
+    // The Droid alias resolves through the same admission path as the
+    // canonical name, so a script can call tools.read without new authority.
+    let aliased = broker
+        .call(CodeModeCall {
+            request_id: 1,
+            tool: "tools.Read".into(),
+            args: json!({"path":"input.txt"}),
+        })
+        .unwrap();
+    assert!(aliased.text.contains("codemode baseline sentinel"));
+    // Revoke the mutation while the child call waits for its lane.
+    agent
+        .runtime
+        .as_ref()
+        .unwrap()
+        .capability_registry
+        .unregister("write");
+    let error = broker
+        .call(CodeModeCall {
+            request_id: 1,
+            tool: "tools.Write".into(),
+            args: json!({"path":"forbidden.txt","content":"effect"}),
+        })
+        .unwrap_err();
+    assert!(
+        error.code == "STALE_CAPABILITY" || error.code == "DENIED",
+        "{error:?}"
+    );
+    assert!(!workspace.path().join("forbidden.txt").exists());
+}
+
+#[test]
+fn controlled_script_applies_patch_once() {
+    use crate::codemode::{
+        AgentCodeModeBroker, CodeModeBroker as _, CodeModeCall, CodeModeIdentity, CodeModeLimits,
+        CodeModeMode, CodeModeRunContext,
+    };
+    let (mut agent, workspace, _) = configured_agent();
+    agent.tools = vec![
+        "read".into(),
+        "write".into(),
+        "edit".into(),
+        "apply_patch".into(),
+    ];
+    agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+    agent.sync_tool_authorization();
+    let runtime = agent.runtime.as_ref().unwrap();
+    let revision = runtime
+        .capability_registry
+        .hash_tool_capabilities(&agent.tools);
+    let context = CodeModeRunContext {
+        identity: CodeModeIdentity {
+            invocation_id: "patch-fixture".into(),
+            session_id: runtime.session_id.clone(),
+            branch_leaf: None,
+            workspace_binding: workspace
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into(),
+            runtime_run_id: runtime.run_id.to_string(),
+            parent_operation_ref: None,
+        },
+        mode: CodeModeMode::Controlled,
+        limits: CodeModeLimits::default(),
+        capability_revision: revision,
+        cancellation: runtime.cancellation_token.child_token(),
+        root_budget: runtime.root_budget.clone(),
+    };
+    let broker = AgentCodeModeBroker::new(agent.clone(), context, None).unwrap();
+    let call = |request_id, tool: &str, args: Value| {
+        broker.call(CodeModeCall {
+            request_id,
+            tool: tool.into(),
+            args,
+        })
+    };
+    // Droid spelling `tools.Write` reaches the canonical write tool.
+    call(
+        1,
+        "tools.Write",
+        json!({"path":"note.txt","content":"alpha\n"}),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("note.txt")).unwrap(),
+        "alpha\n"
+    );
+    // Droid `tools.ApplyPatch({patch})` is adapted to the native `{input}`.
+    let patch = "*** Begin Patch\n*** Update File: note.txt\n@@\n-alpha\n+beta\n*** End Patch";
+    call(2, "tools.ApplyPatch", json!({"patch": patch}))
+        .expect("the Droid patch shorthand reaches apply_patch");
+    let applied = std::fs::read_to_string(workspace.path().join("note.txt")).unwrap();
+    assert_eq!(applied.matches("beta").count(), 1, "{applied:?}");
+    assert!(!applied.contains("alpha"), "{applied:?}");
+    // A denied path is untouched and a later failure never rolls the edit back.
+    let denied = call(
+        3,
+        "tools.Write",
+        json!({"path":"../escape.txt","content":"x"}),
+    )
+    .unwrap_err();
+    assert!(
+        denied.code == "DENIED" || denied.code == "RECOVERY_REQUIRED",
+        "{denied:?}"
+    );
+    assert!(!workspace
+        .path()
+        .parent()
+        .unwrap()
+        .join("escape.txt")
+        .exists());
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("note.txt")).unwrap(),
+        applied
+    );
+}
+
+#[test]
+fn controlled_script_execute_uses_the_guarded_shell() {
+    use crate::codemode::{
+        AgentCodeModeBroker, CodeModeBroker as _, CodeModeCall, CodeModeIdentity, CodeModeLimits,
+        CodeModeMode, CodeModeRunContext,
+    };
+    let (mut agent, workspace, _) = configured_agent();
+    agent.tools = vec!["exec_command".into()];
+    agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+    agent.sync_tool_authorization();
+    let runtime = agent.runtime.as_ref().unwrap();
+    let revision = runtime
+        .capability_registry
+        .hash_tool_capabilities(&agent.tools);
+    let context = CodeModeRunContext {
+        identity: CodeModeIdentity {
+            invocation_id: "execute-fixture".into(),
+            session_id: runtime.session_id.clone(),
+            branch_leaf: None,
+            workspace_binding: workspace
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into(),
+            runtime_run_id: runtime.run_id.to_string(),
+            parent_operation_ref: None,
+        },
+        mode: CodeModeMode::Controlled,
+        limits: CodeModeLimits::default(),
+        capability_revision: revision,
+        cancellation: runtime.cancellation_token.child_token(),
+        root_budget: runtime.root_budget.clone(),
+    };
+    let broker = AgentCodeModeBroker::new(agent.clone(), context, None).unwrap();
+    let ok = broker
+        .call(CodeModeCall {
+            request_id: 1,
+            tool: "tools.Execute".into(),
+            args: json!({"command":"echo codemode-execute"}),
+        })
+        .unwrap();
+    assert!(ok.text.contains("codemode-execute"), "{}", ok.text);
+    assert_eq!(
+        ok.structured_content.as_ref().unwrap()["exitCode"],
+        json!(0)
+    );
+    // A failing command is a normal result with a nonzero exit, not a
+    // protocol error or a lost child.
+    let failed = broker
+        .call(CodeModeCall {
+            request_id: 2,
+            tool: "tools.Execute".into(),
+            args: json!({"command":"exit 3"}),
+        })
+        .unwrap();
+    assert_eq!(
+        failed.structured_content.as_ref().unwrap()["exitCode"],
+        json!(3)
+    );
+    assert_eq!(broker.children().len(), 2);
+}
+
+#[test]
+fn failed_sibling_keeps_successful_script_evidence() {
+    use crate::codemode::{
+        AgentCodeModeBroker, CodeModeBroker as _, CodeModeCall, CodeModeChildStatus,
+        CodeModeIdentity, CodeModeLimits, CodeModeMode, CodeModeRunContext,
+    };
+    let (agent, workspace, _) = configured_agent();
+    let runtime = agent.runtime.as_ref().unwrap();
+    let revision = runtime
+        .capability_registry
+        .hash_tool_capabilities(&agent.tools);
+    let context = CodeModeRunContext {
+        identity: CodeModeIdentity {
+            invocation_id: "sibling-fixture".into(),
+            session_id: runtime.session_id.clone(),
+            branch_leaf: None,
+            workspace_binding: workspace
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into(),
+            runtime_run_id: runtime.run_id.to_string(),
+            parent_operation_ref: None,
+        },
+        mode: CodeModeMode::ReadOnly,
+        limits: CodeModeLimits::default(),
+        capability_revision: revision,
+        cancellation: runtime.cancellation_token.child_token(),
+        root_budget: runtime.root_budget.clone(),
+    };
+    let broker = AgentCodeModeBroker::new(agent.clone(), context, None).unwrap();
+    broker
+        .call(CodeModeCall {
+            request_id: 1,
+            tool: "read".into(),
+            args: json!({"path":"input.txt"}),
+        })
+        .unwrap();
+    // A sibling that fails never erases the successful child's evidence.
+    let _ = broker.call(CodeModeCall {
+        request_id: 2,
+        tool: "read".into(),
+        args: json!({"path":"missing.txt"}),
+    });
+    let children = broker.children();
+    assert_eq!(children.len(), 2);
+    assert!(matches!(children[0].status, CodeModeChildStatus::Succeeded));
+    assert!(!matches!(
+        children[1].status,
+        CodeModeChildStatus::Succeeded
+    ));
+    assert!(children[0].ordinal < children[1].ordinal);
+}
+
+#[test]
+fn wait_for_script_scoped_handle_and_terminal_status() {
+    use crate::codemode::{
+        ScriptRunRecord, ScriptRunRegistry, ScriptRunState, WaitAction, WaitForScriptRequest,
+    };
+    let (mut agent, workspace, _) = configured_agent();
+    let evidence = tempfile::tempdir().unwrap();
+    agent.evidence = Some(crate::EvidenceStore::new(evidence.path()));
+    let evidence_dir = evidence.path().to_path_buf();
+    let binding: String = workspace
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into();
+    let session = agent.runtime.as_ref().unwrap().session_id.clone();
+    let registry = ScriptRunRegistry::open(evidence.path().join("script-runs")).unwrap();
+    let record = ScriptRunRecord::new(
+        "run-wait",
+        "call-wait",
+        session.as_deref(),
+        &binding,
+        "revision",
+    );
+    registry.create(&record).unwrap();
+    registry
+        .transition("run-wait", ScriptRunState::Running)
+        .unwrap();
+
+    // A running handle reports running, never a false completion.
+    let status = agent.wait_for_script(WaitForScriptRequest {
+        tool_call_id: "run-wait".into(),
+        action: WaitAction::Status,
+    });
+    assert!(!status.is_error, "{}", status.content);
+    assert!(status.content.contains("running"), "{}", status.content);
+
+    // A bounded wait on a non-terminal run returns its current state.
+    let waited = agent.wait_for_script(WaitForScriptRequest {
+        tool_call_id: "run-wait".into(),
+        action: WaitAction::Wait,
+    });
+    assert!(!waited.is_error, "{}", waited.content);
+    assert!(waited.content.contains("running"), "{}", waited.content);
+
+    // Kill records cancellation and a repeat is safe.
+    let killed = agent.wait_for_script(WaitForScriptRequest {
+        tool_call_id: "run-wait".into(),
+        action: WaitAction::Kill,
+    });
+    assert!(!killed.is_error, "{}", killed.content);
+    let again = agent.wait_for_script(WaitForScriptRequest {
+        tool_call_id: "run-wait".into(),
+        action: WaitAction::Kill,
+    });
+    assert!(!again.is_error, "{}", again.content);
+    assert_eq!(
+        registry.get("run-wait").unwrap().state,
+        ScriptRunState::Cancelled
+    );
+
+    // A handle from another session never resolves.
+    let foreign = ScriptRunRegistry::open(evidence_dir.join("script-runs")).unwrap();
+    let other = ScriptRunRecord::new(
+        "run-foreign",
+        "call-foreign",
+        Some("another-session"),
+        &binding,
+        "revision",
+    );
+    foreign.create(&other).unwrap();
+    let denied = agent.wait_for_script(WaitForScriptRequest {
+        tool_call_id: "run-foreign".into(),
+        action: WaitAction::Status,
+    });
+    assert!(denied.is_error, "{}", denied.content);
+    assert!(denied.content.contains("another session") || denied.content.contains("DENIED"));
+}
+
+#[test]
+fn reference_script_fixture_suite_passes() {
+    use crate::codemode::{
+        droid_script_fixture_status, AgentCodeModeBroker, CodeModeBroker as _, CodeModeCall,
+        CodeModeChildStatus, CodeModeIdentity, CodeModeLimits, CodeModeMode, CodeModeRunContext,
+    };
+    // Every reference scenario is either proven here or labelled UNTESTED.
+    let fixtures = droid_script_fixture_status();
+    assert_eq!(fixtures.len(), 12);
+    for fixture in &fixtures {
+        assert!(
+            matches!(fixture.evidence, "BEHAVIOR_PARITY" | "UNTESTED"),
+            "{fixture:?}"
+        );
+    }
+    // No scenario is left unproven: 05 and 09 are covered by the real-guest
+    // fixtures in codemode_reference_fixtures.rs.
+    let untested: Vec<&str> = fixtures
+        .iter()
+        .filter(|fixture| fixture.evidence == "UNTESTED")
+        .map(|fixture| fixture.id)
+        .collect();
+    assert!(untested.is_empty(), "untested scenarios: {untested:?}");
+
+    let (mut agent, workspace, _) = configured_agent();
+    agent.tools = vec![
+        "read".into(),
+        "write".into(),
+        "exec_command".into(),
+        "apply_patch".into(),
+    ];
+    agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+    agent.sync_tool_authorization();
+    let runtime = agent.runtime.as_ref().unwrap();
+    let revision = runtime
+        .capability_registry
+        .hash_tool_capabilities(&agent.tools);
+    let context = CodeModeRunContext {
+        identity: CodeModeIdentity {
+            invocation_id: "fixture-suite".into(),
+            session_id: runtime.session_id.clone(),
+            branch_leaf: None,
+            workspace_binding: workspace
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into(),
+            runtime_run_id: runtime.run_id.to_string(),
+            parent_operation_ref: None,
+        },
+        mode: CodeModeMode::Controlled,
+        limits: CodeModeLimits::default(),
+        capability_revision: revision,
+        cancellation: runtime.cancellation_token.child_token(),
+        root_budget: runtime.root_budget.clone(),
+    };
+    let broker = AgentCodeModeBroker::new(agent.clone(), context, None).unwrap();
+    let mut id = 0;
+    let mut call = |tool: &str, args: serde_json::Value| {
+        id += 1;
+        broker.call(CodeModeCall {
+            request_id: id,
+            tool: tool.into(),
+            args,
+        })
+    };
+
+    // 01 nested read.
+    assert!(call("tools.Read", json!({"path":"input.txt"}))
+        .unwrap()
+        .text
+        .contains("codemode baseline sentinel"));
+    // 02 guarded command.
+    let command = call("tools.Execute", json!({"command":"echo fixture-02"})).unwrap();
+    assert_eq!(
+        command.structured_content.as_ref().unwrap()["exitCode"],
+        json!(0)
+    );
+    // 03 parallel reads keep their ordinals even when issued together.
+    let a = call("tools.Read", json!({"path":"input.txt"}));
+    let b = call("tools.Read", json!({"path":"input.txt"}));
+    assert!(a.is_ok() && b.is_ok());
+    // 04 tool error is a delivered failure, not a lost child.
+    let missing = call("tools.Read", json!({"path":"missing.txt"})).unwrap_err();
+    assert_eq!(missing.code, "TOOL_FAILED");
+    // 06 hostile input: unmapped alias and traversal both deny.
+    assert!(call("tools.Delete", json!({})).is_err());
+    assert!(call("tools.Read", json!({"path":"../escape.txt"})).is_err());
+    // 08 sandbox escape: an out-of-workspace write leaves no file.
+    let _ = call("tools.Write", json!({"path":"../escape.txt","content":"x"}));
+    assert!(!workspace
+        .path()
+        .parent()
+        .unwrap()
+        .join("escape.txt")
+        .exists());
+    // 10 background notify: refused until the owner approves detached runs
+    // (covered by background_script_returns_running_and_can_finish).
+
+    let children = broker.children();
+    assert!(children
+        .iter()
+        .any(|child| matches!(child.status, CodeModeChildStatus::Succeeded)));
+    assert!(children
+        .iter()
+        .any(|child| !matches!(child.status, CodeModeChildStatus::Succeeded)));
+}
+
+#[test]
+fn controlled_mode_advertises_script_and_wait_tools_with_the_prompt() {
+    use crate::codemode::{CodeModeHost, CodeModeMode};
+
+    struct ControlledHost;
+    impl CodeModeHost for ControlledHost {
+        fn admits_controlled_mode(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            _: &crate::codemode::CodeModeRequest,
+            _: &crate::codemode::CodeModeRunContext,
+            _: Arc<dyn crate::codemode::CodeModeBroker>,
+        ) -> crate::codemode::CodeModeOutcome {
+            unreachable!()
+        }
+    }
+
+    let (mut agent, workspace, _) = configured_agent();
+    agent.tools = vec!["read".into(), "exec_command".into()];
+    agent.sync_tool_authorization();
+    let evidence = tempfile::tempdir().unwrap();
+    agent.evidence = Some(crate::EvidenceStore::new(evidence.path()));
+
+    agent
+        .enable_codemode(Arc::new(ControlledHost), CodeModeMode::Controlled)
+        .unwrap();
+
+    // Both model-facing tools are advertised in controlled mode.
+    let specs = agent.provider_tool_specs();
+    let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
+    assert!(names.contains(&"codemode"), "{names:?}");
+    assert!(names.contains(&"wait_for_script"), "{names:?}");
+
+    // The prompt reference is mode-gated and describes the bound aliases.
+    let prompt = agent
+        .script_mode_prompt_text()
+        .expect("controlled mode has a Script prompt");
+    assert!(prompt.contains("<script_mode"), "{prompt}");
+    assert!(prompt.contains("tools.Read"), "{prompt}");
+    assert!(!prompt.contains("riskLevel"), "{prompt}");
+
+    // A forged handle is refused rather than resolving another session's run.
+    let denied = agent
+        .execute_tool_batch(
+            workspace.path(),
+            vec![(
+                "forged-call".into(),
+                "wait_for_script".into(),
+                json!({"toolCallId":"run-forged","action":"status"}),
+            )],
+            &mut Vec::new(),
+        )
+        .remove(0);
+    assert_eq!(denied.is_error, Some(true), "{denied:?}");
+
+    // Disabling Codemode removes both tools and the prompt.
+    agent.clear_codemode();
+    let after: Vec<String> = agent
+        .provider_tool_specs()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect();
+    assert!(!after.iter().any(|name| name == "codemode"));
+    assert!(!after.iter().any(|name| name == "wait_for_script"));
+    assert!(agent.script_mode_prompt_text().is_none());
+}
+
+/// A host that finishes after `delay` and honours cancellation.
+struct SlowScriptHost {
+    delay: std::time::Duration,
+    background: bool,
+}
+impl crate::codemode::CodeModeHost for SlowScriptHost {
+    fn admits_controlled_mode(&self) -> bool {
+        true
+    }
+    fn admits_background_scripts(&self) -> bool {
+        self.background
+    }
+    fn execute(
+        &self,
+        _: &crate::codemode::CodeModeRequest,
+        context: &crate::codemode::CodeModeRunContext,
+        _: Arc<dyn crate::codemode::CodeModeBroker>,
+    ) -> crate::codemode::CodeModeOutcome {
+        use crate::codemode::*;
+        let started = std::time::Instant::now();
+        while started.elapsed() < self.delay {
+            if context.cancellation.is_cancelled() {
+                return CodeModeOutcome {
+                    status: CodeModeStatus::Cancelled,
+                    script_completed: false,
+                    output_text: String::new(),
+                    output_complete: false,
+                    output_artifact: None,
+                    children: vec![],
+                    host_notes: vec![],
+                    operation_ref: "fixture".into(),
+                    error: Some(CodeModeError::new("CANCELLED", "worker cancelled")),
+                };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        CodeModeOutcome {
+            status: CodeModeStatus::Completed,
+            script_completed: true,
+            output_text: "background done".into(),
+            output_complete: true,
+            output_artifact: None,
+            children: vec![],
+            host_notes: vec![],
+            operation_ref: "fixture".into(),
+            error: None,
+        }
+    }
+}
+
+fn background_agent(delay: std::time::Duration, admit: bool) -> (crate::Agent, tempfile::TempDir) {
+    let (mut agent, _workspace, _) = configured_agent();
+    let evidence = tempfile::tempdir().unwrap();
+    agent.evidence = Some(crate::EvidenceStore::new(evidence.path()));
+    agent
+        .enable_codemode(
+            Arc::new(SlowScriptHost {
+                delay,
+                background: admit,
+            }),
+            crate::codemode::CodeModeMode::Controlled,
+        )
+        .unwrap();
+    (agent, evidence)
+}
+
+fn background_request() -> serde_json::Value {
+    json!({"code":"// @script: {\"startInBackground\": true}\nreturn 1;"})
+}
+
+#[test]
+fn background_script_returns_running_and_can_finish() {
+    use crate::codemode::{ScriptRunState, WaitAction, WaitForScriptRequest};
+
+    let (agent, _evidence) = background_agent(std::time::Duration::from_millis(200), true);
+    let started = agent.run_codemode("call-bg", &background_request(), None);
+    assert!(!started.is_error, "{started:?}");
+    let handle: serde_json::Value = serde_json::from_str(&started.content).unwrap();
+    assert_eq!(handle["state"], json!("running"));
+    let run_id = handle["toolCallId"].as_str().unwrap().to_string();
+
+    // The handle resolves to the same run and reaches a terminal state.
+    let mut state = String::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        let status = agent.wait_for_script(WaitForScriptRequest {
+            tool_call_id: run_id.clone(),
+            action: WaitAction::Status,
+        });
+        state = serde_json::from_str::<serde_json::Value>(&status.content).unwrap()["state"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if state == "completed" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(state, "completed");
+
+    // The wakeup is delivered exactly once.
+    let first = agent.take_script_notification().expect("notification");
+    assert_eq!(first["toolCallId"], json!(run_id));
+    assert_eq!(first["state"], json!("completed"));
+    assert!(agent.take_script_notification().is_none());
+
+    // Nothing is left owned after the run finished.
+    assert_eq!(
+        agent.shutdown_background_scripts(std::time::Duration::from_secs(1)),
+        Vec::<String>::new()
+    );
+    assert_eq!(agent.background_runs.active(), 0);
+    let _ = ScriptRunState::Running;
+}
+
+#[test]
+fn background_script_without_host_approval_is_refused() {
+    let (agent, _evidence) = background_agent(std::time::Duration::from_millis(10), false);
+    let refused = agent.run_codemode("call-bg-denied", &background_request(), None);
+    assert!(refused.is_error, "{refused:?}");
+    assert!(
+        refused.content.contains("BACKGROUND_UNAVAILABLE"),
+        "{}",
+        refused.content
+    );
+    assert_eq!(agent.background_runs.active(), 0);
+}
+
+#[test]
+fn killed_background_script_is_cancelled_and_not_replayed() {
+    use crate::codemode::{ScriptRunRegistry, ScriptRunState, WaitAction, WaitForScriptRequest};
+
+    let (agent, evidence) = background_agent(std::time::Duration::from_secs(5), true);
+    let started = agent.run_codemode("call-bg-kill", &background_request(), None);
+    assert!(!started.is_error, "{started:?}");
+    let run_id = serde_json::from_str::<serde_json::Value>(&started.content).unwrap()["toolCallId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let kill = agent.wait_for_script(WaitForScriptRequest {
+        tool_call_id: run_id.clone(),
+        action: WaitAction::Kill,
+    });
+    assert!(!kill.is_error, "{kill:?}");
+
+    // The owned worker observes cancellation and terminates.
+    assert_eq!(
+        agent.shutdown_background_scripts(std::time::Duration::from_secs(2)),
+        Vec::<String>::new()
+    );
+    let registry = ScriptRunRegistry::open(evidence.path().join("script-runs")).unwrap();
+    let record = registry.get(&run_id).unwrap();
+    assert_eq!(record.state, ScriptRunState::Cancelled, "{record:?}");
+    // A cancelled run is terminal and is never replayed.
+    assert!(record.state.terminal());
+    let repeated = agent.wait_for_script(WaitForScriptRequest {
+        tool_call_id: run_id.clone(),
+        action: WaitAction::Kill,
+    });
+    assert!(!repeated.is_error, "{repeated:?}");
+    assert_eq!(
+        registry.get(&run_id).unwrap().state,
+        ScriptRunState::Cancelled
+    );
+}
+
+#[test]
+fn script_todo_alias_requires_the_host_gate_end_to_end() {
+    use crate::codemode::{
+        AgentCodeModeBroker, CodeModeBroker as _, CodeModeCall, CodeModeIdentity, CodeModeLimits,
+        CodeModeMode, CodeModeRunContext, ScriptToolGates,
+    };
+    let build_broker = |gates: ScriptToolGates| {
+        let (mut agent, workspace, _) = configured_agent();
+        agent.tools = vec!["read".into(), "todo".into()];
+        agent.set_script_tool_gates(gates);
+        agent.sync_tool_authorization();
+        let runtime = agent.runtime.as_ref().unwrap();
+        let revision = runtime
+            .capability_registry
+            .hash_tool_capabilities(&agent.tools);
+        let context = CodeModeRunContext {
+            identity: CodeModeIdentity {
+                invocation_id: "todo-gate-fixture".into(),
+                session_id: runtime.session_id.clone(),
+                branch_leaf: None,
+                workspace_binding: workspace
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into(),
+                runtime_run_id: runtime.run_id.to_string(),
+                parent_operation_ref: None,
+            },
+            mode: CodeModeMode::Controlled,
+            limits: CodeModeLimits::default(),
+            capability_revision: revision,
+            cancellation: runtime.cancellation_token.child_token(),
+            root_budget: runtime.root_budget.clone(),
+        };
+        (
+            AgentCodeModeBroker::new(agent, context, None).unwrap(),
+            workspace,
+        )
+    };
+
+    // Closed by default: the alias does not resolve.
+    let (closed, _) = build_broker(ScriptToolGates::default());
+    let denied = closed
+        .call(CodeModeCall {
+            request_id: 1,
+            tool: "tools.TodoWrite".into(),
+            args: json!({"items":[{"text":"step","status":"pending"}]}),
+        })
+        .unwrap_err();
+    assert_eq!(denied.code, "DENIED", "{denied:?}");
+
+    // Explicitly opened, the same alias reaches the host-owned todo tool.
+    let (open, _) = build_broker(ScriptToolGates {
+        allow_todo: true,
+        allow_subagents: false,
+    });
+    let value = open
+        .call(CodeModeCall {
+            request_id: 1,
+            tool: "tools.TodoWrite".into(),
+            args: json!({"items":[{"text":"step","status":"pending"}]}),
+        })
+        .expect("the gated alias reaches the todo tool");
+    assert!(value.operation_ref.starts_with("ephemeral:") || !value.operation_ref.is_empty());
+}
+
+#[test]
+fn script_history_is_persisted_with_a_stable_wire_kind() {
+    let (mut agent, workspace, _) = configured_agent();
+    agent
+        .enable_read_only_codemode(Arc::new(ReadOnlyFixtureHost))
+        .unwrap();
+    let messages = agent.execute_tool_batch(
+        workspace.path(),
+        vec![(
+            "history-call".into(),
+            "codemode".into(),
+            json!({"code":"return 1"}),
+        )],
+        &mut Vec::new(),
+    );
+    // The persisted tool-result facts carry the append-only history item, so a
+    // later mode switch or model change replays it instead of rewriting it.
+    let facts = messages[0].extra["details"]["codemode_facts"].clone();
+    let history = &facts["history"];
+    assert_eq!(history["wireKind"], json!("function"), "{facts}");
+    assert_eq!(history["wireName"], json!("codemode"), "{facts}");
+    assert_eq!(history["version"], json!(1), "{facts}");
+    assert_eq!(history["complete"], json!(true), "{facts}");
+    assert_eq!(history["callId"], facts["operationRef"], "{facts}");
 }

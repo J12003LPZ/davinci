@@ -92,6 +92,53 @@ fn native_truncated_output_is_partial_not_completed() {
 
 #[test]
 #[ignore = "requires the disposable admitted Node and fixture bundle"]
+fn oversized_script_fails_closed_and_preserves_tail() {
+    // A 10 MB accidental emit must be bounded by the host without crashing,
+    // and the model must still learn that the output was cut.
+    let outcome = fixture_host().execute(
+        &CodeModeRequest {
+            code: "text('x'.repeat(10485760)); return 'tail-marker';".into(),
+            timeout_ms: Some(5000),
+            max_output_bytes: Some(8192),
+        },
+        &fixture_context("oversized-fixture"),
+        std::sync::Arc::new(Catalog {
+            delay: Default::default(),
+        }),
+    );
+    assert!(
+        !outcome.output_complete || outcome.error.is_some(),
+        "{outcome:?}"
+    );
+    assert!(outcome.output_text.len() <= 8192, "{outcome:?}");
+    // The emit is either truncated with an explicit marker or refused with an
+    // explicit limit error; either way it is bounded and explained, never a
+    // crash and never a silent drop.
+    let explained = outcome.output_text.contains("truncated")
+        || outcome
+            .error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("LIMIT_EXCEEDED"));
+    assert!(explained, "{outcome:?}");
+    assert!(
+        matches!(
+            outcome.status,
+            CodeModeStatus::Partial | CodeModeStatus::Failed
+        ),
+        "{outcome:?}"
+    );
+    // A refusal is reported as the limit, not as an unexplained sandbox fault.
+    if outcome.output_text.is_empty() {
+        assert_eq!(
+            outcome.error.as_ref().map(|error| error.code.as_str()),
+            Some("LIMIT_EXCEEDED"),
+            "{outcome:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the disposable admitted Node and fixture bundle"]
 fn native_slow_catalog_discovery_counts_against_the_timeout() {
     let outcome = fixture_host().execute(
         &CodeModeRequest {

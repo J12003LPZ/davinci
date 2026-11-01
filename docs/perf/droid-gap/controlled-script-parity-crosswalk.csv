@@ -1,0 +1,37 @@
+id,contract,evidence,baseline_at_ecc8485,tasks
+S01,"Droid tool aliases, immutable snapshot",RUNTIME/STATIC,open,"S01,S03,S19"
+S02,User-controlled controlled mode,DAVINCI_CODE,open,"S02,S20"
+S03,Read and search from JavaScript,DROID_RUNTIME,partial,"S01,S19"
+S04,"Write, Edit, ApplyPatch",DROID_STATIC + REQUESTED,open,"S03,S04,S05"
+S05,Execute shell and tests,DROID_RUNTIME,open,"S03,S08,S19"
+S06,Nested calls inside one Script,DROID_RUNTIME,read-only partial,"S07,S09,S19"
+S07,Parallel independent calls,DROID_RUNTIME,read-only partial,"S09,S19"
+S08,Risk/approval on every nested effect,DROID_RUNTIME,partial (controlled not active),"S03,S05,S08"
+S09,Uncaught JS error semantics,DROID_RUNTIME,partial,"S07,S19"
+S10,Sandbox no fs/process/network/import,DROID_RUNTIME,partial,S19
+S11,Raw multiline // @input blocks,DROID_STATIC,absent,"S06,S19"
+S12,Script output text()/image()/notify(),DROID_STATIC,absent/partial,"S07,S10,S14"
+S13,Head+tail truncation,DAVINCI_TEST,implemented PR #264,"regression S10,S19"
+S14,Result logs with bounded retrieval,DROID_STATIC,partial evidence store,"S11,S12"
+S15,Running handle/WaitForScript,DROID_RUNTIME,absent,"S12,S13"
+S16,startInBackground true,DROID_RUNTIME,absent,S14
+S17,"Worker crash, no replay",DAVINCI_CODE + DROID_STATIC,partial,"S05,S15"
+S18,Model mode transition stable history,DROID_STATIC,partial,"S16,S17"
+S19,Native OpenAI custom_tool_call JS,DROID_RUNTIME,absent,"S17,K03"
+S20,Hosted OpenAI programmatic tool calling,PUBLIC API ONLY,unverified on Codex OAuth,"K03,S17"
+S21,Frozen bind catalog / deferred discovery,DROID_STATIC,partial,"S01,K04"
+S22,Cache read/drop diagnosis,STAGE0 LIVE,unknown cause,"K01,K02"
+S23,Append-only prefix stability,DROID_STATIC + DAVINCI_CODE,partial,"K02,K07"
+S24,Route-gated cache TTL and breakpoints,PUBLIC API ONLY,unverified on Codex OAuth,"K03,K06"
+S25,Context VM off/hybrid/active,DAVINCI_CODE,implemented modes; quality not proven,K05
+S26,Loop-stop progress watchdog,DAVINCI_TEST,implemented PR #264,regression B02
+S27,Droid benchmark arm and task success,STAGE0 LIVE,implemented PR #264; small/biased fixtures,"B01,B03,B04"
+S28,Verified performance parity,HYPOTHESIS,not established,"B03,B04,B06"
+S29,Subscription longevity improvement,UNKNOWN,no account usage delta,"B05,B06"
+S30,Startup / memory,STAGE0 OFFLINE,"--version DaVinci wins, active session not tested",B05
+S31,Safe cancellation / owned background tree,SECURITY REQUIREMENT,open,"S14,S15,S19"
+S32,Test/executor output preserves errors,DROID_RUNTIME,read-only partial,"S07,S08,S10"
+S33,Model/task-dependent Script prompt,DROID_STATIC + FACTORY VENDOR,open,"S18,B03"
+S34,Tool schema stability and cache preservation,OPENAI PUBLIC API + DAVINCI CODE,partial,"K02,K03,K04"
+S35,Optional subagent calls from Script,DROID STATIC,absent by default,S21
+S36,TodoWrite co-located with real work,DROID STATIC,absent,S22

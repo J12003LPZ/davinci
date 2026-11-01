@@ -1,17 +1,37 @@
 //! Default-off sandbox execution contracts and Rust-owned capability policy.
 mod authority;
+mod background;
 mod deadline;
 mod dispatch;
 mod execution;
+mod fixtures;
+mod history;
 mod policy;
 pub mod projection;
+mod recovery;
+mod runs;
+mod script_log;
 mod types;
 pub(crate) use authority::fingerprint as authority_fingerprint;
+pub use background::BackgroundRuns;
 pub(crate) use deadline::remaining_root_wall_ms;
 pub use dispatch::AgentCodeModeBroker;
 pub(crate) use execution::mandatory_facts;
 pub(crate) use execution::CodeModeBinding;
-pub use policy::{js_name, CapabilityPolicy};
+pub use fixtures::{droid_script_fixture_status, ScriptFixtureStatus};
+pub use history::{project_script_history, ScriptHistoryItem, SCRIPT_WIRE_KIND};
+pub use policy::{
+    admit_script_subagent, effect_is_admitted, js_name, resolve_script_alias, CapabilityPolicy,
+    ScriptSubagentPolicy, ScriptSubagentRequest, ScriptToolGates,
+};
+pub use recovery::{reconcile_script_child_effect, resolve_script_effect, ScriptEffectResolution};
+pub use runs::{
+    reconcile_script_run, ReconciledScriptRun, ScriptRunError, ScriptRunRecord, ScriptRunRegistry,
+    ScriptRunState,
+};
+pub use script_log::{
+    ScriptLogError, ScriptLogEvent, ScriptLogRef, ScriptLogSlice, ScriptLogStore,
+};
 pub use types::*;
 
 impl Default for CodeModeMode {
@@ -35,6 +55,8 @@ impl Default for CodeModeLimits {
             total_result_bytes: 8388608,
             frame_bytes: 2097152,
             output_bytes: 16384,
+            output_events: 1024,
+            input_bytes: 1048576,
             collected_output_bytes: 1048576,
             metadata_calls: 64,
             metadata_bytes: 524288,
@@ -43,11 +65,118 @@ impl Default for CodeModeLimits {
     }
 }
 
+/// Bounded mirror of the host's raw-source lexer. The host owns the
+/// authoritative parse; this refuses a header that cannot be well formed
+/// before any child is dispatched.
+pub fn validate_script_source(code: &str, input_limit: usize) -> Result<(), CodeModeError> {
+    fn check_name(name: &str) -> bool {
+        let mut chars = name.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+    fn check_tag(tag: &str) -> bool {
+        !tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+    let mut inputs: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut directive = false;
+    let mut input_bytes = 0usize;
+    let lines: Vec<&str> = code.split('\n').collect();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        if let Some(spec) = line.strip_prefix("// @input: ") {
+            let (name, rest) = spec.split_once(" <<'").ok_or_else(|| {
+                CodeModeError::new("INVALID_INPUT", "malformed script input marker")
+            })?;
+            let tag = rest
+                .strip_suffix('\'')
+                .filter(|tag| check_tag(tag) && rest.matches('\'').count() == 1)
+                .ok_or_else(|| {
+                    CodeModeError::new("INVALID_INPUT", "malformed script input marker")
+                })?;
+            if !check_name(name) {
+                return Err(CodeModeError::new(
+                    "INVALID_INPUT",
+                    "malformed script input name",
+                ));
+            }
+            if matches!(name, "__proto__" | "constructor" | "prototype") {
+                return Err(CodeModeError::new(
+                    "INVALID_INPUT",
+                    "reserved script input name",
+                ));
+            }
+            if !inputs.insert(name) {
+                return Err(CodeModeError::new(
+                    "INVALID_INPUT",
+                    "duplicate script input",
+                ));
+            }
+            let start = index + 1;
+            let end = lines[start..]
+                .iter()
+                .position(|candidate| *candidate == tag)
+                .map(|offset| start + offset)
+                .ok_or_else(|| CodeModeError::new("INVALID_INPUT", "unclosed script input"))?;
+            input_bytes += lines[start..end]
+                .iter()
+                .map(|line| line.len() + 1)
+                .sum::<usize>();
+            if input_bytes > input_limit {
+                return Err(CodeModeError::new(
+                    "LIMIT_EXCEEDED",
+                    "script input aggregate exceeds limit",
+                ));
+            }
+            index = end + 1;
+            continue;
+        }
+        if line.starts_with("// @input") {
+            return Err(CodeModeError::new(
+                "INVALID_INPUT",
+                "malformed script input marker",
+            ));
+        }
+        if let Some(raw) = line.strip_prefix("// @script: ") {
+            if directive {
+                return Err(CodeModeError::new(
+                    "INVALID_INPUT",
+                    "duplicate script directive",
+                ));
+            }
+            directive = true;
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            struct ScriptDirective {
+                #[serde(default)]
+                start_in_background: Option<bool>,
+            }
+            let parsed = serde_json::from_str::<ScriptDirective>(raw)
+                .map_err(|_| CodeModeError::new("INVALID_INPUT", "malformed script directive"))?;
+            // Parsed and bounded here; the host decides when to detach.
+            let _requested_background = parsed.start_in_background;
+            index += 1;
+            continue;
+        }
+        if line.starts_with("// @script") {
+            return Err(CodeModeError::new(
+                "INVALID_INPUT",
+                "malformed script directive",
+            ));
+        }
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    Ok(())
+}
+
 /// Whether the script opens with an option-header directive. Option
-/// headers are not a supported control channel, so they are refused rather
-/// than silently ignored. Only the header counts: the leading run of blank
-/// and `//` lines. The first line of code ends it, so the same text later in
-/// the script (a comment, or a line inside a template literal) is content.
 fn has_option_header(code: &str) -> bool {
     for line in code.lines() {
         let line = line.trim_start();
@@ -56,6 +185,30 @@ fn has_option_header(code: &str) -> bool {
         }
         if !line.is_empty() && !line.starts_with("//") {
             return false;
+        }
+    }
+    false
+}
+
+/// True when the raw source asks the host to detach. The directive is parsed
+/// by the same bounded lexer that validates the rest of the header.
+pub fn script_requests_background(code: &str) -> bool {
+    for line in code.lines() {
+        let line = line.trim_start();
+        if let Some(raw) = line.strip_prefix("// @script: ") {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            struct Directive {
+                #[serde(default)]
+                start_in_background: Option<bool>,
+            }
+            return serde_json::from_str::<Directive>(raw)
+                .ok()
+                .and_then(|directive| directive.start_in_background)
+                .unwrap_or(false);
+        }
+        if !line.is_empty() && !line.starts_with("//") {
+            break;
         }
     }
     false
@@ -70,6 +223,7 @@ impl CodeModeLimits {
                 "nonempty source without option-header directives is required",
             ));
         }
+        validate_script_source(&request.code, limits.input_bytes)?;
         if request.code.len() > self.script_bytes.min(65536) {
             return Err(CodeModeError::new(
                 "LIMIT_EXCEEDED",

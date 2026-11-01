@@ -34,6 +34,13 @@ impl Drop for InFlight<'_> {
     }
 }
 
+/// A child call that passed every admission check for this exact revision.
+pub(crate) struct AuthorizedChild {
+    pub canonical: String,
+    pub args: Value,
+    pub capability: crate::runtime::RuntimeCapability,
+}
+
 /// Borrows the actual parent agent. IPC never supplies its identity or policy.
 pub struct AgentCodeModeBroker {
     agent: Agent,
@@ -97,7 +104,11 @@ impl AgentCodeModeBroker {
             .into_iter()
             .filter(|capability| authorized.contains(&capability.name))
             .collect();
-        let policy = CapabilityPolicy::new(context.mode.clone(), capabilities)?;
+        let policy = CapabilityPolicy::new_with_gates(
+            context.mode.clone(),
+            capabilities,
+            agent.script_tool_gates,
+        )?;
         if context.capability_revision
             != runtime
                 .capability_registry
@@ -247,6 +258,75 @@ impl AgentCodeModeBroker {
             ))
         }
     }
+
+    /// Every check a child call needs, made against the live policy at the
+    /// moment it will run. A queued call is checked again immediately before
+    /// dispatch, so a revocation or capability change denies it instead of
+    /// letting an already-admitted call perform the effect.
+    fn authorize_script_child(
+        &self,
+        tool: &str,
+        args: &Value,
+        revision: &str,
+    ) -> Result<AuthorizedChild, CodeModeError> {
+        self.live()?;
+        let runtime = self
+            .agent
+            .runtime
+            .as_ref()
+            .ok_or_else(|| CodeModeError::new("UNAVAILABLE", "runtime unavailable"))?;
+        if revision != self.context.capability_revision
+            || runtime
+                .capability_registry
+                .hash_tool_capabilities(&self.agent.tools)
+                != self.context.capability_revision
+        {
+            return Err(CodeModeError::new(
+                "STALE_CAPABILITY",
+                "capability snapshot changed",
+            ));
+        }
+        // `tools.<Alias>` is Droid spelling for an already-authorized tool; it
+        // is never a way to name something the policy did not admit.
+        let canonical = if tool.starts_with("tools.") {
+            resolve_script_alias(tool, self.context.mode.clone(), &self.policy)?
+        } else {
+            tool.to_owned()
+        };
+        self.require_authorized(&canonical)?;
+        let capability = self.policy.resolve(&canonical)?.clone();
+        for effect in &capability.declared_effects {
+            if !effect_is_admitted(&self.context.mode, effect) {
+                return Err(CodeModeError::new(
+                    "DENIED",
+                    "declared effect class is outside this Codemode mode",
+                ));
+            }
+        }
+        // Risk is host-owned: a script cannot annotate a command as safe.
+        if args.get("riskLevel").is_some() || args.get("risk_level").is_some() {
+            return Err(CodeModeError::new(
+                "INVALID_INPUT",
+                "risk classification is host-owned",
+            ));
+        }
+        let args = super::projection::adapt_script_arguments(&canonical, args.clone())?;
+        super::projection::validate_json(&args, self.context.limits.json_depth)?;
+        if !args.is_object()
+            || super::projection::serialized_size(&args, self.context.limits.argument_bytes)
+                .is_err()
+        {
+            return Err(CodeModeError::new(
+                "INVALID_INPUT",
+                "arguments exceed admitted boundary",
+            ));
+        }
+        Ok(AuthorizedChild {
+            canonical,
+            args,
+            capability,
+        })
+    }
 }
 
 impl CodeModeBroker for AgentCodeModeBroker {
@@ -333,26 +413,15 @@ impl CodeModeBroker for AgentCodeModeBroker {
 
     fn call(&self, call: CodeModeCall) -> Result<CodeModeToolValue, CodeModeError> {
         self.live()?;
-        self.require_authorized(&call.tool)?;
-        let capability = self.policy.resolve(&call.tool)?;
-        let mutating = !capability.read_only;
+        let admitted =
+            self.authorize_script_child(&call.tool, &call.args, &self.context.capability_revision)?;
         // `None` means exclusive: a serial call must run alone, not merely
         // under a limit of one that a parallel-safe call would step over.
         let shared_limit = shared_limit(
             &self.context.mode,
-            capability.concurrency_policy,
+            admitted.capability.concurrency_policy,
             self.context.limits.parallelism,
         );
-        super::projection::validate_json(&call.args, self.context.limits.json_depth)?;
-        if !call.args.is_object()
-            || super::projection::serialized_size(&call.args, self.context.limits.argument_bytes)
-                .is_err()
-        {
-            return Err(CodeModeError::new(
-                "INVALID_INPUT",
-                "arguments exceed admitted boundary",
-            ));
-        }
         let ordinal = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             if state.terminal {
@@ -369,6 +438,15 @@ impl CodeModeBroker for AgentCodeModeBroker {
                 return Err(CodeModeError::new(
                     "LIMIT_EXCEEDED",
                     "child request budget exhausted",
+                ));
+            }
+            // Bound in-flight and pending work independently of the total
+            // call budget, so a fan-out cannot exhaust workers.
+            if state.in_flight >= self.context.limits.pending_calls {
+                state.terminal = true;
+                return Err(CodeModeError::new(
+                    "LIMIT_EXCEEDED",
+                    "too many pending child calls",
                 ));
             }
             state.in_flight += 1;
@@ -411,42 +489,62 @@ impl CodeModeBroker for AgentCodeModeBroker {
             }
         };
         let id = format!("{}#codemode:{ordinal}", self.context.identity.invocation_id);
+        // Re-check authority after the lane is held. Admission happened while
+        // this call may have queued, so a revocation in between must deny it.
+        let admitted = match self.authorize_script_child(
+            &call.tool,
+            &call.args,
+            &self.context.capability_revision,
+        ) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                self.record_child(CodeModeChildOutcome {
+                    request_id: call.request_id,
+                    ordinal: ordinal as u32,
+                    tool: call.tool,
+                    operation_ref: String::new(),
+                    status: if error.code == "CANCELLED" {
+                        CodeModeChildStatus::Cancelled
+                    } else {
+                        CodeModeChildStatus::NotStarted
+                    },
+                    incomplete: false,
+                    error: Some(error.clone()),
+                });
+                return Err(error);
+            }
+        };
+        let mutating = !admitted.capability.read_only;
         let (result, structured, operation_ref) = self.agent.dispatch_script_child(
             &self.agent.cwd,
             &id,
-            &call.tool,
-            &call.args,
+            &admitted.canonical,
+            &admitted.args,
             self.parent,
             ordinal,
         );
-        let unresolved_effect = if mutating {
-            use crate::runtime::operations::{EffectStatus, OperationState};
+        let failed_command = command_status(&admitted.canonical, &result);
+        // A delivered result proves the effect outcome; only a lost or failed
+        // reply can leave a mutation ambiguous.
+        let unresolved_effect = if mutating && result.is_error && !failed_command {
+            // The journal is the authority: an ambiguous effect stays
+            // unresolved and closes admission instead of replaying.
             self.agent
                 .runtime
                 .as_ref()
                 .and_then(|runtime| runtime.operations.as_ref())
-                .and_then(|operations| operations.dispatcher().journal().snapshot().ok())
-                .map(|snapshot| {
-                    snapshot
-                        .attempts
-                        .iter()
-                        .find(|attempt| attempt.operation_id().to_string() == operation_ref)
-                        .map(|attempt| {
-                            attempt.state() != OperationState::Succeeded
-                                && matches!(
-                                    attempt.effect_status(),
-                                    EffectStatus::Possible
-                                        | EffectStatus::Unknown
-                                        | EffectStatus::EffectsObserved
-                                )
-                        })
-                        .unwrap_or(true)
+                .map(|operations| {
+                    super::reconcile_script_child_effect(
+                        operations.dispatcher().journal(),
+                        &operation_ref,
+                    )
+                    .requires_postcondition()
                 })
                 .unwrap_or(true)
         } else {
             false
         };
-        let mut error = (result.is_error || unresolved_effect).then(|| {
+        let mut error = ((result.is_error && !failed_command) || unresolved_effect).then(|| {
             let recovery = unresolved_effect
                 || result.details.as_ref().is_some_and(|details| {
                     [
@@ -481,7 +579,8 @@ impl CodeModeBroker for AgentCodeModeBroker {
             error
         });
         let value = if error.is_none() {
-            match super::projection::project_script_result(
+            match super::projection::adapt_script_tool_result(
+                &admitted.canonical,
                 result,
                 structured,
                 operation_ref.clone(),
@@ -551,6 +650,17 @@ impl CodeModeBroker for AgentCodeModeBroker {
     }
 }
 
+/// A command that ran and exited non-zero is a result with a status, not a
+/// delivered tool error.
+fn command_status(tool: &str, result: &crate::ToolResult) -> bool {
+    matches!(tool, "exec_command" | "bash" | "powershell")
+        && result.details.as_ref().is_some_and(|details| {
+            details
+                .get("exitCode")
+                .is_some_and(|code| code.as_i64() != Some(0))
+        })
+}
+
 /// How a child call shares the dispatch lane: `Some(limit)` runs beside other
 /// parallel-safe reads up to `limit`; `None` runs alone.
 fn shared_limit(
@@ -558,7 +668,8 @@ fn shared_limit(
     policy: ConcurrencyPolicy,
     parallelism: usize,
 ) -> Option<usize> {
-    (matches!(mode, CodeModeMode::ReadOnly) && policy == ConcurrencyPolicy::ParallelSafe)
+    (matches!(mode, CodeModeMode::ReadOnly | CodeModeMode::Controlled)
+        && policy == ConcurrencyPolicy::ParallelSafe)
         .then(|| parallelism.max(1))
 }
 
@@ -578,13 +689,38 @@ mod tests {
             shared(CodeModeMode::ReadOnly, ConcurrencyPolicy::SerialBarrier),
             None
         );
+        // Controlled mode shares only parallel-safe reads; serial calls below
+        // keep the exclusive lane.
         assert_eq!(
             shared(CodeModeMode::Controlled, ConcurrencyPolicy::ParallelSafe),
-            None
+            Some(4)
         );
         assert_eq!(
             shared_limit(&CodeModeMode::ReadOnly, ConcurrencyPolicy::ParallelSafe, 0),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn parallel_reads_overlap_mutations_serialize() {
+        // Independent reads share a bounded lane in every enabled mode.
+        for mode in [CodeModeMode::ReadOnly, CodeModeMode::Controlled] {
+            assert_eq!(
+                shared_limit(&mode, ConcurrencyPolicy::ParallelSafe, 4),
+                Some(4),
+                "{mode:?}"
+            );
+            // Ambiguous or mutating calls keep the exclusive lane: a
+            // same-file writer can never overlap another writer.
+            assert_eq!(
+                shared_limit(&mode, ConcurrencyPolicy::SerialBarrier, 4),
+                None,
+                "{mode:?}"
+            );
+        }
+        assert_eq!(
+            shared_limit(&CodeModeMode::Off, ConcurrencyPolicy::ParallelSafe, 4),
+            None
         );
     }
 }

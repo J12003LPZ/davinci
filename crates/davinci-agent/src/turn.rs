@@ -3187,6 +3187,20 @@ Issue the call again if it is still needed.";
                         details: None,
                     },
                 }
+            } else if name == "wait_for_script" && depth == 0 {
+                match serde_json::from_value::<crate::codemode::WaitForScriptRequest>(args.clone())
+                {
+                    Ok(request) => self.wait_for_script(request),
+                    Err(_) => crate::ToolResult {
+                        content: crate::codemode::CodeModeError::new(
+                            "INVALID_INPUT",
+                            "invalid WaitForScript request",
+                        )
+                        .message,
+                        is_error: true,
+                        details: None,
+                    },
+                }
             } else if name == "codemode" && depth == 0 {
                 self.run_codemode(id, args, parent_operation_id)
             } else if name == "batch" && depth == 0 {

@@ -123,6 +123,73 @@ impl ProviderCacheUsageBreakdown {
     }
 }
 
+/// Why a mid-run cache-read drop happened. A drop with an unchanged prefix is
+/// never attributed to a local cause: the honest answer is provider-side or
+/// unknown, and missing evidence stays missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CacheDropReason {
+    /// The canonical request prefix actually changed between the requests.
+    LocalPrefixChange,
+    /// Same prefix bytes, so no local mutation can explain the drop.
+    ProviderOrUnknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheDropRecord {
+    pub request_index: u64,
+    pub prev_cache_read: u64,
+    pub next_cache_read: u64,
+    pub wire_prefix_digest: String,
+    pub route: String,
+    pub reason: CacheDropReason,
+}
+
+/// One request's cache evidence. `cache_read` is `None` when the provider did
+/// not report it; such a request is never coerced into a hit or a miss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheRequestSample<'a> {
+    pub cache_read: Option<u64>,
+    pub wire_prefix_digest: &'a str,
+}
+
+/// Classify a drop between two adjacent requests. Returns `None` when there is
+/// no drop to explain, or when usage is missing.
+pub fn classify_cache_drop(
+    request_index: u64,
+    previous: CacheRequestSample<'_>,
+    next: CacheRequestSample<'_>,
+    route: &str,
+) -> Option<CacheDropRecord> {
+    let prev = previous.cache_read?;
+    let next_read = next.cache_read?;
+    if next_read >= prev {
+        return None;
+    }
+    let reason = if previous.wire_prefix_digest == next.wire_prefix_digest {
+        CacheDropReason::ProviderOrUnknown
+    } else {
+        CacheDropReason::LocalPrefixChange
+    };
+    Some(CacheDropRecord {
+        request_index,
+        prev_cache_read: prev,
+        next_cache_read: next_read,
+        wire_prefix_digest: next.wire_prefix_digest.to_string(),
+        route: route.to_string(),
+        reason,
+    })
+}
+
+/// Serialize unscored, secret-free drop evidence for one run.
+pub fn cache_drop_report(records: &[CacheDropRecord]) -> Value {
+    serde_json::json!({
+        "version": 1,
+        "drops": records,
+    })
+}
+
 pub fn diagnostics_every_n_from_env() -> u64 {
     std::env::var(OPENAI_CACHE_DIAGNOSTICS_EVERY_N_ENV)
         .ok()

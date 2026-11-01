@@ -636,6 +636,10 @@ pub struct Agent {
     /// Admitted at startup, registered on each turn's runtime once it has an
     /// operation journal (see `activate_staged_codemode`).
     pub(crate) staged_codemode: Option<codemode::CodeModeBinding>,
+    /// Detached Script runs owned by this agent; cloned with it.
+    pub(crate) background_runs: codemode::BackgroundRuns,
+    /// Trusted host opt-ins for otherwise-excluded script tools.
+    pub(crate) script_tool_gates: codemode::ScriptToolGates,
     /// The Codemode mode the host resolved from `--codemode` and `/config`,
     /// reported by `feature_use` even when the runtime was not admitted.
     codemode_configured_mode: Option<String>,
@@ -980,6 +984,8 @@ impl Agent {
             agent_profile_models: None,
             codemode: None,
             staged_codemode: None,
+            background_runs: codemode::BackgroundRuns::default(),
+            script_tool_gates: codemode::ScriptToolGates::default(),
             codemode_configured_mode: None,
             pre_tool: None,
             post_tool: None,
@@ -1447,6 +1453,7 @@ impl Agent {
             environment: self.runtime_environment.clone(),
             additional_directories: self.additional_directories(),
             codemode_available: self.codemode_exposed(),
+            codemode_controlled: self.codemode_controlled(),
         }
     }
 
@@ -2642,7 +2649,7 @@ impl Agent {
         }
     }
 
-    /// TS `evalSession.reload()` — isolated evals have no extensions; count the step.
+    /// TS `evalSession.reload()` â€” isolated evals have no extensions; count the step.
     pub fn reload(&mut self) {
         self.reload_count = self.reload_count.saturating_add(1);
         self.aborted = false;
@@ -2719,11 +2726,12 @@ impl Agent {
             plan_active: permission_mode == PermissionMode::ReadOnly,
         };
 
-        let composed = prompt::turn::compose_turn_prompt(
+        let composed = prompt::turn::compose_turn_prompt_with(
             &self.prompt_session,
             &ctx,
             &capabilities,
             &runtime_state,
+            self.script_mode_prompt(),
         )?;
         self.reset_capability_run_state(&capabilities, runtime_state.visual_verification_available);
 
@@ -2798,8 +2806,13 @@ impl Agent {
             permission_mode,
             plan_active: permission_mode == PermissionMode::ReadOnly,
         };
-        let composed =
-            prompt::turn::compose_turn_prompt(&self.prompt_session, &ctx, &union, &runtime_state)?;
+        let composed = prompt::turn::compose_turn_prompt_with(
+            &self.prompt_session,
+            &ctx,
+            &union,
+            &runtime_state,
+            self.script_mode_prompt(),
+        )?;
         self.reset_capability_run_state(&union, runtime_state.visual_verification_available);
         self.apply_composed_turn_prompt(&composed);
         self.prompt_manifest = Some(composed.manifest.clone());
@@ -4692,6 +4705,13 @@ impl Agent {
         self.activate_tool_families(&families);
     }
 
+    /// Host-owned opt-ins for tools a Script may otherwise never reach
+    /// (`TodoWrite`, script subagents). Both default off.
+    pub fn set_script_tool_gates(&mut self, gates: crate::codemode::ScriptToolGates) {
+        self.script_tool_gates = gates;
+    }
+
+    /// Perceive the run's tool exposure for diagnostics.
     pub fn visible_tool_names(&self) -> std::collections::BTreeSet<String> {
         self.tool_context
             .tool_exposure
@@ -4944,7 +4964,7 @@ impl Agent {
         self.sync_tool_authorization();
     }
 
-    /// TS `setActiveToolsByName` — only registry names are enabled; unknown names ignored.
+    /// TS `setActiveToolsByName` â€” only registry names are enabled; unknown names ignored.
     pub fn set_active_tools_by_name(&mut self, names: &[String]) {
         self.tools = names
             .iter()
@@ -6686,9 +6706,9 @@ pub fn default_system_prompt() -> String {
 
 /// The orchestration rules every pi prompt carries: they are what turns a
 /// thirty-turn investigation into a six-turn one. Runtime and prompt have
-/// to agree — the scheduler overlaps independent calls (`scheduler.rs`),
+/// to agree â€” the scheduler overlaps independent calls (`scheduler.rs`),
 /// `batch` hides several operations behind one boundary, `agent` fans out
-/// workers — and this is the prompt's half of that agreement.
+/// workers â€” and this is the prompt's half of that agreement.
 pub const TOOL_USE_STRATEGY: &str = prompt::tool_strategy::TOOL_USE_STRATEGY;
 
 pub fn new_message_id() -> String {

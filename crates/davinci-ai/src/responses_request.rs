@@ -145,6 +145,38 @@ impl PreparedProviderRequest {
     }
 }
 
+/// One cache-sensitive segment's identity, safe to compare across attempts.
+/// No prompt text, paths, or tool names appear here.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireSegmentDigest {
+    pub order: usize,
+    pub category: WireSegmentCategory,
+    pub trust: WireTrustClass,
+    pub digest: String,
+    pub byte_len: usize,
+}
+
+impl PreparedProviderRequest {
+    /// The ordered cache-sensitive segment identity of this exact request.
+    /// Byte-identical prefixes produce identical digests; a reordered tool
+    /// catalog or rewritten instructions produce different ones.
+    pub fn cache_prefix_manifest(&self) -> Vec<WireSegmentDigest> {
+        self.manifest
+            .segments
+            .iter()
+            .filter(|segment| segment.cache_sensitive)
+            .map(|segment| WireSegmentDigest {
+                order: segment.order,
+                category: segment.category,
+                trust: segment.trust,
+                digest: segment.digest.clone(),
+                byte_len: segment.byte_len,
+            })
+            .collect()
+    }
+}
+
 fn build_segments(body: &Value) -> Vec<WireSegmentManifest> {
     let Some(map) = body.as_object() else {
         return vec![segment(

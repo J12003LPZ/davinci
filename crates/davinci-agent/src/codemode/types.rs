@@ -1,6 +1,6 @@
 //! Shared Codemode contracts. Authority-bearing context is host-created only.
 use serde::{Deserialize, Serialize};
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum CodeModeMode {
     #[serde(rename = "off")]
@@ -70,6 +70,8 @@ pub struct CodeModeLimits {
     pub total_result_bytes: usize,
     pub frame_bytes: usize,
     pub output_bytes: usize,
+    pub output_events: usize,
+    pub input_bytes: usize,
     pub collected_output_bytes: usize,
     pub metadata_calls: u32,
     pub metadata_bytes: usize,
@@ -182,6 +184,78 @@ pub struct ToolPage {
     pub total: usize,
     pub cursor: Option<String>,
 }
+/// Script wire shape for the selected provider route. Only a shape the route
+/// has actually accepted may be used; the function JSON shape is always valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScriptWireMode {
+    FunctionJson,
+    CustomFreeform,
+    HostedProgrammatic,
+}
+
+/// Observed route capabilities. Every flag defaults to false: public API
+/// documentation is not evidence for this authenticated route.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScriptWireCapabilities {
+    pub custom_script: bool,
+    pub programmatic_tool_calling: bool,
+}
+
+/// The most capable shape the route has proven it accepts.
+pub fn script_wire_mode(capabilities: &ScriptWireCapabilities) -> ScriptWireMode {
+    if capabilities.custom_script && capabilities.programmatic_tool_calling {
+        ScriptWireMode::HostedProgrammatic
+    } else if capabilities.custom_script {
+        ScriptWireMode::CustomFreeform
+    } else {
+        ScriptWireMode::FunctionJson
+    }
+}
+
+/// After a rejected shape, fall back to a shape this route has accepted.
+/// Falling back changes only the wire presentation, never the call's effects.
+pub fn script_wire_fallback(
+    rejected: ScriptWireMode,
+    capabilities: &ScriptWireCapabilities,
+) -> ScriptWireMode {
+    let accepted = script_wire_mode(capabilities);
+    if rejected == accepted {
+        return accepted;
+    }
+    match rejected {
+        ScriptWireMode::FunctionJson => ScriptWireMode::FunctionJson,
+        ScriptWireMode::CustomFreeform if capabilities.custom_script => {
+            ScriptWireMode::CustomFreeform
+        }
+        ScriptWireMode::HostedProgrammatic
+            if capabilities.custom_script && capabilities.programmatic_tool_calling =>
+        {
+            ScriptWireMode::HostedProgrammatic
+        }
+        _ => ScriptWireMode::FunctionJson,
+    }
+}
+
+/// `WaitForScript` action, host-owned and never inferred from a script.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum WaitAction {
+    #[serde(rename = "status")]
+    Status,
+    #[serde(rename = "wait")]
+    Wait,
+    #[serde(rename = "kill")]
+    Kill,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WaitForScriptRequest {
+    pub tool_call_id: String,
+    pub action: WaitAction,
+}
+
 pub trait CodeModeBroker: Send + Sync {
     fn search(&self, query: ToolQuery) -> Result<ToolPage, CodeModeError>;
     fn describe(&self, canonical_name: &str) -> Result<serde_json::Value, CodeModeError>;
@@ -219,6 +293,17 @@ pub trait CodeModeBroker: Send + Sync {
     }
 }
 pub trait CodeModeHost: Send + Sync {
+    /// Trusted host statement that this host's configuration admits mutating
+    /// script children. Defaults to no: a host must opt in explicitly.
+    fn admits_controlled_mode(&self) -> bool {
+        false
+    }
+    /// Trusted host statement that detached Script runs are admitted. The
+    /// C08 resident-service prohibition stands until an owner approves it, so
+    /// the default refuses.
+    fn admits_background_scripts(&self) -> bool {
+        false
+    }
     fn execute(
         &self,
         request: &CodeModeRequest,
