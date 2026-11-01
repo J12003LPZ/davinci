@@ -1144,7 +1144,7 @@ All 53 findings were fixed on branch `fix/graph-runtime-bugs`. Regression tests 
 | 4 | `render.rs`: tokenizer failure makes `parse_advanced_graph_command` return `None` (goal text) instead of a quote error. |
 | 5 | `controller.rs`: `failure_branch_succeeded` requires every terminal node reachable from the `OnFailure` branch to have succeeded; an intermediate descendant or a failed terminal reviewer does not recover a required node. |
 | 6 | `briefings.rs`: `push_bounded_section` charges risks, gaps, and the test baseline against the same evidence budget. |
-| 7 | `bindings.rs`: saved review receives bound plan artifacts and the saved security verdict; its diff is split into tracked review chunks instead of being truncated (`bounded_review_diff` removed). |
+| 7 | `bindings.rs`: saved review receives bound plan artifacts and the saved security verdict; its evidence diff remains bounded by `bounded_review_diff` (the saved path has no chunk-coverage claim). |
 | 8 | `process.rs`: post-exit drain is bounded by `DRAIN_BUDGET` wall time instead of a frame count. |
 | 9 | `worker.rs`: a failed artifact unlink is a worker failure instead of being ignored. |
 | 10 | `worker.rs`: supervisor errors report `worker supervisor failed` with exit code, stderr tail, delivered text, and usage. |
