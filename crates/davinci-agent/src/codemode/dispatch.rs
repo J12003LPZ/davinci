@@ -37,6 +37,7 @@ impl Drop for InFlight<'_> {
 /// A child call that passed every admission check for this exact revision.
 pub(crate) struct AuthorizedChild {
     pub canonical: String,
+    pub args: Value,
     pub capability: crate::runtime::RuntimeCapability,
 }
 
@@ -305,9 +306,11 @@ impl AgentCodeModeBroker {
                 "risk classification is host-owned",
             ));
         }
-        super::projection::validate_json(args, self.context.limits.json_depth)?;
+        let args = super::projection::adapt_script_arguments(&canonical, args.clone())?;
+        super::projection::validate_json(&args, self.context.limits.json_depth)?;
         if !args.is_object()
-            || super::projection::serialized_size(args, self.context.limits.argument_bytes).is_err()
+            || super::projection::serialized_size(&args, self.context.limits.argument_bytes)
+                .is_err()
         {
             return Err(CodeModeError::new(
                 "INVALID_INPUT",
@@ -316,6 +319,7 @@ impl AgentCodeModeBroker {
         }
         Ok(AuthorizedChild {
             canonical,
+            args,
             capability,
         })
     }
@@ -502,7 +506,7 @@ impl CodeModeBroker for AgentCodeModeBroker {
             &self.agent.cwd,
             &id,
             &admitted.canonical,
-            &call.args,
+            &admitted.args,
             self.parent,
             ordinal,
         );

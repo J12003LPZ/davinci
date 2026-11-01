@@ -65,6 +65,29 @@ pub fn validate_json(value: &Value, max_depth: usize) -> Result<(), CodeModeErro
     visit(value, 0, max_depth)
 }
 
+/// Adapt a Droid-shaped call to the canonical tool's native input schema.
+/// Only explicit, tested differences are rewritten; anything else passes
+/// through untouched so no argument silently changes meaning.
+pub fn adapt_script_arguments(tool: &str, args: Value) -> Result<Value, CodeModeError> {
+    if tool != "apply_patch" || args.get("input").is_some() {
+        return Ok(args);
+    }
+    let Some(object) = args.as_object() else {
+        return Err(CodeModeError::new(
+            "INVALID_INPUT",
+            "apply_patch arguments must be an object",
+        ));
+    };
+    let patch = object.get("patch").and_then(Value::as_str);
+    if object.len() != 1 || patch.is_none() {
+        return Err(CodeModeError::new(
+            "INVALID_INPUT",
+            "apply_patch requires the native `input` or exactly one `patch` string",
+        ));
+    }
+    Ok(serde_json::json!({"input": patch.unwrap_or_default()}))
+}
+
 pub fn project_script_result(
     result: crate::ToolResult,
     structured: Option<Value>,

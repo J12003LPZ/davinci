@@ -33,6 +33,28 @@ fn mode_is_default_off_and_labels_are_stable() {
 }
 
 #[test]
+fn droid_patch_shorthand_never_rewrites_native_arguments() {
+    use davinci_agent::codemode::projection::adapt_script_arguments;
+    assert_eq!(
+        adapt_script_arguments("apply_patch", serde_json::json!({"patch":"P"})).unwrap(),
+        serde_json::json!({"input":"P"})
+    );
+    // Native arguments pass through unchanged: the adapter never replaces a
+    // complete DaVinci-shaped call.
+    assert_eq!(
+        adapt_script_arguments("apply_patch", serde_json::json!({"input":"P"})).unwrap(),
+        serde_json::json!({"input":"P"})
+    );
+    assert_eq!(
+        adapt_script_arguments("write", serde_json::json!({"path":"a","content":"b"})).unwrap(),
+        serde_json::json!({"path":"a","content":"b"})
+    );
+    for bad in [serde_json::json!({}), serde_json::json!({"patch":7})] {
+        assert!(adapt_script_arguments("apply_patch", bad).is_err());
+    }
+}
+
+#[test]
 fn controlled_mode_is_opt_in_and_host_owned() {
     let mut agent = Agent::new("codemode mode fixture");
     // Off is the only implicit state and never stages a host.

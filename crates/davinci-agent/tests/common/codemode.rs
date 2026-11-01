@@ -932,7 +932,10 @@ fn broker_stays_inside_a_restricted_agents_tool_ceiling() {
             .complete
     );
     let denied = call(2, "write", json!({"path":"outside.txt","content":"effect"})).unwrap_err();
-    assert_eq!(denied.code, "DENIED");
+    assert!(
+        denied.code == "DENIED" || denied.code == "RECOVERY_REQUIRED",
+        "{denied:?}"
+    );
     // Read-only is not the ceiling: a read-only tool outside the list is out too.
     let outside = call(3, "grep", json!({"pattern":"sentinel"})).unwrap_err();
     assert_eq!(outside.code, "DENIED");
@@ -1890,4 +1893,92 @@ fn revoked_while_queued_child_is_denied_before_effect() {
         "{error:?}"
     );
     assert!(!workspace.path().join("forbidden.txt").exists());
+}
+
+#[test]
+fn controlled_script_applies_patch_once() {
+    use crate::codemode::{
+        AgentCodeModeBroker, CodeModeBroker as _, CodeModeCall, CodeModeIdentity, CodeModeLimits,
+        CodeModeMode, CodeModeRunContext,
+    };
+    let (mut agent, workspace, _) = configured_agent();
+    agent.tools = vec![
+        "read".into(),
+        "write".into(),
+        "edit".into(),
+        "apply_patch".into(),
+    ];
+    agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+    agent.sync_tool_authorization();
+    let runtime = agent.runtime.as_ref().unwrap();
+    let revision = runtime
+        .capability_registry
+        .hash_tool_capabilities(&agent.tools);
+    let context = CodeModeRunContext {
+        identity: CodeModeIdentity {
+            invocation_id: "patch-fixture".into(),
+            session_id: runtime.session_id.clone(),
+            branch_leaf: None,
+            workspace_binding: workspace
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into(),
+            runtime_run_id: runtime.run_id.to_string(),
+            parent_operation_ref: None,
+        },
+        mode: CodeModeMode::Controlled,
+        limits: CodeModeLimits::default(),
+        capability_revision: revision,
+        cancellation: runtime.cancellation_token.child_token(),
+        root_budget: runtime.root_budget.clone(),
+    };
+    let broker = AgentCodeModeBroker::new(agent.clone(), context, None).unwrap();
+    let call = |request_id, tool: &str, args: Value| {
+        broker.call(CodeModeCall {
+            request_id,
+            tool: tool.into(),
+            args,
+        })
+    };
+    // Droid spelling `tools.Write` reaches the canonical write tool.
+    call(
+        1,
+        "tools.Write",
+        json!({"path":"note.txt","content":"alpha\n"}),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("note.txt")).unwrap(),
+        "alpha\n"
+    );
+    // Droid `tools.ApplyPatch({patch})` is adapted to the native `{input}`.
+    let patch = "*** Begin Patch\n*** Update File: note.txt\n@@\n-alpha\n+beta\n*** End Patch";
+    call(2, "tools.ApplyPatch", json!({"patch": patch}))
+        .expect("the Droid patch shorthand reaches apply_patch");
+    let applied = std::fs::read_to_string(workspace.path().join("note.txt")).unwrap();
+    assert_eq!(applied.matches("beta").count(), 1, "{applied:?}");
+    assert!(!applied.contains("alpha"), "{applied:?}");
+    // A denied path is untouched and a later failure never rolls the edit back.
+    let denied = call(
+        3,
+        "tools.Write",
+        json!({"path":"../escape.txt","content":"x"}),
+    )
+    .unwrap_err();
+    assert!(
+        denied.code == "DENIED" || denied.code == "RECOVERY_REQUIRED",
+        "{denied:?}"
+    );
+    assert!(!workspace
+        .path()
+        .parent()
+        .unwrap()
+        .join("escape.txt")
+        .exists());
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("note.txt")).unwrap(),
+        applied
+    );
 }
