@@ -34,6 +34,12 @@ impl Drop for InFlight<'_> {
     }
 }
 
+/// A child call that passed every admission check for this exact revision.
+pub(crate) struct AuthorizedChild {
+    pub canonical: String,
+    pub capability: crate::runtime::RuntimeCapability,
+}
+
 /// Borrows the actual parent agent. IPC never supplies its identity or policy.
 pub struct AgentCodeModeBroker {
     agent: Agent,
@@ -247,6 +253,72 @@ impl AgentCodeModeBroker {
             ))
         }
     }
+
+    /// Every check a child call needs, made against the live policy at the
+    /// moment it will run. A queued call is checked again immediately before
+    /// dispatch, so a revocation or capability change denies it instead of
+    /// letting an already-admitted call perform the effect.
+    fn authorize_script_child(
+        &self,
+        tool: &str,
+        args: &Value,
+        revision: &str,
+    ) -> Result<AuthorizedChild, CodeModeError> {
+        self.live()?;
+        let runtime = self
+            .agent
+            .runtime
+            .as_ref()
+            .ok_or_else(|| CodeModeError::new("UNAVAILABLE", "runtime unavailable"))?;
+        if revision != self.context.capability_revision
+            || runtime
+                .capability_registry
+                .hash_tool_capabilities(&self.agent.tools)
+                != self.context.capability_revision
+        {
+            return Err(CodeModeError::new(
+                "STALE_CAPABILITY",
+                "capability snapshot changed",
+            ));
+        }
+        // `tools.<Alias>` is Droid spelling for an already-authorized tool; it
+        // is never a way to name something the policy did not admit.
+        let canonical = if tool.starts_with("tools.") {
+            resolve_script_alias(tool, self.context.mode.clone(), &self.policy)?
+        } else {
+            tool.to_owned()
+        };
+        self.require_authorized(&canonical)?;
+        let capability = self.policy.resolve(&canonical)?.clone();
+        for effect in &capability.declared_effects {
+            if !effect_is_admitted(&self.context.mode, effect) {
+                return Err(CodeModeError::new(
+                    "DENIED",
+                    "declared effect class is outside this Codemode mode",
+                ));
+            }
+        }
+        // Risk is host-owned: a script cannot annotate a command as safe.
+        if args.get("riskLevel").is_some() || args.get("risk_level").is_some() {
+            return Err(CodeModeError::new(
+                "INVALID_INPUT",
+                "risk classification is host-owned",
+            ));
+        }
+        super::projection::validate_json(args, self.context.limits.json_depth)?;
+        if !args.is_object()
+            || super::projection::serialized_size(args, self.context.limits.argument_bytes).is_err()
+        {
+            return Err(CodeModeError::new(
+                "INVALID_INPUT",
+                "arguments exceed admitted boundary",
+            ));
+        }
+        Ok(AuthorizedChild {
+            canonical,
+            capability,
+        })
+    }
 }
 
 impl CodeModeBroker for AgentCodeModeBroker {
@@ -333,26 +405,15 @@ impl CodeModeBroker for AgentCodeModeBroker {
 
     fn call(&self, call: CodeModeCall) -> Result<CodeModeToolValue, CodeModeError> {
         self.live()?;
-        self.require_authorized(&call.tool)?;
-        let capability = self.policy.resolve(&call.tool)?;
-        let mutating = !capability.read_only;
+        let admitted =
+            self.authorize_script_child(&call.tool, &call.args, &self.context.capability_revision)?;
         // `None` means exclusive: a serial call must run alone, not merely
         // under a limit of one that a parallel-safe call would step over.
         let shared_limit = shared_limit(
             &self.context.mode,
-            capability.concurrency_policy,
+            admitted.capability.concurrency_policy,
             self.context.limits.parallelism,
         );
-        super::projection::validate_json(&call.args, self.context.limits.json_depth)?;
-        if !call.args.is_object()
-            || super::projection::serialized_size(&call.args, self.context.limits.argument_bytes)
-                .is_err()
-        {
-            return Err(CodeModeError::new(
-                "INVALID_INPUT",
-                "arguments exceed admitted boundary",
-            ));
-        }
         let ordinal = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             if state.terminal {
@@ -411,10 +472,36 @@ impl CodeModeBroker for AgentCodeModeBroker {
             }
         };
         let id = format!("{}#codemode:{ordinal}", self.context.identity.invocation_id);
+        // Re-check authority after the lane is held. Admission happened while
+        // this call may have queued, so a revocation in between must deny it.
+        let admitted = match self.authorize_script_child(
+            &call.tool,
+            &call.args,
+            &self.context.capability_revision,
+        ) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                self.record_child(CodeModeChildOutcome {
+                    request_id: call.request_id,
+                    ordinal: ordinal as u32,
+                    tool: call.tool,
+                    operation_ref: String::new(),
+                    status: if error.code == "CANCELLED" {
+                        CodeModeChildStatus::Cancelled
+                    } else {
+                        CodeModeChildStatus::NotStarted
+                    },
+                    incomplete: false,
+                    error: Some(error.clone()),
+                });
+                return Err(error);
+            }
+        };
+        let mutating = !admitted.capability.read_only;
         let (result, structured, operation_ref) = self.agent.dispatch_script_child(
             &self.agent.cwd,
             &id,
-            &call.tool,
+            &admitted.canonical,
             &call.args,
             self.parent,
             ordinal,

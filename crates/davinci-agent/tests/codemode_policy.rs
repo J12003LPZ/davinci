@@ -171,6 +171,53 @@ fn codemode_aliases_are_policy_bounded() {
 }
 
 #[test]
+fn queued_mutation_revocation_is_denied() {
+    use davinci_agent::codemode::effect_is_admitted;
+    use davinci_agent::runtime::DeclaredEffect;
+
+    let mutating = capability("write", false);
+    // Controlled admits the declared mutation classes and nothing wider.
+    assert!(effect_is_admitted(
+        &CodeModeMode::Controlled,
+        &DeclaredEffect::FileSystemWrite
+    ));
+    assert!(effect_is_admitted(
+        &CodeModeMode::Controlled,
+        &DeclaredEffect::ProcessExecution
+    ));
+    for denied in [
+        DeclaredEffect::HostInteraction,
+        DeclaredEffect::Other("other".into()),
+    ] {
+        assert!(!effect_is_admitted(&CodeModeMode::Controlled, &denied));
+    }
+    // An MCP mutation is a real, authorization-guarded effect, not a class
+    // the mode silently widens or drops.
+    assert!(effect_is_admitted(
+        &CodeModeMode::Controlled,
+        &DeclaredEffect::McpMutation
+    ));
+    assert!(!effect_is_admitted(
+        &CodeModeMode::ReadOnly,
+        &DeclaredEffect::FileSystemWrite
+    ));
+    assert!(!effect_is_admitted(
+        &CodeModeMode::Off,
+        &DeclaredEffect::FileSystemRead
+    ));
+
+    // A mutation is admitted only while the live policy still holds it. Once
+    // the capability is revoked, the queued call resolves to DENIED and the
+    // effect class is no longer admitted either.
+    let before = CapabilityPolicy::new(CodeModeMode::Controlled, vec![mutating.clone()]).unwrap();
+    assert!(before.resolve("write").is_ok());
+    let after = CapabilityPolicy::new(CodeModeMode::Controlled, vec![]).unwrap();
+    let error = after.resolve("write").unwrap_err();
+    assert_eq!(error.code, "DENIED");
+    assert!(!error.message.contains("effect"));
+}
+
+#[test]
 fn canonical_resolution_never_accepts_an_alias() {
     let policy = CapabilityPolicy::new(
         CodeModeMode::ReadOnly,

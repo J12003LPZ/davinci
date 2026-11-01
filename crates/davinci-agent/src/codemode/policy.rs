@@ -96,6 +96,27 @@ pub fn resolve_script_alias(
         .ok_or_else(|| CodeModeError::new("DENIED", "unsupported script alias"))
 }
 
+/// Whether a declared effect class may be dispatched at all under `mode`.
+/// Aliasing and script arguments never widen this ceiling.
+pub fn effect_is_admitted(mode: &CodeModeMode, effect: &DeclaredEffect) -> bool {
+    match mode {
+        CodeModeMode::Off => false,
+        CodeModeMode::ReadOnly => matches!(
+            effect,
+            DeclaredEffect::FileSystemRead
+                | DeclaredEffect::NetworkAccess
+                | DeclaredEffect::McpRead
+        ),
+        // Controlled admits the same ceiling `CapabilityPolicy::new` admits:
+        // host interaction and unknown effects stay out, everything the
+        // ordinary authorizer guards may run.
+        CodeModeMode::Controlled => !matches!(
+            effect,
+            DeclaredEffect::HostInteraction | DeclaredEffect::Other(_)
+        ),
+    }
+}
+
 pub struct CapabilityPolicy {
     capabilities: BTreeMap<String, RuntimeCapability>,
     /// Admissible tools excluded because their JS aliases collide.

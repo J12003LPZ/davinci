@@ -1569,7 +1569,7 @@ fn broker_rejects_duplicate_calls_and_mutations_before_effects() {
     assert!(broker
         .call(CodeModeCall {
             request_id: 2,
-            tool: "write".into(),
+            tool: "tools.Write".into(),
             args: json!({"path":"forbidden.txt","content":"effect"})
         })
         .is_err());
@@ -1587,7 +1587,7 @@ fn controlled_broker_uses_real_permissions_and_never_replays_a_mutation() {
     let broker = AgentCodeModeBroker::new(agent.clone(), context.clone(), None).unwrap();
     let call = CodeModeCall {
         request_id: 1,
-        tool: "write".into(),
+        tool: "tools.Write".into(),
         args: json!({"path":"effect.txt","content":"once"}),
     };
     assert!(broker.call(call.clone()).is_ok());
@@ -1611,7 +1611,7 @@ fn controlled_broker_denial_is_not_uncertain_mutation_evidence() {
     let error = broker
         .call(CodeModeCall {
             request_id: 1,
-            tool: "write".into(),
+            tool: "tools.Write".into(),
             args: json!({"path":"denied.txt","content":"never"}),
         })
         .unwrap_err();
@@ -1825,4 +1825,69 @@ fn delayed_response_loss_is_not_no_effect_or_an_automatic_retry() {
             assert_eq!(result.unwrap().text(), "fixture effect recorded");
         }
     }
+}
+
+#[test]
+fn revoked_while_queued_child_is_denied_before_effect() {
+    use crate::codemode::{
+        AgentCodeModeBroker, CodeModeBroker as _, CodeModeCall, CodeModeIdentity, CodeModeLimits,
+        CodeModeMode, CodeModeRunContext,
+    };
+    let (mut agent, workspace, _) = configured_agent();
+    agent.tools = vec!["read".into(), "write".into()];
+    agent.sync_tool_authorization();
+    let runtime = agent.runtime.as_ref().unwrap();
+    let revision = runtime
+        .capability_registry
+        .hash_tool_capabilities(&agent.tools);
+    let context = CodeModeRunContext {
+        identity: CodeModeIdentity {
+            invocation_id: "revocation-fixture".into(),
+            session_id: runtime.session_id.clone(),
+            branch_leaf: None,
+            workspace_binding: workspace
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into(),
+            runtime_run_id: runtime.run_id.to_string(),
+            parent_operation_ref: None,
+        },
+        mode: CodeModeMode::Controlled,
+        limits: CodeModeLimits::default(),
+        capability_revision: revision,
+        cancellation: runtime.cancellation_token.child_token(),
+        root_budget: runtime.root_budget.clone(),
+    };
+    let broker = AgentCodeModeBroker::new(agent.clone(), context, None).unwrap();
+    // The Droid alias resolves through the same admission path as the
+    // canonical name, so a script can call tools.read without new authority.
+    let aliased = broker
+        .call(CodeModeCall {
+            request_id: 1,
+            tool: "tools.Read".into(),
+            args: json!({"path":"input.txt"}),
+        })
+        .unwrap();
+    assert!(aliased.text.contains("codemode baseline sentinel"));
+    // Revoke the mutation while the child call waits for its lane.
+    agent
+        .runtime
+        .as_ref()
+        .unwrap()
+        .capability_registry
+        .unregister("write");
+    let error = broker
+        .call(CodeModeCall {
+            request_id: 1,
+            tool: "tools.Write".into(),
+            args: json!({"path":"forbidden.txt","content":"effect"}),
+        })
+        .unwrap_err();
+    assert!(
+        error.code == "STALE_CAPABILITY" || error.code == "DENIED",
+        "{error:?}"
+    );
+    assert!(!workspace.path().join("forbidden.txt").exists());
 }
