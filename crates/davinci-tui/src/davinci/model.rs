@@ -4160,8 +4160,9 @@ impl Model {
     /// submit — and are flattened in a query, which is one line by definition.
     pub fn paste(&mut self, text: &str) {
         // The `/theme` picker takes every key, so it takes the paste a fast
-        // typist's burst becomes on Windows; the draft is left as it was.
-        if self.theme_picker.is_some() || self.onboarding.is_some() {
+        // typist's burst becomes on Windows; the draft is left as it was. A
+        // panel in view takes the paste first, as it takes the keys.
+        if self.overlay.is_none() && (self.theme_picker.is_some() || self.onboarding.is_some()) {
             return;
         }
         // Selectors own their search input independently of the conversation.

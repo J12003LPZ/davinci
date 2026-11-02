@@ -242,6 +242,21 @@ pub struct Theme {
     /// below it (`ansi`); this is where the next theme starts from. Read only
     /// while `wants_reference` is set.
     pub negotiated: ColorDepth,
+    /// The terminal's own depth, kept through every `with_name` so switching
+    /// the reference on after a narrowing theme (`ansi`) can start from it.
+    /// It never takes part in comparing two themes.
+    pub terminal: TerminalDepth,
+}
+
+/// A depth carried along with a theme that is not part of what the theme is:
+/// any two compare equal.
+#[derive(Debug, Clone, Copy, Eq)]
+pub struct TerminalDepth(pub ColorDepth);
+
+impl PartialEq for TerminalDepth {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 pub fn css_color(color: Color) -> Option<String> {
@@ -990,6 +1005,7 @@ const CC_REF_LIGHT: Cc = Cc {
 /// with the dim attribute, and bright yellow for the mode line.
 const CC_REF_BASIC: Cc = Cc {
     auto_mode: Color::LightYellow,
+    prompt_border: Color::Gray,
     inactive_modifier: Modifier::DIM,
     ..CC_BASIC
 };
@@ -1099,6 +1115,12 @@ impl Theme {
     /// Legacy/custom names retain the native dark palette.
     pub fn with_name(&self, name: &str) -> Self {
         let themed = self.named(name);
+        // The terminal's own depth outlives a theme that narrowed itself below
+        // it (`ansi`), whether or not the reference was on yet.
+        let themed = Self {
+            terminal: self.terminal,
+            ..themed
+        };
         if !self.wants_reference {
             return themed;
         }
@@ -1117,7 +1139,8 @@ impl Theme {
         let themed = Self {
             reference: true,
             ..themed
-        };
+        }
+        .with_default_ink();
         if themed.variant != Variant::Light || themed.depth_hint() != ColorDepth::TrueColor {
             return themed;
         }
@@ -1126,6 +1149,7 @@ impl Theme {
             reference: true,
             wants_reference: true,
             negotiated: themed.negotiated,
+            terminal: themed.terminal,
             ..Self::from_ramp(&LIGHT_REF, false, false)
         };
         if themed.daltonized {
@@ -1142,7 +1166,32 @@ impl Theme {
         Self {
             reference: wants && !self.is_vox(),
             wants_reference: wants,
+            // A theme that narrowed itself before the switch came on starts
+            // the next one from the terminal's depth, not from its own.
+            negotiated: if wants && !self.wants_reference {
+                self.terminal.0
+            } else {
+                self.negotiated
+            },
             ..self
+        }
+        .with_default_ink()
+    }
+
+    /// The reference's ANSI-only dark theme leaves the text in the terminal's own
+    /// foreground, as its truecolor themes do; the named white is for the quiet inks.
+    fn with_default_ink(self) -> Self {
+        if self.reference
+            && !self.no_color
+            && self.variant == Variant::Dark
+            && self.depth_hint() == ColorDepth::Basic
+        {
+            Self {
+                text: Color::Reset,
+                ..self
+            }
+        } else {
+            self
         }
     }
 
@@ -1362,6 +1411,7 @@ impl Theme {
         dimmed.reference = self.reference;
         dimmed.wants_reference = self.wants_reference;
         dimmed.negotiated = self.negotiated;
+        dimmed.terminal = self.terminal;
         // Nothing is emphasised behind a modal; the modal is what is in hand.
         dimmed.emphasis = Modifier::empty();
         dimmed
@@ -1441,6 +1491,7 @@ impl Theme {
             reference: false,
             wants_reference: false,
             negotiated: depth_of(ramp.primary),
+            terminal: TerminalDepth(depth_of(ramp.primary)),
         }
     }
 

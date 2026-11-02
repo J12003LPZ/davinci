@@ -629,7 +629,12 @@ pub fn effort_line(model: &Model) -> Line<'static> {
         return spread(
             model.width,
             Vec::new(),
-            vec![span(format!("{label}  "), cc.inactive)],
+            vec![Span::styled(
+                format!("{label}  "),
+                Style::default()
+                    .fg(cc.inactive)
+                    .add_modifier(cc.inactive_modifier),
+            )],
         );
     }
     spread(model.width, Vec::new(), Vec::new())
@@ -661,7 +666,12 @@ pub fn effort_rule(model: &Model) -> Line<'static> {
             return Line::from(vec![
                 span("▔".repeat(bars), cc.permission),
                 span(" ", model.theme.text),
-                span(label, cc.inactive),
+                Span::styled(
+                    label,
+                    Style::default()
+                        .fg(cc.inactive)
+                        .add_modifier(cc.inactive_modifier),
+                ),
                 span(" ", model.theme.text),
                 span("▔", cc.permission),
             ]);

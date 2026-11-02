@@ -89,6 +89,9 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
         }
         KeyCode::Enter => {
             let name = ENTRIES[picker.index].0.to_string();
+            // The preview shows only if the highlight moved; a theme that
+            // failed to save can leave another one on screen.
+            model.theme = picker.previous.with_name(&name);
             model.theme_picker = None;
             return Flow::Choose(Choice::Theme(name));
         }

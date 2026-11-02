@@ -26,12 +26,38 @@ golden from ``cc2316_rules.json`` (empty until a task earns an entry) and reject
 * ``data``: text is ignored inside the box; style is compared.
 * ``structure``: like ``data``, and the wide-glyph geometry (which columns are the
   second half of a wide glyph) is compared too.
-* ``dropped``: a surface DaVinci does not draw (decision D3 or D6, cited in the reason).
+* ``dropped``: a surface DaVinci does not draw (decision D3, D6 or D7, cited in the reason).
   The expected cells are ignored and every actual cell in the box must be blank: a space
   that passes the comparison's own blank test (no underline, strike or inverse; the
   invisible fg, bold, dim, italic and blink are not looked at) with the capture's default
   background. Anything drawn there is a ``dropped`` difference, so the rule cannot hide a
-  defect. ``compare_golden`` accepts it only inside ``DROPPED_REGIONS``.
+  defect. ``compare_golden`` accepts it only inside ``DROPPED_REGIONS`` (D7: the reference's
+  underlined link, one row).
+* ``copy``: DaVinci's own wording on a ``structure`` golden. Per row ``{"row", "col", "text"}``:
+  the capture's cells in the rule's region must be exactly that text at that column and
+  blank everywhere else (``copy-text``, ``copy-stray``); the set of foreground and modifier
+  combinations on the non-blank cells of each row must equal the golden's set for the same
+  columns (``copy-style``); backgrounds are compared cell by cell as always. The golden's
+  own text is ignored. The text in a manifest is DaVinci's, never the reference's.
+* ``art``: DaVinci's own picture. ``region`` is the rectangle, ``lines`` its exact text (one
+  per row, padded with blanks) and ``band`` the zone around it that the reference fills with
+  its own art. Rectangle cells must equal the lines (style is ignored); every other cell of
+  the band must be a plain blank. The golden's band cells are not compared.
+  ``compare_golden`` accepts art only for the goldens and rectangles in ``ART_REGIONS``.
+  Rows are 0-based.
+
+``Compact`` (a rule of its own, at most one per golden; decision D6) removes the release
+notice and its separator from the *expected* frame before anything is compared: the rows
+after the block, within ``transcript``, move up by its height, and the rows vacated at the
+bottom of ``transcript`` must be blank in the capture (the ``dropped`` check), or hold the
+exact DaVinci text rows in ``exposed``. Rows outside ``transcript`` are untouched. Every other
+rule of the golden is written in post-compaction coordinates for the rows below the removed
+block. The block is verified in the golden itself: every notice row begins with the notice
+bar glyph (``NOTICE_BAR``) in column 0, and the last row (the separator) is blank.
+``transcript`` must end at least two rows above the composer's top rule (the first row after
+the block that begins with one of ``RULE_GLYPHS``: the rule itself, or the edge of a picker
+or panel that replaces the composer), because the effort row and everything below are pinned. A ``transcript`` that reaches there, rows outside the transcript, a block that fails
+these checks or a golden with no composer rule raise ``ValueError``.
 
 What is compared outside the grid, and how:
 
@@ -75,14 +101,32 @@ MODE_FIELDS = ("alternate_screen", "mouse_click", "mouse_drag", "mouse_move", "m
                "synchronized_output")
 _STYLE_DEFAULTS = {"fg": None, "bg": None, "bold": False, "dim": False, "italic": False,
                    "underline": False, "strike": False, "inverse": False, "blink": False}
-KINDS = ("mark", "identity", "data", "structure", "dropped")
+KINDS = ("mark", "identity", "data", "structure", "dropped", "copy", "art")
 MARK_BOX = {"rows": (1, 3), "cols": (0, 9)}  # the header mark of the plan, "Region rules"
 # A ``dropped`` rule names the decision that removed a surface. Only the regions listed here
-# may be dropped, and ``load_rules`` rejects any other: D6 is the release notice in rows 5-8
-# (columns 0-159 take in the widest golden). D3's surfaces are not listed because none has
-# a region yet.
-DROPPED_REGIONS = {"D6": {"rows": (5, 8), "cols": (0, 159)}}
-_DECISION = re.compile(r"\bD[36]\b")
+# may be dropped, and ``load_rules`` rejects any other. D7 is the reference's underlined
+# security link line: one row of the first-run security notes, its caption and the link,
+# columns 4-55 (0-based; the link itself is columns 16-55). D6's notice
+# is removed by ``Compact``, which moves the rows instead of leaving a gap, so it is not
+# listed. D3's surfaces are not listed because none has a region yet.
+DROPPED_REGIONS = {"D7": {"rows": (24, 24), "cols": (4, 55)}}
+# Where DaVinci draws its own art over the reference's (0-based rows): the sprite on rows 10-14
+# and the dots under it on row 15, inside the band between the two dot rows that the reference
+# fills with its star field. The rectangle holds the whole sprite and its dot row.
+_ONBOARDING_ART = [{"rect": {"rows": (10, 15), "cols": (0, 57)},
+                    "band": {"rows": (2, 15), "cols": (0, 119)}}]
+ART_REGIONS = {"onboarding__01_onboarding": _ONBOARDING_ART,
+               "onboarding__03_after_enter": _ONBOARDING_ART}
+# The glyph that begins every row of the release notice, in column 0 (U+258E, LEFT ONE EIGHTH
+# BLOCK), measured on the goldens' notice rows.
+NOTICE_BAR = "▎"
+# The top edge of the pinned bottom begins with one of these glyphs: the composer's rule
+# (U+2500) or, when a picker or panel replaces the composer, the panel's edge (U+2594). The
+# transcript must end above it.
+RULE_GLYPHS = ("─", "▔")
+RULE_PREFIX = 8
+_DECISION = re.compile(r"\bD[367]\b")
+_COMPACT_DECISION = re.compile(r"\bD6\b")
 _MISSING = object()
 _CONT = ""  # text of the second column of a wide glyph
 
@@ -118,6 +162,9 @@ class Rule:
     kind: str
     reason: str
     substitutions: dict | None = None
+    entries: object = None
+    lines: object = None
+    band: object = None
     row0: int = field(init=False)
     row1: int = field(init=False)
     col0: int = field(init=False)
@@ -142,15 +189,68 @@ class Rule:
             raise ValueError(f"a mark must sit inside rows {MARK_BOX['rows']}, "
                              f"columns {MARK_BOX['cols']}, got {self.region!r}")
         if self.kind == "dropped" and not _DECISION.search(self.reason):
-            raise ValueError("a dropped rule's reason must cite decision D3 or D6")
+            raise ValueError("a dropped rule's reason must cite decision D3, D6 or D7")
         if self.kind == "identity":
             if not self.substitutions or any(not k for k in self.substitutions):
                 raise ValueError("an identity rule needs a substitution table with non-empty keys")
         elif self.substitutions is not None:
             raise ValueError("only identity rules take substitutions")
+        if self.kind == "copy":
+            self._check_copy()
+        elif self.entries is not None:
+            raise ValueError("only copy rules take entries")
+        if self.kind == "art":
+            self._check_art()
+        elif self.lines is not None or self.band is not None:
+            raise ValueError("only art rules take lines or a band")
+
+    def _check_copy(self):
+        entries = self.entries
+        if not isinstance(entries, (list, tuple)) or not entries:
+            raise ValueError("a copy rule needs entries")
+        seen = set()
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {"row", "col", "text"}:
+                raise ValueError(f"a copy entry is a row, a col and a text, got {entry!r:.60}")
+            row, col, text = entry["row"], entry["col"], entry["text"]
+            if any(isinstance(v, bool) or not isinstance(v, int) for v in (row, col)):
+                raise ValueError(f"a copy entry needs integer row and col: {entry!r:.60}")
+            width = _plain_width(text, "a copy entry's text")
+            if not self.row0 <= row <= self.row1:
+                raise ValueError(f"copy row {row} is outside the region {self.region!r}")
+            if row in seen:
+                raise ValueError(f"two copy entries for row {row}")
+            seen.add(row)
+            if col < self.col0 or col + width - 1 > self.col1:
+                raise ValueError(f"copy text on row {row} does not fit columns "
+                                 f"{self.col0}-{self.col1} from column {col}")
+        missing = [r for r in range(self.row0, self.row1 + 1) if r not in seen]
+        if missing:
+            raise ValueError(f"copy region rows without an entry: {missing}")
+
+    def _check_art(self):
+        if self.lines is None or self.band is None:
+            raise ValueError("an art rule needs lines and a band")
+        if (not isinstance(self.lines, (list, tuple)) or not self.lines
+                or len(self.lines) != self.row1 - self.row0 + 1):
+            raise ValueError("an art rule needs one line per rectangle row")
+        width = self.col1 - self.col0 + 1
+        for line in self.lines:
+            if _plain_width(line, "an art line", allow_empty=True) > width:
+                raise ValueError(f"an art line is wider than the {width}-column rectangle: {line!r:.40}")
+        try:
+            (b0, b1), (d0, d1) = self.band["rows"], self.band["cols"]  # type: ignore[index]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"band must be a rows and a cols interval: {exc!r}") from exc
+        if not (b0 <= self.row0 and self.row1 <= b1 and d0 <= self.col0 and self.col1 <= d1):
+            raise ValueError("the art band must hold the rectangle")
+        # The rule owns its whole band, so that is what it must not overlap.
+        object.__setattr__(self, "rect", (self.row0, self.row1, self.col0, self.col1))
+        for name, value in (("row0", b0), ("row1", b1), ("col0", d0), ("col1", d1)):
+            object.__setattr__(self, name, value)
 
     def decision(self) -> str | None:
-        """The decision (``D3`` or ``D6``) a dropped rule's reason cites."""
+        """The decision (``D3``, ``D6`` or ``D7``) a dropped rule's reason cites."""
         found = _DECISION.search(self.reason)
         return found.group(0) if found else None
 
@@ -160,6 +260,51 @@ class Rule:
     def overlaps(self, other: "Rule") -> bool:
         return (self.row0 <= other.row1 and other.row0 <= self.row1
                 and self.col0 <= other.col1 and other.col0 <= self.col1)
+
+
+def _plain_width(text, what, allow_empty=False) -> int:
+    """Columns of ``text``: a string of printable characters with no zero-width lead."""
+    if not isinstance(text, str) or (not text and not allow_empty):
+        raise ValueError(f"{what} must be a non-empty string")
+    if any(unicodedata.category(ch) == "Cc" for ch in text):
+        raise ValueError(f"{what} holds a control character: {text!r:.40}")
+    cells, leading = _text_cells(text, ())
+    if leading:
+        raise ValueError(f"{what} starts with a zero-width character: {text!r:.40}")
+    return len(cells)
+
+
+@dataclass(frozen=True)
+class Compact:
+    """Remove the release notice (decision D6) from the expected frame. See the module
+    docstring. ``rows`` is the notice's rows plus its separator, ``transcript`` the scrolling
+    region, both ``(first, last)``, inclusive and 0-based."""
+    golden: str
+    rows: tuple
+    transcript: tuple
+    reason: str
+    exposed: tuple = ()
+
+    def __post_init__(self):
+        if not isinstance(self.reason, str) or not _COMPACT_DECISION.search(self.reason):
+            raise ValueError("a compact rule's reason must cite decision D6")
+        for name in ("rows", "transcript"):
+            value = getattr(self, name)
+            if (not isinstance(value, (list, tuple)) or len(value) != 2
+                    or any(isinstance(v, bool) or not isinstance(v, int) for v in value)):
+                raise ValueError(f"compact {name} must be (first, last) integers, got {value!r}")
+            object.__setattr__(self, name, tuple(value))
+        if not 0 <= self.rows[0] <= self.rows[1]:
+            raise ValueError(f"compact rows {self.rows!r} are not an interval")
+        if not self.transcript[0] <= self.rows[0] or self.rows[1] > self.transcript[1]:
+            raise ValueError(f"compact rows {self.rows!r} are outside the transcript {self.transcript!r}")
+        if not isinstance(self.exposed, (list, tuple)):
+            raise ValueError("compact exposed must be a list of text rows")
+        object.__setattr__(self, "exposed", tuple(self.exposed))
+        for text in self.exposed:
+            _plain_width(text, "an exposed row")
+        if len(self.exposed) > self.rows[1] - self.rows[0] + 1:
+            raise ValueError("compact has more exposed rows than rows it vacates")
 
 
 def load_capture(path) -> dict:
@@ -336,6 +481,70 @@ def _identity_cells(rule: Rule, cells: dict, blank: tuple, out: list) -> dict:
     return rewritten
 
 
+def _row_blank(cells, row, ncols, blank) -> bool:
+    return all(_dropped_blank(cells.get((row, c), blank), blank) for c in range(ncols))
+
+
+def _compacted(expected: dict, rule: Compact):
+    """The expected frame without the notice, and the rules for the rows it vacates."""
+    golden = expected.get("name")
+    if rule.golden != golden:
+        raise ValueError(f"compact is for golden {rule.golden!r}, comparing {golden!r}")
+    dims = expected.get("dimensions") or {}
+    ncols, nrows = dims.get("cols", 0), dims.get("rows", 0)
+    first, last = rule.rows
+    top, bottom = rule.transcript
+    if top < 0 or bottom >= nrows:
+        raise ValueError(f"compact transcript {rule.transcript!r} is outside the {nrows}-row grid")
+    cells, _, _ = _grid(expected, "expected", [])
+    blank = _blank(expected)
+    for row in range(first, last):
+        if _cell_text(cells, row, 0, blank) != NOTICE_BAR:
+            raise ValueError(f"compact row {row} of {golden!r} does not begin with the notice bar "
+                             f"in column 0")
+    if not _row_blank(cells, last, ncols, blank):
+        raise ValueError(f"compact separator row {last} of {golden!r} is not blank")
+    if first == last:
+        raise ValueError("compact needs at least one notice row and a separator")
+    rule_row = next((row for row in range(last + 1, nrows)
+                     if any(all(_cell_text(cells, row, c, blank) == glyph
+                                for c in range(min(RULE_PREFIX, ncols))) for glyph in RULE_GLYPHS)),
+                    None)
+    if rule_row is None:
+        raise ValueError(f"golden {golden!r} has no composer rule below the notice")
+    if bottom > rule_row - 2:
+        raise ValueError(f"compact transcript {rule.transcript!r} reaches the pinned bottom, which "
+                         f"begins at row {rule_row - 1} (the composer rule is row {rule_row})")
+    height = last - first + 1
+    rows = list(expected.get("rows", []))
+    rows += [[] for _ in range(nrows - len(rows))]
+    for row in range(first, bottom - height + 1):
+        rows[row] = expected["rows"][row + height] if row + height < len(expected["rows"]) else []
+    vacated = bottom - height + 1
+    for row in range(vacated, bottom + 1):
+        rows[row] = []
+    shifted = {**expected, "rows": rows}
+    extra = []
+    reason = rule.reason
+    for index, text in enumerate(rule.exposed):
+        row = vacated + index
+        width = _plain_width(text, "an exposed row")
+        if width > ncols:
+            raise ValueError(f"exposed row {text!r:.40} is wider than the {ncols}-column grid")
+        extra.append(Rule(golden=golden, region={"rows": (row, row), "cols": (0, width - 1)},
+                          kind="art", reason=reason, lines=(text,),
+                          band={"rows": (row, row), "cols": (0, ncols - 1)}))
+    rest = vacated + len(rule.exposed)
+    if rest <= bottom:
+        extra.append(Rule(golden=golden, region={"rows": (rest, bottom), "cols": (0, ncols - 1)},
+                          kind="dropped", reason=reason))
+    return shifted, extra
+
+
+def _cell_text(cells, row, col, blank) -> str:
+    return cells.get((row, col), blank)[0]
+
+
 def _validate_rules(rules, expected, ncols, nrows):
     rules = list(rules)
     golden = expected.get("name")
@@ -390,7 +599,66 @@ def _compare_pair(row, col, left, right, ignore_text, geometry, out):
             out.append(Difference(row, col, name, lv, rv))
 
 
+def _style_set(cells, row, c0, c1, blank_cell) -> set:
+    """The foreground and modifier combinations of the non-blank cells of a row segment."""
+    found = set()
+    for col in range(c0, c1 + 1):
+        text, style = cells.get((row, col), blank_cell)
+        if text not in (" ", _CONT):
+            found.add(tuple(v for name, v in zip(STYLE_FIELDS, style) if name != "bg"))
+    return found
+
+
+def _check_copy(rule: Rule, ecells, eblank, acells, ablank, arows, acols, out):
+    for entry in rule.entries:
+        row, col = entry["row"], entry["col"]
+        wanted, _ = _text_cells(entry["text"], ())
+        end = col + len(wanted)
+        for c in range(rule.col0, rule.col1 + 1):
+            cell = _cell_at(acells, row, c, arows, acols, ablank)
+            if cell is None:
+                out.append(Difference(row, c, "copy-text", "inside the grid", None))
+            elif col <= c < end:
+                if cell[0] != wanted[c - col][0]:
+                    out.append(Difference(row, c, "copy-text", wanted[c - col][0], cell[0]))
+            elif not _plain_blank(cell):
+                out.append(Difference(row, c, "copy-stray", "blank", cell))
+        have = _style_set(acells, row, rule.col0, rule.col1, ablank)
+        want = _style_set(ecells, row, rule.col0, rule.col1, eblank)
+        if have != want:
+            out.append(Difference(row, None, "copy-style", sorted(map(repr, want)),
+                                  sorted(map(repr, have))))
+
+
+def _check_art(rule: Rule, acells, ablank, arows, acols, out):
+    r0, r1, c0, c1 = rule.rect  # type: ignore[attr-defined]
+    wanted = {}
+    for index, line in enumerate(rule.lines):
+        cells, _ = _text_cells(line, ())
+        for offset, (text, _) in enumerate(cells):
+            wanted[(r0 + index, c0 + offset)] = text
+    for row in range(rule.row0, rule.row1 + 1):
+        for col in range(rule.col0, rule.col1 + 1):
+            cell = _cell_at(acells, row, col, arows, acols, ablank)
+            inside = r0 <= row <= r1 and c0 <= col <= c1
+            if cell is None:
+                out.append(Difference(row, col, "art", "inside the grid", None))
+            elif inside:
+                if cell[0] != wanted.get((row, col), " "):
+                    out.append(Difference(row, col, "art", wanted.get((row, col), " "), cell[0]))
+            elif not _dropped_blank(cell, ablank):
+                out.append(Difference(row, col, "art", "blank", cell))
+
+
 def compare(expected: dict, actual: dict, rules=()) -> DiffReport:
+    rules = list(rules)
+    compacts = [r for r in rules if isinstance(r, Compact)]
+    if len(compacts) > 1:
+        raise ValueError("a golden takes at most one compact rule")
+    rules = [r for r in rules if not isinstance(r, Compact)]
+    if compacts:
+        expected, vacated = _compacted(expected, compacts[0])
+        rules += vacated
     out: list[Difference] = []
     edims, adims = expected.get("dimensions"), actual.get("dimensions")
     if edims != adims:
@@ -423,10 +691,18 @@ def compare(expected: dict, actual: dict, rules=()) -> DiffReport:
     for row in range(max(erows, arows)):
         for col in range(max(ecols, acols)):
             rule = owner.get((row, col))
-            if rule is not None and rule.kind == "mark":
-                continue
+            if rule is not None and rule.kind in ("mark", "art"):
+                continue  # art is checked below, against its own lines
             left = _cell_at(ecells, row, col, erows, ecols, eblank)
             right = _cell_at(acells, row, col, arows, acols, ablank)
+            if rule is not None and rule.kind == "copy":
+                # Text and the foreground are DaVinci's own; only the background is the golden's.
+                if left is None or right is None:
+                    out.append(Difference(row, col, "outside-grid", left, right))
+                elif left[1][STYLE_FIELDS.index("bg")] != right[1][STYLE_FIELDS.index("bg")]:
+                    out.append(Difference(row, col, "bg", left[1][STYLE_FIELDS.index("bg")],
+                                          right[1][STYLE_FIELDS.index("bg")]))
+                continue
             if rule is not None and rule.kind == "dropped":
                 if right is None or not _dropped_blank(right, ablank):
                     out.append(Difference(row, col, "dropped", "blank", right))
@@ -438,6 +714,11 @@ def compare(expected: dict, actual: dict, rules=()) -> DiffReport:
             _compare_pair(row, col, left, right,
                           ignore_text=rule is not None and rule.kind in ("data", "structure"),
                           geometry=rule is not None and rule.kind == "structure", out=out)
+    for rule in rules:
+        if rule.kind == "copy":
+            _check_copy(rule, ecells, eblank, acells, ablank, arows, acols, out)
+        elif rule.kind == "art":
+            _check_art(rule, acells, ablank, arows, acols, out)
     return DiffReport(out)
 
 
@@ -445,7 +726,15 @@ DEFAULT_RULES = Path(__file__).with_name("cc2316_rules.json")
 DEFAULT_OWNERS = Path(__file__).with_name("cc2316_owners.json")
 
 
-def load_rules(name: str, manifest_path=DEFAULT_RULES, owners_path=DEFAULT_OWNERS) -> list[Rule]:
+def _box(region) -> tuple:
+    return tuple(region["rows"]), tuple(region["cols"])
+
+
+SPEC_KEYS = {"kind", "reason", "region", "substitutions", "entries", "lines", "band", "rows",
+             "transcript", "exposed"}
+
+
+def load_rules(name: str, manifest_path=DEFAULT_RULES, owners_path=DEFAULT_OWNERS) -> list:
     """The approved rules for golden ``name``, checked against its tier in the owners file."""
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     specs = (manifest.get("goldens") or {}).get(name) or []
@@ -455,12 +744,33 @@ def load_rules(name: str, manifest_path=DEFAULT_RULES, owners_path=DEFAULT_OWNER
             .get(name) or {}).get("tier")
     rules = []
     for spec in specs:
-        rule = Rule(golden=name, region=spec.get("region"), kind=spec.get("kind"),
-                    reason=spec.get("reason"), substitutions=spec.get("substitutions"))
+        unknown = set(spec) - SPEC_KEYS
+        if unknown:
+            raise ValueError(f"golden {name!r}: unknown rule keys {sorted(unknown)}")
         if tier == "exception":
             raise ValueError(f"golden {name!r} is an exception; it takes no rules")
-        if rule.kind == "structure" and tier != "structure":
-            raise ValueError(f"a structure rule needs golden {name!r} to be tier structure, not {tier!r}")
+        if spec.get("kind") == "compact":
+            if set(spec) - {"kind", "reason", "rows", "transcript", "exposed"}:
+                raise ValueError(f"golden {name!r}: a compact rule takes rows, transcript, exposed "
+                                 f"and a reason, nothing else")
+            if any(isinstance(r, Compact) for r in rules):
+                raise ValueError(f"golden {name!r} takes at most one compact rule")
+            rules.append(Compact(golden=name, rows=spec.get("rows"), transcript=spec.get("transcript"),
+                                 reason=spec.get("reason"), exposed=spec.get("exposed") or ()))
+            continue
+        if {"rows", "transcript", "exposed"} & set(spec):
+            raise ValueError(f"golden {name!r}: only a compact rule takes rows, transcript or exposed")
+        rule = Rule(golden=name, region=spec.get("region"), kind=spec.get("kind"),
+                    reason=spec.get("reason"), substitutions=spec.get("substitutions"),
+                    entries=spec.get("entries"), lines=spec.get("lines"), band=spec.get("band"))
+        if rule.kind in ("structure", "copy", "art") and tier != "structure":
+            raise ValueError(f"a {rule.kind} rule needs golden {name!r} to be tier structure, "
+                             f"not {tier!r}")
+        if rule.kind == "art":
+            listed = [(_box(item["rect"]), _box(item["band"])) for item in ART_REGIONS.get(name, [])]
+            if (_box(spec["region"]), _box(spec["band"])) not in listed:
+                raise ValueError(f"golden {name!r}: art must use a rectangle and band listed in "
+                                 f"ART_REGIONS, got {spec['region']!r} in {spec['band']!r}")
         if rule.kind == "dropped":
             listed = DROPPED_REGIONS.get(rule.decision())
             if listed is None or not (listed["rows"][0] <= rule.row0 and rule.row1 <= listed["rows"][1]

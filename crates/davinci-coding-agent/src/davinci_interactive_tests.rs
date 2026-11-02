@@ -476,6 +476,31 @@ fn the_theme_line_opens_the_picker_only_in_the_reference_shell() {
 }
 
 #[test]
+fn the_first_run_steps_open_on_the_stored_theme() {
+    let mut off = model();
+    assert!(!super::begin_first_run(&mut off, &Default::default()));
+    for (stored, shown) in [
+        (Some("light"), "light"),
+        (Some("ansi"), "ansi"),
+        (None, "dark"),
+    ] {
+        let mut on = model();
+        on.reference = true;
+        let settings = crate::settings::Settings {
+            theme: stored.map(String::from),
+            ..Default::default()
+        };
+        assert!(super::begin_first_run(&mut on, &settings));
+        let picker = on.theme_picker.as_ref().expect("opened");
+        assert_eq!(
+            davinci_tui::davinci::views::theme_picker::ENTRIES[picker.index].0,
+            shown
+        );
+        assert_eq!(picker.applied, shown);
+    }
+}
+
+#[test]
 fn a_queued_theme_line_waits_behind_the_lines_that_start_a_turn() {
     let queue = |lines: &[&str]| lines.iter().map(ToString::to_string).collect::<Vec<_>>();
     let drain =

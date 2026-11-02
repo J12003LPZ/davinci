@@ -369,10 +369,19 @@ fn reference_banner(model: &Model, info: &Startup, home: Option<&str>) -> Vec<Li
     let cc = th.cc();
     let mut name = span("DaVinci", th.text);
     name.style = name.style.add_modifier(Modifier::BOLD);
+    // The quiet ink, with the dim attribute where the theme makes it quiet that way.
+    let quiet = |words: String| {
+        Span::styled(
+            words,
+            Style::default()
+                .fg(cc.inactive)
+                .add_modifier(cc.inactive_modifier),
+        )
+    };
     let (title, provider) = model_and_provider(model);
-    let mut serving = vec![span(title.replace('-', " "), cc.inactive)];
+    let mut serving = vec![quiet(title.replace('-', " "))];
     if !provider.is_empty() {
-        serving.push(span(format!(" · {provider}"), cc.inactive));
+        serving.push(quiet(format!(" · {provider}")));
     }
     let column = MARK[0].chars().count() as u16;
     let side_by_side = model.width >= column + MIN_TEXT_COLUMNS;
@@ -383,12 +392,9 @@ fn reference_banner(model: &Model, info: &Startup, home: Option<&str>) -> Vec<Li
     };
     let path = home_relative(&info.cwd, home);
     let text = [
-        vec![
-            name,
-            span(format!(" v{}", env!("CARGO_PKG_VERSION")), cc.inactive),
-        ],
+        vec![name, quiet(format!(" v{}", env!("CARGO_PKG_VERSION")))],
         serving,
-        vec![span(clip_ellipsis(&path, text_room), cc.inactive)],
+        vec![quiet(clip_ellipsis(&path, text_room))],
     ];
     let art = MARK
         .iter()

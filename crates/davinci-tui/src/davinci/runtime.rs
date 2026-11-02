@@ -89,8 +89,13 @@ fn supports_keyboard_enhancement() -> bool {
 /// so the terminal can be given back from a panic hook, which has no `Session`
 /// to ask.
 static DISAMBIGUATED: AtomicBool = AtomicBool::new(false);
-/// Whether the alternate screen is currently ours.
+/// Whether the terminal is currently ours (raw mode and the modes set at open).
 static HELD: AtomicBool = AtomicBool::new(false);
+/// Whether the alternate screen is currently ours.
+static ALTERNATE: AtomicBool = AtomicBool::new(false);
+/// Whether the main screen is ours instead: the reference's first-run steps, which run
+/// off the alternate screen until they end.
+static INLINE: AtomicBool = AtomicBool::new(false);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static MAIN_THREAD: OnceLock<std::thread::ThreadId> = OnceLock::new();
 
@@ -137,6 +142,35 @@ pub fn reference_enabled(env: Option<&str>, setting: bool) -> bool {
         Some("1" | "true" | "yes" | "on") => true,
         Some("0" | "false" | "no" | "off") => false,
         _ => setting,
+    }
+}
+
+/// Whether a session opens on the alternate screen, with the mouse on, at once. The
+/// reference's first run does not: its welcome steps run on the main screen with the mouse
+/// off, and the session goes fullscreen when they end. Everything else is fullscreen.
+pub fn fullscreen_at_open(reference: bool, defer_first_run: bool) -> bool {
+    !(reference && defer_first_run)
+}
+
+/// What a restore does with the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenExit {
+    /// Leave the alternate screen.
+    Alternate,
+    /// The main screen was ours: start a fresh line under the last frame.
+    Inline,
+    /// The screen was never taken.
+    Nothing,
+}
+
+/// What to undo for the screen, from what was entered.
+pub fn screen_exit(alternate: bool, inline: bool) -> ScreenExit {
+    if alternate {
+        ScreenExit::Alternate
+    } else if inline {
+        ScreenExit::Inline
+    } else {
+        ScreenExit::Nothing
     }
 }
 
@@ -193,7 +227,22 @@ pub fn restore() -> io::Result<()> {
         let _ = out.flush();
     }
     let _ = execute!(io::stdout(), DisableFocusChange, DisableBracketedPaste);
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+    match screen_exit(
+        ALTERNATE.swap(false, Ordering::SeqCst),
+        INLINE.swap(false, Ordering::SeqCst),
+    ) {
+        ScreenExit::Alternate => {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        }
+        ScreenExit::Inline => {
+            let mut out = io::stdout();
+            let _ = out.write_all(b"\x1b[0m\r\n");
+            let _ = execute!(out, Show);
+        }
+        ScreenExit::Nothing => {
+            let _ = execute!(io::stdout(), Show);
+        }
+    }
     let _ = disable_raw_mode();
     io::stdout().flush()
 }
@@ -413,6 +462,9 @@ pub struct Session {
     keyboard: Keyboard,
     /// `tui.reference` (or `PI_DAVINCI_REFERENCE`), fixed when the session opened.
     reference: bool,
+    /// The reference's first run: still on the main screen, mouse off, until the welcome
+    /// steps end.
+    deferred: bool,
     paste: PasteFilter,
     rendered_lines: Vec<String>,
     selector: super::selection::Selector,
@@ -518,21 +570,36 @@ impl Session {
     /// [`Session::open`] with the `tui.reference` setting. The setting and
     /// `PI_DAVINCI_REFERENCE` are read here, once, and never again.
     pub fn open_with(reference_setting: bool) -> io::Result<Self> {
+        Self::open_deferring(reference_setting, false)
+    }
+
+    /// [`Session::open_with`] for a first run that may be due. With the reference on and
+    /// `first_run` set, the session starts on the main screen with the mouse off, as the
+    /// reference's welcome steps do, and [`Session::draw`] takes the alternate screen and
+    /// the mouse when the steps end. With the reference off nothing differs from
+    /// [`Session::open_with`].
+    pub fn open_deferring(reference_setting: bool, first_run: bool) -> io::Result<Self> {
         let reference = reference_enabled(
             std::env::var("PI_DAVINCI_REFERENCE").ok().as_deref(),
             reference_setting,
         );
+        let deferred = !fullscreen_at_open(reference, first_run);
         install_panic_hook();
         let generation = Generation::begin();
         let named_sgr = Arc::new(AtomicBool::new(false));
         let opened = (|| {
             enable_raw_mode()?;
             HELD.store(true, Ordering::SeqCst);
-            REFERENCE.store(reference, Ordering::SeqCst);
+            REFERENCE.store(reference && !deferred, Ordering::SeqCst);
             let mut out = io::stdout();
-            execute!(out, EnterAlternateScreen)?;
+            if deferred {
+                INLINE.store(true, Ordering::SeqCst);
+            } else {
+                ALTERNATE.store(true, Ordering::SeqCst);
+                execute!(out, EnterAlternateScreen)?;
+            }
             let _ = execute!(out, EnableBracketedPaste, EnableFocusChange);
-            if reference {
+            if reference && !deferred {
                 write_reference_modes(&mut out);
             }
             let disambiguated = supports_keyboard_enhancement();
@@ -545,8 +612,13 @@ impl Session {
                 )?;
                 DISAMBIGUATED.store(true, Ordering::SeqCst);
             }
-            let terminal =
+            let mut terminal =
                 Terminal::new(CrosstermBackend::new(NamedSgr::new(out, named_sgr.clone())))?;
+            if deferred {
+                // The main screen holds the shell's own text; the first frame only
+                // writes the cells it fills.
+                terminal.clear()?;
+            }
             Ok::<_, io::Error>((terminal, disambiguated))
         })();
         let (terminal, disambiguated) = match opened {
@@ -562,6 +634,7 @@ impl Session {
             generation,
             keyboard: Keyboard { disambiguated },
             reference,
+            deferred,
             paste: PasteFilter {
                 burst: cfg!(windows).then(super::paste_burst::PasteBurst::default),
                 ..PasteFilter::default()
@@ -595,6 +668,30 @@ impl Session {
         self.reference
     }
 
+    /// Whether the session is still on the main screen with the mouse off (the
+    /// reference's first-run steps).
+    pub fn deferred(&self) -> bool {
+        self.deferred
+    }
+
+    /// Take the alternate screen and the reference's modes, once the first-run steps
+    /// have ended. Does nothing when the session was never deferred.
+    pub fn enter_fullscreen(&mut self) -> io::Result<()> {
+        if !self.deferred {
+            return Ok(());
+        }
+        self.deferred = false;
+        INLINE.store(false, Ordering::SeqCst);
+        ALTERNATE.store(true, Ordering::SeqCst);
+        let mut out = io::stdout();
+        execute!(out, EnterAlternateScreen)?;
+        if self.reference {
+            REFERENCE.store(true, Ordering::SeqCst);
+            write_reference_modes(&mut out);
+        }
+        self.forget_screen()
+    }
+
     /// Use the terminal's own cursor at the caret (the `showHardwareCursor`
     /// setting); the environment can turn it on but a setting cannot turn
     /// the environment's choice off.
@@ -613,11 +710,16 @@ impl Session {
         }
         enable_raw_mode()?;
         HELD.store(true, Ordering::SeqCst);
-        REFERENCE.store(self.reference, Ordering::SeqCst);
+        REFERENCE.store(self.reference && !self.deferred, Ordering::SeqCst);
         let mut out = io::stdout();
-        execute!(out, EnterAlternateScreen)?;
+        if self.deferred {
+            INLINE.store(true, Ordering::SeqCst);
+        } else {
+            ALTERNATE.store(true, Ordering::SeqCst);
+            execute!(out, EnterAlternateScreen)?;
+        }
         let _ = execute!(out, EnableBracketedPaste, EnableFocusChange);
-        if self.reference {
+        if self.reference && !self.deferred {
             write_reference_modes(&mut out);
         }
         if self.keyboard.disambiguated {
@@ -792,6 +894,10 @@ impl Session {
         if !HELD.load(Ordering::SeqCst) {
             return Ok(());
         }
+        // The first-run steps ended (finished, left or answered): fullscreen from here on.
+        if self.deferred && model.onboarding.is_none() {
+            self.enter_fullscreen()?;
+        }
         if let Some(task) = model.viewer_task.take() {
             self.run_viewer_task(task, model)?;
         }
@@ -800,7 +906,7 @@ impl Session {
             Some(TerminalTask::Suspend) => self.suspend()?,
             None => {}
         }
-        let mouse = !env_flag("DAVINCI_DISABLE_MOUSE");
+        let mouse = !self.deferred && !env_flag("DAVINCI_DISABLE_MOUSE");
         if mouse != MOUSE.load(Ordering::SeqCst) {
             #[cfg(unix)]
             {

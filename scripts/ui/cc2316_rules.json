@@ -70,18 +70,16 @@
     "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
    },
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "keys_panels__08_ctrl_c": [
@@ -153,18 +151,16 @@
     "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
    },
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "layout_sizes__01_120x44": [
@@ -236,18 +232,16 @@
     "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
    },
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "layout_sizes__02_100x30": [
@@ -317,6 +311,18 @@
      "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
     },
     "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     10
+    ],
+    "transcript": [
+     5,
+     24
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "layout_sizes__03_80x24": [
@@ -386,6 +392,18 @@
      "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
     },
     "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     10
+    ],
+    "transcript": [
+     5,
+     18
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "layout_sizes__04_60x20": [
@@ -455,6 +473,18 @@
      "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
     },
     "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     11
+    ],
+    "transcript": [
+     5,
+     14
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "layout_sizes__05_160x50": [
@@ -526,18 +556,16 @@
     "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
    },
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      159
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     44
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "layout_sizes__06_120x18": [
@@ -609,34 +637,30 @@
     "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
    },
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     12
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "ansi_theme__02_settled": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    },
    {
     "region": {
@@ -708,402 +732,352 @@
   ],
   "context_cmd__02_context_empty": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     40
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "context_cmd__03_context_settled": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     40
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "esc_clear__01_esc1": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "esc_clear__02_esc2": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "external_editor__01_after_editor": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "help_tabs__01_general": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     23
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "help_tabs__03_custom": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     34
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "image_paste__02_after_typing": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "keys_panels__01_mode1": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "keys_panels__02_mode2": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "keys_panels__03_mode3": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "keys_panels__04_mode4": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "keys_panels__05_todos": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "keys_panels__06_history": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     28
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "model_nav__01_model": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     30
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "model_nav__02_effort_right": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     30
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "model_nav__03_session_only": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     40
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "paste_large__01_paste_12k": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "paste_large__03_unicode": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     30
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "paste_only__01_paste": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "permissions_tabs__01_perms": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     33
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "permissions_tabs__03_tab4": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     22
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "slash_only__01_slash": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "slash_only__02_tab": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "theme_apply__01_light_selected": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     19
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    },
    {
     "region": {
@@ -1259,18 +1233,16 @@
   ],
   "theme_apply__02_light_main": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    },
    {
     "region": {
@@ -1342,18 +1314,16 @@
   ],
   "theme_nav__01_theme": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     21
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    },
    {
     "region": {
@@ -1526,18 +1496,16 @@
   ],
   "theme_nav__02_down2": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     21
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    },
    {
     "region": {
@@ -1710,18 +1678,16 @@
   ],
   "theme_nav__03_syntax_toggle": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     21
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    },
    {
     "region": {
@@ -1877,34 +1843,30 @@
   ],
   "tui_panel__02_tui_panel": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "vim_mode__04_dw": [
    {
-    "region": {
-     "rows": [
-      5,
-      8
-     ],
-     "cols": [
-      0,
-      119
-     ]
-    },
-    "kind": "dropped",
-    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
    }
   ],
   "onboarding__01_onboarding": [
@@ -1941,177 +1903,10 @@
     "reason": "The band of dots is DaVinci's own (D2); only its text is left out."
    },
    {
-    "region": {
-     "rows": [
-      3,
-      3
-     ],
-     "cols": [
-      0,
-      52
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      4,
-      4
-     ],
-     "cols": [
-      0,
-      54
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      5,
-      5
-     ],
-     "cols": [
-      0,
-      46
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      6,
-      6
-     ],
-     "cols": [
-      0,
-      46
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      7,
-      7
-     ],
-     "cols": [
-      0,
-      54
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      8,
-      8
-     ],
-     "cols": [
-      0,
-      53
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      9,
-      9
-     ],
-     "cols": [
-      0,
-      38
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
+    "kind": "art",
     "region": {
      "rows": [
       10,
-      10
-     ],
-     "cols": [
-      0,
-      40
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      11,
-      11
-     ],
-     "cols": [
-      0,
-      46
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      12,
-      12
-     ],
-     "cols": [
-      0,
-      56
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      13,
-      13
-     ],
-     "cols": [
-      0,
-      41
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      14,
-      14
-     ],
-     "cols": [
-      0,
-      22
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      15,
       15
      ],
      "cols": [
@@ -2119,8 +1914,25 @@
       57
      ]
     },
-    "kind": "structure",
-    "reason": "The band of dots is DaVinci's own (D2); only its text is left out."
+    "band": {
+     "rows": [
+      2,
+      15
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "lines": [
+     "         ▄▄███▀▄▄   ▄▄",
+     "        ▀▀▀▀▀▀▀▀▀▀  █",
+     "       ███████████ █",
+     "      ▄▄ ▀▀▀▀▀▀▀▄▄▀",
+     "     ▀▀▀▀ ▀▀▀▀▀▀",
+     "··························································"
+    ],
+    "reason": "DaVinci's own welcome art (D2): the reference's star field and mark are not drawn. The rectangle holds DaVinci's painter sprite on rows 10-14 and its dot row 15 (0-based); nothing else is drawn in the band between the title and the steps."
    },
    {
     "region": {
@@ -2137,6 +1949,7 @@
     "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
    },
    {
+    "kind": "copy",
     "region": {
      "rows": [
       19,
@@ -2147,10 +1960,17 @@
       56
      ]
     },
-    "kind": "structure",
-    "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
+    "entries": [
+     {
+      "row": 19,
+      "col": 1,
+      "text": "Pick the colour palette that reads best in your terminal"
+     }
+    ],
+    "reason": "DaVinci's own wording (D2): same words as the manifest says, same foreground and modifier combinations as the row it stands for."
    },
    {
+    "kind": "copy",
     "region": {
      "rows": [
       20,
@@ -2161,8 +1981,14 @@
       32
      ]
     },
-    "kind": "structure",
-    "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
+    "entries": [
+     {
+      "row": 20,
+      "col": 1,
+      "text": "So switch when wanted via /theme"
+     }
+    ],
+    "reason": "DaVinci's own wording (D2): same words as the manifest says, same foreground and modifier combinations as the row it stands for."
    },
    {
     "region": {
@@ -2255,177 +2081,10 @@
     "reason": "The band of dots is DaVinci's own (D2); only its text is left out."
    },
    {
-    "region": {
-     "rows": [
-      3,
-      3
-     ],
-     "cols": [
-      0,
-      52
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      4,
-      4
-     ],
-     "cols": [
-      0,
-      54
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      5,
-      5
-     ],
-     "cols": [
-      0,
-      46
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      6,
-      6
-     ],
-     "cols": [
-      0,
-      46
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      7,
-      7
-     ],
-     "cols": [
-      0,
-      54
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      8,
-      8
-     ],
-     "cols": [
-      0,
-      53
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      9,
-      9
-     ],
-     "cols": [
-      0,
-      38
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
+    "kind": "art",
     "region": {
      "rows": [
       10,
-      10
-     ],
-     "cols": [
-      0,
-      40
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      11,
-      11
-     ],
-     "cols": [
-      0,
-      46
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      12,
-      12
-     ],
-     "cols": [
-      0,
-      56
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      13,
-      13
-     ],
-     "cols": [
-      0,
-      41
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      14,
-      14
-     ],
-     "cols": [
-      0,
-      22
-     ]
-    },
-    "kind": "structure",
-    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
-   },
-   {
-    "region": {
-     "rows": [
-      15,
       15
      ],
      "cols": [
@@ -2433,8 +2092,25 @@
       57
      ]
     },
-    "kind": "structure",
-    "reason": "The band of dots is DaVinci's own (D2); only its text is left out."
+    "band": {
+     "rows": [
+      2,
+      15
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "lines": [
+     "         ▄▄███▀▄▄   ▄▄",
+     "        ▀▀▀▀▀▀▀▀▀▀  █",
+     "       ███████████ █",
+     "      ▄▄ ▀▀▀▀▀▀▀▄▄▀",
+     "     ▀▀▀▀ ▀▀▀▀▀▀",
+     "··························································"
+    ],
+    "reason": "DaVinci's own welcome art (D2): the reference's star field and mark are not drawn. The rectangle holds DaVinci's painter sprite on rows 10-14 and its dot row 15 (0-based); nothing else is drawn in the band between the title and the steps."
    },
    {
     "region": {
@@ -2451,6 +2127,7 @@
     "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
    },
    {
+    "kind": "copy",
     "region": {
      "rows": [
       19,
@@ -2458,13 +2135,20 @@
      ],
      "cols": [
       1,
-      28
+      32
      ]
     },
-    "kind": "structure",
-    "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
+    "entries": [
+     {
+      "row": 19,
+      "col": 1,
+      "text": "1. DaVinci can get things wrong."
+     }
+    ],
+    "reason": "DaVinci's own wording (D2): same words as the manifest says, same foreground and modifier combinations as the row it stands for."
    },
    {
+    "kind": "copy",
     "region": {
      "rows": [
       20,
@@ -2475,10 +2159,17 @@
       60
      ]
     },
-    "kind": "structure",
-    "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
+    "entries": [
+     {
+      "row": 20,
+      "col": 4,
+      "text": "You decide what runs: read each change and each command"
+     }
+    ],
+    "reason": "DaVinci's own wording (D2): same words as the manifest says, same foreground and modifier combinations as the row it stands for."
    },
    {
+    "kind": "copy",
     "region": {
      "rows": [
       21,
@@ -2486,13 +2177,20 @@
      ],
      "cols": [
       1,
-      45
+      61
      ]
     },
-    "kind": "structure",
-    "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
+    "entries": [
+     {
+      "row": 21,
+      "col": 4,
+      "text": "before you approve it, most of all when code will execute."
+     }
+    ],
+    "reason": "DaVinci's own wording (D2): same words as the manifest says, same foreground and modifier combinations as the row it stands for."
    },
    {
+    "kind": "copy",
     "region": {
      "rows": [
       23,
@@ -2500,25 +2198,31 @@
      ],
      "cols": [
       1,
-      65
+      107
      ]
     },
-    "kind": "structure",
-    "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
+    "entries": [
+     {
+      "row": 23,
+      "col": 1,
+      "text": "2. Files and web pages can hide instructions for the agent (prompt injection), so open only code you trust."
+     }
+    ],
+    "reason": "DaVinci's own wording (D2): same words as the manifest says, same foreground and modifier combinations as the row it stands for."
    },
    {
+    "kind": "dropped",
     "region": {
      "rows": [
       24,
       24
      ],
      "cols": [
-      1,
+      4,
       55
      ]
     },
-    "kind": "structure",
-    "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
+    "reason": "D7: the reference's link line (a caption and an underlined documentation link) is not drawn; these cells must be blank."
    },
    {
     "region": {

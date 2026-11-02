@@ -1,6 +1,7 @@
 //! P05: the `tui.reference` setting and the terminal modes it asks for.
 use davinci_tui::davinci::runtime::{
-    reference_enabled, reference_mouse_on, REFERENCE_MODES_OFF, REFERENCE_MODES_ON,
+    fullscreen_at_open, reference_enabled, reference_mouse_on, screen_exit, ScreenExit,
+    REFERENCE_MODES_OFF, REFERENCE_MODES_ON,
 };
 use davinci_tui::{interactive_settings_list, InteractiveSettingsConfig};
 
@@ -70,6 +71,28 @@ fn nothing_is_written_with_the_setting_off_or_the_mouse_disabled() {
     assert_eq!(reference_mouse_on(false, true), "");
     assert_eq!(reference_mouse_on(true, false), "");
     assert_eq!(reference_mouse_on(true, true), REFERENCE_MODES_ON);
+}
+
+#[test]
+fn only_the_reference_defers_the_alternate_screen_for_a_first_run() {
+    // Off, nothing changes whatever the first-run state: the alternate screen at once.
+    assert!(fullscreen_at_open(false, false));
+    assert!(fullscreen_at_open(false, true));
+    // On, a normal start is fullscreen at once; a first run starts on the main screen.
+    assert!(fullscreen_at_open(true, false));
+    assert!(!fullscreen_at_open(true, true));
+}
+
+#[test]
+fn a_restore_leaves_exactly_the_screen_it_entered() {
+    assert_eq!(screen_exit(true, false), ScreenExit::Alternate);
+    // Quitting during the first-run steps: the main screen is ours; the cursor moves
+    // to a fresh line so the shell's prompt does not land on the last frame.
+    assert_eq!(screen_exit(false, true), ScreenExit::Inline);
+    // Never taken: nothing to undo.
+    assert_eq!(screen_exit(false, false), ScreenExit::Nothing);
+    // Both flags cannot be up together; the alternate screen wins.
+    assert_eq!(screen_exit(true, true), ScreenExit::Alternate);
 }
 
 #[test]

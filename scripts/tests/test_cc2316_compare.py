@@ -575,18 +575,22 @@ class DroppedRuleTests(unittest.TestCase):
 
 
 class DroppedGoldenTests(unittest.TestCase):
+    """D7: the reference's link line, row 24, columns 4-55, is the one region a
+    manifest may drop. D6's notice is a compact rule (test_cc2316_regions.py)."""
     setUp = CompareGoldenTests.setUp
     files = CompareGoldenTests.files
 
     def spec(self, kind, region=None, **extra):
-        return dict({"region": region or {"rows": [5, 8], "cols": [0, 9]}, "kind": kind,
-                     "reason": "D6: no release notice"}, **extra)
+        return dict({"region": region or {"rows": [24, 24], "cols": [4, 55]}, "kind": kind,
+                     "reason": "D7: no external Claude link"}, **extra)
 
     def pair(self):
-        notice = {y: [run(0, "notice    ")] for y in range(5, 9)}
-        return dcap(notice), dcap({})
+        link = {24: [run(0, " " * 4), run(4, "caption" + " " * 5), run(16, "x" * 40, underline=True),
+                     run(56, " " * 4)]}
+        return (capture(link, cols=60, nrows=26, defaults=DEFAULTS),
+                capture({}, cols=60, nrows=26, defaults=DEFAULTS))
 
-    def test_the_d6_region_loads_on_an_exact_golden(self):
+    def test_the_d7_region_loads_on_an_exact_golden(self):
         manifest, owners = self.files("exact", [self.spec("dropped")])
         expected, actual = self.pair()
         self.assertTrue(compare_golden(expected, actual, manifest, owners).ok)
@@ -596,20 +600,26 @@ class DroppedGoldenTests(unittest.TestCase):
         expected, actual = self.pair()
         self.assertTrue(compare_golden(expected, actual, manifest, owners).ok)
 
-    def test_a_whole_screen_dropped_rule_raises(self):
-        for region in ({"rows": [0, 11], "cols": [0, 9]}, {"rows": [0, 2], "cols": [0, 9]},
-                       {"rows": [4, 8], "cols": [0, 9]}, {"rows": [5, 9], "cols": [0, 9]},
-                       {"rows": [5, 8], "cols": [0, 160]}):
+    def test_a_larger_dropped_rule_raises(self):
+        for region in ({"rows": [0, 25], "cols": [0, 59]}, {"rows": [23, 24], "cols": [4, 55]},
+                       {"rows": [24, 25], "cols": [4, 55]}, {"rows": [24, 24], "cols": [3, 55]},
+                       {"rows": [24, 24], "cols": [4, 56]}, {"rows": [5, 8], "cols": [0, 9]}):
             with self.subTest(region=region):
                 manifest, owners = self.files("exact", [self.spec("dropped", region)])
                 expected, actual = self.pair()
                 with self.assertRaises(ValueError):
                     compare_golden(expected, actual, manifest, owners)
 
-    def test_a_smaller_region_inside_d6_is_allowed(self):
+    def test_a_smaller_region_inside_d7_is_allowed(self):
         from cc2316_compare import load_rules
-        manifest, owners = self.files("exact", [self.spec("dropped", {"rows": [6, 7], "cols": [2, 5]})])
+        manifest, owners = self.files("exact", [self.spec("dropped", {"rows": [24, 24], "cols": [20, 30]})])
         self.assertEqual(len(load_rules("g1", manifest, owners)), 1)
+
+    def test_d6_is_no_longer_a_dropped_region(self):
+        manifest, owners = self.files("exact", [dict(self.spec("dropped"), reason="D6: no release notice")])
+        expected, actual = self.pair()
+        with self.assertRaises(ValueError):
+            compare_golden(expected, actual, manifest, owners)
 
     def test_a_reason_naming_a_decision_without_a_listed_region_raises(self):
         manifest, owners = self.files("exact", [dict(self.spec("dropped"), reason="D3: no survey")])
@@ -632,23 +642,22 @@ class DroppedGoldenTests(unittest.TestCase):
     def test_draw_in_the_region_fails_through_the_manifest(self):
         manifest, owners = self.files("exact", [self.spec("dropped")])
         expected, _ = self.pair()
-        drawn = dcap({6: [run(0, "DaVinci   ")]})
+        drawn = capture({24: [run(0, " " * 4), run(4, "DaVinci" + " " * 49)]},
+                        cols=60, nrows=26, defaults=DEFAULTS)
         self.assertFalse(compare_golden(expected, drawn, manifest, owners).ok)
 
-    def test_the_committed_manifest_only_drops_the_d6_region(self):
+    def test_the_committed_manifest_only_drops_the_d7_region(self):
         from cc2316_compare import DEFAULT_RULES, DROPPED_REGIONS
         data = json.loads(Path(DEFAULT_RULES).read_text(encoding="utf-8"))
-        box_ = DROPPED_REGIONS["D6"]
-        seen = 0
+        self.assertEqual(set(DROPPED_REGIONS), {"D7"})
+        box_ = DROPPED_REGIONS["D7"]
         for name, specs in data["goldens"].items():
             for spec in specs:
                 if spec["kind"] != "dropped":
                     continue
-                seen += 1
                 (r0, r1), (c0, c1) = spec["region"]["rows"], spec["region"]["cols"]
                 self.assertTrue(box_["rows"][0] <= r0 and r1 <= box_["rows"][1]
                                 and box_["cols"][0] <= c0 and c1 <= box_["cols"][1], name)
-        self.assertGreater(seen, 0)
 
 
 class LoaderTests(unittest.TestCase):

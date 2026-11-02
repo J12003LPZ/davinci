@@ -2,7 +2,7 @@
 
 **Goal:** Match the observable Claude Code CLI 2.1.316 Windows terminal experience in DaVinci: exact layout, colours, terminal behaviour and interactions, with DaVinci's own name, mark, wording and real provider data.
 
-**Status (2026-11-01):** P00–P06b are done. P07 is in progress. P08–P20 have not started. No DaVinci parity is claimed.
+**Status (2026-11-01):** P00–P07b are done, with composer and footer cells left to P08 and P12b. P08 is in progress. P09–P20 have not started. No DaVinci parity is claimed.
 
 **Replaces** the earlier version of this plan. Where `docs/superpowers/specs/2026-11-01-claude-code-2.1.316-tui-parity-design.md` conflicts with the decisions below, this plan wins.
 
@@ -35,8 +35,10 @@ These were taken on 2026-11-01 from the plan review. Each can be reversed, and r
 | D3 | **Drop Claude-only surfaces:** powerups, feedback survey, custom API-key consent, voice. | They have no DaVinci purpose. The survey would also imply sending data. | Add a task for each. |
 | D4 | **Everything ships behind an off-by-default setting** (`tui.reference`, overridable with `PI_DAVINCI_REFERENCE=1`, read once at `Session::open`). | `--legacy-tui` opens the older chrome, not today's shell, so it can't be the rollback for this work. | Keep the branch unmerged until every gate passes. |
 | D5 | **Keep the worktree.** | The main checkout is shared with other sessions. This is an exception to the usual no-worktree rule. | Work in the main checkout. |
-| D6 | **Drop one-off release announcements.** The four-row notice about a Claude Code default change, shown in rows 5–8 of the boot, layout and theme goldens, is not drawn. | It announces a Claude product change and has no DaVinci purpose. Those cells must be blank, checked by a `dropped` rule, so this cannot hide anything else. | Write a DaVinci notice for the same rows. |
+| D6 | **Drop one-off release announcements, and let the conversation close the gap.** The notice about a Claude Code default change is not drawn, and the conversation starts right under the header. | It announces a Claude product change and has no DaVinci purpose, and a permanent blank gap would be a visible defect. A `compact` rule, declared per golden with exact rows, removes the notice and its separator from the expected frame only. Vacated rows must be blank, or match a stated expectation. A scrolled golden with no such expectation stays a recorded limitation. | Reserve blank rows, or write a DaVinci notice for the same rows. |
+| D7 | **No external Claude links in DaVinci's own copy.** The reference's underlined security link is not drawn. | The link goes to Claude's documentation. Those cells must be blank, checked by a `dropped` rule. | Link to a DaVinci page, but none is documented. |
 
+**D4 exception:** the `/config` row for `tui.reference` itself appears with the setting off, because people need it to turn the setting on. `PI_DAVINCI_REFERENCE=1` overrides a stored `false`. Every other off-mode frame and terminal byte stays unchanged.
 **Dropped goldens (4):** `powerup_modes__01_modes_lesson`, `powerup_modes__02_next_lesson`, `mock_stream2__00_key_dialog`, `voice_probe__02_voice`.
 
 **Streaming exceptions, body region only:** `mock_stream_rmoff__f10`, `mock_stream_scroll2__01_mid`.

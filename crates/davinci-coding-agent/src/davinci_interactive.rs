@@ -1698,6 +1698,16 @@ fn theme_line(model: &mut Model, line: &str, stored: impl FnOnce() -> Option<Str
     true
 }
 
+/// The reference shell's welcome steps, opened on the theme the merged
+/// settings store so the highlight and the live theme agree from the first
+/// frame. `false` elsewhere: the first run is asked at once.
+fn begin_first_run(model: &mut Model, settings: &crate::settings::Settings) -> bool {
+    davinci_tui::davinci::views::onboarding::start(
+        model,
+        settings.theme.as_deref().unwrap_or("dark"),
+    )
+}
+
 /// The next queued line. In the reference shell `/theme` waits behind every
 /// line that will start a turn: a picker open while a turn runs would take the
 /// keys of its approval prompts. Everywhere else the queue is first in, first out.
@@ -5141,8 +5151,16 @@ pub fn run(
     // is reachable from this interface.
     let mut attached_images: Vec<davinci_ai::MessageContent> = Vec::new();
 
-    let mut terminal = Session::open_with(stored_settings.tui.reference.unwrap_or(false))
-        .map_err(|err| err.to_string())?;
+    // The reference's welcome steps run on the main screen with the mouse off; the session
+    // goes fullscreen when they end. Everywhere else the first run is fullscreen at once.
+    let first_run_due = crate::settings::should_run_first_time_setup(
+        &crate::settings::settings_path(&crate::default_agent_dir()),
+    );
+    let mut terminal = Session::open_deferring(
+        stored_settings.tui.reference.unwrap_or(false),
+        first_run_due,
+    )
+    .map_err(|err| err.to_string())?;
     if let Some(hint) = terminal_hint(
         std::env::var_os("TMUX").is_some(),
         &crate::default_agent_dir(),
@@ -5196,7 +5214,7 @@ pub fn run(
         pending = Some(Question::FirstRun);
         // The reference shell walks the welcome steps first; the analytics
         // question follows them. Everywhere else it is asked at once.
-        if !davinci_tui::davinci::views::onboarding::start(&mut model, "dark") {
+        if !begin_first_run(&mut model, &stored_settings) {
             model.ask = Question::FirstRun.ask(agent);
             open_ask_overlay(&mut model);
         }

@@ -1341,7 +1341,13 @@ fn result_lines(th: &Theme, text: &str, accent: Option<&str>, width: u16) -> Vec
         .enumerate()
         .map(|(index, row)| {
             let hang = if index == 0 {
-                ELBOW.to_string()
+                // The reference hangs a command's outcome from plain spaces; only
+                // a tool's result carries the non-breaking one.
+                if th.reference {
+                    ELBOW.replace('\u{a0}', " ")
+                } else {
+                    ELBOW.to_string()
+                }
             } else {
                 " ".repeat(usize::from(lead))
             };

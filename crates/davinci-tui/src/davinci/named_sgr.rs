@@ -25,6 +25,11 @@ enum State {
     Osc,
     /// `ESC` inside such a string; `\` ends it.
     OscEsc,
+    /// Inside a DCS, APC, PM or SOS string: opaque like an OSC, but only the
+    /// string terminator (`ESC \`) ends it.
+    Str,
+    /// `ESC` inside one of those strings.
+    StrEsc,
 }
 
 /// Wraps the writer frames go through. The switch is shared with the session,
@@ -82,6 +87,12 @@ impl<W: Write> NamedSgr<W> {
                         out.push(byte);
                         self.state = State::Osc;
                     }
+                    // DCS, SOS, PM and APC.
+                    b'P' | b'X' | b'^' | b'_' => {
+                        self.release(out);
+                        out.push(byte);
+                        self.state = State::Str;
+                    }
                     _ => {
                         self.release(out);
                         self.ground(byte, out);
@@ -116,8 +127,32 @@ impl<W: Write> NamedSgr<W> {
                         State::Osc
                     };
                 }
+                State::Str => {
+                    out.push(byte);
+                    if byte == ESC {
+                        self.state = State::StrEsc;
+                    }
+                }
+                State::StrEsc => {
+                    out.push(byte);
+                    self.state = if byte == b'\\' {
+                        State::Ground
+                    } else {
+                        State::Str
+                    };
+                }
             }
         }
+    }
+
+    /// Write out a partial sequence as it came and return to rest.
+    fn write_held(&mut self) -> io::Result<()> {
+        if self.state == State::Ground || self.held.is_empty() {
+            return Ok(());
+        }
+        let held = std::mem::take(&mut self.held);
+        self.state = State::Ground;
+        self.inner.write_all(&held)
     }
 
     /// A whole `ESC [ params final`: rewritten if it is plain SGR, else as it came.
@@ -182,6 +217,10 @@ fn named(params: &[u8]) -> Vec<u8> {
 
 impl<W: Write> Write for NamedSgr<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Off, with nothing held: there is nothing to rewrite.
+        if self.state == State::Ground && !self.on.load(Ordering::SeqCst) {
+            return self.inner.write(buf);
+        }
         let mut out = Vec::with_capacity(buf.len());
         self.feed(buf, &mut out);
         self.inner.write_all(&out)?;
@@ -189,7 +228,14 @@ impl<W: Write> Write for NamedSgr<W> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        self.write_held()?;
         self.inner.flush()
+    }
+}
+
+impl<W: Write> Drop for NamedSgr<W> {
+    fn drop(&mut self) {
+        let _ = self.write_held();
     }
 }
 
@@ -227,11 +273,13 @@ mod tests {
     /// Feed `pieces` as separate `write` calls and return what came out.
     fn through(on: bool, pieces: &[&[u8]]) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut writer = NamedSgr::new(&mut out, switch(on));
-        for piece in pieces {
-            writer.write_all(piece).unwrap();
+        {
+            let mut writer = NamedSgr::new(&mut out, switch(on));
+            for piece in pieces {
+                writer.write_all(piece).unwrap();
+            }
+            writer.flush().unwrap();
         }
-        writer.flush().unwrap();
         out
     }
 
@@ -412,6 +460,80 @@ mod tests {
             through(true, &osc),
             b"\x1b]8;;http://a/\x1b[38;5;1m\x07\x1b[32m"
         );
+    }
+
+    /// Accepts at most two bytes per call.
+    struct Short(Vec<u8>);
+
+    impl Write for Short {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let n = buf.len().min(2);
+            self.0.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn off_and_idle_the_bytes_go_straight_to_the_inner_writer() {
+        let mut writer = NamedSgr::new(Short(Vec::new()), switch(false));
+        assert_eq!(writer.write(b"abcd").unwrap(), 2, "the inner count");
+        assert_eq!(writer.inner.0, b"ab");
+        // Escapes do not change that, and nothing is held back.
+        assert_eq!(writer.write(b"\x1b[38;5;1m").unwrap(), 2);
+        assert_eq!(writer.inner.0, b"ab\x1b[");
+    }
+
+    #[test]
+    fn flush_writes_a_held_partial_sequence_unchanged() {
+        let mut out = Vec::new();
+        let mut writer = NamedSgr::new(&mut out, switch(true));
+        writer.write_all(b"ab\x1b[38;5;").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        assert_eq!(out, b"ab\x1b[38;5;");
+        // The rest is plain text now; the stream is back at rest.
+        let mut out = Vec::new();
+        let mut writer = NamedSgr::new(&mut out, switch(true));
+        writer.write_all(b"\x1b[38;5;").unwrap();
+        writer.flush().unwrap();
+        writer.write_all(b"1m\x1b[38;5;1m").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        assert_eq!(out, b"\x1b[38;5;1m\x1b[31m");
+    }
+
+    #[test]
+    fn dropping_the_adapter_writes_what_it_held() {
+        let mut out = Vec::new();
+        {
+            let mut writer = NamedSgr::new(&mut out, switch(true));
+            writer.write_all(b"\x1b").unwrap();
+        }
+        assert_eq!(out, b"\x1b");
+    }
+
+    #[test]
+    fn device_control_and_application_strings_are_opaque() {
+        for (open, name) in [
+            (&b"\x1bP"[..], "DCS"),
+            (b"\x1b_", "APC"),
+            (b"\x1b^", "PM"),
+            (b"\x1bX", "SOS"),
+        ] {
+            let mut wire = open.to_vec();
+            wire.extend_from_slice(b"q\x1b[38;5;1m\x07more\x1b\\\x1b[38;5;1m");
+            let mut expected = open.to_vec();
+            expected.extend_from_slice(b"q\x1b[38;5;1m\x07more\x1b\\\x1b[31m");
+            assert_eq!(through(true, &[&wire]), expected, "{name}");
+            // Split anywhere, the payload is still left alone.
+            for cut in 1..wire.len() {
+                let (head, tail) = wire.split_at(cut);
+                assert_eq!(through(true, &[head, tail]), expected, "{name} cut {cut}");
+            }
+        }
     }
 
     #[test]

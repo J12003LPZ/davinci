@@ -8,9 +8,10 @@ What is asserted is every cell except the areas that a later task, or a rule the
 tier does not allow, still leaves open. ``owned_areas`` names each one with its owner, and a
 test prints the differences by field inside and outside them:
 
-* the startup notice rows that D6 does not cover: the notice at rows 5-8 is a ``dropped`` rule
-  (blank in DaVinci); at 100, 80 and 60 columns it wraps to a fifth row or more, outside the
-  D6 region, so those goldens leave the notice rows to no owner, reported to the reviewer;
+* the startup notice: every golden here carries a ``compact`` rule (D6) with the notice's own
+  height (4 rows at 120 and 160 columns, 5 at 100 and 80, 6 at 60), so the conversation closes
+  the gap and the vacated rows must be blank. A golden whose notice is scrolled or partly off
+  screen would get no rule and leaves the notice rows to no owner, reported to the reviewer;
 * the composer row from column 2 on (the caret and the placeholder): P08;
 * the footer row (the mode label and the hints beside it): P12b, except in the Ctrl-C golden,
   where the footer is the P07 exit hint and is compared whole.
@@ -88,9 +89,9 @@ def owned_areas(expected, name):
     height = expected["dimensions"]["rows"]
     areas = []
     notice = notice_rows(expected)
-    dropped = any(rule.kind == "dropped" for rule in compare.load_rules(name))
-    if notice and not dropped:
-        areas.append((set(notice), 0, "none", "startup notice wraps beyond the D6 region"))
+    compacted = any(isinstance(rule, compare.Compact) for rule in compare.load_rules(name))
+    if notice and not compacted:
+        areas.append((set(notice), 0, "none", "startup notice is scrolled or partly off screen"))
     areas.append(({height - 3}, 2, "P08", "caret and placeholder"))
     if name != "keys_panels__08_ctrl_c":
         areas.append(({height - 1}, 0, "P12b", "mode label, hints and context gauge"))

@@ -1261,11 +1261,15 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     if key.kind == KeyEventKind::Release {
         return Flow::Continue;
     }
-    if model.onboarding.is_some() {
-        return super::views::onboarding::handle_key(model, key);
-    }
-    if model.theme_picker.is_some() {
-        return super::views::theme_picker::handle_key(model, key);
+    // A question or approval in view is answered before the surface hidden
+    // behind it; the renderer shows it over the steps and the picker too.
+    if model.overlay.is_none() {
+        if model.onboarding.is_some() {
+            return super::views::onboarding::handle_key(model, key);
+        }
+        if model.theme_picker.is_some() {
+            return super::views::theme_picker::handle_key(model, key);
+        }
     }
     // ? in an empty conversation composer opens the shortcuts panel. Any
     // other key closes it and is then handled normally.

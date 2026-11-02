@@ -81,7 +81,9 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
         }
         (OnboardStep::Theme, KeyCode::Enter) => {
             if let Some(picker) = model.theme_picker.as_ref() {
-                model.first_run_theme = Some(ENTRIES[picker.index.min(LIST - 1)].0.to_string());
+                let name = ENTRIES[picker.index.min(LIST - 1)].0;
+                model.theme = picker.previous.with_name(name);
+                model.first_run_theme = Some(name.to_string());
                 model.onboarding = Some(OnboardStep::Security);
             }
         }
@@ -182,7 +184,7 @@ fn security_rows(model: &Model) -> Vec<Line<'static>> {
         ])
     };
     let ask = Style::default().fg(cc.permission);
-    vec![
+    let mut rows = vec![
         text(
             model,
             1,
@@ -194,11 +196,20 @@ fn security_rows(model: &Model) -> Vec<Line<'static>> {
         more("You decide what runs: read each change and each command"),
         more("before you approve it, most of all when code will execute."),
         ui::blank(),
-        note(
-            "2.",
-            "Files and web pages can hide instructions for the agent",
-        ),
-        more("(prompt injection), so open only code and content you trust."),
+    ];
+    // The second note takes one row where the window is wide enough, and the row under it
+    // is where the reference draws its documentation link: DaVinci draws no external
+    // link (D7), so that row stays blank. A narrow window wraps the note onto it instead,
+    // so the advice is never cut off.
+    let advice = "Files and web pages can hide instructions for the agent (prompt injection), so open only code you trust.";
+    let room = usize::from(model.width).saturating_sub(4);
+    let wrapped = wrap_note(advice, room);
+    rows.push(note("2.", wrapped[0]));
+    if wrapped.len() == 1 {
+        rows.push(ui::blank());
+    }
+    rows.extend(wrapped[1..].iter().map(|words| more(words)));
+    rows.extend([
         ui::blank(),
         clip(vec![
             span(" ", model.theme.text),
@@ -206,7 +217,26 @@ fn security_rows(model: &Model) -> Vec<Line<'static>> {
             Span::styled("Enter", ask.add_modifier(Modifier::BOLD)),
             Span::styled(" to continue…", ask),
         ]),
-    ]
+    ]);
+    rows
+}
+
+/// A note's words in rows of at most `room` columns, broken at spaces. A word wider than
+/// the room keeps a row of its own.
+fn wrap_note(words: &str, room: usize) -> Vec<&str> {
+    use unicode_width::UnicodeWidthStr;
+    let mut rows = Vec::new();
+    let mut start = 0;
+    let mut end = 0;
+    for (at, _) in words.match_indices(' ').chain([(words.len(), " ")]) {
+        if end > start && words[start..at].width() > room {
+            rows.push(&words[start..end]);
+            start = end + 1;
+        }
+        end = at;
+    }
+    rows.push(&words[start..]);
+    rows
 }
 
 /// The whole screen, `height` rows. A screen too short for it drops the
