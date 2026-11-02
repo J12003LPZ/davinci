@@ -777,6 +777,40 @@ impl Agent {
             ));
             // Guest and host output cannot forge the authoritative child evidence.
             outcome.children = broker.children();
+            // Capture the full pre-truncation body before anything else mutates
+            // the outcome. The host measured the cut; this layer owns the store.
+            if let Some(body) = outcome.retained_output.take() {
+                let omitted_bytes = outcome.omitted_bytes;
+                let omitted_line = outcome.omitted_start_line.unwrap_or(1);
+                if let Some(evidence) = self.evidence.as_ref() {
+                    match evidence.store("script-output", &body) {
+                        Ok(path) => {
+                            outcome.output_artifact = Some(super::CodeModeArtifact {
+                                id: path.to_string_lossy().into_owned(),
+                                kind: super::CodeModeArtifactKind::ToolOutput,
+                                bytes: body.len() as u64,
+                            });
+                            outcome.host_notes.push(format!(
+                                "Full output retained at {}; {} bytes omitted; the omitted region begins at line {}; call read with path: {}, offset: {}, limit: 2000.",
+                                path.display(),
+                                omitted_bytes,
+                                omitted_line,
+                                path.display(),
+                                omitted_line
+                            ));
+                        }
+                        Err(_) => outcome.host_notes.push(format!(
+                            "Full output not retained: evidence store write failed; {} bytes omitted beginning at line {}.",
+                            omitted_bytes, omitted_line
+                        )),
+                    }
+                } else {
+                    outcome.host_notes.push(format!(
+                        "Full output not retained: no evidence store in this agent; {} bytes omitted beginning at line {}; rerun with a narrower script or smaller output.",
+                        omitted_bytes, omitted_line
+                    ));
+                }
+            }
             if let Some(evidence) = self.evidence.as_ref() {
                 let session = context
                     .identity
@@ -937,6 +971,9 @@ impl Agent {
                         .clone()
                         .unwrap_or_else(|| "unavailable".into()),
                     error: Some(error.clone()),
+                    retained_output: None,
+                    omitted_bytes: 0,
+                    omitted_start_line: None,
                 };
                 ToolResult {
                     content: serde_json::to_string(&outcome)

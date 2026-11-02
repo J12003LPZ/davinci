@@ -50,6 +50,18 @@ const IDENTITY_KEYS: &[&str] = &[
     "id", "name", "path", "file", "line", "status", "type", "error", "message",
 ];
 
+/// Total items a compact JSON view may show.
+const MAX_SELECTED_ITEMS: usize = 16;
+/// Diagnostics selected before the identity fill.
+const MAX_DIAGNOSTIC_ITEMS: usize = 12;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct JsonSelection {
+    indices: BTreeSet<usize>,
+    diagnostics_kept: usize,
+    diagnostics_omitted: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentKind {
     Log,
@@ -313,39 +325,71 @@ fn build_log_view(kind: ContentKind, content: &str, output_id: &str) -> Option<S
     let shown = rendered.len();
     let mut view = rendered.join("\n");
     view.push_str("\n\n");
-    view.push_str(&retrieval_trailer(kind, shown, lines.len(), output_id));
+    view.push_str(&retrieval_trailer(
+        kind,
+        shown,
+        lines.len(),
+        output_id,
+        None,
+    ));
     Some(view)
 }
 
-fn selected_json_indices(items: &[Value]) -> BTreeSet<usize> {
-    let mut selected = BTreeSet::new();
-    if items.is_empty() {
-        return selected;
-    }
-    selected.insert(0);
-    if items.len() > 1 {
-        selected.insert(items.len() - 1);
-    }
-    let mut signal_count = 0;
-    let mut identities = HashSet::new();
+fn selected_json_indices(items: &[Value]) -> JsonSelection {
+    let mut all_diagnostics = Vec::new();
     for (index, item) in items.iter().enumerate() {
-        let compact = serde_json::to_string(item).unwrap_or_default();
-        if is_diagnostic(&compact) && signal_count < 4 {
-            selected.insert(index);
-            signal_count += 1;
+        if is_diagnostic(&serde_json::to_string(item).unwrap_or_default()) {
+            all_diagnostics.push(index);
         }
-        if selected.len() < 10 {
-            if let Some(identity) = json_identity(item) {
-                if identities.insert(identity) {
-                    selected.insert(index);
-                }
-            }
-        }
-        if selected.len() >= 10 {
+    }
+    if items.is_empty() {
+        return JsonSelection::default();
+    }
+    if items.len() <= MAX_SELECTED_ITEMS {
+        return JsonSelection {
+            indices: (0..items.len()).collect(),
+            diagnostics_kept: all_diagnostics.len(),
+            diagnostics_omitted: 0,
+        };
+    }
+    let diagnostic_seeds = &all_diagnostics[..all_diagnostics.len().min(MAX_DIAGNOSTIC_ITEMS)];
+    let mut selected = diagnostic_seeds.iter().copied().collect::<BTreeSet<_>>();
+    selected.insert(0);
+    selected.insert(items.len() - 1);
+    let mut identities = selected
+        .iter()
+        .filter_map(|index| json_identity(&items[*index]))
+        .collect::<HashSet<_>>();
+    for (index, item) in items.iter().enumerate() {
+        if selected.len() >= MAX_SELECTED_ITEMS {
             break;
         }
+        if selected.contains(&index) {
+            continue;
+        }
+        if let Some(identity) = json_identity(item) {
+            if identities.insert(identity) {
+                selected.insert(index);
+            }
+        }
     }
-    selected
+    if selected.len() < MAX_SELECTED_ITEMS {
+        for index in 0..items.len() {
+            if selected.len() >= MAX_SELECTED_ITEMS {
+                break;
+            }
+            selected.insert(index);
+        }
+    }
+    let diagnostics_kept = all_diagnostics
+        .iter()
+        .filter(|index| selected.contains(index))
+        .count();
+    JsonSelection {
+        indices: selected,
+        diagnostics_kept,
+        diagnostics_omitted: all_diagnostics.len() - diagnostics_kept,
+    }
 }
 
 fn json_identity(value: &Value) -> Option<String> {
@@ -369,13 +413,13 @@ fn build_json_array_view(content: &str, output_id: &str) -> Option<String> {
     if items.len() <= 5 {
         return None;
     }
-    let selected = selected_json_indices(&items);
-    let shown = selected.len();
+    let selection = selected_json_indices(&items);
+    let shown = selection.indices.len();
     let mut view = format!("JSON array compact view: {} total items", items.len());
-    for index in selected {
+    for index in &selection.indices {
         view.push_str(&format!(
             "\nitem[{index}]: {}",
-            serde_json::to_string(&items[index]).ok()?
+            serde_json::to_string(&items[*index]).ok()?
         ));
     }
     view.push_str("\n\n");
@@ -384,6 +428,7 @@ fn build_json_array_view(content: &str, output_id: &str) -> Option<String> {
         shown,
         items.len(),
         output_id,
+        Some((selection.diagnostics_kept, selection.diagnostics_omitted)),
     ));
     Some(view)
 }
@@ -397,20 +442,21 @@ fn build_ndjson_view(content: &str, output_id: &str) -> Option<String> {
     if values.len() < 8 {
         return None;
     }
-    let selected = selected_json_indices(&values);
+    let selection = selected_json_indices(&values);
     let mut view = format!("NDJSON compact view: {} parsed records", values.len());
-    for index in selected.iter().copied() {
+    for index in &selection.indices {
         view.push_str(&format!(
             "\nrecord[{index}]: {}",
-            serde_json::to_string(&values[index]).ok()?
+            serde_json::to_string(&values[*index]).ok()?
         ));
     }
     view.push_str("\n\n");
     view.push_str(&retrieval_trailer(
         ContentKind::Ndjson,
-        selected.len(),
+        selection.indices.len(),
         values.len(),
         output_id,
+        Some((selection.diagnostics_kept, selection.diagnostics_omitted)),
     ));
     Some(view)
 }
@@ -422,19 +468,25 @@ fn build_json_object_view(content: &str, output_id: &str) -> Option<String> {
     let mut view = String::from("JSON object compact view");
     let mut total = 0usize;
     let mut shown = 0usize;
+    let mut diagnostics_kept = 0usize;
+    let mut diagnostics_omitted = 0usize;
+    let mut saw_array = false;
     let mut keys = map.keys().collect::<Vec<_>>();
     keys.sort();
     for key in keys {
         let value = &map[key];
         if let Some(items) = value.as_array() {
             total += items.len();
-            let selected = selected_json_indices(items);
-            shown += selected.len();
+            let selection = selected_json_indices(items);
+            saw_array = true;
+            shown += selection.indices.len();
+            diagnostics_kept += selection.diagnostics_kept;
+            diagnostics_omitted += selection.diagnostics_omitted;
             view.push_str(&format!("\n{key}: {} total items", items.len()));
-            for index in selected {
+            for index in &selection.indices {
                 view.push_str(&format!(
                     "\n  {key}[{index}]: {}",
-                    serde_json::to_string(&items[index]).ok()?
+                    serde_json::to_string(&items[*index]).ok()?
                 ));
             }
         } else if DIAGNOSTIC_MARKERS
@@ -455,6 +507,7 @@ fn build_json_object_view(content: &str, output_id: &str) -> Option<String> {
         shown,
         total.max(shown),
         output_id,
+        saw_array.then_some((diagnostics_kept, diagnostics_omitted)),
     ));
     Some(view)
 }
@@ -520,6 +573,7 @@ fn build_search_results_view(args: &Value, content: &str, output_id: &str) -> Op
         ranked.len(),
         lines.len(),
         output_id,
+        None,
     ));
     Some(view)
 }
@@ -554,6 +608,7 @@ fn build_bounded_line_view(kind: ContentKind, content: &str, output_id: &str) ->
         rendered.len(),
         lines.len(),
         output_id,
+        None,
     ));
     Some(view)
 }
@@ -575,8 +630,17 @@ fn collapse_adjacent_exact_lines(lines: Vec<String>) -> Vec<String> {
     collapsed
 }
 
-fn retrieval_trailer(kind: ContentKind, shown: usize, total: usize, output_id: &str) -> String {
-    format!("[… {kind} compact view: showing {shown} of {total}; full exact output is saved as {output_id}. Call retrieve_output with id \"{output_id}\" to inspect omitted data.]", kind = kind.as_str())
+fn retrieval_trailer(
+    kind: ContentKind,
+    shown: usize,
+    total: usize,
+    output_id: &str,
+    diagnostics: Option<(usize, usize)>,
+) -> String {
+    let diagnostic_note = diagnostics
+        .map(|(kept, omitted)| format!("; diagnostics kept: {kept}, omitted: {omitted}"))
+        .unwrap_or_default();
+    format!("[… {kind} compact view: showing {shown} of {total}{diagnostic_note}; full exact output is saved as {output_id}. Call retrieve_output with id \"{output_id}\" to inspect omitted data.]", kind = kind.as_str())
 }
 
 #[cfg(test)]
@@ -734,5 +798,118 @@ mod tests {
             ),
             ContentKind::PlainText
         );
+    }
+
+    #[test]
+    fn json_selection_keeps_a_diagnostic_past_the_identity_budget() {
+        let items = (0..30)
+            .map(|i| {
+                serde_json::json!({
+                    "id": i,
+                    "status": if i == 25 { "error" } else { "ok" },
+                    "payload": "repetitive payload"
+                })
+            })
+            .collect::<Vec<_>>();
+        let json = serde_json::Value::Array(items).to_string();
+        let view = build_specialized_view(
+            ContentKind::JsonArray,
+            "bash",
+            &serde_json::json!({}),
+            &json,
+            "out-0123456789ab",
+        )
+        .unwrap();
+        assert!(view.content.contains("item[25]"), "{}", view.content);
+        assert!(
+            view.content.contains("diagnostics kept: 1, omitted: 0"),
+            "{}",
+            view.content
+        );
+    }
+
+    fn json_array_view(items: Vec<serde_json::Value>) -> String {
+        let json = serde_json::Value::Array(items).to_string();
+        build_specialized_view(
+            ContentKind::JsonArray,
+            "bash",
+            &serde_json::json!({}),
+            &json,
+            "out-0123456789ab",
+        )
+        .unwrap()
+        .content
+    }
+
+    #[test]
+    fn json_diagnostic_counts_describe_the_selected_view() {
+        let many = (0..40)
+            .map(|i| {
+                serde_json::json!({
+                    "id": i,
+                    "status": if i < 20 { "error" } else { "ok" },
+                    "payload": "p"
+                })
+            })
+            .collect::<Vec<_>>();
+        let view = json_array_view(many);
+        assert!(view.contains("showing 16 of 40"), "{view}");
+        assert!(view.contains("diagnostics kept: 15, omitted: 5"), "{view}");
+
+        let all_errors = (0..30)
+            .map(|i| serde_json::json!({"id": i, "status": "error"}))
+            .collect::<Vec<_>>();
+        let view = json_array_view(all_errors);
+        assert!(view.contains("showing 16 of 30"), "{view}");
+        assert!(view.contains("diagnostics kept: 16, omitted: 14"), "{view}");
+    }
+
+    #[test]
+    fn json_small_arrays_keep_every_diagnostic() {
+        let mut items = (0..5)
+            .map(|i| serde_json::json!({"id": i, "status": "ok"}))
+            .collect::<Vec<_>>();
+        items.push(serde_json::json!({"id": 5, "status": "error"}));
+        let view = json_array_view(items);
+        assert!(view.contains("showing 6 of 6"), "{view}");
+        assert!(view.contains("diagnostics kept: 1, omitted: 0"), "{view}");
+    }
+
+    #[test]
+    fn json_identity_fill_does_not_duplicate_a_selected_diagnostic_identity() {
+        let items = (0..30)
+            .map(|i| {
+                if i == 0 {
+                    serde_json::json!({"id": 5, "status": "error"})
+                } else if i == 10 {
+                    serde_json::json!({"id": 5, "status": "ok"})
+                } else {
+                    serde_json::json!({"id": i, "status": "ok"})
+                }
+            })
+            .collect::<Vec<_>>();
+        let view = json_array_view(items);
+        assert!(view.contains("item[0]"), "{view}");
+        assert!(!view.contains("item[10]"), "{view}");
+        assert!(view.contains("item[11]"), "{view}");
+    }
+
+    #[test]
+    fn json_duplicate_identities_still_keep_the_diagnostic() {
+        let status_only = (0..30)
+            .map(|_| serde_json::json!({"status": "ok"}))
+            .collect::<Vec<_>>();
+        let view = json_array_view(status_only);
+        assert!(view.contains("showing 16 of 30"), "{view}");
+        assert!(view.contains("diagnostics kept: 0, omitted: 0"), "{view}");
+
+        let mut with_error = (0..29)
+            .map(|_| serde_json::json!({"status": "ok", "payload": "repeated"}))
+            .collect::<Vec<_>>();
+        with_error.push(serde_json::json!({"id": 25, "status": "error", "message": "boom"}));
+        let view = json_array_view(with_error);
+        assert!(view.contains("item[29]"), "{view}");
+        assert!(view.contains("diagnostics kept: 1, omitted: 0"), "{view}");
+        assert!(view.contains("item[29]: {\"id\":25"), "{view}");
     }
 }

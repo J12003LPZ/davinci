@@ -154,6 +154,15 @@ pub struct CodeModeOutcome {
     pub host_notes: Vec<String>,
     pub operation_ref: String,
     pub error: Option<CodeModeError>,
+    /// The full pre-truncation body. In-process only; never serialized.
+    #[serde(skip)]
+    pub retained_output: Option<String>,
+    /// Bytes cut from `output_text`. In-process only; never serialized.
+    #[serde(skip)]
+    pub omitted_bytes: usize,
+    /// 1-based line in the full body where the omitted region begins.
+    #[serde(skip)]
+    pub omitted_start_line: Option<usize>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

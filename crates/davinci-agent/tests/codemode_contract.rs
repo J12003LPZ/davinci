@@ -119,6 +119,9 @@ fn script_to_direct_switch_preserves_history_and_wire_kind() {
         host_notes: vec![],
         operation_ref: "op-42".into(),
         error: None,
+        retained_output: None,
+        omitted_bytes: 0,
+        omitted_start_line: None,
     };
     let read_only = project_script_history(&outcome, &CodeModeMode::ReadOnly);
     let controlled = project_script_history(&outcome, &CodeModeMode::Controlled);

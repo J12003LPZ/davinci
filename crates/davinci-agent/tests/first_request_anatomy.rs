@@ -83,6 +83,9 @@ impl CodeModeHost for NoopCodeModeHost {
             host_notes: vec![],
             operation_ref: "noop".into(),
             error: None,
+            retained_output: None,
+            omitted_bytes: 0,
+            omitted_start_line: None,
         }
     }
 }

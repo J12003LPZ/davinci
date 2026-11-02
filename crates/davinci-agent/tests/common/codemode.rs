@@ -155,6 +155,9 @@ impl crate::codemode::CodeModeHost for ReadOnlyFixtureHost {
             host_notes: vec![],
             operation_ref: "forged".into(),
             error: None,
+            retained_output: None,
+            omitted_bytes: 0,
+            omitted_start_line: None,
         }
     }
 }
@@ -508,6 +511,9 @@ fn in_flight_child_is_awaited_before_parent_evidence_is_taken() {
                 host_notes: vec![],
                 operation_ref: "fixture".into(),
                 error: Some(CodeModeError::new("LIMIT_EXCEEDED", "fixture early error")),
+                retained_output: None,
+                omitted_bytes: 0,
+                omitted_start_line: None,
             }
         }
     }
@@ -584,6 +590,9 @@ fn undrained_child_makes_the_run_recovery_required() {
                 host_notes: vec![],
                 operation_ref: "fixture".into(),
                 error: None,
+                retained_output: None,
+                omitted_bytes: 0,
+                omitted_start_line: None,
             }
         }
     }
@@ -1411,6 +1420,9 @@ impl crate::codemode::CodeModeHost for TruncatedReadHost {
             host_notes: vec![],
             operation_ref: "forged".into(),
             error: None,
+            retained_output: None,
+            omitted_bytes: 0,
+            omitted_start_line: None,
         }
     }
 }
@@ -1531,6 +1543,9 @@ impl crate::codemode::CodeModeHost for EmptyAfterReadHost {
             host_notes: vec![],
             operation_ref: "forged".into(),
             error: None,
+            retained_output: None,
+            omitted_bytes: 0,
+            omitted_start_line: None,
         }
     }
 }
@@ -2537,6 +2552,9 @@ impl crate::codemode::CodeModeHost for SlowScriptHost {
                     host_notes: vec![],
                     operation_ref: "fixture".into(),
                     error: Some(CodeModeError::new("CANCELLED", "worker cancelled")),
+                    retained_output: None,
+                    omitted_bytes: 0,
+                    omitted_start_line: None,
                 };
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2551,8 +2569,188 @@ impl crate::codemode::CodeModeHost for SlowScriptHost {
             host_notes: vec![],
             operation_ref: "fixture".into(),
             error: None,
+            retained_output: None,
+            omitted_bytes: 0,
+            omitted_start_line: None,
         }
     }
+}
+
+#[test]
+fn retained_script_body_is_stored_and_named_in_the_completion_note() {
+    use crate::codemode::{
+        CodeModeBroker, CodeModeHost, CodeModeMode, CodeModeOutcome, CodeModeRequest,
+        CodeModeRunContext, CodeModeStatus,
+    };
+
+    struct TruncatedHost;
+    impl CodeModeHost for TruncatedHost {
+        fn admits_controlled_mode(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            _: &CodeModeRequest,
+            _: &CodeModeRunContext,
+            _: Arc<dyn CodeModeBroker>,
+        ) -> CodeModeOutcome {
+            CodeModeOutcome {
+                status: CodeModeStatus::Partial,
+                script_completed: true,
+                output_text: "HEAD\n[... 100 bytes omitted ...]\nTAIL".into(),
+                output_complete: false,
+                output_artifact: None,
+                children: vec![],
+                host_notes: vec![],
+                operation_ref: "fixture".into(),
+                error: None,
+                retained_output: Some("HEAD\nNEEDLE\nTAIL".into()),
+                omitted_bytes: 100,
+                omitted_start_line: Some(2),
+            }
+        }
+    }
+
+    let (mut agent, _workspace, _) = configured_agent();
+    let evidence = tempfile::tempdir().unwrap();
+    let store = crate::EvidenceStore::new(evidence.path());
+    agent.evidence = Some(store.clone());
+    agent
+        .enable_codemode(Arc::new(TruncatedHost), CodeModeMode::Controlled)
+        .unwrap();
+    let result = agent.run_codemode("call-retained", &json!({"code":"return 1"}), None);
+    let details = result.details.as_ref().unwrap();
+    let artifact_id = details["codemode"]["outputArtifact"]["id"]
+        .as_str()
+        .unwrap();
+    assert!(
+        artifact_id.starts_with(store.dir().to_string_lossy().as_ref()),
+        "{artifact_id}"
+    );
+    let body = std::fs::read_to_string(artifact_id).unwrap();
+    assert!(body.contains("NEEDLE"), "{body}");
+    let notes = details["codemode"]["hostNotes"].as_array().unwrap();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.as_str().unwrap().contains("Full output retained at")),
+        "{notes:?}"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.as_str().unwrap().contains("begins at line 2")),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn no_store_marks_only_truncated_script_output_as_unretained() {
+    use crate::codemode::{
+        CodeModeBroker, CodeModeHost, CodeModeMode, CodeModeOutcome, CodeModeRequest,
+        CodeModeRunContext, CodeModeStatus,
+    };
+
+    struct TruncatedHost;
+    impl CodeModeHost for TruncatedHost {
+        fn admits_controlled_mode(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            _: &CodeModeRequest,
+            _: &CodeModeRunContext,
+            _: Arc<dyn CodeModeBroker>,
+        ) -> CodeModeOutcome {
+            CodeModeOutcome {
+                status: CodeModeStatus::Partial,
+                script_completed: true,
+                output_text: "HEAD\n[... 100 bytes omitted ...]\nTAIL".into(),
+                output_complete: false,
+                output_artifact: None,
+                children: vec![],
+                host_notes: vec![],
+                operation_ref: "fixture".into(),
+                error: None,
+                retained_output: Some("HEAD\nNEEDLE\nTAIL".into()),
+                omitted_bytes: 100,
+                omitted_start_line: Some(2),
+            }
+        }
+    }
+
+    let (mut agent, _workspace, _) = configured_agent();
+    agent.evidence = None;
+    agent
+        .enable_codemode(Arc::new(TruncatedHost), CodeModeMode::Controlled)
+        .unwrap();
+    let result = agent.run_codemode("call-no-store", &json!({"code":"return 1"}), None);
+    let details = result.details.as_ref().unwrap();
+    assert!(details["codemode"]["outputArtifact"].is_null());
+    let notes = details["codemode"]["hostNotes"].as_array().unwrap();
+    assert!(
+        notes.iter().any(|note| note
+            .as_str()
+            .unwrap()
+            .contains("no evidence store in this agent")),
+        "{notes:?}"
+    );
+    assert_eq!(details["codemode"]["status"], "partial");
+}
+
+#[test]
+fn complete_no_store_script_output_has_no_omission_marker() {
+    use crate::codemode::{
+        CodeModeBroker, CodeModeHost, CodeModeMode, CodeModeOutcome, CodeModeRequest,
+        CodeModeRunContext, CodeModeStatus,
+    };
+
+    struct CompleteHost;
+    impl CodeModeHost for CompleteHost {
+        fn admits_controlled_mode(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            _: &CodeModeRequest,
+            _: &CodeModeRunContext,
+            _: Arc<dyn CodeModeBroker>,
+        ) -> CodeModeOutcome {
+            CodeModeOutcome {
+                status: CodeModeStatus::Completed,
+                script_completed: true,
+                output_text: "complete".into(),
+                output_complete: true,
+                output_artifact: None,
+                children: vec![],
+                host_notes: vec![],
+                operation_ref: "fixture".into(),
+                error: None,
+                retained_output: None,
+                omitted_bytes: 0,
+                omitted_start_line: None,
+            }
+        }
+    }
+
+    let (mut agent, _workspace, _) = configured_agent();
+    agent.evidence = None;
+    agent
+        .enable_codemode(Arc::new(CompleteHost), CodeModeMode::Controlled)
+        .unwrap();
+    let result = agent.run_codemode("call-complete", &json!({"code":"return 1"}), None);
+    let details = result.details.as_ref().unwrap();
+    assert!(details["codemode"]["outputArtifact"].is_null());
+    let notes = details["codemode"]["hostNotes"]
+        .as_array()
+        .map(|notes| {
+            notes
+                .iter()
+                .any(|note| note.as_str().unwrap().contains("not retained"))
+        })
+        .unwrap_or(false);
+    assert!(!notes);
+    assert_eq!(details["codemode"]["status"], "completed");
 }
 
 /// Guards come before the agent so they drop after it: the workspace and
