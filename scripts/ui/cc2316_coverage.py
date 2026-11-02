@@ -36,7 +36,7 @@ WEAK = ("EXPECTED_FAIL", "BLOCKED", "UNVERIFIED", "PARTIAL", "SOURCE_SUPPORTED")
 STATES = ("NOT_STARTED", "UNCLASSIFIED", "IN_PROGRESS", "VERIFIED", "FAILED", "BLOCKED",
           "NO_REFERENCE", "SAME", "EQUIVALENT", "DROPPED")
 UNASSIGNED = "UNASSIGNED"
-EXCEPTION_REASON = re.compile(r"^D[13]: ")
+EXCEPTION_REASON = re.compile(r"^D[123]: ")
 COMMAND_ROW = re.compile(r"^\| (`/[^|]*?)\s*\|")
 KEY_ROW = re.compile(r"^\| `(.+?)` \| `(.+?)` \| ([A-Z_]+) \|\s*$")
 
@@ -122,7 +122,7 @@ def _check_owner(kind: str, key: str, entry, errors: list):
     if entry.get("tier") not in TIERS:
         errors.append(f"{where}: tier must be one of {', '.join(TIERS)}")
     if entry.get("tier") == "exception" and not EXCEPTION_REASON.match(str(entry.get("reason", ""))):
-        errors.append(f"{where}: an exception needs a reason citing D1 or D3")
+        errors.append(f"{where}: an exception needs a reason citing D1, D2 or D3")
     if not isinstance(entry.get("source_owners", []), list):
         errors.append(f"{where}: source_owners must be a list")
 
@@ -139,6 +139,8 @@ def _row(rid, kind, label, status, owner, golden, results, errors):
         notes.append(owner.get("reason", ""))
     if status in WEAK:
         notes.append(f"Reference status {status}: parity cannot be claimed beyond what is exercised.")
+    if owner and owner.get("limitation"):
+        notes.append(str(owner["limitation"]))
     res = results.get(rid)
     if res is not None:
         state = res.get("state")

@@ -2,7 +2,7 @@
 
 **Goal:** Match the observable Claude Code CLI 2.1.316 Windows terminal experience in DaVinci: exact layout, colours, terminal behaviour and interactions, with DaVinci's own name, mark, wording and real provider data.
 
-**Status (2026-11-01):** P00–P02 are done. P03 and P04 are in review. P05–P20 have not started. No DaVinci parity is claimed.
+**Status (2026-11-01):** P00–P04 are done. P05 is in progress. P06–P20 have not started. No DaVinci parity is claimed.
 
 **Replaces** the earlier version of this plan. Where `docs/superpowers/specs/2026-11-01-claude-code-2.1.316-tui-parity-design.md` conflicts with the decisions below, this plan wins.
 

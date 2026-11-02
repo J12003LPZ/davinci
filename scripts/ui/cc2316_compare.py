@@ -9,7 +9,13 @@ Region rules (see the plan, "Region rules, not cell masks") are boxes in the
 expected golden. Region coordinates are inclusive: ``{"rows": (r0, r1),
 "cols": (c0, c1)}``. Cells outside every region are always compared exactly.
 
-* ``mark``: cells inside the box are not compared at all. Nothing else is
+Rules reach a result only through ``compare_golden``, which loads the rules approved for the
+golden from ``cc2316_rules.json`` (empty until a task earns an entry) and rejects a
+``structure`` rule on a golden that is not tier ``structure`` and any rule on an
+``exception`` golden. ``compare`` takes any rules and is for tests.
+
+* ``mark``: must sit inside the header box (rows 1-3, columns 0-9). Cells inside the box
+  are not compared at all. Nothing else is
   checked specially: a mark that spills out of its box leaves cells outside the
   box that differ from the golden, and those are compared normally and fail.
 * ``identity``: the expected cells in the box are rewritten with the rule's
@@ -63,6 +69,7 @@ MODE_FIELDS = ("alternate_screen", "mouse_click", "mouse_drag", "mouse_move", "m
 _STYLE_DEFAULTS = {"fg": None, "bg": None, "bold": False, "dim": False, "italic": False,
                    "underline": False, "strike": False, "inverse": False, "blink": False}
 KINDS = ("mark", "identity", "data", "structure")
+MARK_BOX = {"rows": (1, 3), "cols": (0, 9)}  # the header mark of the plan, "Region rules"
 _MISSING = object()
 _CONT = ""  # text of the second column of a wide glyph
 
@@ -116,6 +123,11 @@ class Rule:
             raise ValueError(f"empty region {self.region!r}")
         for name, value in (("row0", r0), ("row1", r1), ("col0", c0), ("col1", c1)):
             object.__setattr__(self, name, value)
+        if self.kind == "mark" and not (
+                MARK_BOX["rows"][0] <= r0 and r1 <= MARK_BOX["rows"][1]
+                and MARK_BOX["cols"][0] <= c0 and c1 <= MARK_BOX["cols"][1]):
+            raise ValueError(f"a mark must sit inside rows {MARK_BOX['rows']}, "
+                             f"columns {MARK_BOX['cols']}, got {self.region!r}")
         if self.kind == "identity":
             if not self.substitutions or any(not k for k in self.substitutions):
                 raise ValueError("an identity rule needs a substitution table with non-empty keys")
@@ -210,6 +222,12 @@ def _grid(capture: dict, side: str, out: list):
             if not isinstance(x, int):
                 bad(y, None, f"run without an integer x: {item!r:.60}")
                 continue
+            if x < 0:
+                bad(y, x, f"run starts at negative column {x}")
+                continue
+            w = item.get("w", 0)
+            if isinstance(w, bool) or not isinstance(w, int) or w < 0:
+                bad(y, x, f"run w={w!r} is not a non-negative integer")
             run_cells, leading = _text_cells(item.get("text", ""), _style(item, defaults))
             if leading:
                 base = x - 1
@@ -391,3 +409,33 @@ def compare(expected: dict, actual: dict, rules=()) -> DiffReport:
                           ignore_text=rule is not None and rule.kind in ("data", "structure"),
                           geometry=rule is not None and rule.kind == "structure", out=out)
     return DiffReport(out)
+
+
+DEFAULT_RULES = Path(__file__).with_name("cc2316_rules.json")
+DEFAULT_OWNERS = Path(__file__).with_name("cc2316_owners.json")
+
+
+def load_rules(name: str, manifest_path=DEFAULT_RULES, owners_path=DEFAULT_OWNERS) -> list[Rule]:
+    """The approved rules for golden ``name``, checked against its tier in the owners file."""
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    specs = (manifest.get("goldens") or {}).get(name) or []
+    if not specs:
+        return []
+    tier = ((json.loads(Path(owners_path).read_text(encoding="utf-8")).get("goldens") or {})
+            .get(name) or {}).get("tier")
+    rules = []
+    for spec in specs:
+        rule = Rule(golden=name, region=spec.get("region"), kind=spec.get("kind"),
+                    reason=spec.get("reason"), substitutions=spec.get("substitutions"))
+        if tier == "exception":
+            raise ValueError(f"golden {name!r} is an exception; it takes no rules")
+        if rule.kind == "structure" and tier != "structure":
+            raise ValueError(f"a structure rule needs golden {name!r} to be tier structure, not {tier!r}")
+        rules.append(rule)
+    return rules
+
+
+def compare_golden(expected, actual, manifest_path=DEFAULT_RULES, owners_path=DEFAULT_OWNERS) -> DiffReport:
+    """Compare with the rules approved for ``expected["name"]``. Callers that produce
+    results use this; ``compare`` takes any rules and is for tests."""
+    return compare(expected, actual, load_rules(expected.get("name"), manifest_path, owners_path))

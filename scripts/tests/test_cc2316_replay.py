@@ -82,6 +82,36 @@ class MockTest(unittest.TestCase):
             self.assertEqual(event_types(result[0])[-1], "response.completed")
 
 
+    def test_release_does_not_complete_a_later_held_turn(self):
+        import threading
+        import time
+        with mock.MockServer([mock.text_turn("one", hold=True), mock.text_turn("two", hold=True)]) as s:
+            done = {}
+
+            def call(key):
+                done[key] = post(s)
+
+            first = threading.Thread(target=call, args=("one",))
+            first.start()
+            self.assertTrue(s.wait_for_requests(1))
+            deadline = time.time() + 5
+            while s.held < 1 and time.time() < deadline:
+                time.sleep(0.01)
+            releasing = threading.Thread(target=s.release)
+            releasing.start()
+            time.sleep(0.01)
+            second = threading.Thread(target=call, args=("two",))
+            second.start()
+            releasing.join(5)
+            first.join(5)
+            second.join(0.4)
+            self.assertIn("one", done)
+            self.assertTrue(second.is_alive(), "release() completed a hold registered after it")
+            s.release()
+            second.join(5)
+            self.assertIn("two", done)
+
+
 class ScenarioCheckTest(unittest.TestCase):
     def test_unknown_action_is_blocked_without_a_process(self):
         with tempfile.TemporaryDirectory() as out:
@@ -137,10 +167,114 @@ class ScenarioCheckTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as out:
             self.assertFalse(replay.inside_repo(out))
 
+    def test_profile_env_only_allows_presentation_variables(self):
+        for key in ("PI_CATALOG_DRY_RUN", "HOME", "PI_DISABLE_NETWORK", "HTTP_PROXY", "USERPROFILE"):
+            self.assertIn(key, replay.check_profile(replay.Profile(env={key: "0"})))
+        self.assertEqual(replay.check_profile(replay.Profile(
+            env={"NO_COLOR": "1", "FORCE_COLOR": "1", "COLORFGBG": "15;0"})), "")
+        with self.assertRaises(ValueError):
+            replay.build_env(Path("h"), Path("a"), 1, {"PI_CATALOG_DRY_RUN": "0"})
+        env = replay.build_env(Path("h"), Path("a"), 1, {"NO_COLOR": "1"})
+        self.assertEqual((env["NO_COLOR"], env["PI_CATALOG_DRY_RUN"]), ("1", "1"))
+
+    def test_replay_blocks_a_profile_that_changes_isolation(self):
+        with tempfile.TemporaryDirectory() as out:
+            cap = replay.replay(Path(out) / "nope.exe", {}, replay.Profile(env={"HOME": "x"}),
+                                out_dir=out)
+        self.assertEqual(cap.status, replay.BLOCKED)
+        self.assertIn("HOME", cap.reason)
+
+    def test_rooted_and_drive_paths_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = Path(tmp).resolve() / "outside" / "escape.txt"
+            rooted = str(outside)[len(outside.drive):]       # a rooted path without a drive
+            for rel in (rooted, "/x/y.txt", "\\x\\y.txt", "C:y.txt", "C:\\y.txt", "a/../b"):
+                self.assertIn("relative", replay.check_scenario({"files": {rel: "x"}}), rel)
+            work = Path(tmp) / "work"
+            work.mkdir()
+            self.assertIn("relative", replay.write_files(work, {rooted: "x"}))
+            self.assertFalse(outside.exists())
+            self.assertEqual(replay.write_files(work, {"sub/ok.txt": "x"}), "")
+            self.assertTrue((work / "sub" / "ok.txt").is_file())
+
+    def test_a_target_resolving_outside_work_is_rejected(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            work, away = Path(tmp) / "work", Path(tmp) / "away"
+            work.mkdir()
+            away.mkdir()
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(work / "link"), str(away)],
+                                  capture_output=True)
+            if made.returncode != 0:
+                self.skipTest("cannot create a junction here")
+            self.assertEqual(replay.check_scenario({"files": {"link/x.txt": "x"}}), "")
+            self.assertIn("outside", replay.write_files(work, {"link/x.txt": "x"}))
+            self.assertFalse((away / "x.txt").exists())
+
     def test_missing_binary_is_blocked(self):
         with tempfile.TemporaryDirectory() as out:
             cap = replay.replay(Path(out) / "nope.exe", {}, replay.Profile(), out_dir=out)
         self.assertEqual(cap.status, replay.BLOCKED)
+
+
+class FakeBase:
+    """Stands in for the reference Harness, with its offset-based find_text and click_text."""
+    def __init__(self, cols, rows, *args):
+        self.cols, self.rows, self.clicks = cols, rows, []
+
+    def text(self):
+        return ""
+
+    def event(self, *args):
+        pass
+
+    def mouse(self, action, x, y, button=0):
+        self.clicks.append((action, x, y))
+
+    def find_text(self, needle):
+        for y, line in enumerate(self.display().splitlines()):
+            x = line.split("|", 1)[1].find(needle)
+            if x >= 0:
+                return x + 1, y + 1
+        return None
+
+    def click_text(self, needle, dx=0):
+        pos = self.find_text(needle)
+        if not pos:
+            return False
+        x, y = pos
+        self.mouse("left", x + dx, y)
+        self.mouse("release", x + dx, y)
+        return True
+
+
+class ClickTextTest(unittest.TestCase):
+    def harness(self, rows):
+        import types
+        dump = {"rows": [{"runs": runs} for runs in rows]}
+        xt = types.SimpleNamespace(
+            trim_to_current_screen=lambda raw: raw, dump=lambda *a: dump,
+            styled_capture=types.SimpleNamespace(sanitize=lambda raw: raw))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cls = replay.make_harness_class(types.SimpleNamespace(Harness=FakeBase), xt, Path(tmp.name))
+        return cls(20, len(rows))
+
+    def test_text_after_a_wide_glyph_maps_to_its_real_column(self):
+        h = self.harness([[{"x": 0, "text": "\u4f60Z"}]])
+        self.assertEqual(h.find_text("Z"), (3, 1))      # columns 0-1 are the glyph, Z is column 2
+
+    def test_text_after_a_combining_mark_maps_to_its_real_column(self):
+        h = self.harness([[{"x": 0, "text": "e\u0301Z"}]])
+        self.assertEqual(h.find_text("Z"), (2, 1))
+        self.assertEqual(h.find_text("e\u0301Z"), (1, 1))
+
+    def test_click_uses_the_cell_column_and_row(self):
+        h = self.harness([[{"x": 0, "text": "ab"}],
+                          [{"x": 1, "text": "\u4f60\u4f60Q"}]])
+        self.assertTrue(h.click_text("Q"))
+        self.assertEqual(h.clicks, [("left", 6, 2), ("release", 6, 2)])
+        self.assertFalse(h.click_text("missing"))
 
 
 def live_skip_reason():
@@ -205,10 +339,15 @@ class LiveReplayTest(unittest.TestCase):
 
     def test_import_leaves_the_reference_package_untouched(self):
         cache = replay.ref_root() / "scripts" / "__pycache__"
-        self.assertFalse(cache.exists(), "reference package already has a __pycache__")
+
+        def snapshot():
+            return sorted((p.name, p.stat().st_size, p.stat().st_mtime_ns)
+                          for p in cache.iterdir()) if cache.exists() else None
+
+        before, flag = snapshot(), sys.dont_write_bytecode
         replay.load_reference()
-        self.assertFalse(cache.exists())
-        self.assertFalse(sys.dont_write_bytecode)
+        self.assertEqual(snapshot(), before)
+        self.assertEqual(sys.dont_write_bytecode, flag)
 
     def test_duplicate_provider_request_fails_the_run(self):
         cap = replay.replay(BINARY, {

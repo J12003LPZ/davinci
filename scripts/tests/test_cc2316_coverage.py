@@ -106,12 +106,28 @@ class LedgerTest(unittest.TestCase):
         own["features"]["F-1"]["tier"] = "approx"
         self.assertTrue(any("tier" in e for e in self.build(own).errors))
 
-    def test_exception_without_d1_or_d3_reason_fails(self):
+    def test_exception_without_d1_d2_or_d3_reason_fails(self):
         own = owners()
         own["features"]["F-1"].update(tier="exception", reason="we felt like it")
-        self.assertTrue(any("D1 or D3" in e for e in self.build(own).errors))
+        self.assertTrue(any("D1, D2 or D3" in e for e in self.build(own).errors))
         own["features"]["F-1"].pop("reason")
-        self.assertTrue(any("D1 or D3" in e for e in self.build(own).errors))
+        self.assertTrue(any("D1, D2 or D3" in e for e in self.build(own).errors))
+        own["features"]["F-1"].update(reason="D4: nope")
+        self.assertTrue(any("D1, D2 or D3" in e for e in self.build(own).errors))
+
+    def test_d1_d2_and_d3_exceptions_are_accepted(self):
+        for tag in ("D1", "D2", "D3"):
+            own = owners()
+            own["features"]["F-1"].update(tier="exception", reason=f"{tag}: because")
+            c = self.build(own)
+            self.assertEqual(c.errors, [], tag)
+            self.assertEqual(self.row(c, "F-1")["limitation"], f"{tag}: because")
+
+    def test_owner_limitation_reaches_the_row(self):
+        own = owners()
+        own["features"]["F-1"]["limitation"] = "cursor shape unverified in the reference"
+        row = self.row(self.build(own), "F-1")
+        self.assertIn("cursor shape unverified in the reference", row["limitation"])
 
     def test_verified_needs_a_passing_result_with_evidence(self):
         for result in ({}, {"result": "PASS"}, {"evidence": "e.txt"}, {"result": "FAIL", "evidence": "e.txt"}):
@@ -199,10 +215,11 @@ class OwnersFileTest(unittest.TestCase):
         self.assertEqual(set(data), {"version", "defaults", "features", "goldens"})
         entries = list(data["features"].values()) + list(data["goldens"].values())
         for e in entries:
-            self.assertLessEqual(set(e), {"owner_task", "source_owners", "tier", "reason", "dropped"})
+            self.assertLessEqual(set(e), {"owner_task", "source_owners", "tier", "reason", "dropped",
+                                          "limitation"})
             self.assertIn(e["tier"], cov.TIERS)
             if e["tier"] == "exception":
-                self.assertRegex(e["reason"], r"^D[13]: ")
+                self.assertRegex(e["reason"], r"^D[123]: ")
                 self.assertLess(len(e["reason"]), 80)
         self.assertEqual(sum(1 for e in data["goldens"].values() if e.get("dropped")), 4)
         self.assertEqual(sum(1 for e in data["goldens"].values()
@@ -219,6 +236,7 @@ class RealLedgerTest(unittest.TestCase):
             c = cov.build_coverage(REF, REF / "artifacts/data/test_results.json", OWNERS_FILE,
                                    out_dir=Path(out))
             self.assertEqual(c.errors, [])
+            self.assertEqual(c.unassigned, [])
             self.assertEqual(c.counts["kinds"]["feature"], 77)
             self.assertEqual(c.counts["kinds"]["golden"], 99)
             self.assertEqual(c.counts["kinds"]["command"], 91)
@@ -226,7 +244,7 @@ class RealLedgerTest(unittest.TestCase):
             self.assertEqual(c.counts["states"], {"NOT_STARTED": 176, "UNCLASSIFIED": 319})
             for r in c.rows:
                 if r["tier"] == "exception":
-                    self.assertRegex(r["limitation"], r"^D[13]: ")
+                    self.assertRegex(r["limitation"], r"^D[123]: ")
             self.assertTrue((Path(out) / "coverage.md").is_file())
 
 

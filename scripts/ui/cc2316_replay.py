@@ -43,15 +43,20 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cc2316_compare  # noqa: E402
 import cc2316_mock  # noqa: E402
 
 PASS, FAIL, SKIP, BLOCKED = "PASS", "FAIL", "SKIP", "BLOCKED"
 LOOPBACK = {"127.0.0.1", "::1"}
 UNSPECIFIED = {"0.0.0.0", "::", ""}
 BASE_ENV_KEYS = ("PATH", "SystemRoot", "WINDIR", "TEMP", "TMP")
+# The only variables a profile may set. They change how the shell paints, never where it
+# runs or what it can reach. The P05 setting (tui.reference) is a DaVinci setting, so a
+# scenario passes it in ``davinci_settings``, not here.
+PROFILE_ENV_KEYS = ("NO_COLOR", "FORCE_COLOR", "COLORFGBG")
 ACTIONS = ("key", "wait", "snapshot", "resize", "mouse", "click_text", "release")
 SCENARIO_KEYS = ("name", "cols", "rows", "wait_ms", "actions", "graceful", "timeout", "turns",
                  "files", "davinci_settings", "expect_requests")
@@ -220,7 +225,7 @@ def check_scenario(scenario) -> str:
                 return f"action {i}: snapshot needs a unique name of letters, digits, _ . -"
             seen.add(name)
     for rel in (scenario.get("files") or {}):
-        if Path(rel).is_absolute() or ".." in Path(rel).parts:
+        if not relative_inside(rel):
             return f"file {rel!r} must be a relative path inside the working directory"
     expected = scenario.get("expect_requests")
     counted = isinstance(expected, int) and not isinstance(expected, bool) and expected >= 0
@@ -229,6 +234,44 @@ def check_scenario(scenario) -> str:
             return "a scenario with turns must state expect_requests as an integer (the mock repeats its last turn)"
     elif expected not in (None, 0) or (expected is not None and not counted):
         return "a scenario without turns expects exactly 0 provider requests"
+    return ""
+
+
+def relative_inside(rel) -> bool:
+    """True for a path with no root, drive or ``..``, read as a Windows and as a POSIX path."""
+    if not isinstance(rel, str) or not rel:
+        return False
+    for flavour in (Path, PureWindowsPath, PurePosixPath):
+        p = flavour(rel)
+        if p.is_absolute() or p.root or p.drive or ".." in p.parts:
+            return False
+    return True
+
+
+def write_files(work, files) -> str:
+    """Write scenario files under ``work``. Returns a reason instead of writing when a
+    path is not relative or its resolved target is outside ``work``."""
+    base = Path(work).resolve()
+    targets = []
+    for rel, content in (files or {}).items():
+        if not relative_inside(rel):
+            return f"file {rel!r} must be a relative path inside the working directory"
+        target = (base / rel).resolve()
+        if not target.is_relative_to(base):
+            return f"file {rel!r} resolves outside the working directory"
+        targets.append((target, content))
+    for target, content in targets:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    return ""
+
+
+def check_profile(profile) -> str:
+    """Return a reason the profile cannot be used, or '' when its env is presentation only."""
+    bad = sorted(k for k in profile.env if k not in PROFILE_ENV_KEYS)
+    if bad:
+        return (f"profile env {bad!r} is not allowed; only {', '.join(PROFILE_ENV_KEYS)} "
+                "may be set, so the run stays isolated")
     return ""
 
 
@@ -266,6 +309,9 @@ def build_env(home: Path, agent: Path, proxy_port: int, extra: dict) -> dict:
         "PI_CODING_AGENT_DIR": str(agent), "DAVINCI_CODING_AGENT_DIR": str(agent),
         "HTTP_PROXY": proxy, "HTTPS_PROXY": proxy, "ALL_PROXY": proxy, "NO_PROXY": "127.0.0.1",
     })
+    bad = sorted(k for k in extra if k not in PROFILE_ENV_KEYS)
+    if bad:
+        raise ValueError(f"env {bad!r} is not an allowed profile variable")
     env.update(extra)
     return env
 
@@ -297,16 +343,26 @@ def make_harness_class(tui_harness, styled_xterm, scratch: Path):
     ``Harness.display`` feeds pyte, which cannot follow DaVinci's output (the package
     itself notes pyte misreads some sequences); it stayed blank here. Everything else,
     including ``find_text``/``click_text`` built on ``display``, is reused unchanged.
-    Wide glyphs count as one column when locating text, so a click on a row that has
-    them can land a column off.
+    ``find_text`` is overridden to report real cell columns: a wide glyph is two columns
+    and a combining mark none, which ``display()`` does not model.
     """
     class DaVinciHarness(tui_harness.Harness):
-        def display(self) -> str:
+        def _dump(self) -> dict:
             raw = styled_xterm.trim_to_current_screen(
                 styled_xterm.styled_capture.sanitize(self.text()))
             path = scratch / "_display.ansi"
             path.write_text(raw, encoding="utf-8", newline="")
-            dump = styled_xterm.dump(str(path), self.cols, self.rows)
+            return styled_xterm.dump(str(path), self.cols, self.rows)
+
+        def find_text(self, needle):
+            for y, row in enumerate(self._dump()["rows"]):
+                column = find_column(row["runs"], needle, self.cols)
+                if column is not None:
+                    return column + 1, y + 1  # SGR mouse is 1-based
+            return None
+
+        def display(self) -> str:
+            dump = self._dump()
             lines = []
             for y, row in enumerate(dump["rows"]):
                 cells = [" "] * self.cols
@@ -320,6 +376,22 @@ def make_harness_class(tui_harness, styled_xterm, scratch: Path):
             return "\n".join(lines)
 
     return DaVinciHarness
+
+
+def find_column(runs, needle: str, cols: int):
+    """Terminal column where ``needle`` starts in one dumped row, or None. Columns follow
+    the cell model of ``cc2316_compare``: a wide glyph takes two, a combining mark none."""
+    text, columns = "", []
+    for run in runs:
+        cells, _ = cc2316_compare._text_cells(run["text"], ())
+        x = run["x"]
+        for glyph, _style in cells:
+            if glyph != "" and x < cols:   # "" is the second column of a wide glyph
+                text += glyph
+                columns.extend([x] * len(glyph))
+            x += 1
+    at = text.find(needle) if needle else -1
+    return columns[at] if at >= 0 else None
 
 
 def kill_tree(pid: int):
@@ -355,6 +427,10 @@ def replay(binary, scenario, profile, *, out_dir) -> Capture:
     if reason:
         cap.reason = reason
         return cap
+    reason = check_profile(profile)
+    if reason:
+        cap.reason = reason
+        return cap
     if inside_repo(out):
         cap.reason = f"out_dir {out} is inside the repository; captures must be written outside it"
         return cap
@@ -382,10 +458,11 @@ def replay(binary, scenario, profile, *, out_dir) -> Capture:
     agent = root / "agent"
     for d in (work, agent):
         d.mkdir(parents=True)
-    for rel, content in (scenario.get("files") or {}).items():
-        target = work / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+    reason = write_files(work, scenario.get("files"))
+    if reason:
+        shutil.rmtree(root, ignore_errors=True)
+        cap.reason = reason
+        return cap
 
     mock = cc2316_mock.MockServer(make_turns(scenario.get("turns"))).start()
     proxy = RefusingProxy().start()

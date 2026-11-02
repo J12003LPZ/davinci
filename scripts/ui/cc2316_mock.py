@@ -102,7 +102,7 @@ class MockServer:
         self.turns = list(turns) if turns else [text_turn("ok")]
         self.requests: list[dict] = []
         self._lock = threading.Lock()
-        self._release = threading.Event()
+        self._holds: list[threading.Event] = []   # one event per active hold
         self._closing = threading.Event()
         self.held = 0
         outer = self
@@ -148,7 +148,7 @@ class MockServer:
 
     def stop(self):
         self._closing.set()
-        self._release.set()
+        self.release()
         self._httpd.shutdown()
         self._httpd.server_close()
 
@@ -160,10 +160,11 @@ class MockServer:
 
     # -- scripting -------------------------------------------------------
     def release(self):
-        """Let every held turn finish. Later held turns hold again."""
-        self._release.set()
-        time.sleep(0.05)
-        self._release.clear()
+        """Let the turns held right now finish. A hold reached after this call holds again."""
+        with self._lock:
+            holds = list(self._holds)
+        for event in holds:
+            event.set()
 
     def wait_for_requests(self, n: int, timeout: float = 10.0) -> bool:
         end = time.time() + timeout
@@ -213,10 +214,12 @@ class MockServer:
                 if delay:
                     time.sleep(delay)
             if turn.hold:
+                release = threading.Event()
                 with self._lock:
                     self.held += 1
+                    self._holds.append(release)
                 try:
-                    while not self._release.wait(0.05):
+                    while not release.wait(0.05):
                         if self._closing.is_set():
                             return
                         # Detect a client that went away (interrupt): a probe write
@@ -226,6 +229,7 @@ class MockServer:
                 finally:
                     with self._lock:
                         self.held -= 1
+                        self._holds.remove(release)
             for event in tail:
                 handler.wfile.write(sse(event))
                 handler.wfile.flush()

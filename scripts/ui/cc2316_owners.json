@@ -109,9 +109,10 @@
    "tier": "exact"
   },
   "START-09": {
-   "owner_task": "UNASSIGNED",
+   "owner_task": "P05",
    "source_owners": [],
-   "tier": "exact"
+   "tier": "exact",
+   "limitation": "source-supported only; banner never rendered in the reference"
   },
   "MSG-01": {
    "owner_task": "P10",
@@ -385,9 +386,9 @@
    "tier": "structure"
   },
   "PANEL-07": {
-   "owner_task": "UNASSIGNED",
+   "owner_task": "P13",
    "source_owners": [],
-   "tier": "exact"
+   "tier": "structure"
   },
   "PANEL-08": {
    "owner_task": "P13",
@@ -734,9 +735,10 @@
    "tier": "exact"
   },
   "VIS-03": {
-   "owner_task": "UNASSIGNED",
+   "owner_task": "NONE",
    "source_owners": [],
-   "tier": "exact"
+   "tier": "exception",
+   "reason": "D2: no mark animation is copied"
   },
   "VIS-04": {
    "owner_task": "P11",
@@ -781,9 +783,10 @@
    "tier": "exact"
   },
   "VIS-08": {
-   "owner_task": "UNASSIGNED",
+   "owner_task": "P05",
    "source_owners": [],
-   "tier": "exact"
+   "tier": "exact",
+   "limitation": "cursor shape unverified in the reference"
   },
   "A11Y-01": {
    "owner_task": "P17",
@@ -805,14 +808,16 @@
    "tier": "exact"
   },
   "A11Y-03": {
-   "owner_task": "UNASSIGNED",
+   "owner_task": "P20",
    "source_owners": [],
-   "tier": "exact"
+   "tier": "exact",
+   "limitation": "non-parity platform; needs its own evidence"
   },
   "A11Y-04": {
-   "owner_task": "UNASSIGNED",
+   "owner_task": "P20",
    "source_owners": [],
-   "tier": "exact"
+   "tier": "exact",
+   "limitation": "non-parity platform; needs its own evidence"
   },
   "PERF-01": {
    "owner_task": "P20",

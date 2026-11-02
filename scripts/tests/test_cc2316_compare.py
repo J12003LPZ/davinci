@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ui"))
-from cc2316_compare import DiffReport, Rule, compare, load_capture
+from cc2316_compare import DiffReport, Rule, compare, compare_golden, load_capture
 
 PACKAGE_FRAMES = Path("C:/Users/sergi/Desktop/lean-claude-ui/artifacts/frames/reference")
 FG = "#e6e6e6"
@@ -125,6 +125,20 @@ class CompareTests(unittest.TestCase):
         report = compare(base(), bigger)
         self.assertIn((None, None, "dimensions"), fields(report))
         self.assertTrue(any(d.row == 3 for d in report.differences))
+
+    def test_negative_column_run_is_a_layout_difference(self):
+        other = base()
+        other["rows"][0].append(run(-1, "z"))
+        report = compare(base(), other)
+        self.assertTrue(any(d.field == "layout" and d.row == 0 for d in report.differences))
+        self.assertFalse(compare(other, other).ok)
+
+    def test_negative_or_non_integer_width_is_a_layout_difference(self):
+        for text, w in (("hello", -1), ("hello", 5.0), ("h", True), ("", -0.0)):
+            other = base()
+            other["rows"][0] = [run(0, text, w=w), run(len(text), "hello"[len(text):] + " " * 5)]
+            report = compare(base(), other)
+            self.assertTrue(any(d.field == "layout" for d in report.differences), repr(w))
 
     def test_overlapping_runs_are_reported(self):
         other = base()
@@ -308,18 +322,20 @@ def rule(kind, region, golden="g1", reason="test", **extra):
 
 class RuleTests(unittest.TestCase):
     def test_mark_ignores_inside_and_compares_outside(self):
-        r = rule("mark", box(0, 0, 0, 4))
-        other = capture({0: [run(0, "XYZ", bold=True), run(3, "lo     ")]})
-        self.assertTrue(compare(base(), other, [r]).ok)
-        spill = capture({0: [run(0, "hello", bold=True), run(5, "Q    ")]})
-        self.assertEqual(fields(compare(base(), spill, [r])), {(0, 5, "text")})
+        r = rule("mark", box(1, 1, 0, 4))
+        one = capture({1: [run(0, "hello     ")]})
+        other = capture({1: [run(0, "XYZ", bold=True), run(3, "lo     ")]})
+        self.assertTrue(compare(one, other, [r]).ok)
+        spill = capture({1: [run(0, "hello", bold=True), run(5, "Q    ")]})
+        self.assertEqual(fields(compare(one, spill, [r])), {(1, 5, "text")})
 
     def test_mark_corruption_just_outside_still_fails(self):
-        r = rule("mark", box(0, 0, 0, 4))
-        other = capture({0: [run(0, "hello"), run(5, "     ", bg="#010101")]})
-        self.assertEqual(fields(compare(base(), other, [r])), {(0, c, "bg") for c in range(5, 10)})
-        below = capture({0: [run(0, "hello     ")], 1: [run(0, "a" + " " * 9)]})
-        self.assertEqual(fields(compare(base(), below, [r])), {(1, 0, "text")})
+        r = rule("mark", box(1, 1, 0, 4))
+        one = capture({1: [run(0, "hello     ")]})
+        other = capture({1: [run(0, "hello"), run(5, "     ", bg="#010101")]})
+        self.assertEqual(fields(compare(one, other, [r])), {(1, c, "bg") for c in range(5, 10)})
+        below = capture({1: [run(0, "hello     ")], 2: [run(0, "a" + " " * 9)]})
+        self.assertEqual(fields(compare(one, below, [r])), {(2, 0, "text")})
 
     def test_data_ignores_text_but_not_style(self):
         r = rule("data", box(0, 0, 0, 4))
@@ -400,15 +416,90 @@ class RuleTests(unittest.TestCase):
 
     def test_overlapping_rules_raise(self):
         with self.assertRaises(ValueError):
-            compare(base(), base(), [rule("data", box(0, 1, 0, 3)), rule("mark", box(1, 2, 3, 5))])
+            compare(base(), base(), [rule("data", box(0, 1, 0, 3)), rule("data", box(1, 2, 3, 5))])
 
     def test_adjacent_rules_are_allowed(self):
         self.assertTrue(compare(base(), base(), [rule("data", box(0, 0, 0, 3)),
-                                                 rule("mark", box(0, 0, 4, 5))]).ok)
+                                                 rule("data", box(0, 0, 4, 5))]).ok)
 
     def test_rule_for_another_golden_raises(self):
         with self.assertRaises(ValueError):
             compare(base(), base(), [rule("data", box(0, 0, 0, 1), golden="other")])
+
+
+class MarkBoxTests(unittest.TestCase):
+    def test_mark_must_sit_inside_the_header_box(self):
+        for region in (box(0, 0, 0, 4), box(1, 4, 0, 4), box(1, 3, 0, 10), box(0, 43, 0, 119)):
+            with self.assertRaises(ValueError, msg=str(region)):
+                rule("mark", region)
+        rule("mark", box(1, 3, 0, 9))
+
+    def test_whole_screen_mark_raises(self):
+        with self.assertRaises(ValueError):
+            compare(base(), capture({}), [rule("mark", box(0, 2, 0, 9))])
+
+    def test_the_real_mark_fits_the_box(self):
+        path = PACKAGE_FRAMES / "boot__02_settled.json"
+        if not path.is_file():
+            self.skipTest("reference package not present")
+        cap = load_capture(path)
+        cells = {(y, x + i) for y, row in enumerate(cap["rows"][:5]) for run_ in row
+                 if run_.get("fg") == "#d77757" and run_["x"] < 11
+                 for i, ch in enumerate(run_["text"]) if ch != " " for x in [run_["x"]]}
+        self.assertTrue(cells)
+        self.assertTrue(all(1 <= y <= 3 and 0 <= x <= 9 for y, x in cells), sorted(cells))
+
+
+class CompareGoldenTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def files(self, tier, rules, golden="g1", reason=None):
+        owner = {"owner_task": "P00", "source_owners": [], "tier": tier}
+        if reason:
+            owner["reason"] = reason
+        owners = Path(self.tmp.name) / "owners.json"
+        owners.write_text(json.dumps({"version": 1, "goldens": {golden: owner}}), encoding="utf-8")
+        manifest = Path(self.tmp.name) / "rules.json"
+        manifest.write_text(json.dumps({"version": 1, "goldens": {golden: rules}}), encoding="utf-8")
+        return manifest, owners
+
+    def spec(self, kind, region=None, **extra):
+        return dict({"region": region or {"rows": [0, 0], "cols": [0, 4]}, "kind": kind,
+                     "reason": "test"}, **extra)
+
+    def test_empty_manifest_means_exact_comparison(self):
+        manifest, owners = self.files("exact", [])
+        other = capture({0: [run(0, "HELLO     ")]})
+        self.assertFalse(compare_golden(base(), other, manifest, owners).ok)
+        self.assertTrue(compare_golden(base(), copy.deepcopy(base()), manifest, owners).ok)
+
+    def test_approved_rule_is_applied(self):
+        manifest, owners = self.files("structure", [self.spec("data")])
+        other = capture({0: [run(0, "12345"), run(5, " " * 5)]})
+        self.assertTrue(compare_golden(base(), other, manifest, owners).ok)
+
+    def test_structure_rule_needs_a_structure_tier(self):
+        manifest, owners = self.files("exact", [self.spec("structure")])
+        with self.assertRaises(ValueError):
+            compare_golden(base(), base(), manifest, owners)
+
+    def test_any_rule_on_an_exception_golden_is_rejected(self):
+        manifest, owners = self.files("exception", [self.spec("data")], reason="D1: test")
+        with self.assertRaises(ValueError):
+            compare_golden(base(), base(), manifest, owners)
+
+    def test_whole_screen_mark_in_the_manifest_raises(self):
+        manifest, owners = self.files("exact", [self.spec("mark", {"rows": [0, 2], "cols": [0, 9]})])
+        with self.assertRaises(ValueError):
+            compare_golden(base(), capture({}), manifest, owners)
+
+    def test_committed_manifest_loads_and_is_empty(self):
+        from cc2316_compare import DEFAULT_RULES
+        data = json.loads(Path(DEFAULT_RULES).read_text(encoding="utf-8"))
+        self.assertEqual(data, {"version": 1, "goldens": {}})
 
 
 class LoaderTests(unittest.TestCase):
