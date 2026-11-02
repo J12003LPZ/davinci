@@ -152,6 +152,8 @@ pub struct InteractiveSettingsConfig {
     pub install_telemetry: bool,
     pub default_project_trust: String,
     pub tui_mode: String,
+    /// `tui.reference`: the reference-style terminal modes, read at the next start.
+    pub tui_reference: bool,
     pub fullscreen_exit_output: String,
     pub fullscreen_scrollbar: String,
     pub fullscreen_copy_on_select: bool,
@@ -201,6 +203,7 @@ impl Default for InteractiveSettingsConfig {
             install_telemetry: false,
             default_project_trust: "Ask".into(),
             tui_mode: "regular".into(),
+            tui_reference: false,
             fullscreen_exit_output: "transcript".into(),
             fullscreen_scrollbar: "auto".into(),
             fullscreen_copy_on_select: true,
@@ -532,6 +535,12 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 current_value: config.tui_mode.clone(),
                 values: vec!["regular".into(), "fullscreen".into()],
             },
+            bool_item(
+                "tui.reference",
+                "Reference interface (next start)",
+                "Match the reference terminal modes; takes effect on next start, PI_DAVINCI_REFERENCE=1 forces it on",
+                config.tui_reference,
+            ),
             SettingItem {
                 id: "fullscreen-exit-output".into(),
                 label: "Fullscreen exit output".into(),

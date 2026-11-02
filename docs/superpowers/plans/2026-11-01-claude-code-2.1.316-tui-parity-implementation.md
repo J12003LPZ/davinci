@@ -2,7 +2,7 @@
 
 **Goal:** Match the observable Claude Code CLI 2.1.316 Windows terminal experience in DaVinci: exact layout, colours, terminal behaviour and interactions, with DaVinci's own name, mark, wording and real provider data.
 
-**Status (2026-11-01):** P00–P04 are done. P05 is in progress. P06–P20 have not started. No DaVinci parity is claimed.
+**Status (2026-11-01):** P00–P05 are done. P06 is in progress. P07–P20 have not started. No DaVinci parity is claimed.
 
 **Replaces** the earlier version of this plan. Where `docs/superpowers/specs/2026-11-01-claude-code-2.1.316-tui-parity-design.md` conflicts with the decisions below, this plan wins.
 
@@ -340,6 +340,8 @@ Bindings the reference marks BLOCKED or SOURCE_SUPPORTED can't be claimed as par
 - Enter queues, Up restores queued edits, Ctrl+Enter preempts.
 - The request count stays exact.
 
+**Adverse:** Two Ctrl-C presses during a turn currently send the queued line as a new provider request even when the user is exiting. Decide and test that an exit never starts a new request. Today only two quick Esc presses exit without one.
+
 **Command:** `cargo test --locked -p davinci-coding-agent --bin davinci davinci_interactive`
 
 ### P12: Permission dialog
@@ -405,6 +407,7 @@ The active shell's copy path is `copy_to_clipboard` in `runtime.rs`. It doesn't 
 - Tool expand. A second click doesn't collapse, as in the reference.
 - Selection highlight, copy on select, selection across resize.
 - Fix stale rows with a targeted full redraw, not a permanent one.
+- P05 enabled `?1000h ?1002h ?1003h ?1006h` with the setting on, confirming selection, link clicks and drag only by reading the code. Drive them live here.
 
 Hover and OSC 8 are UNVERIFIED in the reference, so mark them `NO_REFERENCE`.
 

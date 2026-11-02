@@ -112,6 +112,48 @@ fn panic_restores_terminal() -> bool {
         .is_some_and(|main| *main == std::thread::current().id())
 }
 static MOUSE: AtomicBool = AtomicBool::new(false);
+/// Whether this process asked the terminal for the reference's extra modes.
+/// Restore reads this, never the setting, so a session that started with the
+/// reference on gives it back whatever the setting says by then.
+static REFERENCE: AtomicBool = AtomicBool::new(false);
+
+/// Mouse click, drag, move and SGR coordinates, as the reference asks for at
+/// fullscreen. Written as text on every platform: crossterm's Windows mouse
+/// capture sets a console flag and puts nothing in the output stream.
+pub const REFERENCE_MODES_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+/// The matching offs, plus synchronized output so a frame cut short by a
+/// panic cannot leave the terminal holding its display.
+pub const REFERENCE_MODES_OFF: &str = "\x1b[?2026l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+
+/// Whether the reference shell is on: `PI_DAVINCI_REFERENCE` decides when it
+/// says yes (`1`, `true`, `yes`, `on`) or no (`0`, `false`, `no`, `off`); an
+/// empty or unreadable value leaves it to the `tui.reference` setting.
+pub fn reference_enabled(env: Option<&str>, setting: bool) -> bool {
+    match env
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        _ => setting,
+    }
+}
+
+/// What the reference adds for the mouse: nothing unless it is on and the
+/// mouse has not been turned off with `DAVINCI_DISABLE_MOUSE`.
+pub fn reference_mouse_on(reference: bool, mouse: bool) -> &'static str {
+    if reference && mouse {
+        REFERENCE_MODES_ON
+    } else {
+        ""
+    }
+}
+
+fn write_reference_modes(out: &mut impl Write) {
+    let on = reference_mouse_on(true, !env_flag("DAVINCI_DISABLE_MOUSE"));
+    let _ = out.write_all(on.as_bytes());
+    let _ = out.flush();
+}
 
 #[cfg(unix)]
 const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
@@ -143,6 +185,11 @@ pub fn restore() -> io::Result<()> {
         {
             let _ = execute!(io::stdout(), event::DisableMouseCapture);
         }
+    }
+    if REFERENCE.swap(false, Ordering::SeqCst) {
+        let mut out = io::stdout();
+        let _ = out.write_all(REFERENCE_MODES_OFF.as_bytes());
+        let _ = out.flush();
     }
     let _ = execute!(io::stdout(), DisableFocusChange, DisableBracketedPaste);
     let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
@@ -360,6 +407,8 @@ pub struct Session {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     generation: Generation,
     keyboard: Keyboard,
+    /// `tui.reference` (or `PI_DAVINCI_REFERENCE`), fixed when the session opened.
+    reference: bool,
     paste: PasteFilter,
     rendered_lines: Vec<String>,
     selector: super::selection::Selector,
@@ -459,14 +508,28 @@ impl Session {
     /// Take the terminal: raw mode, alternate screen, and the kitty keyboard
     /// protocol when the terminal supports it.
     pub fn open() -> io::Result<Self> {
+        Self::open_with(false)
+    }
+
+    /// [`Session::open`] with the `tui.reference` setting. The setting and
+    /// `PI_DAVINCI_REFERENCE` are read here, once, and never again.
+    pub fn open_with(reference_setting: bool) -> io::Result<Self> {
+        let reference = reference_enabled(
+            std::env::var("PI_DAVINCI_REFERENCE").ok().as_deref(),
+            reference_setting,
+        );
         install_panic_hook();
         let generation = Generation::begin();
         let opened = (|| {
             enable_raw_mode()?;
             HELD.store(true, Ordering::SeqCst);
+            REFERENCE.store(reference, Ordering::SeqCst);
             let mut out = io::stdout();
             execute!(out, EnterAlternateScreen)?;
             let _ = execute!(out, EnableBracketedPaste, EnableFocusChange);
+            if reference {
+                write_reference_modes(&mut out);
+            }
             let disambiguated = supports_keyboard_enhancement();
             if disambiguated {
                 execute!(
@@ -491,6 +554,7 @@ impl Session {
             terminal,
             generation,
             keyboard: Keyboard { disambiguated },
+            reference,
             paste: PasteFilter {
                 burst: cfg!(windows).then(super::paste_burst::PasteBurst::default),
                 ..PasteFilter::default()
@@ -537,9 +601,13 @@ impl Session {
         }
         enable_raw_mode()?;
         HELD.store(true, Ordering::SeqCst);
+        REFERENCE.store(self.reference, Ordering::SeqCst);
         let mut out = io::stdout();
         execute!(out, EnterAlternateScreen)?;
         let _ = execute!(out, EnableBracketedPaste, EnableFocusChange);
+        if self.reference {
+            write_reference_modes(&mut out);
+        }
         if self.keyboard.disambiguated {
             let _ = execute!(
                 out,

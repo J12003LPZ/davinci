@@ -5115,7 +5115,8 @@ pub fn run(
     // is reachable from this interface.
     let mut attached_images: Vec<davinci_ai::MessageContent> = Vec::new();
 
-    let mut terminal = Session::open().map_err(|err| err.to_string())?;
+    let mut terminal = Session::open_with(stored_settings.tui.reference.unwrap_or(false))
+        .map_err(|err| err.to_string())?;
     if let Some(hint) = terminal_hint(
         std::env::var_os("TMUX").is_some(),
         &crate::default_agent_dir(),

@@ -54,9 +54,12 @@ LOOPBACK = {"127.0.0.1", "::1"}
 UNSPECIFIED = {"0.0.0.0", "::", ""}
 BASE_ENV_KEYS = ("PATH", "SystemRoot", "WINDIR", "TEMP", "TMP")
 # The only variables a profile may set. They change how the shell paints, never where it
-# runs or what it can reach. The P05 setting (tui.reference) is a DaVinci setting, so a
-# scenario passes it in ``davinci_settings``, not here.
-PROFILE_ENV_KEYS = ("NO_COLOR", "FORCE_COLOR", "COLORFGBG")
+# runs or what it can reach. ``PI_DAVINCI_REFERENCE`` overrides the ``tui.reference``
+# setting (a scenario can also pass the setting in ``davinci_settings``).
+# ``PI_DAVINCI_PANIC_FIXTURE`` makes the shell panic right after it takes the terminal,
+# to prove the terminal is given back; it adds no reach.
+PROFILE_ENV_KEYS = ("NO_COLOR", "FORCE_COLOR", "COLORFGBG", "PI_DAVINCI_REFERENCE",
+                    "PI_DAVINCI_PANIC_FIXTURE")
 ACTIONS = ("key", "wait", "snapshot", "resize", "mouse", "click_text", "release")
 SCENARIO_KEYS = ("name", "cols", "rows", "wait_ms", "actions", "graceful", "timeout", "turns",
                  "files", "davinci_settings", "expect_requests")
@@ -624,7 +627,12 @@ def _end(harness, pid, graceful: bool, problems: list) -> str:
     if pid is None:
         return how
     how = "killed"
-    if graceful:
+    try:
+        if not harness.proc.isalive():
+            how = "exited"   # it left on its own, e.g. a scenario that quit or panicked
+    except Exception:  # noqa: BLE001
+        pass
+    if graceful and how == "killed":
         try:
             harness.proc.write("\x04")
             for _ in range(40):

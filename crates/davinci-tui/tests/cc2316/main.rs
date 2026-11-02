@@ -1,0 +1,2 @@
+//! Claude Code 2.1.316 parity: one test binary, one module per area.
+mod terminal;

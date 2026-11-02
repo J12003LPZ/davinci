@@ -5610,6 +5610,37 @@ fn config_context_vm_row_persists_and_switches_the_live_agent() {
 }
 
 #[test]
+fn config_tui_reference_row_is_stored_nested_and_off_by_default() {
+    let _env_lock = PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+    let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+    let saved = || -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(dir.path().join("settings.json")).unwrap()).unwrap()
+    };
+
+    let unset =
+        crate::settings::to_interactive_config(&crate::settings::Settings::default(), "dark");
+    assert!(!unset.tui_reference, "off by default");
+
+    super::persist_interactive_setting("other=1").unwrap();
+    assert!(
+        saved().get("tui").is_none(),
+        "an unset setting writes nothing"
+    );
+
+    super::persist_interactive_setting("tui.reference=true").unwrap();
+    assert_eq!(saved()["tui"]["reference"], true);
+    let on = crate::settings::load_settings(dir.path());
+    assert!(crate::settings::to_interactive_config(&on, "dark").tui_reference);
+
+    super::persist_interactive_setting("tui.reference=false").unwrap();
+    assert_eq!(saved()["tui"]["reference"], false);
+}
+
+#[test]
 fn config_codemode_switch_keeps_custom_paths_and_explains_a_missing_runtime() {
     let _env_lock = PROCESS_ENV_LOCK
         .lock()

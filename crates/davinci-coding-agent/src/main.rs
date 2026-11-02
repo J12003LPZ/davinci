@@ -8604,6 +8604,7 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
             stored.default_project_trust = Some(default_project_trust_value(value).into());
         }
         "tui-mode" => stored.tui_mode = Some(value.to_string()),
+        "tui.reference" => stored.tui.reference = Some(value == "true"),
         "fullscreen-exit-output" => stored.fullscreen_exit_output = Some(value.to_string()),
         "fullscreen-scrollbar" => stored.fullscreen_scrollbar = Some(value.to_string()),
         "fullscreen-copy-on-select" => stored.fullscreen_copy_on_select = Some(value == "true"),
