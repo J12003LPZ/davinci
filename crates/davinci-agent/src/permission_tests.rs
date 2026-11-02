@@ -2095,6 +2095,48 @@ fn read_outside_root_policy_enforcement() {
 }
 
 #[test]
+fn evidence_reads_bypass_the_outside_root_deny_but_not_deny_rules() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let evidence = temp.path().join("evidence");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&evidence).unwrap();
+    let evidence_file = evidence.join("script-output-abc.txt");
+    std::fs::write(&evidence_file, "recoverable").unwrap();
+    let other = temp.path().join("other.txt");
+    std::fs::write(&other, "other").unwrap();
+
+    let mut policy = PermissionPolicy::new(PermissionMode::Ask);
+    policy.set_worktree_boundary(&root, None);
+    policy.set_read_outside_root_policy(ReadOutsideRootPolicy::Deny);
+    policy.set_evidence_root(Some(evidence.clone()));
+
+    let read_evidence = json!({"path": evidence_file.to_string_lossy().to_string()});
+    assert_eq!(
+        policy.decide("e1", "read", &read_evidence, &root),
+        PermissionVerdict::Allow
+    );
+    assert!(matches!(
+        policy.decide(
+            "e2",
+            "read",
+            &json!({"path": other.to_string_lossy().to_string()}),
+            &root
+        ),
+        PermissionVerdict::Deny { .. }
+    ));
+
+    // An explicit deny rule still wins over the evidence exception.
+    policy
+        .deny
+        .push(PermissionRule::subject("read", "**/script-output-abc.txt"));
+    assert!(matches!(
+        policy.decide("e3", "read", &read_evidence, &root),
+        PermissionVerdict::Deny { .. }
+    ));
+}
+
+#[test]
 fn git_metadata_access_preserved() {
     let temp = tempfile::tempdir().unwrap();
     let repo_dir = temp.path().join("repo");

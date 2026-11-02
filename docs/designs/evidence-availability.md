@@ -132,7 +132,9 @@ Exact algorithm:
 6. If the walk ends below `MAX_SELECTED_ITEMS`, insert the remaining indices in ascending order until the cap is reached. This handles arrays with fewer than 16 unique identities.
 7. Set `diagnostics_kept` to the number of indices in `all_diagnostics` that are present in `selected`. Set `diagnostics_omitted = all_diagnostics.len() - diagnostics_kept`. These counts describe the final view, not the pass-one quota.
 
-`json_identity` keeps its current behavior: the first present key from `IDENTITY_KEYS` (`id`, `name`, `path`, `file`, `line`, `status`, `type`, `error`, `message`), rendered as `key=value`. `is_diagnostic` keeps its current marker list.
+`json_identity` keeps its current behavior: the first present key from `IDENTITY_KEYS` (`id`, `name`, `path`, `file`, `line`, `status`, `type`, `error`, `message`), rendered as `key=value`.
+
+Diagnostics are classified from structured fields and values, not from ordinary field names. A record counts when a status-like field (`status`, `level`, `severity`, `result`, `outcome`) names a failure; when `error`, `failure`, `panic`, or `exception` is non-null and not `false`; when `exitCode` or `exit_code` is non-zero; when `passed`, `success`, or `ok` is `false`; or when `failed` is `true` or greater than zero. Free text counts only for explicit failure markers such as `panic`, `assertion failed`, `error:`, or `traceback`. `expected` and `actual` are ordinary data and do not consume the diagnostic quota.
 
 Change `retrieval_trailer` to:
 
@@ -168,6 +170,8 @@ The object view keeps one aggregate trailer. It does not emit one trailer per ar
 Files: `crates/davinci-coding-agent/src/native_extensions/token_governor.rs` and `content_router.rs`.
 
 Add `rejected: u64` to `KindRetrievalStats` (the per-kind counter struct), with `#[serde(default)]`. In `after_tool`, capture whether `specialized.is_some()` before the match. In the `_` arm, when a specialized view existed but failed `clears_specialized_threshold`, increment `self.content_routing.by_kind.get_mut(kind).rejected`. The status JSON already serializes `by_kind`, so `contentRouting.byKind.<kind>.rejected` appears without a new key.
+
+A specialized view that contains a diagnostic is preferred over the generic digest when it is smaller than the original content, even when it fails the 10% gate. A diagnostic view that is larger than the input is not a reduction; the generic digest wins and the diagnostic is left to the trailer. This keeps an all-error log compressible while a sparse late diagnostic still reaches the model.
 
 ### 3. Codemode pre-truncation body
 
@@ -243,9 +247,11 @@ After the host returns and before `script_log_events`:
 
 Read limits: `read` requires `path` and caps at 2,000 lines and 50 KiB per call. An omitted region larger than that needs multiple reads. A single line longer than 50 KiB is marked `too_long` and returns no bytes; in that case the marker says `the omitted region is one long line; read may not return it`. The design does not add a byte-oriented reader.
 
+The evidence directory is a narrow read-boundary exception, like git metadata. The agent permission policy records the active evidence root before each tool batch, so `ReadOutsideRootPolicy::Deny` does not make the advertised recovery path unusable. Only `read`, only paths under the agent's own evidence root; explicit deny rules still apply. Setting the root does not advance the permission revision, so it does not invalidate pending approvals.
+
 ### 5. Evidence store facts
 
-`EvidenceStore` is one flat directory per agent: `~/.davinci/agent/evidence`, constructed at `crates/davinci-coding-agent/src/main.rs:1275-1277`. Files are named `<tag>-<uuid>.txt` and are readable by `read` with offset and limit. The directory is not session-scoped. A path is protected by the normal permission check on `read`, not by session identity.
+`EvidenceStore` is one flat directory per agent: `~/.davinci/agent/evidence`, constructed at `crates/davinci-coding-agent/src/main.rs:1275-1277`. Files are named `<tag>-<uuid>.txt` and are readable by `read` with offset and limit. The directory is not session-scoped. A path is protected by the normal permission check on `read`, not by session identity. On Unix, the store creates the directory with mode `0700` and each file with mode `0600`; on other platforms it relies on the agent directory's ACLs.
 
 This design does not add session isolation. It also does not claim that a foreign session cannot read another session's evidence. If session isolation is required, it is a separate change.
 
@@ -307,7 +313,7 @@ This design does not add session isolation. It also does not claim that a foreig
 
 ## Non-Functional Requirements
 
-**Security and privacy.** The retained body is stored byte-exact and protected by the same permission gate as pruning evidence. It is not scrubbed. The store is agent-scoped, not session-scoped; the document does not claim otherwise. No new cross-session access path is added. `read` re-checks path and tool permission on every call.
+**Security and privacy.** The retained body is stored byte-exact and protected by the same permission gate as pruning evidence. It is not scrubbed. On Unix the store creates the directory with mode `0700` and each file with mode `0600`. The store is agent-scoped, not session-scoped; the document does not claim otherwise. No new cross-session access path is added. `read` re-checks path and tool permission on every call, and the evidence directory is a narrow read-boundary exception that explicit deny rules still override.
 
 **Performance and latency.** The Governor selector is a linear scan over the tool result with a bounded output. The Code mode change adds one disk write per over-budget run when a store exists. No model call is added to any reduction path.
 

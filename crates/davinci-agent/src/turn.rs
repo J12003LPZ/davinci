@@ -2075,6 +2075,7 @@ Issue the call again if it is still needed.";
         // permission check of this batch. The prepare loop below holds only
         // `&Agent`, so this is the last point with `&mut self`.
         self.apply_pending_permission_mode();
+        self.sync_evidence_root();
         // Provider history retains the original spelling and call ID. Every
         // downstream decision uses this shared ingress interpretation.
         let tool_calls: Vec<_> = tool_calls

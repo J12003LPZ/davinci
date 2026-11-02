@@ -43,8 +43,7 @@ const DIAGNOSTIC_MARKERS: &[&str] = &[
     "exception",
     "warning",
     "assertion",
-    "expected",
-    "actual",
+    "mismatch",
 ];
 const IDENTITY_KEYS: &[&str] = &[
     "id", "name", "path", "file", "line", "status", "type", "error", "message",
@@ -97,6 +96,10 @@ impl ContentKind {
 pub struct SpecializedView {
     pub kind: ContentKind,
     pub content: String,
+    /// The view contains at least one diagnostic record. A smaller generic
+    /// digest must not replace it, even when the reduction gate would prefer
+    /// the generic view.
+    pub has_diagnostics: bool,
 }
 
 pub fn classify_content(tool: &str, args: &Value, content: &str) -> ContentKind {
@@ -150,6 +153,7 @@ pub fn build_specialized_view(
     }?;
     Some(SpecializedView {
         kind,
+        has_diagnostics: view_has_diagnostics(kind, content),
         content: rendered,
     })
 }
@@ -338,7 +342,7 @@ fn build_log_view(kind: ContentKind, content: &str, output_id: &str) -> Option<S
 fn selected_json_indices(items: &[Value]) -> JsonSelection {
     let mut all_diagnostics = Vec::new();
     for (index, item) in items.iter().enumerate() {
-        if is_diagnostic(&serde_json::to_string(item).unwrap_or_default()) {
+        if is_diagnostic_value(item) {
             all_diagnostics.push(index);
         }
     }
@@ -620,6 +624,95 @@ fn is_diagnostic(line: &str) -> bool {
         .any(|marker| lower.contains(marker))
 }
 
+fn view_has_diagnostics(kind: ContentKind, content: &str) -> bool {
+    match kind {
+        ContentKind::Log | ContentKind::CompilerDiagnostics | ContentKind::TestOutput => {
+            content.lines().any(is_diagnostic)
+        }
+        ContentKind::JsonArray => serde_json::from_str::<Value>(content.trim())
+            .ok()
+            .and_then(|value| value.as_array().cloned())
+            .is_some_and(|items| selected_json_indices(&items).diagnostics_kept > 0),
+        ContentKind::Ndjson => {
+            let values = content
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+                .collect::<Vec<_>>();
+            !values.is_empty() && selected_json_indices(&values).diagnostics_kept > 0
+        }
+        ContentKind::JsonObject => {
+            let Ok(Value::Object(map)) = serde_json::from_str::<Value>(content.trim()) else {
+                return false;
+            };
+            map.values()
+                .filter_map(Value::as_array)
+                .any(|items| selected_json_indices(items).diagnostics_kept > 0)
+        }
+        _ => false,
+    }
+}
+
+/// A structured record is a diagnostic only when an explicit field says so.
+/// Field names such as `expected` and `actual` are ordinary data; matching them
+/// as substrings made successful comparison records consume the diagnostic
+/// quota and pushed a real error out of the view.
+fn is_diagnostic_value(value: &Value) -> bool {
+    let Value::Object(map) = value else {
+        return value_has_failure_text(value);
+    };
+    map.iter().any(|(key, value)| {
+        let key = key.to_ascii_lowercase();
+        match key.as_str() {
+            "status" | "level" | "severity" | "result" | "outcome" => value_is_failure(value),
+            "error" | "failure" | "panic" | "exception" => {
+                !value.is_null() && value != &Value::Bool(false)
+            }
+            "exitcode" | "exit_code" => value.as_i64().is_some_and(|code| code != 0),
+            "passed" | "success" | "ok" => value == &Value::Bool(false),
+            "failed" => value == &Value::Bool(true) || value.as_u64().is_some_and(|n| n > 0),
+            _ => value_has_failure_text(value),
+        }
+    })
+}
+
+fn value_is_failure(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| {
+        let lower = text.to_ascii_lowercase();
+        [
+            "error",
+            "failed",
+            "failure",
+            "panic",
+            "exception",
+            "fatal",
+            "critical",
+            "timeout",
+            "assert",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    })
+}
+
+fn value_has_failure_text(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| {
+        let lower = text.to_ascii_lowercase();
+        [
+            "panic",
+            "exception",
+            "assertion failed",
+            "assertionerror",
+            "error:",
+            "failed:",
+            "traceback",
+            "stack trace",
+            "mismatch",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    })
+}
+
 fn collapse_adjacent_exact_lines(lines: Vec<String>) -> Vec<String> {
     let mut collapsed = Vec::with_capacity(lines.len());
     for line in lines {
@@ -839,6 +932,24 @@ mod tests {
         )
         .unwrap()
         .content
+    }
+
+    #[test]
+    fn successful_expected_actual_fields_do_not_consume_the_diagnostic_quota() {
+        let items = (0..30)
+            .map(|i| {
+                serde_json::json!({
+                    "id": i,
+                    "expected": 1,
+                    "actual": 1,
+                    "status": if i == 25 { "error" } else { "ok" },
+                    "payload": "p"
+                })
+            })
+            .collect::<Vec<_>>();
+        let view = json_array_view(items);
+        assert!(view.contains("item[25]"), "{view}");
+        assert!(view.contains("diagnostics kept: 1, omitted: 0"), "{view}");
     }
 
     #[test]

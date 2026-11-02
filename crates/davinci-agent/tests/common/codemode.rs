@@ -2753,6 +2753,40 @@ fn complete_no_store_script_output_has_no_omission_marker() {
     assert_eq!(details["codemode"]["status"], "completed");
 }
 
+#[test]
+fn read_can_open_agent_evidence_under_deny_outside_root() {
+    use crate::{PermissionMode, PermissionPolicy, PermissionState, ReadOutsideRootPolicy};
+    let (mut agent, workspace, _) = configured_agent();
+    let evidence = tempfile::tempdir().unwrap();
+    let store = crate::EvidenceStore::new(evidence.path());
+    let path = store.store("script-output", "RECOVERED EVIDENCE").unwrap();
+    agent.evidence = Some(store);
+    agent.permissions = Arc::new(PermissionState::new(PermissionPolicy::new(
+        PermissionMode::Ask,
+    )));
+    {
+        let mut policy = agent.permissions.lock().unwrap();
+        policy.set_worktree_boundary(workspace.path(), None);
+        policy.set_read_outside_root_policy(ReadOutsideRootPolicy::Deny);
+    }
+    let mut events = Vec::new();
+    let messages = agent.execute_tool_batch(
+        workspace.path(),
+        vec![(
+            "evidence-read".into(),
+            "read".into(),
+            json!({"path": path.to_string_lossy().to_string()}),
+        )],
+        &mut events,
+    );
+    let message = &messages[0];
+    assert_eq!(message.is_error, Some(false), "{message:?}");
+    assert!(
+        davinci_ai::content_text(&message.content).contains("RECOVERED EVIDENCE"),
+        "{message:?}"
+    );
+}
+
 /// Guards come before the agent so they drop after it: the workspace and
 /// evidence directories must outlive background workers through shutdown.
 fn background_agent(

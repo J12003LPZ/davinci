@@ -34,6 +34,12 @@ impl EvidenceStore {
     /// caller then keeps the truncation note without a path.
     pub fn store(&self, tag: &str, text: &str) -> Result<PathBuf, String> {
         std::fs::create_dir_all(&self.dir).map_err(|err| err.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|err| err.to_string())?;
+        }
         let safe_tag: String = tag
             .chars()
             .map(|c| {
@@ -50,7 +56,23 @@ impl EvidenceStore {
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         );
         let path = self.dir.join(name);
-        std::fs::write(&path, text).map_err(|err| err.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .map_err(|err| err.to_string())?;
+            file.write_all(text.as_bytes())
+                .map_err(|err| err.to_string())?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&path, text).map_err(|err| err.to_string())?;
+        }
         Ok(path)
     }
 
@@ -155,6 +177,19 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(store.sweep(Duration::from_millis(1)), 1);
         assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stored_evidence_is_private_to_the_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvidenceStore::new(dir.path().join("evidence"));
+        let path = store.store("script-output", "secret").unwrap();
+        let dir_mode = std::fs::metadata(store.dir()).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
     }
 
     #[test]
