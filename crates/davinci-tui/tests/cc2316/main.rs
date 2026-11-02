@@ -2,6 +2,7 @@
 mod chrome;
 mod completion;
 mod editor;
+mod keys;
 mod review;
 mod terminal;
 mod theme;
