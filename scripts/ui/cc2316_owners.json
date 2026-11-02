@@ -1,0 +1,1946 @@
+{
+ "version": 1,
+ "defaults": {
+  "commands": {
+   "owner_task": "P09b",
+   "source_owners": [
+    "views/keys.rs",
+    "davinci/app.rs",
+    "tests/cc2316/keys.rs"
+   ]
+  },
+  "keybindings": {
+   "owner_task": "P09b",
+   "source_owners": [
+    "views/keys.rs",
+    "davinci/app.rs",
+    "tests/cc2316/keys.rs"
+   ]
+  }
+ },
+ "features": {
+  "START-01": {
+   "owner_task": "P07",
+   "source_owners": [
+    "views/chrome.rs",
+    "views/startup.rs",
+    "davinci/app.rs",
+    "davinci/ui.rs",
+    "tests/cc2316/chrome.rs"
+   ],
+   "tier": "exact"
+  },
+  "START-02": {
+   "owner_task": "P07b",
+   "source_owners": [
+    "views/startup.rs",
+    "views/trust.rs",
+    "tests/cc2316/chrome.rs"
+   ],
+   "tier": "structure"
+  },
+  "START-03": {
+   "owner_task": "P07b",
+   "source_owners": [
+    "views/startup.rs",
+    "views/trust.rs",
+    "tests/cc2316/chrome.rs"
+   ],
+   "tier": "structure"
+  },
+  "START-04": {
+   "owner_task": "P07",
+   "source_owners": [
+    "views/chrome.rs",
+    "views/startup.rs",
+    "davinci/app.rs",
+    "davinci/ui.rs",
+    "tests/cc2316/chrome.rs"
+   ],
+   "tier": "exact"
+  },
+  "START-05": {
+   "owner_task": "P05",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/term.rs",
+    "tests/cc2316/terminal.rs"
+   ],
+   "tier": "exact"
+  },
+  "START-06": {
+   "owner_task": "P07",
+   "source_owners": [
+    "views/chrome.rs",
+    "views/startup.rs",
+    "davinci/app.rs",
+    "davinci/ui.rs",
+    "tests/cc2316/chrome.rs"
+   ],
+   "tier": "exact"
+  },
+  "START-07": {
+   "owner_task": "P05",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/term.rs",
+    "tests/cc2316/terminal.rs"
+   ],
+   "tier": "exact"
+  },
+  "FULL-02": {
+   "owner_task": "P16",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/model.rs",
+    "davinci_interactive.rs",
+    "tests/cc2316/modes.rs"
+   ],
+   "tier": "exact"
+  },
+  "START-08": {
+   "owner_task": "P16",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/model.rs",
+    "davinci_interactive.rs",
+    "tests/cc2316/modes.rs"
+   ],
+   "tier": "exact"
+  },
+  "START-09": {
+   "owner_task": "UNASSIGNED",
+   "source_owners": [],
+   "tier": "exact"
+  },
+  "MSG-01": {
+   "owner_task": "P10",
+   "source_owners": [
+    "views/transcript.rs",
+    "views/transcript_cache.rs",
+    "views/markdown.rs",
+    "views/highlight.rs",
+    "views/opera.rs",
+    "views/diff.rs",
+    "davinci/sanitize.rs",
+    "tests/cc2316/transcript.rs"
+   ],
+   "tier": "exact"
+  },
+  "MSG-02": {
+   "owner_task": "P10",
+   "source_owners": [
+    "views/transcript.rs",
+    "views/transcript_cache.rs",
+    "views/markdown.rs",
+    "views/highlight.rs",
+    "views/opera.rs",
+    "views/diff.rs",
+    "davinci/sanitize.rs",
+    "tests/cc2316/transcript.rs"
+   ],
+   "tier": "exact"
+  },
+  "MSG-03": {
+   "owner_task": "P10",
+   "source_owners": [
+    "views/transcript.rs",
+    "views/transcript_cache.rs",
+    "views/markdown.rs",
+    "views/highlight.rs",
+    "views/opera.rs",
+    "views/diff.rs",
+    "davinci/sanitize.rs",
+    "tests/cc2316/transcript.rs"
+   ],
+   "tier": "exact"
+  },
+  "MSG-04": {
+   "owner_task": "P10",
+   "source_owners": [
+    "views/transcript.rs",
+    "views/transcript_cache.rs",
+    "views/markdown.rs",
+    "views/highlight.rs",
+    "views/opera.rs",
+    "views/diff.rs",
+    "davinci/sanitize.rs",
+    "tests/cc2316/transcript.rs"
+   ],
+   "tier": "exact"
+  },
+  "MSG-05": {
+   "owner_task": "P10",
+   "source_owners": [
+    "views/transcript.rs",
+    "views/transcript_cache.rs",
+    "views/markdown.rs",
+    "views/highlight.rs",
+    "views/opera.rs",
+    "views/diff.rs",
+    "davinci/sanitize.rs",
+    "tests/cc2316/transcript.rs"
+   ],
+   "tier": "exact"
+  },
+  "MSG-06": {
+   "owner_task": "P10",
+   "source_owners": [
+    "views/transcript.rs",
+    "views/transcript_cache.rs",
+    "views/markdown.rs",
+    "views/highlight.rs",
+    "views/opera.rs",
+    "views/diff.rs",
+    "davinci/sanitize.rs",
+    "tests/cc2316/transcript.rs"
+   ],
+   "tier": "exact"
+  },
+  "MSG-07": {
+   "owner_task": "P10",
+   "source_owners": [
+    "views/transcript.rs",
+    "views/transcript_cache.rs",
+    "views/markdown.rs",
+    "views/highlight.rs",
+    "views/opera.rs",
+    "views/diff.rs",
+    "davinci/sanitize.rs",
+    "tests/cc2316/transcript.rs"
+   ],
+   "tier": "exact"
+  },
+  "MSG-08": {
+   "owner_task": "P10",
+   "source_owners": [
+    "views/transcript.rs",
+    "views/transcript_cache.rs",
+    "views/markdown.rs",
+    "views/highlight.rs",
+    "views/opera.rs",
+    "views/diff.rs",
+    "davinci/sanitize.rs",
+    "tests/cc2316/transcript.rs"
+   ],
+   "tier": "exact"
+  },
+  "MSG-09": {
+   "owner_task": "P10",
+   "source_owners": [
+    "views/transcript.rs",
+    "views/transcript_cache.rs",
+    "views/markdown.rs",
+    "views/highlight.rs",
+    "views/opera.rs",
+    "views/diff.rs",
+    "davinci/sanitize.rs",
+    "tests/cc2316/transcript.rs"
+   ],
+   "tier": "exact"
+  },
+  "MSG-10": {
+   "owner_task": "P11",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci_interactive.rs",
+    "davinci_interactive_tests.rs"
+   ],
+   "tier": "exact"
+  },
+  "MSG-11": {
+   "owner_task": "P12",
+   "source_owners": [
+    "views/approval_modal.rs",
+    "views/ask.rs",
+    "views/decision_modal.rs",
+    "davinci_interactive.rs",
+    "tests/cc2316/permissions.rs"
+   ],
+   "tier": "exact"
+  },
+  "MSG-12": {
+   "owner_task": "P11",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci_interactive.rs",
+    "davinci_interactive_tests.rs"
+   ],
+   "tier": "exact"
+  },
+  "MSG-13": {
+   "owner_task": "P11",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci_interactive.rs",
+    "davinci_interactive_tests.rs"
+   ],
+   "tier": "exact"
+  },
+  "MSG-14": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "exact"
+  },
+  "AUTH-01": {
+   "owner_task": "NONE",
+   "source_owners": [],
+   "tier": "exception",
+   "reason": "D3: Claude-only surface dropped"
+  },
+  "AGENT-01": {
+   "owner_task": "P15",
+   "source_owners": [
+    "views/agents.rs",
+    "views/agent_focus.rs",
+    "davinci/roster.rs",
+    "davinci/model.rs",
+    "agent_roster_host.rs",
+    "tests/cc2316/agents.rs"
+   ],
+   "tier": "exact"
+  },
+  "PANEL-01": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "structure"
+  },
+  "PANEL-02": {
+   "owner_task": "P06b",
+   "source_owners": [
+    "views/settings.rs",
+    "davinci/runtime.rs",
+    "davinci_interactive.rs",
+    "tests/cc2316/theme.rs"
+   ],
+   "tier": "exact"
+  },
+  "PANEL-03": {
+   "owner_task": "P06",
+   "source_owners": [
+    "davinci/theme.rs",
+    "tests/cc2316/theme.rs"
+   ],
+   "tier": "exact"
+  },
+  "PANEL-04": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "exact"
+  },
+  "PANEL-05": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "structure"
+  },
+  "PANEL-06": {
+   "owner_task": "P13b",
+   "source_owners": [
+    "views/permissions.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "structure"
+  },
+  "PANEL-07": {
+   "owner_task": "UNASSIGNED",
+   "source_owners": [],
+   "tier": "exact"
+  },
+  "PANEL-08": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "exact"
+  },
+  "PANEL-10": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "exact"
+  },
+  "PANEL-09": {
+   "owner_task": "NONE",
+   "source_owners": [],
+   "tier": "exception",
+   "reason": "D3: Claude-only surface dropped"
+  },
+  "INPUT-01": {
+   "owner_task": "P09b",
+   "source_owners": [
+    "views/keys.rs",
+    "davinci/app.rs",
+    "tests/cc2316/keys.rs"
+   ],
+   "tier": "exact"
+  },
+  "INPUT-02": {
+   "owner_task": "P12b",
+   "source_owners": [
+    "davinci/app.rs",
+    "views/chrome.rs",
+    "tests/cc2316/permissions.rs"
+   ],
+   "tier": "exact"
+  },
+  "INPUT-03": {
+   "owner_task": "P08",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci/paste_burst.rs",
+    "davinci/runtime.rs",
+    "tests/cc2316/editor.rs"
+   ],
+   "tier": "exact"
+  },
+  "INPUT-04": {
+   "owner_task": "P08",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci/paste_burst.rs",
+    "davinci/runtime.rs",
+    "tests/cc2316/editor.rs"
+   ],
+   "tier": "exact"
+  },
+  "INPUT-05": {
+   "owner_task": "P08",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci/paste_burst.rs",
+    "davinci/runtime.rs",
+    "tests/cc2316/editor.rs"
+   ],
+   "tier": "exact"
+  },
+  "INPUT-06": {
+   "owner_task": "P08",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci/paste_burst.rs",
+    "davinci/runtime.rs",
+    "tests/cc2316/editor.rs"
+   ],
+   "tier": "exact"
+  },
+  "INPUT-07": {
+   "owner_task": "P09b",
+   "source_owners": [
+    "views/keys.rs",
+    "davinci/app.rs",
+    "tests/cc2316/keys.rs"
+   ],
+   "tier": "exact"
+  },
+  "INPUT-08": {
+   "owner_task": "P09b",
+   "source_owners": [
+    "views/keys.rs",
+    "davinci/app.rs",
+    "tests/cc2316/keys.rs"
+   ],
+   "tier": "exact"
+  },
+  "INPUT-09": {
+   "owner_task": "P09",
+   "source_owners": [
+    "autocomplete.rs",
+    "views/completion.rs",
+    "views/keys.rs",
+    "tests/cc2316/completion.rs"
+   ],
+   "tier": "exact"
+  },
+  "INPUT-10": {
+   "owner_task": "P09",
+   "source_owners": [
+    "autocomplete.rs",
+    "views/completion.rs",
+    "views/keys.rs",
+    "tests/cc2316/completion.rs"
+   ],
+   "tier": "exact"
+  },
+  "INPUT-11": {
+   "owner_task": "P08",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci/paste_burst.rs",
+    "davinci/runtime.rs",
+    "tests/cc2316/editor.rs"
+   ],
+   "tier": "exact"
+  },
+  "INPUT-12": {
+   "owner_task": "P08",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci/paste_burst.rs",
+    "davinci/runtime.rs",
+    "tests/cc2316/editor.rs"
+   ],
+   "tier": "exact"
+  },
+  "INPUT-13": {
+   "owner_task": "P08",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci/paste_burst.rs",
+    "davinci/runtime.rs",
+    "tests/cc2316/editor.rs"
+   ],
+   "tier": "exact"
+  },
+  "INPUT-14": {
+   "owner_task": "NONE",
+   "source_owners": [],
+   "tier": "exception",
+   "reason": "D3: Claude-only surface dropped"
+  },
+  "INPUT-18": {
+   "owner_task": "P08",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci/paste_burst.rs",
+    "davinci/runtime.rs",
+    "tests/cc2316/editor.rs"
+   ],
+   "tier": "exact"
+  },
+  "INPUT-15": {
+   "owner_task": "P08",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci/paste_burst.rs",
+    "davinci/runtime.rs",
+    "tests/cc2316/editor.rs"
+   ],
+   "tier": "exact"
+  },
+  "INPUT-16": {
+   "owner_task": "P08",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci/paste_burst.rs",
+    "davinci/runtime.rs",
+    "tests/cc2316/editor.rs"
+   ],
+   "tier": "exact"
+  },
+  "INPUT-17": {
+   "owner_task": "P11",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci_interactive.rs",
+    "davinci_interactive_tests.rs"
+   ],
+   "tier": "exact"
+  },
+  "SCROLL-01": {
+   "owner_task": "P14",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/selection.rs",
+    "davinci/links.rs",
+    "views/scrollbar.rs",
+    "tests/cc2316/mouse.rs"
+   ],
+   "tier": "exact"
+  },
+  "SCROLL-02": {
+   "owner_task": "P14",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/selection.rs",
+    "davinci/links.rs",
+    "views/scrollbar.rs",
+    "tests/cc2316/mouse.rs"
+   ],
+   "tier": "exact"
+  },
+  "SCROLL-03": {
+   "owner_task": "P14",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/selection.rs",
+    "davinci/links.rs",
+    "views/scrollbar.rs",
+    "tests/cc2316/mouse.rs"
+   ],
+   "tier": "exact"
+  },
+  "SCROLL-04": {
+   "owner_task": "P14b",
+   "source_owners": [
+    "views/viewer.rs",
+    "views/transcript_cache.rs",
+    "tests/cc2316/mouse.rs"
+   ],
+   "tier": "exact"
+  },
+  "SCROLL-05": {
+   "owner_task": "P11",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci_interactive.rs",
+    "davinci_interactive_tests.rs"
+   ],
+   "tier": "exact"
+  },
+  "SCROLL-06": {
+   "owner_task": "P07",
+   "source_owners": [
+    "views/chrome.rs",
+    "views/startup.rs",
+    "davinci/app.rs",
+    "davinci/ui.rs",
+    "tests/cc2316/chrome.rs"
+   ],
+   "tier": "exact"
+  },
+  "MOUSE-01": {
+   "owner_task": "P14",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/selection.rs",
+    "davinci/links.rs",
+    "views/scrollbar.rs",
+    "tests/cc2316/mouse.rs"
+   ],
+   "tier": "exact"
+  },
+  "MOUSE-02": {
+   "owner_task": "P14",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/selection.rs",
+    "davinci/links.rs",
+    "views/scrollbar.rs",
+    "tests/cc2316/mouse.rs"
+   ],
+   "tier": "exact"
+  },
+  "MOUSE-03": {
+   "owner_task": "P14",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/selection.rs",
+    "davinci/links.rs",
+    "views/scrollbar.rs",
+    "tests/cc2316/mouse.rs"
+   ],
+   "tier": "exact"
+  },
+  "MOUSE-04": {
+   "owner_task": "P14",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/selection.rs",
+    "davinci/links.rs",
+    "views/scrollbar.rs",
+    "tests/cc2316/mouse.rs"
+   ],
+   "tier": "exact"
+  },
+  "VIS-01": {
+   "owner_task": "P06",
+   "source_owners": [
+    "davinci/theme.rs",
+    "tests/cc2316/theme.rs"
+   ],
+   "tier": "exact"
+  },
+  "VIS-02": {
+   "owner_task": "P07",
+   "source_owners": [
+    "views/chrome.rs",
+    "views/startup.rs",
+    "davinci/app.rs",
+    "davinci/ui.rs",
+    "tests/cc2316/chrome.rs"
+   ],
+   "tier": "exact"
+  },
+  "VIS-03": {
+   "owner_task": "UNASSIGNED",
+   "source_owners": [],
+   "tier": "exact"
+  },
+  "VIS-04": {
+   "owner_task": "P11",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci_interactive.rs",
+    "davinci_interactive_tests.rs"
+   ],
+   "tier": "exact"
+  },
+  "VIS-05": {
+   "owner_task": "P10",
+   "source_owners": [
+    "views/transcript.rs",
+    "views/transcript_cache.rs",
+    "views/markdown.rs",
+    "views/highlight.rs",
+    "views/opera.rs",
+    "views/diff.rs",
+    "davinci/sanitize.rs",
+    "tests/cc2316/transcript.rs"
+   ],
+   "tier": "exact"
+  },
+  "VIS-06": {
+   "owner_task": "P17",
+   "source_owners": [
+    "davinci/term.rs",
+    "views/startup.rs",
+    "views/opera.rs",
+    "tests/cc2316/a11y.rs"
+   ],
+   "tier": "exact"
+  },
+  "VIS-07": {
+   "owner_task": "P06",
+   "source_owners": [
+    "davinci/theme.rs",
+    "tests/cc2316/theme.rs"
+   ],
+   "tier": "exact"
+  },
+  "VIS-08": {
+   "owner_task": "UNASSIGNED",
+   "source_owners": [],
+   "tier": "exact"
+  },
+  "A11Y-01": {
+   "owner_task": "P17",
+   "source_owners": [
+    "davinci/term.rs",
+    "views/startup.rs",
+    "views/opera.rs",
+    "tests/cc2316/a11y.rs"
+   ],
+   "tier": "exact"
+  },
+  "A11Y-02": {
+   "owner_task": "P05",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/term.rs",
+    "tests/cc2316/terminal.rs"
+   ],
+   "tier": "exact"
+  },
+  "A11Y-03": {
+   "owner_task": "UNASSIGNED",
+   "source_owners": [],
+   "tier": "exact"
+  },
+  "A11Y-04": {
+   "owner_task": "UNASSIGNED",
+   "source_owners": [],
+   "tier": "exact"
+  },
+  "PERF-01": {
+   "owner_task": "P20",
+   "source_owners": [
+    "scripts/ui/cc2316_perf.py"
+   ],
+   "tier": "exact"
+  }
+ },
+ "goldens": {
+  "agents_empty__01_agents_empty": {
+   "owner_task": "P15",
+   "source_owners": [
+    "views/agents.rs",
+    "views/agent_focus.rs",
+    "davinci/roster.rs",
+    "davinci/model.rs",
+    "agent_roster_host.rs",
+    "tests/cc2316/agents.rs"
+   ],
+   "tier": "exact"
+  },
+  "screen_reader__02_settled": {
+   "owner_task": "P17",
+   "source_owners": [
+    "davinci/term.rs",
+    "views/startup.rs",
+    "views/opera.rs",
+    "tests/cc2316/a11y.rs"
+   ],
+   "tier": "exact"
+  },
+  "ansi_theme__02_settled": {
+   "owner_task": "P06",
+   "source_owners": [
+    "davinci/theme.rs",
+    "tests/cc2316/theme.rs"
+   ],
+   "tier": "exact"
+  },
+  "usage_stats2__01_tab_status": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "exact"
+  },
+  "usage_stats2__02_tab_usage": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "exact"
+  },
+  "usage_stats3__00_tabs": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "exact"
+  },
+  "usage_stats3__01_r1": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "exact"
+  },
+  "usage_stats3__02_r2": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "exact"
+  },
+  "usage_stats3__03_r3": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "exact"
+  },
+  "rewind_ui__02_rewind": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "exact"
+  },
+  "tui_panel__02_tui_panel": {
+   "owner_task": "P16",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/model.rs",
+    "davinci_interactive.rs",
+    "tests/cc2316/modes.rs"
+   ],
+   "tier": "exact"
+  },
+  "reduce_motion_toggle__02_motion_toggled": {
+   "owner_task": "P17",
+   "source_owners": [
+    "davinci/term.rs",
+    "views/startup.rs",
+    "views/opera.rs",
+    "tests/cc2316/a11y.rs"
+   ],
+   "tier": "exact"
+  },
+  "voice_probe__02_voice": {
+   "owner_task": "NONE",
+   "source_owners": [],
+   "tier": "exception",
+   "dropped": true,
+   "reason": "D3: Claude-only surface dropped"
+  },
+  "context_cmd__02_context_empty": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "exact"
+  },
+  "context_cmd__03_context_settled": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "exact"
+  },
+  "context_all__02_context_all_settled": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "exact"
+  },
+  "mock_stream2__00_key_dialog": {
+   "owner_task": "NONE",
+   "source_owners": [],
+   "tier": "exception",
+   "dropped": true,
+   "reason": "D3: Claude-only surface dropped"
+  },
+  "mock_stream2__f00": {
+   "owner_task": "P11",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci_interactive.rs",
+    "davinci_interactive_tests.rs"
+   ],
+   "tier": "exact"
+  },
+  "mock_stream2__f26": {
+   "owner_task": "P11",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci_interactive.rs",
+    "davinci_interactive_tests.rs"
+   ],
+   "tier": "exact"
+  },
+  "mock_stream_rmoff__f10": {
+   "owner_task": "P11",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci_interactive.rs",
+    "davinci_interactive_tests.rs"
+   ],
+   "tier": "exception",
+   "reason": "D1: live reply body streams; body region excluded"
+  },
+  "mock_stream_rmoff__f26": {
+   "owner_task": "P11",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci_interactive.rs",
+    "davinci_interactive_tests.rs"
+   ],
+   "tier": "exact"
+  },
+  "mock_stream_scroll2__01_mid": {
+   "owner_task": "P11",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci_interactive.rs",
+    "davinci_interactive_tests.rs"
+   ],
+   "tier": "exception",
+   "reason": "D1: live reply body streams; body region excluded"
+  },
+  "mock_stream_scroll2__04_done": {
+   "owner_task": "P11",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci_interactive.rs",
+    "davinci_interactive_tests.rs"
+   ],
+   "tier": "exact"
+  },
+  "mock_permission_write__01_perm_dialog": {
+   "owner_task": "P12",
+   "source_owners": [
+    "views/approval_modal.rs",
+    "views/ask.rs",
+    "views/decision_modal.rs",
+    "davinci_interactive.rs",
+    "tests/cc2316/permissions.rs"
+   ],
+   "tier": "exact"
+  },
+  "mock_perm_approve__03_settled": {
+   "owner_task": "P12",
+   "source_owners": [
+    "views/approval_modal.rs",
+    "views/ask.rs",
+    "views/decision_modal.rs",
+    "davinci_interactive.rs",
+    "tests/cc2316/permissions.rs"
+   ],
+   "tier": "exact"
+  },
+  "mock_perm_deny__03_denied": {
+   "owner_task": "P12",
+   "source_owners": [
+    "views/approval_modal.rs",
+    "views/ask.rs",
+    "views/decision_modal.rs",
+    "davinci_interactive.rs",
+    "tests/cc2316/permissions.rs"
+   ],
+   "tier": "exact"
+  },
+  "mock_perm_cancel__02_after_esc": {
+   "owner_task": "P12",
+   "source_owners": [
+    "views/approval_modal.rs",
+    "views/ask.rs",
+    "views/decision_modal.rs",
+    "davinci_interactive.rs",
+    "tests/cc2316/permissions.rs"
+   ],
+   "tier": "exact"
+  },
+  "mock_perm_session__01_option2": {
+   "owner_task": "P12",
+   "source_owners": [
+    "views/approval_modal.rs",
+    "views/ask.rs",
+    "views/decision_modal.rs",
+    "davinci_interactive.rs",
+    "tests/cc2316/permissions.rs"
+   ],
+   "tier": "exact"
+  },
+  "mock_perm_session__02_allowed": {
+   "owner_task": "P12",
+   "source_owners": [
+    "views/approval_modal.rs",
+    "views/ask.rs",
+    "views/decision_modal.rs",
+    "davinci_interactive.rs",
+    "tests/cc2316/permissions.rs"
+   ],
+   "tier": "exact"
+  },
+  "mock_interrupt2__03_after_submit": {
+   "owner_task": "P11",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci_interactive.rs",
+    "davinci_interactive_tests.rs"
+   ],
+   "tier": "exact"
+  },
+  "mock_queue__03_after_enter": {
+   "owner_task": "P11",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci_interactive.rs",
+    "davinci_interactive_tests.rs"
+   ],
+   "tier": "exact"
+  },
+  "mock_queue__04_after_esc": {
+   "owner_task": "P11",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci_interactive.rs",
+    "davinci_interactive_tests.rs"
+   ],
+   "tier": "exact"
+  },
+  "mock_queue_multi__02_up_edit": {
+   "owner_task": "P11",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci_interactive.rs",
+    "davinci_interactive_tests.rs"
+   ],
+   "tier": "exact"
+  },
+  "mock_sendnow__02_final": {
+   "owner_task": "P11",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci_interactive.rs",
+    "davinci_interactive_tests.rs"
+   ],
+   "tier": "exact"
+  },
+  "agents_mock_working__02_working_settled": {
+   "owner_task": "P15",
+   "source_owners": [
+    "views/agents.rs",
+    "views/agent_focus.rs",
+    "davinci/roster.rs",
+    "davinci/model.rs",
+    "agent_roster_host.rs",
+    "tests/cc2316/agents.rs"
+   ],
+   "tier": "exact"
+  },
+  "agents_mock_needs__02_settled": {
+   "owner_task": "P15",
+   "source_owners": [
+    "views/agents.rs",
+    "views/agent_focus.rs",
+    "davinci/roster.rs",
+    "davinci/model.rs",
+    "agent_roster_host.rs",
+    "tests/cc2316/agents.rs"
+   ],
+   "tier": "exact"
+  },
+  "agents_needs_reply__01_space_reply": {
+   "owner_task": "P15",
+   "source_owners": [
+    "views/agents.rs",
+    "views/agent_focus.rs",
+    "davinci/roster.rs",
+    "davinci/model.rs",
+    "agent_roster_host.rs",
+    "tests/cc2316/agents.rs"
+   ],
+   "tier": "exact"
+  },
+  "agents_needs_approve__02_approved": {
+   "owner_task": "P15",
+   "source_owners": [
+    "views/agents.rs",
+    "views/agent_focus.rs",
+    "davinci/roster.rs",
+    "davinci/model.rs",
+    "agent_roster_host.rs",
+    "tests/cc2316/agents.rs"
+   ],
+   "tier": "exact"
+  },
+  "agents_mock_completed__02_settled": {
+   "owner_task": "P15",
+   "source_owners": [
+    "views/agents.rs",
+    "views/agent_focus.rs",
+    "davinci/roster.rs",
+    "davinci/model.rs",
+    "agent_roster_host.rs",
+    "tests/cc2316/agents.rs"
+   ],
+   "tier": "exact"
+  },
+  "agents_rename_pin__01_renamed": {
+   "owner_task": "P15",
+   "source_owners": [
+    "views/agents.rs",
+    "views/agent_focus.rs",
+    "davinci/roster.rs",
+    "davinci/model.rs",
+    "agent_roster_host.rs",
+    "tests/cc2316/agents.rs"
+   ],
+   "tier": "exact"
+  },
+  "agents_rename_pin__02_pinned": {
+   "owner_task": "P15",
+   "source_owners": [
+    "views/agents.rs",
+    "views/agent_focus.rs",
+    "davinci/roster.rs",
+    "davinci/model.rs",
+    "agent_roster_host.rs",
+    "tests/cc2316/agents.rs"
+   ],
+   "tier": "exact"
+  },
+  "agents_delete_confirm__01_armed": {
+   "owner_task": "P15",
+   "source_owners": [
+    "views/agents.rs",
+    "views/agent_focus.rs",
+    "davinci/roster.rs",
+    "davinci/model.rs",
+    "agent_roster_host.rs",
+    "tests/cc2316/agents.rs"
+   ],
+   "tier": "exact"
+  },
+  "agents_delete_confirm__02_deleted": {
+   "owner_task": "P15",
+   "source_owners": [
+    "views/agents.rs",
+    "views/agent_focus.rs",
+    "davinci/roster.rs",
+    "davinci/model.rs",
+    "agent_roster_host.rs",
+    "tests/cc2316/agents.rs"
+   ],
+   "tier": "exact"
+  },
+  "vim_mode__04_dw": {
+   "owner_task": "P08",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci/paste_burst.rs",
+    "davinci/runtime.rs",
+    "tests/cc2316/editor.rs"
+   ],
+   "tier": "exact"
+  },
+  "external_editor__01_after_editor": {
+   "owner_task": "P08",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci/paste_burst.rs",
+    "davinci/runtime.rs",
+    "tests/cc2316/editor.rs"
+   ],
+   "tier": "exact"
+  },
+  "image_paste__02_after_typing": {
+   "owner_task": "P08",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci/paste_burst.rs",
+    "davinci/runtime.rs",
+    "tests/cc2316/editor.rs"
+   ],
+   "tier": "exact"
+  },
+  "paste_large__01_paste_12k": {
+   "owner_task": "P08",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci/paste_burst.rs",
+    "davinci/runtime.rs",
+    "tests/cc2316/editor.rs"
+   ],
+   "tier": "exact"
+  },
+  "paste_large__03_unicode": {
+   "owner_task": "P08",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci/paste_burst.rs",
+    "davinci/runtime.rs",
+    "tests/cc2316/editor.rs"
+   ],
+   "tier": "exact"
+  },
+  "onboarding__01_onboarding": {
+   "owner_task": "P07b",
+   "source_owners": [
+    "views/startup.rs",
+    "views/trust.rs",
+    "tests/cc2316/chrome.rs"
+   ],
+   "tier": "structure"
+  },
+  "onboarding__03_after_enter": {
+   "owner_task": "P07b",
+   "source_owners": [
+    "views/startup.rs",
+    "views/trust.rs",
+    "tests/cc2316/chrome.rs"
+   ],
+   "tier": "structure"
+  },
+  "boot__02_settled": {
+   "owner_task": "P07",
+   "source_owners": [
+    "views/chrome.rs",
+    "views/startup.rs",
+    "davinci/app.rs",
+    "davinci/ui.rs",
+    "tests/cc2316/chrome.rs"
+   ],
+   "tier": "exact"
+  },
+  "keys_panels__01_mode1": {
+   "owner_task": "P12b",
+   "source_owners": [
+    "davinci/app.rs",
+    "views/chrome.rs",
+    "tests/cc2316/permissions.rs"
+   ],
+   "tier": "exact"
+  },
+  "keys_panels__02_mode2": {
+   "owner_task": "P12b",
+   "source_owners": [
+    "davinci/app.rs",
+    "views/chrome.rs",
+    "tests/cc2316/permissions.rs"
+   ],
+   "tier": "exact"
+  },
+  "keys_panels__03_mode3": {
+   "owner_task": "P12b",
+   "source_owners": [
+    "davinci/app.rs",
+    "views/chrome.rs",
+    "tests/cc2316/permissions.rs"
+   ],
+   "tier": "exact"
+  },
+  "keys_panels__04_mode4": {
+   "owner_task": "P12b",
+   "source_owners": [
+    "davinci/app.rs",
+    "views/chrome.rs",
+    "tests/cc2316/permissions.rs"
+   ],
+   "tier": "exact"
+  },
+  "keys_panels__05_todos": {
+   "owner_task": "P09b",
+   "source_owners": [
+    "views/keys.rs",
+    "davinci/app.rs",
+    "tests/cc2316/keys.rs"
+   ],
+   "tier": "exact"
+  },
+  "keys_panels__06_history": {
+   "owner_task": "P08",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci/paste_burst.rs",
+    "davinci/runtime.rs",
+    "tests/cc2316/editor.rs"
+   ],
+   "tier": "exact"
+  },
+  "keys_panels__08_ctrl_c": {
+   "owner_task": "P07",
+   "source_owners": [
+    "views/chrome.rs",
+    "views/startup.rs",
+    "davinci/app.rs",
+    "davinci/ui.rs",
+    "tests/cc2316/chrome.rs"
+   ],
+   "tier": "exact"
+  },
+  "top_tools2__01_transcript_top": {
+   "owner_task": "P10",
+   "source_owners": [
+    "views/transcript.rs",
+    "views/transcript_cache.rs",
+    "views/markdown.rs",
+    "views/highlight.rs",
+    "views/opera.rs",
+    "views/diff.rs",
+    "davinci/sanitize.rs",
+    "tests/cc2316/transcript.rs"
+   ],
+   "tier": "exact"
+  },
+  "top_tools2__03_pagedown": {
+   "owner_task": "P10",
+   "source_owners": [
+    "views/transcript.rs",
+    "views/transcript_cache.rs",
+    "views/markdown.rs",
+    "views/highlight.rs",
+    "views/opera.rs",
+    "views/diff.rs",
+    "davinci/sanitize.rs",
+    "tests/cc2316/transcript.rs"
+   ],
+   "tier": "exact"
+  },
+  "diff_view__03_diff": {
+   "owner_task": "P10",
+   "source_owners": [
+    "views/transcript.rs",
+    "views/transcript_cache.rs",
+    "views/markdown.rs",
+    "views/highlight.rs",
+    "views/opera.rs",
+    "views/diff.rs",
+    "davinci/sanitize.rs",
+    "tests/cc2316/transcript.rs"
+   ],
+   "tier": "exact"
+  },
+  "error_view3__02_up4": {
+   "owner_task": "P10",
+   "source_owners": [
+    "views/transcript.rs",
+    "views/transcript_cache.rs",
+    "views/markdown.rs",
+    "views/highlight.rs",
+    "views/opera.rs",
+    "views/diff.rs",
+    "davinci/sanitize.rs",
+    "tests/cc2316/transcript.rs"
+   ],
+   "tier": "exact"
+  },
+  "layout_sizes__01_120x44": {
+   "owner_task": "P07",
+   "source_owners": [
+    "views/chrome.rs",
+    "views/startup.rs",
+    "davinci/app.rs",
+    "davinci/ui.rs",
+    "tests/cc2316/chrome.rs"
+   ],
+   "tier": "exact"
+  },
+  "layout_sizes__02_100x30": {
+   "owner_task": "P07",
+   "source_owners": [
+    "views/chrome.rs",
+    "views/startup.rs",
+    "davinci/app.rs",
+    "davinci/ui.rs",
+    "tests/cc2316/chrome.rs"
+   ],
+   "tier": "exact"
+  },
+  "layout_sizes__03_80x24": {
+   "owner_task": "P07",
+   "source_owners": [
+    "views/chrome.rs",
+    "views/startup.rs",
+    "davinci/app.rs",
+    "davinci/ui.rs",
+    "tests/cc2316/chrome.rs"
+   ],
+   "tier": "exact"
+  },
+  "layout_sizes__04_60x20": {
+   "owner_task": "P07",
+   "source_owners": [
+    "views/chrome.rs",
+    "views/startup.rs",
+    "davinci/app.rs",
+    "davinci/ui.rs",
+    "tests/cc2316/chrome.rs"
+   ],
+   "tier": "exact"
+  },
+  "layout_sizes__05_160x50": {
+   "owner_task": "P07",
+   "source_owners": [
+    "views/chrome.rs",
+    "views/startup.rs",
+    "davinci/app.rs",
+    "davinci/ui.rs",
+    "tests/cc2316/chrome.rs"
+   ],
+   "tier": "exact"
+  },
+  "layout_sizes__06_120x18": {
+   "owner_task": "P07",
+   "source_owners": [
+    "views/chrome.rs",
+    "views/startup.rs",
+    "davinci/app.rs",
+    "davinci/ui.rs",
+    "tests/cc2316/chrome.rs"
+   ],
+   "tier": "exact"
+  },
+  "slash_only__01_slash": {
+   "owner_task": "P09",
+   "source_owners": [
+    "autocomplete.rs",
+    "views/completion.rs",
+    "views/keys.rs",
+    "tests/cc2316/completion.rs"
+   ],
+   "tier": "exact"
+  },
+  "slash_only__02_tab": {
+   "owner_task": "P09",
+   "source_owners": [
+    "autocomplete.rs",
+    "views/completion.rs",
+    "views/keys.rs",
+    "tests/cc2316/completion.rs"
+   ],
+   "tier": "exact"
+  },
+  "paste_only__01_paste": {
+   "owner_task": "P08",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci/paste_burst.rs",
+    "davinci/runtime.rs",
+    "tests/cc2316/editor.rs"
+   ],
+   "tier": "exact"
+  },
+  "esc_clear__01_esc1": {
+   "owner_task": "P08",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci/paste_burst.rs",
+    "davinci/runtime.rs",
+    "tests/cc2316/editor.rs"
+   ],
+   "tier": "exact"
+  },
+  "esc_clear__02_esc2": {
+   "owner_task": "P08",
+   "source_owners": [
+    "davinci/model.rs",
+    "davinci/app.rs",
+    "davinci/paste_burst.rs",
+    "davinci/runtime.rs",
+    "tests/cc2316/editor.rs"
+   ],
+   "tier": "exact"
+  },
+  "theme_nav__01_theme": {
+   "owner_task": "P06b",
+   "source_owners": [
+    "views/settings.rs",
+    "davinci/runtime.rs",
+    "davinci_interactive.rs",
+    "tests/cc2316/theme.rs"
+   ],
+   "tier": "exact"
+  },
+  "theme_nav__02_down2": {
+   "owner_task": "P06b",
+   "source_owners": [
+    "views/settings.rs",
+    "davinci/runtime.rs",
+    "davinci_interactive.rs",
+    "tests/cc2316/theme.rs"
+   ],
+   "tier": "exact"
+  },
+  "theme_nav__03_syntax_toggle": {
+   "owner_task": "P06",
+   "source_owners": [
+    "davinci/theme.rs",
+    "tests/cc2316/theme.rs"
+   ],
+   "tier": "exact"
+  },
+  "theme_apply__01_light_selected": {
+   "owner_task": "P06b",
+   "source_owners": [
+    "views/settings.rs",
+    "davinci/runtime.rs",
+    "davinci_interactive.rs",
+    "tests/cc2316/theme.rs"
+   ],
+   "tier": "exact"
+  },
+  "theme_apply__02_light_main": {
+   "owner_task": "P06",
+   "source_owners": [
+    "davinci/theme.rs",
+    "tests/cc2316/theme.rs"
+   ],
+   "tier": "exact"
+  },
+  "model_nav__01_model": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "exact"
+  },
+  "model_nav__02_effort_right": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "exact"
+  },
+  "model_nav__03_session_only": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "exact"
+  },
+  "config_search__01_config": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "structure"
+  },
+  "config_search__02_search_theme": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "structure"
+  },
+  "permissions_tabs__01_perms": {
+   "owner_task": "P13b",
+   "source_owners": [
+    "views/permissions.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "structure"
+  },
+  "permissions_tabs__03_tab4": {
+   "owner_task": "P13b",
+   "source_owners": [
+    "views/permissions.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "structure"
+  },
+  "help_tabs__01_general": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "structure"
+  },
+  "help_tabs__02_commands": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "structure"
+  },
+  "help_tabs__03_custom": {
+   "owner_task": "P13",
+   "source_owners": [
+    "views/settings.rs",
+    "views/cogitator.rs",
+    "views/thinking.rs",
+    "views/keys.rs",
+    "views/context_usage.rs",
+    "views/context_inspector.rs",
+    "views/plan_usage.rs",
+    "views/rewind.rs",
+    "tests/cc2316/panels.rs"
+   ],
+   "tier": "structure"
+  },
+  "powerup_modes__01_modes_lesson": {
+   "owner_task": "NONE",
+   "source_owners": [],
+   "tier": "exception",
+   "dropped": true,
+   "reason": "D3: Claude-only surface dropped"
+  },
+  "powerup_modes__02_next_lesson": {
+   "owner_task": "NONE",
+   "source_owners": [],
+   "tier": "exception",
+   "dropped": true,
+   "reason": "D3: Claude-only surface dropped"
+  },
+  "scroll_fixture__01_bottom": {
+   "owner_task": "P14",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/selection.rs",
+    "davinci/links.rs",
+    "views/scrollbar.rs",
+    "tests/cc2316/mouse.rs"
+   ],
+   "tier": "exact"
+  },
+  "scroll_fixture__04_home": {
+   "owner_task": "P14",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/selection.rs",
+    "davinci/links.rs",
+    "views/scrollbar.rs",
+    "tests/cc2316/mouse.rs"
+   ],
+   "tier": "exact"
+  },
+  "scroll_fixture__06_wheel_up": {
+   "owner_task": "P14",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/selection.rs",
+    "davinci/links.rs",
+    "views/scrollbar.rs",
+    "tests/cc2316/mouse.rs"
+   ],
+   "tier": "exact"
+  },
+  "scroll_fixture__08_transcript": {
+   "owner_task": "P14b",
+   "source_owners": [
+    "views/viewer.rs",
+    "views/transcript_cache.rs",
+    "tests/cc2316/mouse.rs"
+   ],
+   "tier": "exact"
+  },
+  "scroll_fixture__09_resize_80x24": {
+   "owner_task": "P14",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/selection.rs",
+    "davinci/links.rs",
+    "views/scrollbar.rs",
+    "tests/cc2316/mouse.rs"
+   ],
+   "tier": "exact"
+  },
+  "scroll_fixture__10_resize_160x50": {
+   "owner_task": "P14",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/selection.rs",
+    "davinci/links.rs",
+    "views/scrollbar.rs",
+    "tests/cc2316/mouse.rs"
+   ],
+   "tier": "exact"
+  },
+  "selection__01_drag_select": {
+   "owner_task": "P14",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/selection.rs",
+    "davinci/links.rs",
+    "views/scrollbar.rs",
+    "tests/cc2316/mouse.rs"
+   ],
+   "tier": "exact"
+  },
+  "mouse_cursor__01_click_cursor": {
+   "owner_task": "P14",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/selection.rs",
+    "davinci/links.rs",
+    "views/scrollbar.rs",
+    "tests/cc2316/mouse.rs"
+   ],
+   "tier": "exact"
+  },
+  "mouse_cursor__02_click_cursor_start": {
+   "owner_task": "P14",
+   "source_owners": [
+    "davinci/runtime.rs",
+    "davinci/selection.rs",
+    "davinci/links.rs",
+    "views/scrollbar.rs",
+    "tests/cc2316/mouse.rs"
+   ],
+   "tier": "exact"
+  }
+ }
+}

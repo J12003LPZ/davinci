@@ -2,7 +2,7 @@
 
 **Goal:** Match the observable Claude Code CLI 2.1.316 Windows terminal experience in DaVinci: exact layout, colours, terminal behaviour and interactions, with DaVinci's own name, mark, wording and real provider data.
 
-**Status (2026-11-01):** P00–P02 are done. P03 is in progress. P04–P20 have not started. No DaVinci parity is claimed.
+**Status (2026-11-01):** P00–P02 are done. P03 and P04 are in review. P05–P20 have not started. No DaVinci parity is claimed.
 
 **Replaces** the earlier version of this plan. Where `docs/superpowers/specs/2026-11-01-claude-code-2.1.316-tui-parity-design.md` conflicts with the decisions below, this plan wins.
 
@@ -49,7 +49,7 @@ These were taken on 2026-11-01 from the plan review. Each can be reversed, and r
   - Don't copy Anthropic trademarks, the Clawd mark, source or long text.
   - Implementers must not read `artifacts/source`, the code carved from `claude.exe`.
   - Don't call this clean-room. The package's specs draw on that carved code.
-  - Goldens and carved code stay out of the DaVinci repo. Get legal advice before shipping publicly.
+  - Goldens, carved code, the ledger, results and anything else derived from Claude's interface stay out of the DaVinci repo, in `CC2316_EVIDENCE` or the reference package. Get legal advice before shipping publicly.
 - **Security:** Keep project trust, approval expiry and nonce checks, cancellation, sandboxing, credentials and durable task lifecycle. A visual change must never grant execution or change permissions.
 - **Subscription:** No new API-key requirement, billable service or speculative model call, and no change to Codex subscription routing. Automated runs use only the loopback fixture. Don't claim token savings without measurements from the authenticated route.
 - **Code preservation:** Keep the pinned toolchain and dependencies. With the setting off, the shell must behave as it does today, and existing `terminal_*` tests stay unchanged.
@@ -95,7 +95,8 @@ Cells outside every region must match exactly. A rule that covers more than a go
 Use the pattern already in `crates/davinci-coding-agent/tests/output_schema.rs`:
 - A loopback server speaks `openai-responses` SSE, the event shape in `tests/wor37_cache_status.rs`.
 - A `models.json` custom provider in a disposable agent dir points at it, with a dummy key.
-- The process starts with `env_clear`, isolated `HOME`, `USERPROFILE`, `PI_CODING_AGENT_DIR` and `DAVINCI_CODING_AGENT_DIR`, `PI_DISABLE_NETWORK=1` and `PI_OFFLINE=1`. Both are needed: catalog refresh and package update checks honour only `PI_OFFLINE`. P03 must prove no non-loopback connection is attempted, not assume it.
+- The process starts with `env_clear`, isolated `HOME`, `USERPROFILE`, `PI_CODING_AGENT_DIR` and `DAVINCI_CODING_AGENT_DIR`, `PI_DISABLE_NETWORK=1` and `PI_CATALOG_DRY_RUN=1`. Don't set `PI_OFFLINE`: it replaces the provider with a local stub. Without the dry-run gate, startup opens an HTTPS connection that ignores proxy variables.
+- A refusing proxy listener and TCP sampling fail the run on any foreign connection. A pass means nothing was observed, not that nothing happened: the guard can't see connections between samples, UDP or DNS.
 - `TERM=xterm-256color` and `COLORTERM=truecolor`, as the reference harness sets them.
 - No `auth.json` is present, so the subscription route can't be reached.
 - The server records every request. A scenario fails if the count differs from what it expects, which also catches duplicate provider requests.
@@ -211,7 +212,6 @@ PR #275 merged as `543f9a3b`, and the branch has been moved to that commit. P01,
 - `replay(binary, scenario, profile) -> Capture`, reusing the package's `tui_harness.py` scenario runner and `xterm_dump.js`.
 - The offline backend above.
 - Timestamped keyboard, mouse, paste and resize events.
-- A `run_suite.py` adapter that runs the same test IDs against DaVinci snapshots.
 - Produce captures by importing `styled_xterm.process(raw_path, out_dir, name, cols, rows)` from the package, which writes schema `/2` with the goldens' palette and default-colour substitution. `styled_capture.py` is the older pyte schema `/1`; don't use it.
 - `tui_harness.py` launches `claude.exe` by default and takes `--exe`. Its scenario actions are reusable, but `mock_api.py` is Anthropic-only. Four `mock_stream2`, `mock_stream_rmoff`, `mock_stream_scroll2` and `mock_interrupt2` goldens have no scenario file under that exact name, so find how they were driven or record them as needing a new scenario.
 
@@ -221,13 +221,13 @@ PR #275 merged as `543f9a3b`, and the branch has been moved to that commit. P01,
 
 ### P04: Coverage ledger
 
-`docs/ui/claude-2.1.316/coverage.md`, `scripts/ui/cc2316_coverage.py`, `scripts/tests/test_cc2316_coverage.py`
+`scripts/ui/cc2316_coverage.py`, `scripts/ui/cc2316_owners.json`, `scripts/tests/test_cc2316_coverage.py`. Output goes to the evidence folder, `CC2316_EVIDENCE`, outside the repo.
 
 **Required:**
 - One row per evidence feature (77), plus each of the 91 listed command rows and each keybinding (228).
 - Each row has its source owner, tier, golden, regions, state and limitation.
 - Fail on any missing row, or a VERIFIED status with no result behind it.
-- The ledger must not include golden content.
+- The committed owners file holds only IDs and DaVinci facts. The owner doesn't want Claude reference data in the repo.
 
 ### P05: Setting, terminal modes and restore
 
@@ -461,9 +461,9 @@ Hover and OSC 8 are UNVERIFIED in the reference, so mark them `NO_REFERENCE`.
 
 ### P19: Full comparison
 
-`scripts/ui/cc2316_report.py`, `docs/ui/claude-2.1.316/results.md`
+`scripts/ui/cc2316_report.py`, with `results.md` written to the evidence folder
 
-**Required:** Run all 95 kept goldens, all P0 actions and all adverse tests with the setting on, then the existing suites with it off. Report only DaVinci results, with failed, blocked and `NO_REFERENCE` shown as they are.
+**Required:** Add a `run_suite.py` adapter that runs the same test IDs against DaVinci snapshots. Run all 95 kept goldens, all P0 actions and all adverse tests with the setting on, then the existing suites with it off. Report only DaVinci results, with failed, blocked and `NO_REFERENCE` shown as they are.
 
 **Command:**
 
@@ -475,7 +475,7 @@ This task checks the whole, so it has no failing-test step of its own.
 
 ### P20: Performance and rollout
 
-`scripts/ui/cc2316_perf.py`, `docs/ui/claude-2.1.316/release-gates.md`
+`scripts/ui/cc2316_perf.py`, with `release-gates.md` written to the evidence folder
 
 Use the package's `measure_perf.py` on the same machine and terminal. `frame_cost.rs` is a timing probe, not a gate, and can be supporting data only. The harness adds 20–50 ms of noise, so sub-frame targets can't be proven with it.
 
