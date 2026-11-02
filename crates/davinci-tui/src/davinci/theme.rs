@@ -124,7 +124,7 @@ impl Variant {
 fn reference_name(name: &str) -> bool {
     matches!(
         name.strip_suffix("-daltonized").unwrap_or(name),
-        "auto" | "ansi" | "daltonized" | "dark" | "light"
+        "auto" | "ansi" | "light-ansi" | "daltonized" | "dark" | "light"
     )
 }
 
@@ -1201,6 +1201,15 @@ impl Theme {
         }
         if name == "ansi" {
             return Self::da_vinci(ColorDepth::Basic, self.no_color);
+        }
+        // The light twin of `ansi`: the same sixteen named colours on the
+        // light ramp. Only the reference shell lists it; elsewhere the name is
+        // unknown and resolves like any other unknown name.
+        if name == "light-ansi" && self.wants_reference {
+            return Self {
+                variant: Variant::Light,
+                ..Self::from_ramp(&LIGHT_BASIC, self.no_color, false)
+            };
         }
         if name == "daltonized" {
             return self.with_name("dark").daltonize();

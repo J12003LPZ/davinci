@@ -4,7 +4,7 @@
 //! returns the chosen setting value for the host to store.
 use crate::davinci::{
     app::Flow,
-    model::{wrap_index, Choice, Model, ThemePicker},
+    model::{wrap_index, Choice, Entry, EntryLog, Model, ThemePicker},
     ui::{self, span},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -15,17 +15,18 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 /// Every built-in theme DaVinci's shell resolves, as `(setting value, label)`.
-/// The labels of the shared themes are the reference's short functional ones.
-/// There is no "Light mode (ANSI colors only)" and no custom-theme entry:
-/// the shell has neither, and none is invented here.
-pub const ENTRIES: [(&str, &str); 7] = [
+/// The labels of the shared themes are the reference's short functional ones,
+/// in the reference's order. DaVinci's own Vox stands last, where the
+/// reference has its custom-theme entry; there is no such entry here.
+pub const ENTRIES: [(&str, &str); 8] = [
     ("auto", "Auto (match terminal)"),
     ("dark", "Dark mode"),
     ("light", "Light mode"),
-    ("vox", "Vox mode"),
     ("daltonized", "Dark mode (colorblind-friendly)"),
     ("light-daltonized", "Light mode (colorblind-friendly)"),
     ("ansi", "Dark mode (ANSI colors only)"),
+    ("light-ansi", "Light mode (ANSI colors only)"),
+    ("vox", "Vox mode"),
 ];
 
 /// Open the picker on `current` (the stored theme name). Only the reference
@@ -47,6 +48,27 @@ pub fn open(model: &mut Model, current: &str) -> bool {
         syntax: true,
     });
     true
+}
+
+/// The conversation as drawn behind the open picker: a `/theme` still waiting
+/// for its answer is not echoed (the picker is the answer), and the rows it
+/// leaves behind go with it. The line itself stays in the conversation, so the
+/// result hangs from it once a theme is chosen.
+pub fn without_pending_echo(transcript: &mut EntryLog) {
+    let waiting = transcript
+        .iter()
+        .rposition(|entry| matches!(entry, Entry::User(prompt) if prompt.trim() == "/theme"))
+        .filter(|&index| {
+            transcript[index + 1..]
+                .iter()
+                .all(|entry| matches!(entry, Entry::Gap | Entry::Agent(_)))
+        });
+    if let Some(index) = waiting {
+        transcript.truncate(index);
+        while matches!(transcript.last(), Some(Entry::Gap)) {
+            transcript.pop();
+        }
+    }
 }
 
 /// All keys belong to the picker while it is open, so nothing typed reaches
@@ -84,89 +106,128 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     Flow::Continue
 }
 
-fn dashed(model: &Model) -> Line<'static> {
-    let width = usize::from(model.width.saturating_sub(6));
+fn dashed(model: &Model, indent: usize) -> Line<'static> {
+    let width = usize::from(model.width).saturating_sub(2 * indent);
     Line::from(vec![
-        span("   ", model.theme.text),
+        span(" ".repeat(indent), model.theme.text),
         span("╌".repeat(width), model.theme.cc().subtle),
     ])
 }
 
-/// DaVinci's own sample: an unchanged line, a removed one, an added one with
-/// the same word changed, and an unchanged one. Only the colours and
-/// modifiers come from the reference; none of its text does.
-const KEYWORD: &str = "fn";
-const NAME: &str = "label";
-const SIGNATURE: &str = "(n: u32) -> String {";
-const BEFORE: &str = "    format!(\"";
-const REMOVED: &str = "count";
-const ADDED: &str = "total";
-const AFTER: &str = ": {n}\")";
+/// The sentence under the picker's title, DaVinci's own. It takes as many cells
+/// as the reference's, so a structure comparison finds the bold in the same cells.
+pub const HEADING_SENTENCE: &str = "Pick the colour palette that reads best in your terminal";
 
-fn preview(model: &Model, syntax: bool) -> Vec<Line<'static>> {
+/// DaVinci's own sample: an unchanged line, a removed one, an added one with
+/// the same word changed, and an unchanged one. Only the colours, modifiers and
+/// the width of each token come from the reference; none of its text does, so a
+/// structure comparison finds every cell in the style it expects.
+const KEYWORD: &str = "function";
+const NAME: &str = "label";
+const SIGNATURE: &str = "() {";
+const IDENT: &str = "emitter";
+const CALL: &str = "add";
+const OPEN: &str = "\"Total: ";
+const REMOVED: &str = "empty";
+const ADDED: &str = "filled";
+
+pub(super) fn preview(model: &Model, syntax: bool, indent: usize) -> Vec<Line<'static>> {
     let cc = model.theme.diff_palette(syntax);
     let ink = |colour| if syntax { colour } else { cc.diff_text };
     let on = |text: &str, fg, bg| Span::styled(text.to_string(), Style::default().fg(fg).bg(bg));
-    let number = Style::default().fg(cc.inactive).add_modifier(
-        cc.inactive_modifier
-            | if syntax {
-                Modifier::DIM
-            } else {
-                Modifier::empty()
-            },
-    );
+    // With highlighting the numbers are the plain ink, dimmed; without it they
+    // are the quiet ink of the palette.
+    let number = |text: &str| {
+        let style = if syntax {
+            Style::default()
+                .fg(cc.diff_text)
+                .add_modifier(Modifier::DIM)
+        } else {
+            Style::default()
+                .fg(cc.inactive)
+                .add_modifier(cc.inactive_modifier)
+        };
+        Span::styled(text.to_string(), style)
+    };
     let none = ratatui::style::Color::Reset;
-    // The gutter is four cells after a three-cell indent; a changed row is
-    // tinted from the end of its text to the edge.
-    let pad = usize::from(model.width.saturating_sub(7));
+    // A row is a three-cell indent, then cells up to a three-cell margin at the
+    // right edge; a changed row is tinted from its gutter to that margin.
+    let room = usize::from(model.width.saturating_sub(6));
     let row = |spans: Vec<Span<'static>>| {
-        let mut all = vec![span("   ", cc.text)];
+        let mut all = vec![span(" ".repeat(indent), cc.text)];
         all.extend(spans);
         Line::from(ui::truncate_run(all, model.width))
     };
-    let changed = |gutter: &str, sign: ratatui::style::Color, bg, word_bg, text, word: &str| {
-        let used = [BEFORE, word, AFTER]
+    let fill = |used: usize| " ".repeat(room.saturating_sub(used));
+    let width = |parts: &[&str]| {
+        parts
             .iter()
             .map(|part| UnicodeWidthStr::width(*part))
-            .sum::<usize>();
-        let fill = " ".repeat(pad.saturating_sub(used));
+            .sum::<usize>()
+    };
+    let gutter = 4;
+    let before = format!("  {IDENT}.{CALL}({OPEN}");
+    let removed_tail = "!\");";
+    let removed = {
+        let rest = fill(gutter + width(&[&before, REMOVED, removed_tail]));
         row(vec![
-            on(gutter, sign, bg),
-            on(BEFORE, text, bg),
-            on(word, text, word_bg),
-            on(AFTER, text, bg),
-            on(&fill, cc.diff_text, bg),
+            on(
+                " 2 -",
+                if syntax { cc.diff_del } else { cc.diff_text },
+                cc.diff_del_bg,
+            ),
+            on(&before, cc.diff_text, cc.diff_del_bg),
+            on(REMOVED, cc.diff_text, cc.del_word_bg()),
+            on(
+                &format!("{removed_tail}{rest}"),
+                cc.diff_text,
+                cc.diff_del_bg,
+            ),
         ])
     };
-    vec![
+    let added = {
+        let close = "!\"";
+        let end = ");";
+        let rest = fill(gutter + width(&["  ", IDENT, ".", CALL, "(", OPEN, ADDED, close, end]));
         row(vec![
-            Span::styled(" 1 ", number),
-            on(KEYWORD, ink(cc.code_keyword), none),
-            on(" ", cc.diff_text, none),
-            on(NAME, ink(cc.function_ink()), none),
-            on(SIGNATURE, cc.diff_text, none),
-        ]),
-        changed(
-            " 2 -",
-            cc.diff_del,
-            cc.diff_del_bg,
-            cc.del_word_bg(),
-            cc.diff_text,
-            REMOVED,
-        ),
-        changed(
-            " 2 +",
-            cc.diff_add,
-            cc.diff_add_bg,
-            cc.add_word_bg(),
-            ink(cc.code_string),
-            ADDED,
-        ),
-        row(vec![
-            Span::styled(" 3 ", number),
-            on("}", cc.diff_text, none),
-        ]),
-    ]
+            on(
+                " 2 +",
+                if syntax { cc.diff_add } else { cc.diff_text },
+                cc.diff_add_bg,
+            ),
+            on("  ", cc.diff_text, cc.diff_add_bg),
+            on(IDENT, ink(cc.text), cc.diff_add_bg),
+            on(".", cc.diff_text, cc.diff_add_bg),
+            on(CALL, ink(cc.function_ink()), cc.diff_add_bg),
+            on("(", cc.diff_text, cc.diff_add_bg),
+            on(OPEN, ink(cc.code_string), cc.diff_add_bg),
+            on(ADDED, ink(cc.code_string), cc.add_word_bg()),
+            on(close, ink(cc.code_string), cc.diff_add_bg),
+            on(&format!("{end}{rest}"), cc.diff_text, cc.diff_add_bg),
+        ])
+    };
+    let (first, last) = if syntax {
+        (
+            row(vec![
+                number(" 1 "),
+                on(" ", cc.diff_text, none),
+                on(KEYWORD, cc.code_keyword, none),
+                on(" ", cc.diff_text, none),
+                on(NAME, cc.function_ink(), none),
+                on(SIGNATURE, cc.diff_text, none),
+            ]),
+            row(vec![number(" 3 "), on(" }", cc.diff_text, none)]),
+        )
+    } else {
+        (
+            row(vec![
+                number(" 1  "),
+                on(&format!("{KEYWORD} {NAME}{SIGNATURE}"), cc.diff_text, none),
+            ]),
+            row(vec![number(" 3  "), on("}", cc.diff_text, none)]),
+        )
+    };
+    vec![first, removed, added, last]
 }
 
 /// The picker's rows, whole: heading, themes, preview and hint, with blank
@@ -193,7 +254,7 @@ pub fn fitted(model: &Model, height: usize) -> Vec<Line<'static>> {
         return Vec::new();
     };
     let mut head = heading(model);
-    let mut list = entries(model);
+    let mut list = entries(model, 3, ENTRIES.len());
     let hint = hint(model);
     // The intro line, then the rule, then the title.
     for drop in [2, 0, 0] {
@@ -242,14 +303,14 @@ fn heading(model: &Model) -> Vec<Line<'static>> {
         Line::from(vec![
             span("   ", theme.text),
             Span::styled(
-                "Choose a theme for the interface",
+                HEADING_SENTENCE,
                 Style::default().add_modifier(Modifier::BOLD),
             ),
         ]),
     ]
 }
 
-fn entries(model: &Model) -> Vec<Line<'static>> {
+pub(super) fn entries(model: &Model, indent: usize, count: usize) -> Vec<Line<'static>> {
     let Some(picker) = &model.theme_picker else {
         return Vec::new();
     };
@@ -257,6 +318,7 @@ fn entries(model: &Model) -> Vec<Line<'static>> {
     let cc = theme.cc();
     ENTRIES
         .iter()
+        .take(count)
         .enumerate()
         .map(|(index, (name, label))| {
             let selected = index == picker.index;
@@ -264,7 +326,7 @@ fn entries(model: &Model) -> Vec<Line<'static>> {
             let pointer = if selected { "❯" } else { " " };
             let check = if *name == picker.applied { "✔" } else { " " };
             Line::from(vec![
-                span("   ", ink),
+                span(" ".repeat(indent), ink),
                 span(pointer, ink),
                 span(" ", ink),
                 span(check, cc.success),
@@ -309,12 +371,12 @@ fn assemble(model: &Model, with_preview: bool, with_blanks: bool) -> Vec<Line<'s
     blank(&mut rows);
     rows.extend(head.next());
     blank(&mut rows);
-    rows.extend(entries(model));
+    rows.extend(entries(model, 3, ENTRIES.len()));
     if with_preview {
         rows.push(ui::blank());
-        rows.push(dashed(model));
-        rows.extend(preview(model, picker.syntax));
-        rows.push(dashed(model));
+        rows.push(dashed(model, 3));
+        rows.extend(preview(model, picker.syntax, 3));
+        rows.push(dashed(model, 3));
         let status = if picker.syntax {
             " Syntax theme: DaVinci (ctrl+t to disable)"
         } else {
@@ -328,4 +390,29 @@ fn assemble(model: &Model, with_preview: bool, with_blanks: bool) -> Vec<Line<'s
     blank(&mut rows);
     rows.push(hint(model));
     clip(model, rows)
+}
+
+/// The preview as the first-run steps draw it: a dashed rule, the sample, a
+/// dashed rule and the syntax line, all from `indent` cells in.
+pub fn sample(model: &Model, syntax: bool, indent: usize) -> Vec<Line<'static>> {
+    let cc = model.theme.cc();
+    let quiet = Style::default()
+        .fg(cc.inactive)
+        .add_modifier(cc.inactive_modifier);
+    let status = if syntax {
+        " Syntax theme: DaVinci (ctrl+t to disable)"
+    } else {
+        " Syntax highlighting disabled (ctrl+t to enable)"
+    };
+    let mut rows = vec![dashed(model, indent)];
+    rows.extend(preview(model, syntax, indent));
+    rows.push(dashed(model, indent));
+    rows.push(Line::from(ui::truncate_run(
+        vec![
+            span(" ".repeat(indent), model.theme.text),
+            Span::styled(status, quiet),
+        ],
+        model.width,
+    )));
+    rows
 }

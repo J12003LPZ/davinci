@@ -249,6 +249,13 @@ pub struct ThemePicker {
     pub syntax: bool,
 }
 
+/// The step of the first-run welcome in the reference shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardStep {
+    Theme,
+    Security,
+}
+
 /// What enter meant while an instrument was open. The shell knows which row
 /// was highlighted; only the caller knows what to do about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,6 +274,8 @@ pub enum Choice {
     Setting(usize),
     /// A theme picked in the `/theme` picker, by its setting value.
     Theme(String),
+    /// The last welcome step ended: the analytics question comes next.
+    OnboardingDone,
     /// A thinking level (`3c`), as an index into `thinking_rows`.
     ThinkingLevel(usize),
     /// A provider to sign in to (`3d`), as an index into `providers`.
@@ -3019,6 +3028,10 @@ pub struct Model {
     pub reference: bool,
     /// The `/theme` picker, while it is open.
     pub theme_picker: Option<ThemePicker>,
+    /// The first-run welcome step on screen, in the reference shell.
+    pub onboarding: Option<OnboardStep>,
+    /// The theme chosen in the welcome, held until the first-run answer is saved.
+    pub first_run_theme: Option<String>,
     /// `3b` — the settings sheet.
     pub settings_rows: Vec<SettingRow>,
     pub settings_index: usize,
@@ -3600,6 +3613,8 @@ impl Model {
             catalog_search: false,
             reference: false,
             theme_picker: None,
+            onboarding: None,
+            first_run_theme: None,
             settings_rows: Vec::new(),
             settings_index: 0,
             settings_query: String::new(),
@@ -4146,7 +4161,7 @@ impl Model {
     pub fn paste(&mut self, text: &str) {
         // The `/theme` picker takes every key, so it takes the paste a fast
         // typist's burst becomes on Windows; the draft is left as it was.
-        if self.theme_picker.is_some() {
+        if self.theme_picker.is_some() || self.onboarding.is_some() {
             return;
         }
         // Selectors own their search input independently of the conversation.

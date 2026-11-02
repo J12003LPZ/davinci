@@ -283,3 +283,170 @@ fn with_the_setting_off_the_masthead_is_the_painter_and_its_hint() {
     assert!(!frame[39].contains("/effort"));
     assert!(frame.len() == 44 && startup::PET_ROWS == 5);
 }
+
+// ---- P07b: the first-run steps ----------------------------------------------
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use davinci_tui::davinci::{
+    app::Flow,
+    model::{Choice, OnboardStep},
+    views::onboarding,
+};
+
+fn press(model: &mut Model, code: KeyCode) -> Flow {
+    app::handle_key(model, KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+fn ctrl_key(model: &mut Model, ch: char) -> Flow {
+    app::handle_key(
+        model,
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL),
+    )
+}
+
+fn welcome(width: u16, height: u16) -> Model {
+    let mut model = reference(width, height);
+    model.composer.set_text("a draft in progress");
+    assert!(onboarding::start(&mut model, "dark"));
+    model
+}
+
+#[test]
+fn the_steps_only_open_for_the_reference() {
+    let mut model = reference(120, 44);
+    model.reference = false;
+    assert!(!onboarding::start(&mut model, "dark"));
+    assert!(model.onboarding.is_none() && model.theme_picker.is_none());
+}
+
+#[test]
+fn the_welcome_walks_theme_then_security_then_hands_over_to_the_question() {
+    let mut model = welcome(120, 44);
+    let theme = rows(&model).join("\n");
+    assert!(
+        theme.contains("/theme"),
+        "the theme step says where to change it later"
+    );
+    assert!(theme.contains("Dark mode (ANSI colors only)"));
+    assert!(theme.contains("Light mode (ANSI colors only)"));
+    assert!(!theme.contains("Vox"), "the list is the shared themes");
+    press(&mut model, KeyCode::Down);
+    assert_eq!(model.first_run_theme, None, "moving chooses nothing");
+    assert_eq!(press(&mut model, KeyCode::Enter), Flow::Continue);
+    assert_eq!(model.onboarding, Some(OnboardStep::Security));
+    assert_eq!(model.first_run_theme.as_deref(), Some("light"));
+    let notes = rows(&model).join("\n");
+    assert!(notes.contains("1. ") && notes.contains("2. "));
+    assert!(notes.contains("prompt injection") && notes.contains("Press Enter to continue"));
+    assert_eq!(
+        press(&mut model, KeyCode::Enter),
+        Flow::Choose(Choice::OnboardingDone)
+    );
+    assert!(model.onboarding.is_none() && model.theme_picker.is_none());
+    assert_eq!(
+        model.first_run_theme.as_deref(),
+        Some("light"),
+        "held for the answer"
+    );
+}
+
+#[test]
+fn escape_leaves_the_steps_and_ctrl_c_is_the_shells_interrupt() {
+    let mut model = welcome(120, 44);
+    let before = model.theme;
+    press(&mut model, KeyCode::Down);
+    press(&mut model, KeyCode::Enter);
+    assert_eq!(ctrl_key(&mut model, 'c'), Flow::Interrupt);
+    assert_eq!(
+        model.onboarding,
+        Some(OnboardStep::Security),
+        "ctrl+c leaves the step as it was"
+    );
+    assert_eq!(press(&mut model, KeyCode::Esc), Flow::Continue);
+    assert!(model.onboarding.is_none() && model.theme_picker.is_none());
+    assert_eq!(model.first_run_theme, None);
+    assert_eq!(model.theme, before);
+    assert_eq!(model.composer.editor().get_text(), "a draft in progress");
+}
+
+#[test]
+fn nothing_in_the_steps_trusts_submits_or_grants() {
+    // Any key at either step: nothing but a move comes back, never a submit, a
+    // trust choice or a permission change.
+    let keys = [
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::Tab,
+        KeyCode::Char('y'),
+        KeyCode::Char('1'),
+        KeyCode::Right,
+        KeyCode::BackTab,
+    ];
+    for step in [OnboardStep::Theme, OnboardStep::Security] {
+        let mut model = welcome(120, 44);
+        model.onboarding = Some(step);
+        let mode = model.permission_mode.clone();
+        for code in keys {
+            assert_eq!(press(&mut model, code), Flow::Continue, "{step:?} {code:?}");
+        }
+        assert_eq!(model.permission_mode, mode);
+        assert_eq!(model.composer.editor().get_text(), "a draft in progress");
+        assert!(model.overlay.is_none());
+    }
+}
+
+#[test]
+fn a_paste_during_a_step_reaches_nothing() {
+    for step in [OnboardStep::Theme, OnboardStep::Security] {
+        let mut model = welcome(120, 44);
+        model.onboarding = Some(step);
+        model.paste("rm -rf /\nPress Enter");
+        assert_eq!(model.composer.editor().get_text(), "a draft in progress");
+        assert_eq!(model.onboarding, Some(step));
+    }
+}
+
+#[test]
+fn every_step_survives_any_resize_and_a_short_screen_keeps_the_highlighted_theme() {
+    for step in [OnboardStep::Theme, OnboardStep::Security] {
+        let mut model = welcome(120, 44);
+        model.onboarding = Some(step);
+        for (width, height) in [
+            (160, 50),
+            (80, 24),
+            (60, 20),
+            (20, 4),
+            (1, 1),
+            (120, 3),
+            (120, 44),
+        ] {
+            model.width = width;
+            model.height = height;
+            let frame = rows(&model);
+            assert_eq!(
+                frame.len(),
+                usize::from(height),
+                "{step:?} {width}x{height}"
+            );
+            assert!(frame.iter().all(|row| row.width() <= usize::from(width)));
+        }
+    }
+    for index in 0..onboarding::LIST {
+        let mut model = welcome(120, 12);
+        model.theme_picker.as_mut().unwrap().index = index;
+        let frame = rows(&model);
+        assert!(
+            frame.iter().any(|row| row.contains('❯')),
+            "index {index}: {frame:?}"
+        );
+    }
+}
+
+#[test]
+fn the_welcome_band_and_the_steps_sit_on_the_pinned_rows() {
+    let frame = rows(&welcome(120, 44));
+    assert!(frame[0].starts_with("Welcome to DaVinci v"));
+    assert!(frame[1].starts_with('·') && frame[15].contains('·'));
+    assert!(frame[22].contains("Auto (match terminal)"));
+    assert!(frame[23].starts_with(" ❯ "));
+}

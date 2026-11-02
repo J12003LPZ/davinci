@@ -508,6 +508,149 @@ class CompareGoldenTests(unittest.TestCase):
             self.assertTrue(all(rule.reason.strip() for rule in rules), name)
 
 
+DEFAULTS = {"fg": FG, "bg": BG}
+
+
+def dcap(rows, name="g1"):
+    """A 10x12 capture whose blank cells are the capture's own defaults, as in a golden."""
+    return capture(rows, cols=10, nrows=12, name=name, defaults=DEFAULTS)
+
+
+class DroppedRuleTests(unittest.TestCase):
+    """D6: a surface DaVinci does not draw. The expected cells are ignored and the actual
+    cells must be blank, so the rule cannot hide anything drawn there."""
+
+    def notice(self):
+        # rows 5-8 of a 12-row grid hold the golden's notice
+        rows = {y: [run(0, "notice " + str(y) + "  ")] for y in range(5, 9)}
+        return dcap(rows)
+
+    def region(self):
+        return box(5, 8, 0, 9)
+
+    def test_a_blank_region_passes_whatever_the_golden_shows(self):
+        r = rule("dropped", self.region(), reason="D6: no release notice")
+        self.assertTrue(compare(self.notice(), dcap({}), [r]).ok)
+
+    def test_text_in_the_region_fails(self):
+        r = rule("dropped", self.region(), reason="D6: no release notice")
+        drawn = dcap({6: [run(0, "DaVinci   ")]})
+        found = compare(self.notice(), drawn, [r])
+        self.assertEqual({(d.row, d.column) for d in found.differences if d.field == "dropped"},
+                         {(6, c) for c in range(7)})
+
+    def test_one_stray_cell_fails_and_only_that_cell(self):
+        r = rule("dropped", self.region(), reason="D6: no release notice")
+        drawn = dcap({7: [run(0, " " * 4), run(4, "x"), run(5, " " * 5)]})
+        self.assertEqual({(d.row, d.column) for d in compare(self.notice(), drawn, [r]).differences},
+                         {(7, 4)})
+
+    def test_a_blank_with_a_visible_style_fails(self):
+        r = rule("dropped", self.region(), reason="D6: no release notice")
+        for style in ({"underline": True}, {"inverse": True}, {"bg": "#111111"}):
+            drawn = dcap({5: [run(0, " ", **style), run(1, " " * 9)]})
+            self.assertEqual({(d.row, d.column) for d in compare(self.notice(), drawn, [r]).differences},
+                             {(5, 0)}, style)
+
+    def test_a_blank_with_invisible_style_passes(self):
+        r = rule("dropped", self.region(), reason="D6: no release notice")
+        drawn = dcap({5: [run(0, " ", fg="#ff0000", bold=True), run(1, " " * 9)]})
+        self.assertTrue(compare(self.notice(), drawn, [r]).ok)
+
+    def test_cells_outside_the_region_are_still_compared(self):
+        r = rule("dropped", self.region(), reason="D6: no release notice")
+        drawn = dcap({9: [run(0, "stray     ")]})
+        self.assertEqual({(d.row, d.field) for d in compare(self.notice(), drawn, [r]).differences if d.column == 0},
+                         {(9, "text")})
+
+    def test_a_reason_without_a_decision_raises(self):
+        for reason in ("not needed", "D2: own copy", "D1: streaming", "D60", "D6", "d6: x"):
+            with self.subTest(reason=reason):
+                if reason == "D6":
+                    rule("dropped", self.region(), reason=reason)  # the bare decision is enough
+                    continue
+                with self.assertRaises(ValueError):
+                    rule("dropped", self.region(), reason=reason)
+        rule("dropped", self.region(), reason="D3: no survey")
+
+
+class DroppedGoldenTests(unittest.TestCase):
+    setUp = CompareGoldenTests.setUp
+    files = CompareGoldenTests.files
+
+    def spec(self, kind, region=None, **extra):
+        return dict({"region": region or {"rows": [5, 8], "cols": [0, 9]}, "kind": kind,
+                     "reason": "D6: no release notice"}, **extra)
+
+    def pair(self):
+        notice = {y: [run(0, "notice    ")] for y in range(5, 9)}
+        return dcap(notice), dcap({})
+
+    def test_the_d6_region_loads_on_an_exact_golden(self):
+        manifest, owners = self.files("exact", [self.spec("dropped")])
+        expected, actual = self.pair()
+        self.assertTrue(compare_golden(expected, actual, manifest, owners).ok)
+
+    def test_it_loads_on_a_structure_golden_too(self):
+        manifest, owners = self.files("structure", [self.spec("dropped")])
+        expected, actual = self.pair()
+        self.assertTrue(compare_golden(expected, actual, manifest, owners).ok)
+
+    def test_a_whole_screen_dropped_rule_raises(self):
+        for region in ({"rows": [0, 11], "cols": [0, 9]}, {"rows": [0, 2], "cols": [0, 9]},
+                       {"rows": [4, 8], "cols": [0, 9]}, {"rows": [5, 9], "cols": [0, 9]},
+                       {"rows": [5, 8], "cols": [0, 160]}):
+            with self.subTest(region=region):
+                manifest, owners = self.files("exact", [self.spec("dropped", region)])
+                expected, actual = self.pair()
+                with self.assertRaises(ValueError):
+                    compare_golden(expected, actual, manifest, owners)
+
+    def test_a_smaller_region_inside_d6_is_allowed(self):
+        from cc2316_compare import load_rules
+        manifest, owners = self.files("exact", [self.spec("dropped", {"rows": [6, 7], "cols": [2, 5]})])
+        self.assertEqual(len(load_rules("g1", manifest, owners)), 1)
+
+    def test_a_reason_naming_a_decision_without_a_listed_region_raises(self):
+        manifest, owners = self.files("exact", [dict(self.spec("dropped"), reason="D3: no survey")])
+        expected, actual = self.pair()
+        with self.assertRaises(ValueError):
+            compare_golden(expected, actual, manifest, owners)
+
+    def test_a_reason_without_a_decision_raises_from_the_manifest(self):
+        manifest, owners = self.files("exact", [dict(self.spec("dropped"), reason="not drawn")])
+        expected, actual = self.pair()
+        with self.assertRaises(ValueError):
+            compare_golden(expected, actual, manifest, owners)
+
+    def test_an_exception_golden_still_takes_no_rule(self):
+        manifest, owners = self.files("exception", [self.spec("dropped")], reason="D1: test")
+        expected, actual = self.pair()
+        with self.assertRaises(ValueError):
+            compare_golden(expected, actual, manifest, owners)
+
+    def test_draw_in_the_region_fails_through_the_manifest(self):
+        manifest, owners = self.files("exact", [self.spec("dropped")])
+        expected, _ = self.pair()
+        drawn = dcap({6: [run(0, "DaVinci   ")]})
+        self.assertFalse(compare_golden(expected, drawn, manifest, owners).ok)
+
+    def test_the_committed_manifest_only_drops_the_d6_region(self):
+        from cc2316_compare import DEFAULT_RULES, DROPPED_REGIONS
+        data = json.loads(Path(DEFAULT_RULES).read_text(encoding="utf-8"))
+        box_ = DROPPED_REGIONS["D6"]
+        seen = 0
+        for name, specs in data["goldens"].items():
+            for spec in specs:
+                if spec["kind"] != "dropped":
+                    continue
+                seen += 1
+                (r0, r1), (c0, c1) = spec["region"]["rows"], spec["region"]["cols"]
+                self.assertTrue(box_["rows"][0] <= r0 and r1 <= box_["rows"][1]
+                                and box_["cols"][0] <= c0 and c1 <= box_["cols"][1], name)
+        self.assertGreater(seen, 0)
+
+
 class LoaderTests(unittest.TestCase):
     def test_load_capture_round_trip_and_rejects_non_capture(self):
         import tempfile

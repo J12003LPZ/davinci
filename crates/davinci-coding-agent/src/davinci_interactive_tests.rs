@@ -2638,6 +2638,20 @@ fn first_run_asks_only_what_davinci_cannot_decide_for_itself() {
 }
 
 #[test]
+fn the_question_after_the_welcome_steps_is_the_analytics_one_and_grants_no_trust() {
+    // The steps end in this question and nothing else: it offers no trust,
+    // permission or credential choice, and it is unchanged by the steps.
+    let agent = davinci_agent::Agent::new("test");
+    let panel = Question::FirstRun.ask(&agent);
+    for item in &panel.items {
+        let text = format!("{} {}", item.label, item.detail).to_lowercase();
+        assert!(!text.contains("trust") && !text.contains("allow"), "{text}");
+    }
+    assert_eq!(panel.items.len(), 2);
+    assert!(panel.note.contains("usage data"));
+}
+
+#[test]
 fn an_untrusted_project_with_pi_resources_is_warned_about_by_glyph() {
     let dir = tempfile::tempdir().unwrap();
     let _agent_dir = AgentDirEnv::set(dir.path().join("agent"));

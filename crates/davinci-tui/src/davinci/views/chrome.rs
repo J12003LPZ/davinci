@@ -653,6 +653,20 @@ fn effort_label(model: &Model) -> Option<String> {
 
 pub fn effort_rule(model: &Model) -> Line<'static> {
     let cc = model.theme.cc();
+    // The reference sets the effort in the rule itself, two cells from the edge.
+    if let Some(label) = model.reference.then(|| effort_label(model)).flatten() {
+        let bars = usize::from(model.width)
+            .saturating_sub(unicode_width::UnicodeWidthStr::width(label.as_str()) + 3);
+        if bars > 0 {
+            return Line::from(vec![
+                span("▔".repeat(bars), cc.permission),
+                span(" ", model.theme.text),
+                span(label, cc.inactive),
+                span(" ", model.theme.text),
+                span("▔", cc.permission),
+            ]);
+        }
+    }
     Line::from(span("▔".repeat(model.width as usize), cc.permission))
 }
 /// Rows for the composer plus its hint row. Grows with content. The box takes

@@ -26,6 +26,12 @@ golden from ``cc2316_rules.json`` (empty until a task earns an entry) and reject
 * ``data``: text is ignored inside the box; style is compared.
 * ``structure``: like ``data``, and the wide-glyph geometry (which columns are the
   second half of a wide glyph) is compared too.
+* ``dropped``: a surface DaVinci does not draw (decision D3 or D6, cited in the reason).
+  The expected cells are ignored and every actual cell in the box must be blank: a space
+  that passes the comparison's own blank test (no underline, strike or inverse; the
+  invisible fg, bold, dim, italic and blink are not looked at) with the capture's default
+  background. Anything drawn there is a ``dropped`` difference, so the rule cannot hide a
+  defect. ``compare_golden`` accepts it only inside ``DROPPED_REGIONS``.
 
 What is compared outside the grid, and how:
 
@@ -58,6 +64,7 @@ cursor shape as unverified) and buffer ``length``/``baseY``/``viewportY``.
 from __future__ import annotations
 
 import json
+import re
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,8 +75,14 @@ MODE_FIELDS = ("alternate_screen", "mouse_click", "mouse_drag", "mouse_move", "m
                "synchronized_output")
 _STYLE_DEFAULTS = {"fg": None, "bg": None, "bold": False, "dim": False, "italic": False,
                    "underline": False, "strike": False, "inverse": False, "blink": False}
-KINDS = ("mark", "identity", "data", "structure")
+KINDS = ("mark", "identity", "data", "structure", "dropped")
 MARK_BOX = {"rows": (1, 3), "cols": (0, 9)}  # the header mark of the plan, "Region rules"
+# A ``dropped`` rule names the decision that removed a surface. Only the regions listed here
+# may be dropped, and ``load_rules`` rejects any other: D6 is the release notice in rows 5-8
+# (columns 0-159 take in the widest golden). D3's surfaces are not listed because none has
+# a region yet.
+DROPPED_REGIONS = {"D6": {"rows": (5, 8), "cols": (0, 159)}}
+_DECISION = re.compile(r"\bD[36]\b")
 _MISSING = object()
 _CONT = ""  # text of the second column of a wide glyph
 
@@ -128,11 +141,18 @@ class Rule:
                 and MARK_BOX["cols"][0] <= c0 and c1 <= MARK_BOX["cols"][1]):
             raise ValueError(f"a mark must sit inside rows {MARK_BOX['rows']}, "
                              f"columns {MARK_BOX['cols']}, got {self.region!r}")
+        if self.kind == "dropped" and not _DECISION.search(self.reason):
+            raise ValueError("a dropped rule's reason must cite decision D3 or D6")
         if self.kind == "identity":
             if not self.substitutions or any(not k for k in self.substitutions):
                 raise ValueError("an identity rule needs a substitution table with non-empty keys")
         elif self.substitutions is not None:
             raise ValueError("only identity rules take substitutions")
+
+    def decision(self) -> str | None:
+        """The decision (``D3`` or ``D6``) a dropped rule's reason cites."""
+        found = _DECISION.search(self.reason)
+        return found.group(0) if found else None
 
     def contains(self, row: int, col: int) -> bool:
         return self.row0 <= row <= self.row1 and self.col0 <= col <= self.col1
@@ -348,6 +368,12 @@ def _hide_invisible(cell: tuple) -> tuple:
     return cell[0], tuple(named[k] for k in STYLE_FIELDS)
 
 
+def _dropped_blank(cell: tuple, blank: tuple) -> bool:
+    """A blank cell of the capture: a plain blank (see ``_plain_blank``) on its default bg."""
+    named, default = dict(zip(STYLE_FIELDS, cell[1])), dict(zip(STYLE_FIELDS, blank[1]))
+    return _plain_blank(cell) and named["bg"] == default["bg"]
+
+
 def _compare_pair(row, col, left, right, ignore_text, geometry, out):
     if left is None or right is None:
         out.append(Difference(row, col, "outside-grid", left, right))
@@ -401,6 +427,10 @@ def compare(expected: dict, actual: dict, rules=()) -> DiffReport:
                 continue
             left = _cell_at(ecells, row, col, erows, ecols, eblank)
             right = _cell_at(acells, row, col, arows, acols, ablank)
+            if rule is not None and rule.kind == "dropped":
+                if right is None or not _dropped_blank(right, ablank):
+                    out.append(Difference(row, col, "dropped", "blank", right))
+                continue
             if rule is not None and rule.kind == "identity":
                 if (row, col) not in identity:
                     continue  # the identity failure was already reported
@@ -431,6 +461,13 @@ def load_rules(name: str, manifest_path=DEFAULT_RULES, owners_path=DEFAULT_OWNER
             raise ValueError(f"golden {name!r} is an exception; it takes no rules")
         if rule.kind == "structure" and tier != "structure":
             raise ValueError(f"a structure rule needs golden {name!r} to be tier structure, not {tier!r}")
+        if rule.kind == "dropped":
+            listed = DROPPED_REGIONS.get(rule.decision())
+            if listed is None or not (listed["rows"][0] <= rule.row0 and rule.row1 <= listed["rows"][1]
+                                      and listed["cols"][0] <= rule.col0 and rule.col1 <= listed["cols"][1]):
+                raise ValueError(f"golden {name!r}: a dropped rule must lie inside the region listed "
+                                 f"for its decision in DROPPED_REGIONS, got {rule.region!r} for "
+                                 f"{rule.decision()!r}")
         rules.append(rule)
     return rules
 

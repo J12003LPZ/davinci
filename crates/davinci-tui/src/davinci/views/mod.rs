@@ -37,6 +37,7 @@ pub mod mcp;
 pub mod memoria;
 pub mod mensura;
 pub mod officina;
+pub mod onboarding;
 pub mod opera;
 pub mod permissions;
 pub mod picker;

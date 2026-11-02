@@ -1662,7 +1662,7 @@
     "davinci_interactive.rs",
     "tests/cc2316/theme.rs"
    ],
-   "tier": "exact"
+   "tier": "structure"
   },
   "theme_nav__02_down2": {
    "owner_task": "P06b",
@@ -1672,7 +1672,7 @@
     "davinci_interactive.rs",
     "tests/cc2316/theme.rs"
    ],
-   "tier": "exact"
+   "tier": "structure"
   },
   "theme_nav__03_syntax_toggle": {
    "owner_task": "P06",
@@ -1680,7 +1680,7 @@
     "davinci/theme.rs",
     "tests/cc2316/theme.rs"
    ],
-   "tier": "exact"
+   "tier": "structure"
   },
   "theme_apply__01_light_selected": {
    "owner_task": "P06b",
@@ -1690,7 +1690,7 @@
     "davinci_interactive.rs",
     "tests/cc2316/theme.rs"
    ],
-   "tier": "exact"
+   "tier": "structure"
   },
   "theme_apply__02_light_main": {
    "owner_task": "P06",

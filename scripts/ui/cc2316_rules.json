@@ -68,6 +68,20 @@
      "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
     },
     "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
    }
   ],
   "keys_panels__08_ctrl_c": [
@@ -137,6 +151,20 @@
      "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
     },
     "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
    }
   ],
   "layout_sizes__01_120x44": [
@@ -206,6 +234,20 @@
      "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
     },
     "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
    }
   ],
   "layout_sizes__02_100x30": [
@@ -482,6 +524,20 @@
      "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
     },
     "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      159
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
    }
   ],
   "layout_sizes__06_120x18": [
@@ -551,6 +607,1932 @@
      "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
     },
     "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "ansi_theme__02_settled": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   }
+  ],
+  "context_cmd__02_context_empty": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "context_cmd__03_context_settled": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "esc_clear__01_esc1": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "esc_clear__02_esc2": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "external_editor__01_after_editor": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "help_tabs__01_general": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "help_tabs__03_custom": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "image_paste__02_after_typing": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "keys_panels__01_mode1": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "keys_panels__02_mode2": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "keys_panels__03_mode3": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "keys_panels__04_mode4": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "keys_panels__05_todos": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "keys_panels__06_history": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "model_nav__01_model": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "model_nav__02_effort_right": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "model_nav__03_session_only": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "paste_large__01_paste_12k": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "paste_large__03_unicode": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "paste_only__01_paste": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "permissions_tabs__01_perms": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "permissions_tabs__03_tab4": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "slash_only__01_slash": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "slash_only__02_tab": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "theme_apply__01_light_selected": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "region": {
+     "rows": [
+      24,
+      24
+     ],
+     "cols": [
+      3,
+      58
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sentence under the title is DaVinci's own (D2); it takes the same 56 cells, bold."
+   },
+   {
+    "region": {
+     "rows": [
+      33,
+      33
+     ],
+     "cols": [
+      7,
+      23
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own Vox entry stands in the last row, where the reference lists its custom-theme entry (D2); only its text differs."
+   },
+   {
+    "region": {
+     "rows": [
+      36,
+      36
+     ],
+     "cols": [
+      3,
+      24
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's first line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      37,
+      37
+     ],
+     "cols": [
+      3,
+      37
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's removed line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      38,
+      38
+     ],
+     "cols": [
+      3,
+      38
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's added line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      39,
+      39
+     ],
+     "cols": [
+      3,
+      7
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's last line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   }
+  ],
+  "theme_apply__02_light_main": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   }
+  ],
+  "theme_nav__01_theme": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "region": {
+     "rows": [
+      26,
+      26
+     ],
+     "cols": [
+      3,
+      58
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sentence under the title is DaVinci's own (D2); it takes the same 56 cells, bold."
+   },
+   {
+    "region": {
+     "rows": [
+      35,
+      35
+     ],
+     "cols": [
+      7,
+      23
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own Vox entry stands in the last row, where the reference lists its custom-theme entry (D2); only its text differs."
+   },
+   {
+    "region": {
+     "rows": [
+      38,
+      38
+     ],
+     "cols": [
+      3,
+      24
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's first line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      39,
+      39
+     ],
+     "cols": [
+      3,
+      37
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's removed line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      40,
+      40
+     ],
+     "cols": [
+      3,
+      38
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's added line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      41,
+      41
+     ],
+     "cols": [
+      3,
+      7
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's last line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      43,
+      43
+     ],
+     "cols": [
+      3,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Monokai Extended": "DaVinci"
+    },
+    "reason": "The footer names the syntax theme; DaVinci names its own."
+   }
+  ],
+  "theme_nav__02_down2": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "region": {
+     "rows": [
+      26,
+      26
+     ],
+     "cols": [
+      3,
+      58
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sentence under the title is DaVinci's own (D2); it takes the same 56 cells, bold."
+   },
+   {
+    "region": {
+     "rows": [
+      35,
+      35
+     ],
+     "cols": [
+      7,
+      23
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own Vox entry stands in the last row, where the reference lists its custom-theme entry (D2); only its text differs."
+   },
+   {
+    "region": {
+     "rows": [
+      38,
+      38
+     ],
+     "cols": [
+      3,
+      24
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's first line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      39,
+      39
+     ],
+     "cols": [
+      3,
+      37
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's removed line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      40,
+      40
+     ],
+     "cols": [
+      3,
+      38
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's added line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      41,
+      41
+     ],
+     "cols": [
+      3,
+      7
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's last line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      43,
+      43
+     ],
+     "cols": [
+      3,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Monokai Extended": "DaVinci"
+    },
+    "reason": "The footer names the syntax theme; DaVinci names its own."
+   }
+  ],
+  "theme_nav__03_syntax_toggle": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "region": {
+     "rows": [
+      26,
+      26
+     ],
+     "cols": [
+      3,
+      58
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sentence under the title is DaVinci's own (D2); it takes the same 56 cells, bold."
+   },
+   {
+    "region": {
+     "rows": [
+      35,
+      35
+     ],
+     "cols": [
+      7,
+      23
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own Vox entry stands in the last row, where the reference lists its custom-theme entry (D2); only its text differs."
+   },
+   {
+    "region": {
+     "rows": [
+      38,
+      38
+     ],
+     "cols": [
+      3,
+      24
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's first line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      39,
+      39
+     ],
+     "cols": [
+      3,
+      37
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's removed line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      40,
+      40
+     ],
+     "cols": [
+      3,
+      38
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's added line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      41,
+      41
+     ],
+     "cols": [
+      3,
+      7
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's last line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   }
+  ],
+  "tui_panel__02_tui_panel": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "vim_mode__04_dw": [
+   {
+    "region": {
+     "rows": [
+      5,
+      8
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "kind": "dropped",
+    "reason": "D6: the release notice in rows 5-8 announces a Claude Code change and has no DaVinci purpose; these cells must be blank"
+   }
+  ],
+  "onboarding__01_onboarding": [
+   {
+    "region": {
+     "rows": [
+      0,
+      0
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's, as in the header."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      0,
+      57
+     ]
+    },
+    "kind": "structure",
+    "reason": "The band of dots is DaVinci's own (D2); only its text is left out."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      0,
+      52
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      4,
+      4
+     ],
+     "cols": [
+      0,
+      54
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      5,
+      5
+     ],
+     "cols": [
+      0,
+      46
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      6,
+      6
+     ],
+     "cols": [
+      0,
+      46
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      7,
+      7
+     ],
+     "cols": [
+      0,
+      54
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      8,
+      8
+     ],
+     "cols": [
+      0,
+      53
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      9,
+      9
+     ],
+     "cols": [
+      0,
+      38
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      10,
+      10
+     ],
+     "cols": [
+      0,
+      40
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      11,
+      11
+     ],
+     "cols": [
+      0,
+      46
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      12,
+      12
+     ],
+     "cols": [
+      0,
+      56
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      13,
+      13
+     ],
+     "cols": [
+      0,
+      41
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      14,
+      14
+     ],
+     "cols": [
+      0,
+      22
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      15,
+      15
+     ],
+     "cols": [
+      0,
+      57
+     ]
+    },
+    "kind": "structure",
+    "reason": "The band of dots is DaVinci's own (D2); only its text is left out."
+   },
+   {
+    "region": {
+     "rows": [
+      17,
+      17
+     ],
+     "cols": [
+      1,
+      18
+     ]
+    },
+    "kind": "structure",
+    "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
+   },
+   {
+    "region": {
+     "rows": [
+      19,
+      19
+     ],
+     "cols": [
+      1,
+      56
+     ]
+    },
+    "kind": "structure",
+    "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
+   },
+   {
+    "region": {
+     "rows": [
+      20,
+      20
+     ],
+     "cols": [
+      1,
+      32
+     ]
+    },
+    "kind": "structure",
+    "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
+   },
+   {
+    "region": {
+     "rows": [
+      31,
+      31
+     ],
+     "cols": [
+      1,
+      22
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      32,
+      32
+     ],
+     "cols": [
+      1,
+      35
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      33,
+      33
+     ],
+     "cols": [
+      1,
+      36
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      34,
+      34
+     ],
+     "cols": [
+      1,
+      5
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   }
+  ],
+  "onboarding__03_after_enter": [
+   {
+    "region": {
+     "rows": [
+      0,
+      0
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's, as in the header."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      0,
+      57
+     ]
+    },
+    "kind": "structure",
+    "reason": "The band of dots is DaVinci's own (D2); only its text is left out."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      0,
+      52
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      4,
+      4
+     ],
+     "cols": [
+      0,
+      54
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      5,
+      5
+     ],
+     "cols": [
+      0,
+      46
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      6,
+      6
+     ],
+     "cols": [
+      0,
+      46
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      7,
+      7
+     ],
+     "cols": [
+      0,
+      54
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      8,
+      8
+     ],
+     "cols": [
+      0,
+      53
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      9,
+      9
+     ],
+     "cols": [
+      0,
+      38
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      10,
+      10
+     ],
+     "cols": [
+      0,
+      40
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      11,
+      11
+     ],
+     "cols": [
+      0,
+      46
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      12,
+      12
+     ],
+     "cols": [
+      0,
+      56
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      13,
+      13
+     ],
+     "cols": [
+      0,
+      41
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      14,
+      14
+     ],
+     "cols": [
+      0,
+      22
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own art (D2 and the plan): the starfield is not copied, so only the text of these cells is left out of the comparison."
+   },
+   {
+    "region": {
+     "rows": [
+      15,
+      15
+     ],
+     "cols": [
+      0,
+      57
+     ]
+    },
+    "kind": "structure",
+    "reason": "The band of dots is DaVinci's own (D2); only its text is left out."
+   },
+   {
+    "region": {
+     "rows": [
+      17,
+      17
+     ],
+     "cols": [
+      1,
+      15
+     ]
+    },
+    "kind": "structure",
+    "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
+   },
+   {
+    "region": {
+     "rows": [
+      19,
+      19
+     ],
+     "cols": [
+      1,
+      28
+     ]
+    },
+    "kind": "structure",
+    "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
+   },
+   {
+    "region": {
+     "rows": [
+      20,
+      20
+     ],
+     "cols": [
+      1,
+      60
+     ]
+    },
+    "kind": "structure",
+    "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
+   },
+   {
+    "region": {
+     "rows": [
+      21,
+      21
+     ],
+     "cols": [
+      1,
+      45
+     ]
+    },
+    "kind": "structure",
+    "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
+   },
+   {
+    "region": {
+     "rows": [
+      23,
+      23
+     ],
+     "cols": [
+      1,
+      65
+     ]
+    },
+    "kind": "structure",
+    "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
+   },
+   {
+    "region": {
+     "rows": [
+      24,
+      24
+     ],
+     "cols": [
+      1,
+      55
+     ]
+    },
+    "kind": "structure",
+    "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
+   },
+   {
+    "region": {
+     "rows": [
+      26,
+      26
+     ],
+     "cols": [
+      1,
+      24
+     ]
+    },
+    "kind": "structure",
+    "reason": "The press-Enter line is DaVinci's own wording (D2); structure only."
    }
   ]
  }

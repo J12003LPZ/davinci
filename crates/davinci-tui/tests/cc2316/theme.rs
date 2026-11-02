@@ -300,18 +300,24 @@ fn the_picker_only_opens_for_the_reference() {
 #[test]
 fn it_lists_only_themes_davinci_has() {
     let names: Vec<_> = theme_picker::ENTRIES.iter().map(|entry| entry.0).collect();
+    // The reference's order, with DaVinci's own Vox last, where the reference
+    // has its custom-theme entry.
     assert_eq!(
         names,
         [
             "auto",
             "dark",
             "light",
-            "vox",
             "daltonized",
             "light-daltonized",
-            "ansi"
+            "ansi",
+            "light-ansi",
+            "vox"
         ]
     );
+    let labels: Vec<_> = theme_picker::ENTRIES.iter().map(|entry| entry.1).collect();
+    assert_eq!(labels[6], "Light mode (ANSI colors only)");
+    assert_eq!(labels[7], "Vox mode");
     // Each one resolves to a palette; none is invented for the picker.
     let base = on(ColorDepth::TrueColor);
     for name in names {
@@ -333,7 +339,7 @@ fn moving_previews_each_theme_and_escape_restores_the_old_one() {
         app::handle_key(&mut model, key(KeyCode::Down)),
         Flow::Continue
     );
-    assert_eq!(model.theme, before.with_name("vox"));
+    assert_eq!(model.theme, before.with_name("daltonized"));
     assert_eq!(
         app::handle_key(&mut model, key(KeyCode::Up)),
         Flow::Continue
@@ -473,8 +479,10 @@ fn picking_dark_in_the_picker_after_a_vox_start_gives_the_reference_palette() {
         .with_name("vox")
         .with_reference(true);
     assert!(theme_picker::open(&mut model, "vox"));
-    app::handle_key(&mut model, key(KeyCode::Up));
-    app::handle_key(&mut model, key(KeyCode::Up));
+    // Vox is the last row: six rows up to Dark.
+    for _ in 0..6 {
+        app::handle_key(&mut model, key(KeyCode::Up));
+    }
     assert_eq!(
         theme_picker::ENTRIES[model.theme_picker.as_ref().unwrap().index].0,
         "dark"
@@ -500,6 +508,87 @@ fn leaving_ansi_returns_to_the_terminals_own_depth() {
     }
 }
 
+fn is_named(color: Color) -> bool {
+    !matches!(color, Color::Rgb(..) | Color::Indexed(_))
+}
+
+#[test]
+fn light_ansi_is_the_light_basic_ramp_at_every_terminal_depth() {
+    // `ansi` narrows the theme to the sixteen named colours whatever the terminal
+    // negotiated, and so does its light twin.
+    let basic_light = Theme::da_vinci(ColorDepth::Basic, false).with_name("light");
+    for depth in [
+        ColorDepth::TrueColor,
+        ColorDepth::Ansi256,
+        ColorDepth::Basic,
+    ] {
+        let theme = on(depth).with_name("light-ansi");
+        assert!(theme.reference, "{depth:?}");
+        assert!(theme.wants_reference, "{depth:?}");
+        assert_eq!(
+            theme,
+            Theme {
+                reference: true,
+                wants_reference: true,
+                negotiated: depth,
+                ..basic_light
+            },
+            "{depth:?}"
+        );
+        assert_ne!(theme, on(depth).with_name("ansi"), "{depth:?}");
+        let cc = theme.cc();
+        for colour in [
+            theme.background,
+            theme.text,
+            theme.primary,
+            theme.success,
+            theme.error,
+            cc.permission,
+            cc.inactive,
+            cc.subtle,
+            cc.diff_add_bg,
+            cc.diff_del_bg,
+            cc.diff_text,
+        ] {
+            assert!(is_named(colour), "{depth:?}: {colour:?}");
+        }
+    }
+}
+
+#[test]
+fn leaving_light_ansi_returns_to_the_terminals_own_depth() {
+    for depth in [ColorDepth::TrueColor, ColorDepth::Ansi256] {
+        let light_ansi = on(depth).with_name("light-ansi");
+        for name in ["dark", "light", "daltonized", "ansi", "vox"] {
+            assert_eq!(
+                light_ansi.with_name(name),
+                on(depth).with_name(name),
+                "{depth:?} {name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn with_the_setting_off_light_ansi_is_an_unknown_name_like_any_other() {
+    // Nothing of the new name leaks into the shell as it is today: it resolves
+    // to the native dark theme at the terminal's depth, as `pi` does.
+    for depth in [
+        ColorDepth::TrueColor,
+        ColorDepth::Ansi256,
+        ColorDepth::Basic,
+    ] {
+        let base = Theme::da_vinci(depth, false);
+        let theme = base.with_name("light-ansi");
+        assert_eq!(theme, base.with_name("pi"), "{depth:?}");
+        assert_eq!(theme, base, "{depth:?}");
+        assert!(!theme.reference && !theme.wants_reference, "{depth:?}");
+    }
+    // NO_COLOR keeps winning when the setting is on.
+    let plain = Theme::reference(ColorDepth::TrueColor, true).with_name("light-ansi");
+    assert!(plain.no_color && !plain.reference);
+}
+
 #[test]
 fn the_picker_previews_and_applies_at_the_terminals_depth_after_ansi() {
     let mut model = picker_model();
@@ -516,7 +605,6 @@ fn the_picker_previews_and_applies_at_the_terminals_depth_after_ansi() {
         "daltonized"
     );
     assert_eq!(model.theme.cc().permission, rgb(0x99CCFF), "the preview");
-    app::handle_key(&mut model, key(KeyCode::Up));
     app::handle_key(&mut model, key(KeyCode::Up));
     app::handle_key(&mut model, key(KeyCode::Up));
     assert_eq!(
@@ -540,6 +628,62 @@ fn without_the_setting_ansi_still_sticks_and_no_color_still_wins() {
         .with_name("dark");
     assert!(plain.no_color);
     assert!(!plain.reference);
+}
+
+#[test]
+fn the_sent_theme_line_is_hidden_while_the_picker_is_open_and_answered_after() {
+    let mut model = picker_model();
+    model.composer.set_text("/theme");
+    model.submit();
+    assert!(theme_picker::open(&mut model, "dark"));
+    let rows = composed(&model, 46);
+    assert!(
+        rows.iter().all(|row| !row.contains("/theme")),
+        "the picker is the answer, nothing is echoed above it: {rows:?}"
+    );
+    assert!(rows.iter().any(|row| row.contains("Enter to select")));
+    // The prompt is still in the conversation, so the result hangs from it.
+    model.theme_picker = None;
+    model.confirm("Theme set to light", None);
+    let rows = composed(&model, 46);
+    let at = rows
+        .iter()
+        .position(|row| row.starts_with("❯ /theme"))
+        .unwrap_or_else(|| panic!("no prompt row: {rows:?}"));
+    assert!(rows[at + 1].contains("⎿") && rows[at + 1].contains("Theme set to light"));
+}
+
+#[test]
+fn the_pickers_top_rule_carries_the_effort_label_at_its_right_end() {
+    for width in [120u16, 80] {
+        let mut model = picker_model();
+        model.width = width;
+        model.thinking_level = "medium".into();
+        assert!(theme_picker::open(&mut model, "dark"));
+        let rule = text_of(&theme_picker::lines(&model))[0].clone();
+        let label = "◐ medium · /effort";
+        let bars = usize::from(width) - label.chars().count() - 3;
+        assert_eq!(rule, format!("{} {label} ▔", "▔".repeat(bars)));
+        // Thinking off: a plain rule.
+        model.thinking_level = "off".into();
+        let rule = text_of(&theme_picker::lines(&model))[0].clone();
+        assert_eq!(rule, "▔".repeat(usize::from(width)));
+    }
+}
+
+#[test]
+fn only_a_theme_line_still_waiting_for_its_picker_is_hidden() {
+    let mut model = picker_model();
+    model.composer.set_text("/theme");
+    model.submit();
+    model.confirm("Theme set to light", None);
+    model.composer.set_text("fix the build");
+    model.submit();
+    assert!(theme_picker::open(&mut model, "light"));
+    let rows = composed(&model, 46);
+    // An earlier, answered /theme and the next prompt stay where they were.
+    assert!(rows.iter().any(|row| row.starts_with("❯ /theme")));
+    assert!(rows.iter().any(|row| row.starts_with("❯ fix the build")));
 }
 
 #[test]
@@ -583,7 +727,8 @@ fn the_preview_sample_is_davincis_own_with_four_rows() {
     assert!(theme_picker::open(&mut model, "dark"));
     let rows = text_of(&theme_picker::lines(&model));
     let all = rows.join("\n");
-    for borrowed in ["greet", "console", "Hello", "World", "function"] {
+    // "function" is a keyword anyone may use; the sample's own keyword is as wide.
+    for borrowed in ["greet", "console", "Hello", "World"] {
         assert!(!all.contains(borrowed), "{borrowed:?} is the reference's");
     }
     let shape: Vec<_> = ["1 ", "2 -", "2 +", "3 "]
@@ -612,7 +757,8 @@ fn the_changed_rows_are_tinted_to_the_edge_at_any_width() {
                 .iter()
                 .find(|line| line.to_string().trim_start().starts_with(gutter))
                 .unwrap();
-            assert_eq!(line.width(), usize::from(width), "{gutter} at {width}");
+            // To the reference's three-cell margin at the right edge.
+            assert_eq!(line.width(), usize::from(width) - 3, "{gutter} at {width}");
         }
     }
 }
@@ -648,10 +794,11 @@ fn a_changed_word_keeps_the_rows_tint_where_its_own_is_unmeasured() {
     for (label, theme, tinted) in themes {
         let model = picker_on(theme);
         for gutter in ["2 -", "2 +"] {
-            // indent, gutter, text before, the changed word, text after, fill
+            // indent, gutter, text before, the changed word, then the rest
+            // (an added row splits it further)
             let spans = preview_row(&model, gutter);
             let row_bg = spans[1].style.bg;
-            assert!(spans.len() >= 6, "{spans:?}");
+            assert!(spans.len() >= 5, "{spans:?}");
             for span in &spans[1..] {
                 assert_eq!(span.style.bg, row_bg, "{label} {gutter}: {span:?}");
             }
@@ -664,8 +811,8 @@ fn a_changed_word_keeps_the_rows_tint_where_its_own_is_unmeasured() {
 
 #[test]
 fn an_unmeasured_function_ink_is_the_diff_text() {
-    // indent, number, keyword, space, function name, signature
-    let name = |theme: Theme| preview_row(&picker_on(theme), "1 ")[4].style.fg;
+    // indent, number, space, keyword, space, function name, signature
+    let name = |theme: Theme| preview_row(&picker_on(theme), "1 ")[5].style.fg;
     for theme in [
         on(ColorDepth::Ansi256),
         on(ColorDepth::TrueColor).with_name("light"),

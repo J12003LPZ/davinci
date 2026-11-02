@@ -260,6 +260,18 @@ fn ink(key: u8, palette: Palette) -> Option<Color> {
     })
 }
 
+/// The painter at rest (its first frame, which never moves), row by row, for
+/// the first-run welcome. Empty on a terminal with too few colours for it.
+pub fn sprite_rows(model: &Model) -> Vec<Vec<Span<'static>>> {
+    match palette(model) {
+        Some(palette) => {
+            let frame = &sheet(palette)[0];
+            frame.iter().map(|row| row[1..].to_vec()).collect()
+        }
+        None => Vec::new(),
+    }
+}
+
 /// Runs of one glyph, sliced from these so every span stays `'static`.
 const TOPS: &str = "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀";
 const BOTTOMS: &str = "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄";

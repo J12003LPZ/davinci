@@ -114,6 +114,16 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
             caret: None,
         };
     }
+    if model.onboarding.is_some() && model.overlay.is_none() {
+        return ComposedFrame {
+            lines: pad_to(super::views::onboarding::lines(model, height), height),
+            graph: None,
+            scrollbar: None,
+            suggestion_rows: None,
+            targets: Vec::new(),
+            caret: None,
+        };
+    }
     if model.theme_picker.is_some() && model.overlay.is_none() {
         let picker = super::views::theme_picker::fitted(model, height);
         let picker_height = picker.len();
@@ -123,6 +133,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
             ..model.clone()
         };
         context.graph_run = None;
+        super::views::theme_picker::without_pending_echo(&mut context.transcript);
         let mut lines = body(&context, height.saturating_sub(picker_height));
         lines = pad_to(lines, height.saturating_sub(picker_height));
         lines.extend(picker);
@@ -1249,6 +1260,9 @@ pub fn permission_cycle_chord(model: &Model, key: KeyEvent, data: &str) -> bool 
 pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     if key.kind == KeyEventKind::Release {
         return Flow::Continue;
+    }
+    if model.onboarding.is_some() {
+        return super::views::onboarding::handle_key(model, key);
     }
     if model.theme_picker.is_some() {
         return super::views::theme_picker::handle_key(model, key);

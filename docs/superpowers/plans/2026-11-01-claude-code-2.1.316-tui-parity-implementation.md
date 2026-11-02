@@ -35,6 +35,7 @@ These were taken on 2026-11-01 from the plan review. Each can be reversed, and r
 | D3 | **Drop Claude-only surfaces:** powerups, feedback survey, custom API-key consent, voice. | They have no DaVinci purpose. The survey would also imply sending data. | Add a task for each. |
 | D4 | **Everything ships behind an off-by-default setting** (`tui.reference`, overridable with `PI_DAVINCI_REFERENCE=1`, read once at `Session::open`). | `--legacy-tui` opens the older chrome, not today's shell, so it can't be the rollback for this work. | Keep the branch unmerged until every gate passes. |
 | D5 | **Keep the worktree.** | The main checkout is shared with other sessions. This is an exception to the usual no-worktree rule. | Work in the main checkout. |
+| D6 | **Drop one-off release announcements.** The four-row notice about a Claude Code default change, shown in rows 5–8 of the boot, layout and theme goldens, is not drawn. | It announces a Claude product change and has no DaVinci purpose. Those cells must be blank, checked by a `dropped` rule, so this cannot hide anything else. | Write a DaVinci notice for the same rows. |
 
 **Dropped goldens (4):** `powerup_modes__01_modes_lesson`, `powerup_modes__02_next_lesson`, `mock_stream2__00_key_dialog`, `voice_probe__02_voice`.
 
@@ -274,6 +275,8 @@ PR #275 merged as `543f9a3b`, and the branch has been moved to that commit. P01,
 **Reference:** ONBOARD-01, ONBOARD-02, checklist row 2. `onboarding__01_onboarding`, `onboarding__03_after_enter`. Trust gate is **(text)**.
 
 **Required:** Structure tier with DaVinci's own copy. The trust decision's meaning doesn't change.
+- Steps with the setting on: the welcome band with DaVinci's own art, the theme step, the security notes in DaVinci's own words, then DaVinci's existing analytics question.
+- First run stays gated as `should_run_first_time_setup` has it today. The interactive shell has no launch-time trust gate, only a warning and `/trust`. Don't add one here.
 
 ### P08: Editor
 

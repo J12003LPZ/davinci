@@ -5194,8 +5194,12 @@ pub fn run(
         &crate::default_agent_dir(),
     )) {
         pending = Some(Question::FirstRun);
-        model.ask = Question::FirstRun.ask(agent);
-        open_ask_overlay(&mut model);
+        // The reference shell walks the welcome steps first; the analytics
+        // question follows them. Everywhere else it is asked at once.
+        if !davinci_tui::davinci::views::onboarding::start(&mut model, "dark") {
+            model.ask = Question::FirstRun.ask(agent);
+            open_ask_overlay(&mut model);
+        }
     }
 
     // `pi "do the thing"` and `--file` open straight into a turn rather than
@@ -9896,10 +9900,20 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
         Choice::Setting(index) => cycle_setting(shell, index),
         // `/theme` picker — the same `theme=` write the settings row makes.
         Choice::Theme(name) => {
-            if let Err(err) = crate::persist_interactive_setting(&format!("theme={name}")) {
+            match crate::persist_interactive_setting(&format!("theme={name}")) {
+                // The result hangs from the `/theme` that asked for it.
+                Ok(()) => shell.model.confirm(&format!("Theme set to {name}"), None),
                 // The preview stays on screen; say that it was not saved.
-                shell.note(&err);
+                Err(err) => shell.note(&err),
             }
+            Next::Go
+        }
+        // The last welcome step ended: the analytics question comes next. The
+        // theme chosen stays in the model until that answer is saved.
+        Choice::OnboardingDone => {
+            shell.model.ask = Question::FirstRun.ask(shell.agent);
+            open_ask_overlay(shell.model);
+            *shell.pending = Some(Question::FirstRun);
             Next::Go
         }
         // `3c` — a thinking level.
@@ -10461,8 +10475,13 @@ fn answer(shell: &mut Shell<'_>, question: &Question, index: usize) -> Result<St
             let mut stored = crate::settings::load_settings(&dir);
             let share = index == 0;
             crate::settings::set_enable_analytics(&mut stored, share);
+            // The welcome's theme goes out in this one write, so a first run
+            // left partway stores nothing and is asked again. A failed write
+            // is a message; the steps are over either way.
+            if let Some(theme) = shell.model.first_run_theme.take() {
+                stored.theme = Some(theme);
+            }
             crate::settings::save_settings(&dir, &stored)?;
-            let _ = shell;
             Ok(if share {
                 "sharing anonymous usage data. change it any time in settings.".into()
             } else {
