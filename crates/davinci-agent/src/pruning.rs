@@ -77,7 +77,7 @@ impl PruneSettings {
 /// The text the provider sees in place of a pruned body.
 pub fn placeholder(tool_name: &str, chars: usize) -> String {
     format!(
-        "[output of {tool_name} pruned to save context ({chars} chars). Do not repeat the operation to recover output; consult retained evidence or session history.]"
+        "[output of {tool_name} pruned to save context ({chars} chars); class: tool_output. Do not repeat the operation to recover output; consult retained evidence or session history.]"
     )
 }
 
@@ -154,6 +154,7 @@ mod tests {
         let body = placeholder("bash", 7_000);
         assert!(!body.contains("Re-run"));
         assert!(body.contains("Do not repeat"));
+        assert!(body.contains("class: tool_output"));
     }
 
     fn tool_result(id: &str, chars: usize) -> ChatMessage {

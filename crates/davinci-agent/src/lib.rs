@@ -5034,6 +5034,7 @@ impl Agent {
             .collect::<Vec<_>>();
         let mut parent = parent;
         let mut chunks = 0usize;
+        let mut omitted_events = 0usize;
         // Oldest first, in chunks that each fit the summarizer's window, so
         // every unfolded event reaches the ledger. Each chunk is committed and
         // checkpointed before the next is asked for: a failure part-way keeps
@@ -5060,6 +5061,7 @@ impl Agent {
                     &self.provider,
                     &self.model_id,
                 ) {
+                    omitted_events += chunk.omitted;
                     chunk_len = chunk.covered;
                     request = Some(chunk.request);
                 }
@@ -5163,9 +5165,16 @@ impl Agent {
                 .unwrap_or_default();
         };
         if reason != runtime::context_vm::FoldReason::Manual {
+            let omitted_note = if omitted_events == 0 {
+                String::new()
+            } else {
+                format!(
+                    "; {omitted_events} event(s) could not be represented and remain retrievable by source reference"
+                )
+            };
             runtime.context_vm.push_notice(format!(
                 "Context VM folded ({}): epoch {}, checkpoint ~{before_tokens} -> ~{after_tokens} \
-                 tokens. Folded episodes stay recoverable with retrieve_context.",
+                 tokens{omitted_note}. Folded episodes stay recoverable with retrieve_context.",
                 reason.as_str(),
                 root.epoch
             ));

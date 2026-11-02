@@ -438,6 +438,17 @@ This file is `#[path]`-included into the lib's `#[cfg(test)]` module, already ha
 * Complete no-store case: stubbed `output_complete: true`, `retained_output: None`. Assert no marker and the status is `Completed`.
 * Do not put these in `codemode_contract.rs`; its `FixedHost` is `unreachable!()`, `ReadOnly` and `Controlled` require a trusted journal, and `run_codemode` is `pub(crate)`.
 
+### Phase B. Omission metadata
+
+Phase A already names the quantity and the recovery reference. Phase B makes the class and error flag explicit and surfaces the Context VM fold count:
+
+* The pruning placeholder says `class: tool_output`; it already names the byte and line counts, the call id, the outcome, and the evidence path.
+* The Governor trailer says `class: diagnostic` and reports diagnostics kept and omitted; it already names the output id.
+* The Codemode marker says `class: script_output; error: <bool>`; it already names the omitted bytes, the first omitted line, and the evidence path. The error flag is true for a failed, cancelled, or recovery-required run, or when a child failed.
+* The Context VM fold notice reports how many events the fold could not represent and names them as retrievable by source reference. The count also stays in the summarizer prompt.
+
+No new message type, store, or telemetry schema is added.
+
 ### Verification Plan
 
 * **Build:** `cargo build --workspace --offline --locked`

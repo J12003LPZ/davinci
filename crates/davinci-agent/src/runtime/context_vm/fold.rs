@@ -39,6 +39,9 @@ fn fold_record(event: &super::ContextEvent, cap: usize) -> String {
 pub(crate) struct FoldChunk {
     pub request: crate::compaction::SummarizeRequest,
     pub covered: usize,
+    /// Events the deterministic state carries because their record could not
+    /// fit even alone. The caller surfaces this count in the fold notice.
+    pub omitted: usize,
 }
 
 /// The next chunk of `events` (oldest first) for the summarizer, given the
@@ -120,6 +123,7 @@ pub(crate) fn fold_chunk(
             model_id: model_id.into(),
         },
         covered,
+        omitted,
     })
 }
 
@@ -307,6 +311,7 @@ mod request_tests {
         // Alone, the huge record cannot be shown: covered, and named.
         let second = chunk(&events[1..], 32_000);
         assert_eq!(second.covered, 1);
+        assert_eq!(second.omitted, 1);
         assert!(second.request.prompt.contains("\"omitted_events\":1"));
     }
 
