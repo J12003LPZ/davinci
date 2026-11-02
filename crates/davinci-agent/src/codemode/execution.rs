@@ -779,11 +779,16 @@ impl Agent {
             outcome.children = broker.children();
             // Capture the full pre-truncation body before anything else mutates
             // the outcome. The host measured the cut; this layer owns the store.
+            let session = context
+                .identity
+                .session_id
+                .as_deref()
+                .unwrap_or("sessionless");
             if let Some(body) = outcome.retained_output.take() {
                 let omitted_bytes = outcome.omitted_bytes;
                 let omitted_line = outcome.omitted_start_line.unwrap_or(1);
                 if let Some(evidence) = self.evidence.as_ref() {
-                    match evidence.store("script-output", &body) {
+                    match evidence.store_in_session(session, "script-output", &body) {
                         Ok(path) => {
                             outcome.output_artifact = Some(super::CodeModeArtifact {
                                 id: path.to_string_lossy().into_owned(),
@@ -812,11 +817,6 @@ impl Agent {
                 }
             }
             if let Some(evidence) = self.evidence.as_ref() {
-                let session = context
-                    .identity
-                    .session_id
-                    .clone()
-                    .unwrap_or_else(|| "sessionless".into());
                 let events = script_log_events(&outcome);
                 if let Ok(log) = super::ScriptLogStore::new(evidence.dir(), session)
                     .persist_script_log(&context.identity.invocation_id, &events)

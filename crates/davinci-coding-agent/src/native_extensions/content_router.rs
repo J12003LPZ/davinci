@@ -644,9 +644,11 @@ fn view_has_diagnostics(kind: ContentKind, content: &str) -> bool {
             let Ok(Value::Object(map)) = serde_json::from_str::<Value>(content.trim()) else {
                 return false;
             };
-            map.values()
-                .filter_map(Value::as_array)
-                .any(|items| selected_json_indices(items).diagnostics_kept > 0)
+            object_has_diagnostic(&map)
+                || map
+                    .values()
+                    .filter_map(Value::as_array)
+                    .any(|items| selected_json_indices(items).diagnostics_kept > 0)
         }
         _ => false,
     }
@@ -657,9 +659,13 @@ fn view_has_diagnostics(kind: ContentKind, content: &str) -> bool {
 /// as substrings made successful comparison records consume the diagnostic
 /// quota and pushed a real error out of the view.
 fn is_diagnostic_value(value: &Value) -> bool {
-    let Value::Object(map) = value else {
-        return value_has_failure_text(value);
-    };
+    match value {
+        Value::Object(map) => object_has_diagnostic(map),
+        _ => value_has_failure_text(value),
+    }
+}
+
+fn object_has_diagnostic(map: &serde_json::Map<String, Value>) -> bool {
     map.iter().any(|(key, value)| {
         let key = key.to_ascii_lowercase();
         match key.as_str() {

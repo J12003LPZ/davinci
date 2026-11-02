@@ -2759,7 +2759,9 @@ fn read_can_open_agent_evidence_under_deny_outside_root() {
     let (mut agent, workspace, _) = configured_agent();
     let evidence = tempfile::tempdir().unwrap();
     let store = crate::EvidenceStore::new(evidence.path());
-    let path = store.store("script-output", "RECOVERED EVIDENCE").unwrap();
+    let path = store
+        .store_in_session("sessionless", "script-output", "RECOVERED EVIDENCE")
+        .unwrap();
     agent.evidence = Some(store);
     agent.permissions = Arc::new(PermissionState::new(PermissionPolicy::new(
         PermissionMode::Ask,

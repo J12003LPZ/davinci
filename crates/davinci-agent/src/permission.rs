@@ -833,6 +833,9 @@ pub struct FilesystemBoundaryPolicy {
     /// read-boundary exception, like git metadata, so recovered tool output is
     /// reachable even when reads outside the workspace are denied.
     pub evidence_root: Option<PathBuf>,
+    /// Hash of the active session id. Only evidence files whose names carry
+    /// this token are admitted by the exception.
+    pub evidence_session_token: Option<String>,
     /// Canonical directories the user made writable beside `root`
     /// (`--add-dir`, `permissions.additionalDirectories`). A path inside one
     /// is not outside the project, but its rule subject stays absolute.
@@ -1033,8 +1036,9 @@ impl PermissionPolicy {
     }
 
     /// Point the read-boundary exception at the agent's own evidence store.
-    pub fn set_evidence_root(&mut self, root: Option<PathBuf>) {
+    pub fn set_evidence_access(&mut self, root: Option<PathBuf>, session_token: Option<String>) {
         self.filesystem_boundary.evidence_root = root;
+        self.filesystem_boundary.evidence_session_token = session_token;
     }
 
     /// Whether reads may follow a hard link out of the workspace. The link
@@ -1082,11 +1086,20 @@ impl PermissionPolicy {
 
     /// A read under the agent's own evidence directory. This is a narrow
     /// exception to the workspace read boundary, not a bypass of deny rules.
+    /// The path is canonicalized so a symlink cannot escape the store, and the
+    /// filename must carry the active session's token so another session's
+    /// artifact is not admitted.
     fn is_evidence_target(&self, cwd: &Path, targets: &[permission_risk::FileTarget]) -> bool {
-        let Some(root) = self.filesystem_boundary.evidence_root.as_deref() else {
+        let (Some(root), Some(token)) = (
+            self.filesystem_boundary.evidence_root.as_deref(),
+            self.filesystem_boundary.evidence_session_token.as_deref(),
+        ) else {
             return false;
         };
-        let root = normalize_lexically(root);
+        let Ok(root) = root.canonicalize() else {
+            return false;
+        };
+        let prefix = format!("s{token}-");
         targets.iter().any(|target| {
             let given = Path::new(&target.subject);
             let joined = if given.is_absolute() {
@@ -1094,7 +1107,14 @@ impl PermissionPolicy {
             } else {
                 cwd.join(given)
             };
-            normalize_lexically(&joined).starts_with(&root)
+            let Ok(canonical) = joined.canonicalize() else {
+                return false;
+            };
+            canonical.starts_with(&root)
+                && canonical
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
         })
     }
 

@@ -33,6 +33,22 @@ impl EvidenceStore {
     /// path the model can `read`. Failure is reported, not hidden: the
     /// caller then keeps the truncation note without a path.
     pub fn store(&self, tag: &str, text: &str) -> Result<PathBuf, String> {
+        self.store_named("", tag, text)
+    }
+
+    /// Write evidence bound to one session. The file name carries a hash of
+    /// the session id so the read-boundary exception can admit the current
+    /// session's artifacts without admitting another session's.
+    pub fn store_in_session(
+        &self,
+        session_id: &str,
+        tag: &str,
+        text: &str,
+    ) -> Result<PathBuf, String> {
+        self.store_named(&format!("s{}-", session_token(session_id)), tag, text)
+    }
+
+    fn store_named(&self, prefix: &str, tag: &str, text: &str) -> Result<PathBuf, String> {
         std::fs::create_dir_all(&self.dir).map_err(|err| err.to_string())?;
         #[cfg(unix)]
         {
@@ -52,7 +68,7 @@ impl EvidenceStore {
             .take(40)
             .collect();
         let name = format!(
-            "{safe_tag}-{}.txt",
+            "{prefix}{safe_tag}-{}.txt",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         );
         let path = self.dir.join(name);
@@ -142,6 +158,16 @@ impl EvidenceStore {
         }
         removed
     }
+}
+
+/// Stable, non-reversible token for a session's evidence filenames. The raw
+/// session id never appears in a path the model can read.
+pub fn session_token(session_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(session_id.as_bytes());
+    let digest = format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()));
+    digest[..12].to_string()
 }
 
 /// Cut `text` at a char boundary at or before `cap` bytes.

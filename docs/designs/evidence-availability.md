@@ -134,7 +134,7 @@ Exact algorithm:
 
 `json_identity` keeps its current behavior: the first present key from `IDENTITY_KEYS` (`id`, `name`, `path`, `file`, `line`, `status`, `type`, `error`, `message`), rendered as `key=value`.
 
-Diagnostics are classified from structured fields and values, not from ordinary field names. A record counts when a status-like field (`status`, `level`, `severity`, `result`, `outcome`) names a failure; when `error`, `failure`, `panic`, or `exception` is non-null and not `false`; when `exitCode` or `exit_code` is non-zero; when `passed`, `success`, or `ok` is `false`; or when `failed` is `true` or greater than zero. Free text counts only for explicit failure markers such as `panic`, `assertion failed`, `error:`, or `traceback`. `expected` and `actual` are ordinary data and do not consume the diagnostic quota.
+Diagnostics are classified from structured fields and values, not from ordinary field names. A record counts when a status-like field (`status`, `level`, `severity`, `result`, `outcome`) names a failure; when `error`, `failure`, `panic`, or `exception` is non-null and not `false`; when `exitCode` or `exit_code` is non-zero; when `passed`, `success`, or `ok` is `false`; or when `failed` is `true` or greater than zero. Free text counts only for explicit failure markers such as `panic`, `assertion failed`, `error:`, or `traceback`. `expected` and `actual` are ordinary data and do not consume the diagnostic quota. For `JsonObject`, the same structured check runs on top-level fields, not only on array values.
 
 Change `retrieval_trailer` to:
 
@@ -251,9 +251,11 @@ The evidence directory is a narrow read-boundary exception, like git metadata. T
 
 ### 5. Evidence store facts
 
-`EvidenceStore` is one flat directory per agent: `~/.davinci/agent/evidence`, constructed at `crates/davinci-coding-agent/src/main.rs:1275-1277`. Files are named `<tag>-<uuid>.txt` and are readable by `read` with offset and limit. The directory is not session-scoped. A path is protected by the normal permission check on `read`, not by session identity. On Unix, the store creates the directory with mode `0700` and each file with mode `0600`; on other platforms it relies on the agent directory's ACLs.
+`EvidenceStore` is one flat directory per agent: `~/.davinci/agent/evidence`, constructed at `crates/davinci-coding-agent/src/main.rs:1275-1277`. Files are named `<tag>-<uuid>.txt`; a Script body uses `store_in_session`, which prefixes the name with `s<sha256(session)[..12]>-`. The directory is not session-scoped. A path is protected by the normal permission check on `read`, not by session identity. On Unix, the store creates the directory with mode `0700` and each file with mode `0600`; on other platforms it relies on the agent directory's ACLs.
 
-This design does not add session isolation. It also does not claim that a foreign session cannot read another session's evidence. If session isolation is required, it is a separate change.
+The read-boundary exception is narrower than the store. It applies only to the `read` tool, only to a canonical path under the evidence root, and only to a filename carrying the active session's token. A symlink that resolves outside the root, or to another session's file, does not qualify. Other read-class tools such as `ls` and `find` do not get the exception, so they cannot enumerate the shared directory under `ReadOutsideRootPolicy::Deny`. Explicit deny rules still override the exception.
+
+This design does not add session isolation for the whole evidence store. Script artifacts are session-tagged and the read exception is session-aware; pruning, batch, and other evidence keep the shared layout. If full session isolation is required, it is a separate change.
 
 ## Alternatives Considered
 
@@ -313,7 +315,7 @@ This design does not add session isolation. It also does not claim that a foreig
 
 ## Non-Functional Requirements
 
-**Security and privacy.** The retained body is stored byte-exact and protected by the same permission gate as pruning evidence. It is not scrubbed. On Unix the store creates the directory with mode `0700` and each file with mode `0600`. The store is agent-scoped, not session-scoped; the document does not claim otherwise. No new cross-session access path is added. `read` re-checks path and tool permission on every call, and the evidence directory is a narrow read-boundary exception that explicit deny rules still override.
+**Security and privacy.** The retained body is stored byte-exact and protected by the same permission gate as pruning evidence. It is not scrubbed. On Unix the store creates the directory with mode `0700` and each file with mode `0600`. Script artifacts carry a hashed session token in the filename. The store is agent-scoped, not fully session-scoped; the document does not claim otherwise. `read` re-checks path and tool permission on every call. The evidence exception applies only to `read`, only to canonical paths under the store, only to the active session's token, and explicit deny rules still override it.
 
 **Performance and latency.** The Governor selector is a linear scan over the tool result with a bounded output. The Code mode change adds one disk write per over-budget run when a store exists. No model call is added to any reduction path.
 

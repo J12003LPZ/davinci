@@ -1032,6 +1032,7 @@ impl WorktreeLease {
             enforce_root_for_mutations: true,
             allow_git_metadata: true,
             evidence_root: None,
+            evidence_session_token: None,
             // A lease is isolated: the user's extra roots never follow it.
             extra_roots: Vec::new(),
         }

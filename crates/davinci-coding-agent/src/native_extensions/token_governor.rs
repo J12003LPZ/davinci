@@ -2872,6 +2872,40 @@ mod tests {
     }
 
     #[test]
+    fn governor_keeps_a_top_level_object_error_between_long_arrays() {
+        let dir = tempdir().unwrap();
+        let config = TokenGovernorConfig {
+            compress_threshold_bytes: 1,
+            compress_threshold_lines: 1,
+            content_aware: true,
+            specialized_min_reduction_pct: 99,
+            ..Default::default()
+        };
+        let mut governor =
+            TokenGovernor::with_store("object-error", config, OutputStore::new(dir.path()));
+        let value = serde_json::json!({
+            "items": (0..40)
+                .map(|i| serde_json::json!({"id": i, "status": "ok", "payload": "repetitive payload"}))
+                .collect::<Vec<_>>(),
+            "error": "top-level assertion failed",
+            "others": (0..40)
+                .map(|i| serde_json::json!({"id": i, "status": "ok", "payload": "repetitive payload"}))
+                .collect::<Vec<_>>()
+        });
+        let pretty = serde_json::to_string_pretty(&value).unwrap();
+        let result = governor.after_tool("bash", &json!({"command": "printf json"}), ok(&pretty));
+        assert_eq!(
+            result.details.as_ref().unwrap()["tokenGovernor"]["strategy"],
+            "specialized"
+        );
+        assert!(
+            result.content.contains("top-level assertion failed"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[test]
     fn governor_records_a_rejected_specialized_view() {
         let dir = tempdir().unwrap();
         let config = TokenGovernorConfig {

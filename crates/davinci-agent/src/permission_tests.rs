@@ -2096,20 +2096,25 @@ fn read_outside_root_policy_enforcement() {
 
 #[test]
 fn evidence_reads_bypass_the_outside_root_deny_but_not_deny_rules() {
+    use crate::EvidenceStore;
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("workspace");
     let evidence = temp.path().join("evidence");
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::create_dir_all(&evidence).unwrap();
-    let evidence_file = evidence.join("script-output-abc.txt");
-    std::fs::write(&evidence_file, "recoverable").unwrap();
+    let store = EvidenceStore::new(&evidence);
+    let evidence_file = store
+        .store_in_session("session-a", "script-output", "recoverable")
+        .unwrap();
     let other = temp.path().join("other.txt");
     std::fs::write(&other, "other").unwrap();
 
     let mut policy = PermissionPolicy::new(PermissionMode::Ask);
     policy.set_worktree_boundary(&root, None);
     policy.set_read_outside_root_policy(ReadOutsideRootPolicy::Deny);
-    policy.set_evidence_root(Some(evidence.clone()));
+    policy.set_evidence_access(
+        Some(evidence.clone()),
+        Some(crate::evidence::session_token("session-a")),
+    );
 
     let read_evidence = json!({"path": evidence_file.to_string_lossy().to_string()});
     assert_eq!(
@@ -2125,13 +2130,59 @@ fn evidence_reads_bypass_the_outside_root_deny_but_not_deny_rules() {
         ),
         PermissionVerdict::Deny { .. }
     ));
+    // Enumerating the shared store is not the recovery tool.
+    assert!(matches!(
+        policy.decide("e3", "ls", &json!({"path": evidence}), &root),
+        PermissionVerdict::Deny { .. }
+    ));
+
+    // Another session cannot read this artifact even with the same store.
+    let mut other_session = PermissionPolicy::new(PermissionMode::Ask);
+    other_session.set_worktree_boundary(&root, None);
+    other_session.set_read_outside_root_policy(ReadOutsideRootPolicy::Deny);
+    other_session.set_evidence_access(
+        Some(evidence.clone()),
+        Some(crate::evidence::session_token("session-b")),
+    );
+    assert!(matches!(
+        other_session.decide("b1", "read", &read_evidence, &root),
+        PermissionVerdict::Deny { .. }
+    ));
 
     // An explicit deny rule still wins over the evidence exception.
-    policy
-        .deny
-        .push(PermissionRule::subject("read", "**/script-output-abc.txt"));
+    policy.deny.push(PermissionRule::subject("read", "**"));
     assert!(matches!(
-        policy.decide("e3", "read", &read_evidence, &root),
+        policy.decide("e4", "read", &read_evidence, &root),
+        PermissionVerdict::Deny { .. }
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn evidence_symlink_escape_is_denied() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let evidence = temp.path().join("evidence");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&evidence).unwrap();
+    let outside = temp.path().join("outside.txt");
+    std::fs::write(&outside, "outside").unwrap();
+    let token = crate::evidence::session_token("session-a");
+    let link = evidence.join(format!("s{token}-script-output-link.txt"));
+    symlink(&outside, &link).unwrap();
+
+    let mut policy = PermissionPolicy::new(PermissionMode::Ask);
+    policy.set_worktree_boundary(&root, None);
+    policy.set_read_outside_root_policy(ReadOutsideRootPolicy::Deny);
+    policy.set_evidence_access(Some(evidence), Some(token));
+    assert!(matches!(
+        policy.decide(
+            "s1",
+            "read",
+            &json!({"path": link.to_string_lossy().to_string()}),
+            &root
+        ),
         PermissionVerdict::Deny { .. }
     ));
 }
