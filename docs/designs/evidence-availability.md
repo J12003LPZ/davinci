@@ -456,6 +456,13 @@ No new message type, store, or telemetry schema is added.
 * The profile preserves the route's start and target fractions: 65%/35% on cache-sensitive routes, 50%/35% otherwise. It changes ordering only, so a comparison isolates ordering from the trigger.
 * The profile is an experimental arm, not a default. A live comparison against the default is Phase D.
 
+### Phase D. Measurement
+
+* Pre-registration: `docs/perf/evidence-availability/preregistration.md` fixes the arms, corpus, repetitions, metrics, pass rule, stop rules, and rollback before any live run.
+* Primary metric: the deterministic needle harness at `crates/davinci-coding-agent/tests/evidence_availability.rs` checks the Governor and Code mode on every PR, with no model call.
+* Secondary metrics: verified task success, total and uncached input, compactions and summarizer tokens, first-attempt recovery success, tokens per resolved recovery, and prefix breaks by cause.
+* The 17-task corpus is directional, not powered for a 3 percentage-point success difference. Live runs require separate approval.
+
 ### Verification Plan
 
 * **Build:** `cargo build --workspace --offline --locked`
