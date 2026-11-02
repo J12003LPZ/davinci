@@ -1282,7 +1282,8 @@ impl PermissionPolicy {
         // Git metadata is a narrow read-boundary exception, never a deny-rule
         // exception or permission to write outside an isolated root.
         let is_git_meta = class == ToolClass::Read && self.is_git_metadata_call(tool, args, cwd);
-        let is_evidence_read = class == ToolClass::Read && self.is_evidence_target(cwd, &targets);
+        let is_evidence_read =
+            tool == "read" && class == ToolClass::Read && self.is_evidence_target(cwd, &targets);
         let subjects = if !targets.is_empty() {
             targets
                 .iter()

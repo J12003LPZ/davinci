@@ -2130,9 +2130,14 @@ fn evidence_reads_bypass_the_outside_root_deny_but_not_deny_rules() {
         ),
         PermissionVerdict::Deny { .. }
     ));
-    // Enumerating the shared store is not the recovery tool.
+    // Enumerating or content-scanning the shared store is not the recovery
+    // tool, even when the path carries the session token.
     assert!(matches!(
-        policy.decide("e3", "ls", &json!({"path": evidence}), &root),
+        policy.decide("e3", "ls", &read_evidence, &root),
+        PermissionVerdict::Deny { .. }
+    ));
+    assert!(matches!(
+        policy.decide("e4", "grep", &read_evidence, &root),
         PermissionVerdict::Deny { .. }
     ));
 
@@ -2152,7 +2157,7 @@ fn evidence_reads_bypass_the_outside_root_deny_but_not_deny_rules() {
     // An explicit deny rule still wins over the evidence exception.
     policy.deny.push(PermissionRule::subject("read", "**"));
     assert!(matches!(
-        policy.decide("e4", "read", &read_evidence, &root),
+        policy.decide("e5", "read", &read_evidence, &root),
         PermissionVerdict::Deny { .. }
     ));
 }
