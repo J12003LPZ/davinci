@@ -2,7 +2,7 @@
 
 **Goal:** Match the observable Claude Code CLI 2.1.316 Windows terminal experience in DaVinci: exact layout, colours, terminal behaviour and interactions, with DaVinci's own name, mark, wording and real provider data.
 
-**Status (2026-11-01):** P01 is done. P02 is partly done. P03–P20 have not started. No DaVinci parity is claimed.
+**Status (2026-11-01):** P00–P02 are done. P03 is in progress. P04–P20 have not started. No DaVinci parity is claimed.
 
 **Replaces** the earlier version of this plan. Where `docs/superpowers/specs/2026-11-01-claude-code-2.1.316-tui-parity-design.md` conflicts with the decisions below, this plan wins.
 
@@ -95,7 +95,8 @@ Cells outside every region must match exactly. A rule that covers more than a go
 Use the pattern already in `crates/davinci-coding-agent/tests/output_schema.rs`:
 - A loopback server speaks `openai-responses` SSE, the event shape in `tests/wor37_cache_status.rs`.
 - A `models.json` custom provider in a disposable agent dir points at it, with a dummy key.
-- The process starts with `env_clear`, isolated `HOME`, `USERPROFILE`, `PI_CODING_AGENT_DIR` and `DAVINCI_CODING_AGENT_DIR`, and `PI_DISABLE_NETWORK=1`.
+- The process starts with `env_clear`, isolated `HOME`, `USERPROFILE`, `PI_CODING_AGENT_DIR` and `DAVINCI_CODING_AGENT_DIR`, `PI_DISABLE_NETWORK=1` and `PI_OFFLINE=1`. Both are needed: catalog refresh and package update checks honour only `PI_OFFLINE`. P03 must prove no non-loopback connection is attempted, not assume it.
+- `TERM=xterm-256color` and `COLORTERM=truecolor`, as the reference harness sets them.
 - No `auth.json` is present, so the subscription route can't be reached.
 - The server records every request. A scenario fails if the count differs from what it expects, which also catches duplicate provider requests.
 
@@ -191,11 +192,9 @@ PR #275 merged as `543f9a3b`, and the branch has been moved to that commit. P01,
 
 **Remaining:** Re-run it against the full package and record the output.
 
-### P02: Styled-cell comparison — partly done
+### P02: Styled-cell comparison — done
 
 `scripts/ui/cc2316_compare.py`, `scripts/tests/test_cc2316_compare.py`
-
-Today's function is `compare(expected, actual) -> list[str]`. It compares runs, has no rules, and `zip` stops at the shorter row.
 
 **Required:**
 - Change it to `compare(expected, actual, rules) -> DiffReport`.
@@ -213,6 +212,8 @@ Today's function is `compare(expected, actual) -> list[str]`. It compares runs, 
 - The offline backend above.
 - Timestamped keyboard, mouse, paste and resize events.
 - A `run_suite.py` adapter that runs the same test IDs against DaVinci snapshots.
+- Produce captures by importing `styled_xterm.process(raw_path, out_dir, name, cols, rows)` from the package, which writes schema `/2` with the goldens' palette and default-colour substitution. `styled_capture.py` is the older pyte schema `/1`; don't use it.
+- `tui_harness.py` launches `claude.exe` by default and takes `--exe`. Its scenario actions are reusable, but `mock_api.py` is Anthropic-only. Four `mock_stream2`, `mock_stream_rmoff`, `mock_stream_scroll2` and `mock_interrupt2` goldens have no scenario file under that exact name, so find how they were driven or record them as needing a new scenario.
 
 **First test:** Confirm an interactive `davinci` session accepts the custom provider and reaches the loopback server. Everything after this depends on it, so stop and report if it doesn't.
 
@@ -237,6 +238,7 @@ Today's function is `compare(expected, actual) -> list[str]`. It compares runs, 
 **Required:**
 - Add `tui.reference` (D4), visible in `/config`.
 - Exercise alternate screen, bracketed paste, SGR mouse, focus, synchronized output, keyboard enhancements and fallback.
+- Check `bracketed_paste` and `focus_events` from the full raw recording. The goldens' values are wrong for these two, because `styled_xterm` only reads modes after the last `?1049h`.
 - Restore all modes after normal exit, panic (`PI_DAVINCI_PANIC_FIXTURE` exists), interrupt and renderer switch.
 
 ### P06: Palette and styles
@@ -517,7 +519,3 @@ Keep commands, exit codes and diagnostics in the ledger. Use `rtk` wrappers wher
 - **Off state:** With the setting off, existing suites pass unchanged.
 - **Performance:** Gates in P20 met, with goals and misses recorded.
 - **Reference limits:** Image drag-drop, mic-enabled voice, some reduced-motion, cursor shape and mark animation, the full key sweep, OSC 8 hover, VS Code, macOS, Linux, tmux, Ghostty, and ConPTY Ctrl+L and Shift+Up can't be declared parity-complete without new evidence.
-
-## Open items for the owner
-
-- `docs/ui/claude-code-reference` is already committed to the repo (commit `4fca3918`) and holds captures from Claude Code 2.1.281. Decide whether it should stay.
