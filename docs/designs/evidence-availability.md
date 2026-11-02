@@ -460,6 +460,8 @@ No new message type, store, or telemetry schema is added.
 
 * Pre-registration: `docs/perf/evidence-availability/preregistration.md` fixes the arms, corpus, repetitions, metrics, pass rule, stop rules, and rollback before any live run.
 * Primary metric: the deterministic needle harness at `crates/davinci-coding-agent/tests/evidence_availability.rs` checks that the Governor and Code mode retain the needle and that the first recovery returns it, with a token estimate per recovery. It runs on every PR with no model call.
+* Trigger coverage: the 17-task corpus recorded zero pruning events. A pruning comparison is admissible only after adding at least three long-context tasks per arm that record `prunedResults > 0`; otherwise the pruning arm is void.
+* Diagnostic admission budget: record the diagnostic view, generic digest, and original bytes per task. A view above 90% of the original is flagged and cannot support a compression-default promotion.
 * Secondary metrics: verified task success, total and uncached input, compactions and summarizer tokens, first-attempt recovery success, tokens per resolved recovery, and prefix breaks by cause.
 * The 17-task corpus is directional, not powered for a 3 percentage-point success difference. Live runs require separate approval.
 

@@ -5,7 +5,7 @@
 use davinci_agent::codemode::projection::assemble_script_output;
 use davinci_agent::ToolResult;
 use davinci_coding_agent::native_extensions::{TokenGovernor, TokenGovernorConfig};
-use serde_json::json;
+use serde_json::{json, Value};
 
 fn ok(content: &str) -> ToolResult {
     ToolResult {
@@ -13,6 +13,53 @@ fn ok(content: &str) -> ToolResult {
         is_error: false,
         details: None,
     }
+}
+
+#[test]
+fn diagnostic_view_byte_ratio_is_measured() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = TokenGovernorConfig {
+        compress_threshold_bytes: 1,
+        compress_threshold_lines: 1,
+        content_aware: true,
+        store_dir: Some(dir.path().join("specialized")),
+        ..Default::default()
+    };
+    let mut governor = TokenGovernor::new("diagnostic-ratio", config);
+    let items = (0..120)
+        .map(|i| {
+            if i % 2 == 0 {
+                json!({"id": i, "status": "error", "message": "failure detail"})
+            } else {
+                json!({"id": i, "status": "ok", "payload": "repetitive payload"})
+            }
+        })
+        .collect::<Vec<_>>();
+    let array = Value::Array(items).to_string();
+    let result = governor.after_tool("bash", &json!({"command": "printf json"}), ok(&array));
+    let original_bytes = array.len();
+    let diagnostic_bytes = result.content.len();
+    let ratio = diagnostic_bytes as f64 / original_bytes as f64;
+    assert!(
+        diagnostic_bytes < original_bytes,
+        "diagnostic view grew to {ratio:.3} of the original"
+    );
+
+    let mut generic = TokenGovernor::new(
+        "generic-ratio",
+        TokenGovernorConfig {
+            compress_threshold_bytes: 1,
+            compress_threshold_lines: 1,
+            content_aware: false,
+            store_dir: Some(dir.path().join("generic")),
+            ..Default::default()
+        },
+    );
+    let generic = generic.after_tool("bash", &json!({"command": "printf json"}), ok(&array));
+    eprintln!(
+        "evidence-availability bytes: diagnostic={diagnostic_bytes} generic={} original={original_bytes} ratio={ratio:.3}",
+        generic.content.len()
+    );
 }
 
 #[test]

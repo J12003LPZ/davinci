@@ -933,6 +933,29 @@ fn forced_prune_keeps_a_late_needle_retrievable() {
 }
 
 #[test]
+fn forced_prune_fires_for_both_orders() {
+    for order in [
+        crate::pruning::PruneOrder::OldestFirst,
+        crate::pruning::PruneOrder::ErrorsLast,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("x".repeat(24_000));
+        agent.tools.clear();
+        agent.tools.push("read".into());
+        agent.evidence = Some(EvidenceStore::new(dir.path()));
+        agent.context_window = 10_000;
+        agent.prune_settings.keep_recent = 0;
+        agent.prune_settings.order = order;
+        let mut result = ChatMessage::text("toolResult", "filler ".repeat(4_000));
+        result.tool_call_id = Some(format!("{order:?}-call"));
+        result.is_error = Some(false);
+        agent.messages.push(result);
+        agent.prune_context();
+        assert_eq!(agent.stats.pruned_results, 1, "{order:?}");
+    }
+}
+
+#[test]
 fn pruning_requires_readable_evidence_and_recovers_after_expiry() {
     let dir = tempfile::tempdir().unwrap();
     let mut agent = Agent::new("");
