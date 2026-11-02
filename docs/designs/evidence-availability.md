@@ -329,7 +329,7 @@ This design does not add session isolation for the whole evidence store. Script 
 
 ## Future Improvements
 
-* **Pruning investigation.** The zero-prune result means the question is unmeasured.
+* **Pruning investigation.** The forced-trigger test and the opt-in `evidence` profile now exist; a live comparison against the default is still unmeasured.
 * **Context VM count.** `omitted_events` is a summarizer-prompt counter.
 * **Four-component contract.** Revisit only if a measurement shows the existing trailers are insufficient.
 * **Omission-record schema.** One axis, one owner, one type.
@@ -448,6 +448,12 @@ Phase A already names the quantity and the recovery reference. Phase B makes the
 * The Context VM fold notice reports how many events the fold could not represent and names them as retrievable by source reference. The count also stays in the summarizer prompt.
 
 No new message type, store, or telemetry schema is added.
+
+### Phase C. Pruning investigation
+
+* The forced-trigger test builds an agent whose estimate is over the start line, prunes an old large result with `keep_recent = 0`, and asserts the placeholder names the call id and outcome while the stored body still contains the needle. The mechanism can fire; the earlier 17-run corpus recorded zero prune events, so that corpus could not measure it.
+* `DAVINCI_PRUNE_PROFILE=evidence` selects `PruneOrder::ErrorsLast`. Routine results are pruned before error results; the default remains `PruneOrder::OldestFirst`. The profile does not change the start or target fractions.
+* The profile is an experimental arm, not a default. A live comparison against the default is Phase D.
 
 ### Verification Plan
 

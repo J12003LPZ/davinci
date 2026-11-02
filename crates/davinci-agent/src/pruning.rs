@@ -19,6 +19,15 @@ use std::collections::HashSet;
 
 use davinci_ai::ChatMessage;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PruneOrder {
+    /// Current behavior: prune oldest first, regardless of outcome.
+    #[default]
+    OldestFirst,
+    /// Experimental profile: prune routine results before error results.
+    ErrorsLast,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PruneSettings {
     pub enabled: bool,
@@ -30,6 +39,8 @@ pub struct PruneSettings {
     pub keep_recent: usize,
     /// Results shorter than this are not worth a placeholder.
     pub min_chars: usize,
+    /// Candidate order within the eligible window.
+    pub order: PruneOrder,
 }
 
 impl Default for PruneSettings {
@@ -40,6 +51,7 @@ impl Default for PruneSettings {
             target_fraction: 0.35,
             keep_recent: 8,
             min_chars: 1_500,
+            order: PruneOrder::OldestFirst,
         }
     }
 }
@@ -55,7 +67,16 @@ impl PruneSettings {
         }
     }
 
-    /// `DAVINCI_PRUNE_PROFILE=default|cached|off` overrides the route.
+    /// Experimental profile: errors survive until routine results cannot meet
+    /// the target. The default is unchanged.
+    pub fn evidence_route() -> Self {
+        Self {
+            order: PruneOrder::ErrorsLast,
+            ..Self::default()
+        }
+    }
+
+    /// `DAVINCI_PRUNE_PROFILE=default|cached|off|evidence` overrides the route.
     /// Explicit caller settings are never replaced.
     pub fn for_route(base: &PruneSettings, cache_sensitive: bool) -> PruneSettings {
         if *base != PruneSettings::default() {
@@ -68,6 +89,7 @@ impl PruneSettings {
             },
             Some("default") => *base,
             Some("cached") => PruneSettings::cached_route(),
+            Some("evidence") => PruneSettings::evidence_route(),
             _ if cache_sensitive => PruneSettings::cached_route(),
             _ => *base,
         }
@@ -103,18 +125,22 @@ pub fn plan_prune(
         return Vec::new();
     }
     let target = (context_window as f64 * settings.target_fraction) as u64;
-    let candidates: Vec<(&String, usize)> = messages
+    let mut candidates: Vec<(&String, usize, bool)> = messages
         .iter()
         .filter(|message| message.role == "toolResult")
         .filter_map(|message| {
             let id = message.tool_call_id.as_ref()?;
-            Some((id, result_chars(message)))
+            Some((id, result_chars(message), message.is_error == Some(true)))
         })
         .collect();
+    if settings.order == PruneOrder::ErrorsLast {
+        // Stable sort: routine results keep their order, then error results.
+        candidates.sort_by_key(|(_, _, is_error)| *is_error);
+    }
     let protected = candidates.len().saturating_sub(settings.keep_recent);
     let mut remaining = tokens;
     let mut plan = Vec::new();
-    for (id, chars) in candidates.into_iter().take(protected) {
+    for (id, chars, _) in candidates.into_iter().take(protected) {
         if remaining <= target {
             break;
         }
@@ -159,6 +185,56 @@ mod tests {
 
     fn tool_result(id: &str, chars: usize) -> ChatMessage {
         ChatMessage::tool_result(id, "grep", "x".repeat(chars), false)
+    }
+
+    fn error_result(id: &str, chars: usize) -> ChatMessage {
+        ChatMessage::tool_result(id, "bash", "x".repeat(chars), true)
+    }
+
+    #[test]
+    fn evidence_order_prunes_routine_results_before_errors() {
+        let messages = vec![
+            error_result("e0", 4_000),
+            tool_result("r0", 4_000),
+            error_result("e1", 4_000),
+            tool_result("r1", 4_000),
+            error_result("e2", 4_000),
+            tool_result("r2", 4_000),
+        ];
+        let settings = PruneSettings {
+            keep_recent: 0,
+            order: PruneOrder::ErrorsLast,
+            ..Default::default()
+        };
+        let plan = plan_prune(&messages, &HashSet::new(), 12_000, 20_000, &settings);
+        assert_eq!(plan, vec!["r0", "r1", "r2", "e0", "e1"]);
+    }
+
+    #[test]
+    fn default_order_stays_oldest_first() {
+        let messages = vec![
+            error_result("e0", 4_000),
+            tool_result("r0", 4_000),
+            error_result("e1", 4_000),
+            tool_result("r1", 4_000),
+            error_result("e2", 4_000),
+            tool_result("r2", 4_000),
+        ];
+        let settings = PruneSettings {
+            keep_recent: 0,
+            ..Default::default()
+        };
+        let plan = plan_prune(&messages, &HashSet::new(), 12_000, 20_000, &settings);
+        assert_eq!(plan, vec!["e0", "r0", "e1", "r1", "e2"]);
+    }
+
+    #[test]
+    fn evidence_route_is_errors_last_and_default_is_unchanged() {
+        assert_eq!(PruneSettings::default().order, PruneOrder::OldestFirst);
+        assert_eq!(
+            PruneSettings::evidence_route().order,
+            PruneOrder::ErrorsLast
+        );
     }
 
     #[test]
