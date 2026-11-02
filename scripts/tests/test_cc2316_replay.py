@@ -177,6 +177,18 @@ class ScenarioCheckTest(unittest.TestCase):
         env = replay.build_env(Path("h"), Path("a"), 1, {"NO_COLOR": "1"})
         self.assertEqual((env["NO_COLOR"], env["PI_CATALOG_DRY_RUN"]), ("1", "1"))
 
+    def test_a_first_run_leaves_the_agent_dir_to_the_shell_but_keeps_every_isolation_variable(self):
+        # P07b: the shell asks its first-run question only without a directory override.
+        normal = replay.build_env(Path("h"), Path("a"), 1, {})
+        first = replay.build_env(Path("h"), Path("a"), 1, {}, first_run=True)
+        self.assertEqual({k for k in normal if k not in first},
+                         {"PI_CODING_AGENT_DIR", "DAVINCI_CODING_AGENT_DIR"})
+        self.assertEqual(first["PI_EXPERIMENTAL"], "1")
+        self.assertNotIn("PI_EXPERIMENTAL", normal)
+        for key in ("HOME", "USERPROFILE", "PI_DISABLE_NETWORK", "PI_CATALOG_DRY_RUN", "HTTP_PROXY"):
+            self.assertEqual(first[key], normal[key])
+        self.assertEqual(replay.check_scenario({"first_run": True, "expect_requests": 0}), "")
+
     def test_replay_blocks_a_profile_that_changes_isolation(self):
         with tempfile.TemporaryDirectory() as out:
             cap = replay.replay(Path(out) / "nope.exe", {}, replay.Profile(env={"HOME": "x"}),

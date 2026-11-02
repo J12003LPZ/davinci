@@ -62,7 +62,7 @@ PROFILE_ENV_KEYS = ("NO_COLOR", "FORCE_COLOR", "COLORFGBG", "PI_DAVINCI_REFERENC
                     "PI_DAVINCI_PANIC_FIXTURE")
 ACTIONS = ("key", "wait", "snapshot", "resize", "mouse", "click_text", "release")
 SCENARIO_KEYS = ("name", "cols", "rows", "wait_ms", "actions", "graceful", "timeout", "turns",
-                 "files", "davinci_settings", "expect_requests")
+                 "files", "davinci_settings", "expect_requests", "first_run")
 CLI_ARGS = ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-mcp",
             "--provider", "local", "--model", "demo"]
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -302,7 +302,11 @@ def make_turns(spec) -> list:
     return turns
 
 
-def build_env(home: Path, agent: Path, proxy_port: int, extra: dict) -> dict:
+def build_env(home: Path, agent: Path, proxy_port: int, extra: dict, first_run: bool = False) -> dict:
+    """The isolated environment. ``first_run`` leaves the agent-directory variables out and sets
+    ``PI_EXPERIMENTAL``: the shell asks its first-run question only when it finds no settings
+    file in its default agent directory (under the isolated home) and has no directory override
+    (``should_run_first_time_setup``). The directory is still under the isolated home."""
     env = {k: os.environ[k] for k in BASE_ENV_KEYS if k in os.environ}
     proxy = f"http://127.0.0.1:{proxy_port}"
     env.update({
@@ -310,9 +314,12 @@ def build_env(home: Path, agent: Path, proxy_port: int, extra: dict) -> dict:
         "PI_LEARNING_DISABLE_BACKGROUND": "1", "PI_HOOKS_DRY_RUN": "1",
         "TERM": "xterm-256color", "COLORTERM": "truecolor",
         "HOME": str(home), "USERPROFILE": str(home),
-        "PI_CODING_AGENT_DIR": str(agent), "DAVINCI_CODING_AGENT_DIR": str(agent),
         "HTTP_PROXY": proxy, "HTTPS_PROXY": proxy, "ALL_PROXY": proxy, "NO_PROXY": "127.0.0.1",
     })
+    if first_run:
+        env["PI_EXPERIMENTAL"] = "1"
+    else:
+        env.update({"PI_CODING_AGENT_DIR": str(agent), "DAVINCI_CODING_AGENT_DIR": str(agent)})
     bad = sorted(k for k in extra if k not in PROFILE_ENV_KEYS)
     if bad:
         raise ValueError(f"env {bad!r} is not an allowed profile variable")
@@ -459,7 +466,9 @@ def replay(binary, scenario, profile, *, out_dir) -> Capture:
     root = Path(tempfile.mkdtemp(prefix="cc2316_run_"))
     home = root / "home"
     work = home / "work"      # inside the isolated home so the trust search stops there
-    agent = root / "agent"
+    first_run = bool(scenario.get("first_run"))
+    # A first run finds its agent directory itself, under the isolated home.
+    agent = home / ".davinci" / "agent" if first_run else root / "agent"
     for d in (work, agent):
         d.mkdir(parents=True)
     reason = write_files(work, scenario.get("files"))
@@ -472,7 +481,8 @@ def replay(binary, scenario, profile, *, out_dir) -> Capture:
     proxy = RefusingProxy().start()
     settings = {"processManager": {"enabled": False}}
     settings.update(scenario.get("davinci_settings") or {})
-    (agent / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+    if not first_run:  # a first run is the absence of a settings file
+        (agent / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
     (agent / "models.json").write_text(json.dumps({"providers": {"local": {
         "baseUrl": mock.base_url, "api": "openai-responses", "apiKey": "sk-test",
         "models": [{"id": "demo", "name": "Demo"}]}}}), encoding="utf-8")
@@ -482,7 +492,7 @@ def replay(binary, scenario, profile, *, out_dir) -> Capture:
     scratch.mkdir()
     harness_class = make_harness_class(tui_harness, styled_xterm, scratch)
     harness = harness_class(profile.cols, profile.rows, str(work),
-                            build_env(home, agent, proxy.port, profile.env),
+                            build_env(home, agent, proxy.port, profile.env, first_run),
                             str(binary), CLI_ARGS)
     timer = None
     raw_path = out / "full.raw"

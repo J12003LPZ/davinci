@@ -321,9 +321,102 @@ fn model_and_provider(model: &Model) -> (&str, &str) {
     )
 }
 
+/// `path` with the folder `home` replaced by `~`, when it is `home` itself or
+/// lies under it. The match ignores case (Windows paths) and respects the
+/// separator, so a sibling that merely starts with the same letters stays whole.
+pub fn home_relative(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home
+        .map(|h| h.trim_end_matches(['/', '\\']))
+        .filter(|h| !h.is_empty())
+    else {
+        return path.to_string();
+    };
+    let split = home.len();
+    match path.get(..split) {
+        Some(head) if head.eq_ignore_ascii_case(home) => {
+            let rest = &path[split..];
+            if rest.is_empty() || rest.chars().all(|c| c == '/' || c == '\\') {
+                "~".to_string()
+            } else if rest.starts_with(['/', '\\']) {
+                format!("~{rest}")
+            } else {
+                path.to_string()
+            }
+        }
+        _ => path.to_string(),
+    }
+}
+
+/// The reference masthead: the static three-row mark in its box, then the name
+/// and version, the model and its provider, and the working folder, from column
+/// 11. Nothing here moves: the mark has one frame, which keeps a settled screen
+/// settled. Where the window is too narrow for the text beside the mark, the
+/// text stacks under it.
+fn reference_banner(model: &Model, info: &Startup, home: Option<&str>) -> Vec<Line<'static>> {
+    let th = &model.theme;
+    let cc = th.cc();
+    let mut name = span("DaVinci", th.text);
+    name.style = name.style.add_modifier(Modifier::BOLD);
+    let (title, provider) = model_and_provider(model);
+    let mut serving = vec![span(title.replace('-', " "), cc.inactive)];
+    if !provider.is_empty() {
+        serving.push(span(format!(" · {provider}"), cc.inactive));
+    }
+    let column = MARK[0].chars().count() as u16;
+    let side_by_side = model.width >= column + MIN_TEXT_COLUMNS;
+    let text_room = if side_by_side {
+        model.width.saturating_sub(column)
+    } else {
+        model.width.saturating_sub(STACKED_INDENT)
+    };
+    let path = home_relative(&info.cwd, home);
+    let text = [
+        vec![
+            name,
+            span(format!(" v{}", env!("CARGO_PKG_VERSION")), cc.inactive),
+        ],
+        serving,
+        vec![span(clip_ellipsis(&path, text_room), cc.inactive)],
+    ];
+    let art = MARK
+        .iter()
+        .zip(mark_inks(model))
+        .map(|(row, ink)| vec![span(*row, ink)]);
+    let rows: Vec<Vec<Span<'static>>> = if side_by_side {
+        art.zip(text)
+            .map(|(mut row, mut words)| {
+                row.append(&mut words);
+                row
+            })
+            .collect()
+    } else {
+        let mut rows: Vec<_> = if model.width > column {
+            art.collect()
+        } else {
+            Vec::new()
+        };
+        rows.extend(text.into_iter().map(|mut words| {
+            words.insert(0, Span::raw(" ".repeat(STACKED_INDENT as usize)));
+            words
+        }));
+        rows
+    };
+    rows.into_iter()
+        .map(|row| Line::from(truncate_run(row, model.width)))
+        .collect()
+}
+
 /// Compact identity block, also kept above a short conversation. The path and
 /// selected model come from the running session, never from sample copy.
 pub fn banner(model: &Model, info: &Startup) -> Vec<Line<'static>> {
+    if model.reference {
+        // The first home folder, from the environment, that the path lies under.
+        let home = ["HOME", "USERPROFILE"]
+            .into_iter()
+            .filter_map(|key| std::env::var(key).ok())
+            .find(|home| home_relative(&info.cwd, Some(home)) != info.cwd);
+        return reference_banner(model, info, home.as_deref());
+    }
     let th = &model.theme;
     let cc = th.cc();
     let mut name = span("DaVinci", th.text);

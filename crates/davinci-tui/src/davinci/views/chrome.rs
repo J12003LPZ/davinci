@@ -624,7 +624,31 @@ pub fn effort_line(model: &Model) -> Line<'static> {
             )],
         );
     }
+    if let Some(label) = model.reference.then(|| effort_label(model)).flatten() {
+        // Two columns in from the edge, where the reference ends it.
+        return spread(
+            model.width,
+            Vec::new(),
+            vec![span(format!("{label}  "), cc.inactive)],
+        );
+    }
     spread(model.width, Vec::new(), Vec::new())
+}
+
+/// `◐ medium · /effort`: the thinking effort in force and the command that
+/// changes it. Only medium and high were captured; the other levels take the
+/// neighbouring glyphs of the same family and carry no reference evidence.
+/// Nothing is shown while thinking is off.
+fn effort_label(model: &Model) -> Option<String> {
+    let level = model.thinking_level.to_lowercase();
+    let glyph = match level.as_str() {
+        "" | "off" => return None,
+        "minimal" | "low" => "○",
+        "medium" => "◐",
+        "high" => "●",
+        _ => "◉",
+    };
+    Some(format!("{glyph} {level} · /effort"))
 }
 
 pub fn effort_rule(model: &Model) -> Line<'static> {

@@ -496,10 +496,16 @@ class CompareGoldenTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             compare_golden(base(), capture({}), manifest, owners)
 
-    def test_committed_manifest_loads_and_is_empty(self):
-        from cc2316_compare import DEFAULT_RULES
+    def test_committed_manifest_loads_and_every_rule_is_allowed_by_its_golden_tier(self):
+        # It was empty until P07 earned the first entries; each entry must still load
+        # against the real owners file, which rejects a structure rule on an exact golden.
+        from cc2316_compare import DEFAULT_RULES, load_rules
         data = json.loads(Path(DEFAULT_RULES).read_text(encoding="utf-8"))
-        self.assertEqual(data, {"version": 1, "goldens": {}})
+        self.assertEqual(data["version"], 1)
+        for name, specs in data["goldens"].items():
+            rules = load_rules(name)
+            self.assertEqual(len(rules), len(specs), name)
+            self.assertTrue(all(rule.reason.strip() for rule in rules), name)
 
 
 class LoaderTests(unittest.TestCase):

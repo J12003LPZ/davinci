@@ -2671,6 +2671,80 @@ fn a_trusted_project_opens_without_a_warning() {
 }
 
 #[test]
+fn the_trust_question_stores_nothing_until_a_row_is_answered_and_each_row_means_what_it_says() {
+    use crate::trust::{get_project_trust_options, ProjectTrustStore};
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let _env = AgentDirEnv::set(agent_dir.clone());
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(project.join(".pi").join("skills")).unwrap();
+
+    let options = get_project_trust_options(&project, false);
+    let question = Question::Trust {
+        path: project.display().to_string(),
+        options: options.clone(),
+    };
+    let panel = question.ask(&davinci_agent::Agent::new("test"));
+    // Building and showing the question grants nothing and stores nothing.
+    let store = ProjectTrustStore::open(&agent_dir);
+    assert_eq!(store.get(&project), None);
+    assert!(!agent_dir.join("trust.json").exists());
+
+    // Every row says what it does to the project's `.pi` resources, and the
+    // row's own meaning is the stored decision it carries.
+    assert_eq!(panel.items.len(), options.len());
+    let accept = options.iter().position(|o| o.label == "Trust").unwrap();
+    let decline = options
+        .iter()
+        .position(|o| o.label == "Do not trust")
+        .unwrap();
+    assert_eq!(panel.items[accept].detail, "project .pi resources are used");
+    assert_eq!(
+        panel.items[decline].detail,
+        "project .pi resources are ignored"
+    );
+    assert!(options[accept].trusted && !options[decline].trusted);
+    assert_eq!(options[accept].updates.len(), 1);
+    assert_eq!(options[accept].updates[0].decision, Some(true));
+    assert_eq!(options[decline].updates.len(), 1);
+    assert_eq!(options[decline].updates[0].decision, Some(false));
+
+    // Declining denies; accepting grants that folder; neither touches another.
+    store.set_many(&options[decline].updates).unwrap();
+    assert_eq!(store.get(&project), Some(false));
+    store.set_many(&options[accept].updates).unwrap();
+    assert_eq!(store.get(&project), Some(true));
+    store.set_many(&options[decline].updates).unwrap();
+    assert_eq!(store.get(&project), Some(false));
+    let parent = project.parent().unwrap();
+    assert_eq!(store.get(&parent.join("unrelated")), None);
+}
+
+#[test]
+fn a_this_session_only_trust_row_stores_nothing() {
+    use crate::trust::{get_project_trust_options, ProjectTrustStore};
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let _env = AgentDirEnv::set(agent_dir.clone());
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let options = get_project_trust_options(&project, true);
+    for label in [
+        "Trust (this session only)",
+        "Do not trust (this session only)",
+    ] {
+        let option = options.iter().find(|o| o.label == label).unwrap();
+        assert!(option.updates.is_empty(), "{label}");
+        ProjectTrustStore::open(&agent_dir)
+            .set_many(&option.updates)
+            .unwrap();
+    }
+    assert_eq!(ProjectTrustStore::open(&agent_dir).get(&project), None);
+}
+
+#[test]
 fn a_question_with_nothing_in_it_still_produces_a_panel() {
     let agent = davinci_agent::Agent::new("test");
     let panel = Question::Logout { providers: vec![] }.ask(&agent);
