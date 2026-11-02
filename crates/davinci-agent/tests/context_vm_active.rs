@@ -522,11 +522,16 @@ fn shadow_mismatch_is_noticed_once_and_matching_views_stay_quiet() {
 }
 
 #[test]
-fn automatic_fold_is_noticed_and_manual_fold_is_not() {
+fn automatic_and_manual_folds_are_noticed() {
     let mut agent = agent_in_mode(ContextVmMode::Active);
     agent.messages = vec![ChatMessage::text("user", "task")];
     agent.compact(None);
-    assert!(agent.take_context_vm_notices().is_empty());
+    let manual = agent.take_context_vm_notices();
+    assert_eq!(manual.len(), 1, "{manual:?}");
+    assert!(
+        manual[0].contains("Context VM folded (manual)"),
+        "{manual:?}"
+    );
     agent
         .fold_context(
             davinci_agent::runtime::context_vm::FoldReason::WindowPressure,

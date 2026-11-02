@@ -5164,21 +5164,19 @@ impl Agent {
                 .load_state_from_root()
                 .unwrap_or_default();
         };
-        if reason != runtime::context_vm::FoldReason::Manual {
-            let omitted_note = if omitted_events == 0 {
-                String::new()
-            } else {
-                format!(
-                    "; {omitted_events} event(s) could not be represented and remain retrievable by source reference"
-                )
-            };
-            runtime.context_vm.push_notice(format!(
-                "Context VM folded ({}): epoch {}, checkpoint ~{before_tokens} -> ~{after_tokens} \
-                 tokens{omitted_note}. Folded episodes stay recoverable with retrieve_context.",
-                reason.as_str(),
-                root.epoch
-            ));
-        }
+        let omitted_note = if omitted_events == 0 {
+            String::new()
+        } else {
+            format!(
+                "; {omitted_events} event(s) could not be represented and remain retrievable by source reference"
+            )
+        };
+        runtime.context_vm.push_notice(format!(
+            "Context VM folded ({}): epoch {}, checkpoint ~{before_tokens} -> ~{after_tokens} \
+             tokens{omitted_note}. Folded episodes stay recoverable with retrieve_context.",
+            reason.as_str(),
+            root.epoch
+        ));
         runtime.emit_observe(crate::RuntimeEvent::ContextVmFolded {
             epoch: root.epoch,
             reason: reason.as_str().into(),
