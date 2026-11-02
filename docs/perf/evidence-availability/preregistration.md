@@ -21,9 +21,9 @@ Does protecting task-relevant evidence improve verified task success without an 
 
 ## Primary metric
 
-**Needle survival per layer.** The deterministic harness places a labeled error at Governor index 25 and a labeled failure at Code mode line 250, then asserts the first survives in the visible view and the second survives in the retained body with `omitted_start_line == 110`.
+**Needle survival and first recovery per layer.** The deterministic harness places a labeled error at Governor index 25 and a labeled failure at Code mode line 250, then asserts the first survives in the visible view and the second survives in the retained body with `omitted_start_line == 110`. It then performs the first recovery and asserts the needle is returned, recording a token estimate for that recovery.
 
-Pass: both assertions pass. This is CI-runnable, deterministic, and requires no model call.
+Pass: every assertion passes. This is CI-runnable, deterministic, and requires no model call.
 
 ## Secondary metrics
 

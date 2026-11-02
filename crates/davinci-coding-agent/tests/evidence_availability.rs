@@ -48,6 +48,17 @@ fn needles_survive_the_governor_and_codemode() {
         result.details.as_ref().unwrap()["tokenGovernor"]["strategy"],
         "specialized"
     );
+    let output_id = result.details.as_ref().unwrap()["tokenGovernor"]["outputId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let recovered = governor.retrieve(&json!({"id": output_id})).unwrap();
+    assert!(
+        recovered.content.contains("NEEDLE-GOVERNOR"),
+        "first recovery lost the governor needle"
+    );
+    let governor_recovery_tokens = recovered.content.len().div_ceil(4);
+    assert!(governor_recovery_tokens > 0);
 
     let body = (0..400)
         .map(|i| {
@@ -74,4 +85,20 @@ fn needles_survive_the_governor_and_codemode() {
         "codemode retained body lost the needle"
     );
     assert_eq!(output.omitted_start_line, Some(110));
+    let start = output.omitted_start_line.unwrap();
+    let recovered = output
+        .retained_body
+        .as_deref()
+        .unwrap()
+        .lines()
+        .skip(start - 1)
+        .take(200)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        recovered.contains("NEEDLE-CODE"),
+        "first read from the retained body lost the needle"
+    );
+    let codemode_recovery_tokens = recovered.len().div_ceil(4);
+    assert!(codemode_recovery_tokens > 0);
 }
