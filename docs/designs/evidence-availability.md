@@ -452,7 +452,8 @@ No new message type, store, or telemetry schema is added.
 ### Phase C. Pruning investigation
 
 * The forced-trigger test builds an agent whose estimate is over the start line, prunes an old large result with `keep_recent = 0`, and asserts the placeholder names the call id and outcome while the stored body still contains the needle. The mechanism can fire; the earlier 17-run corpus recorded zero prune events, so that corpus could not measure it.
-* `DAVINCI_PRUNE_PROFILE=evidence` selects `PruneOrder::ErrorsLast`. Routine results are pruned before error results; the default remains `PruneOrder::OldestFirst`. The profile does not change the start or target fractions.
+* `DAVINCI_PRUNE_PROFILE=evidence` selects `PruneOrder::ErrorsLast`. The eligible older results are identified first, so the newest `keep_recent` are always protected; errors-last ordering applies only within that subset. The default remains `PruneOrder::OldestFirst`.
+* The profile preserves the route's start and target fractions: 65%/35% on cache-sensitive routes, 50%/35% otherwise. It changes ordering only, so a comparison isolates ordering from the trigger.
 * The profile is an experimental arm, not a default. A live comparison against the default is Phase D.
 
 ### Verification Plan

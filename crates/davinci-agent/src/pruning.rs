@@ -70,10 +70,20 @@ impl PruneSettings {
     /// Experimental profile: errors survive until routine results cannot meet
     /// the target. The default is unchanged.
     pub fn evidence_route() -> Self {
-        Self {
-            order: PruneOrder::ErrorsLast,
-            ..Self::default()
-        }
+        Self::evidence_route_for(false)
+    }
+
+    /// Errors-last ordering on top of the route's existing thresholds. The
+    /// cache-sensitive route keeps its 65% start; the profile changes order
+    /// only, so a comparison isolates ordering from the trigger.
+    pub fn evidence_route_for(cache_sensitive: bool) -> Self {
+        let mut settings = if cache_sensitive {
+            Self::cached_route()
+        } else {
+            Self::default()
+        };
+        settings.order = PruneOrder::ErrorsLast;
+        settings
     }
 
     /// `DAVINCI_PRUNE_PROFILE=default|cached|off|evidence` overrides the route.
@@ -89,7 +99,7 @@ impl PruneSettings {
             },
             Some("default") => *base,
             Some("cached") => PruneSettings::cached_route(),
-            Some("evidence") => PruneSettings::evidence_route(),
+            Some("evidence") => PruneSettings::evidence_route_for(cache_sensitive),
             _ if cache_sensitive => PruneSettings::cached_route(),
             _ => *base,
         }
@@ -125,7 +135,7 @@ pub fn plan_prune(
         return Vec::new();
     }
     let target = (context_window as f64 * settings.target_fraction) as u64;
-    let mut candidates: Vec<(&String, usize, bool)> = messages
+    let candidates: Vec<(&String, usize, bool)> = messages
         .iter()
         .filter(|message| message.role == "toolResult")
         .filter_map(|message| {
@@ -133,14 +143,19 @@ pub fn plan_prune(
             Some((id, result_chars(message), message.is_error == Some(true)))
         })
         .collect();
+    // The newest `keep_recent` results are outside the eligible window. Order
+    // only the older subset; sorting the full set first could put a recent
+    // successful result ahead of an older error and prune something the
+    // policy promises to protect.
+    let protected = candidates.len().saturating_sub(settings.keep_recent);
+    let mut eligible: Vec<_> = candidates.into_iter().take(protected).collect();
     if settings.order == PruneOrder::ErrorsLast {
         // Stable sort: routine results keep their order, then error results.
-        candidates.sort_by_key(|(_, _, is_error)| *is_error);
+        eligible.sort_by_key(|(_, _, is_error)| *is_error);
     }
-    let protected = candidates.len().saturating_sub(settings.keep_recent);
     let mut remaining = tokens;
     let mut plan = Vec::new();
-    for (id, chars, _) in candidates.into_iter().take(protected) {
+    for (id, chars, _) in eligible {
         if remaining <= target {
             break;
         }
@@ -226,6 +241,38 @@ mod tests {
         };
         let plan = plan_prune(&messages, &HashSet::new(), 12_000, 20_000, &settings);
         assert_eq!(plan, vec!["e0", "r0", "e1", "r1", "e2"]);
+    }
+
+    #[test]
+    fn errors_last_never_prunes_inside_the_recent_window() {
+        let mut messages = vec![error_result("e0", 4_000), error_result("e1", 4_000)];
+        for index in 0..8 {
+            messages.push(tool_result(&format!("s{index}"), 4_000));
+        }
+        let settings = PruneSettings {
+            keep_recent: 8,
+            order: PruneOrder::ErrorsLast,
+            ..Default::default()
+        };
+        let plan = plan_prune(&messages, &HashSet::new(), 12_000, 20_000, &settings);
+        assert_eq!(plan, vec!["e0", "e1"]);
+        assert!(
+            !plan.iter().any(|id| id.starts_with('s')),
+            "a recent result was pruned: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn evidence_route_preserves_route_thresholds() {
+        let cached = PruneSettings::evidence_route_for(true);
+        assert_eq!(cached.start_fraction, 0.65);
+        assert_eq!(cached.target_fraction, 0.35);
+        assert_eq!(cached.order, PruneOrder::ErrorsLast);
+
+        let direct = PruneSettings::evidence_route_for(false);
+        assert_eq!(direct.start_fraction, 0.5);
+        assert_eq!(direct.target_fraction, 0.35);
+        assert_eq!(direct.order, PruneOrder::ErrorsLast);
     }
 
     #[test]
