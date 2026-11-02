@@ -52,6 +52,7 @@ pub mod sheet;
 pub mod startup;
 pub mod studio;
 pub mod task_board;
+pub mod theme_picker;
 pub mod thinking;
 pub mod transcript;
 mod transcript_cache;

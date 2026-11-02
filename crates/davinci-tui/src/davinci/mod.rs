@@ -11,6 +11,7 @@ pub mod app;
 pub mod fixtures;
 pub mod links;
 pub mod model;
+mod named_sgr;
 mod paste_burst;
 pub mod roster;
 pub mod runtime;

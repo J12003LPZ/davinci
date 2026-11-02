@@ -114,6 +114,27 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
             caret: None,
         };
     }
+    if model.theme_picker.is_some() && model.overlay.is_none() {
+        let picker = super::views::theme_picker::fitted(model, height);
+        let picker_height = picker.len();
+        let mut context = Model {
+            screen: Screen::Agent,
+            theme_picker: None,
+            ..model.clone()
+        };
+        context.graph_run = None;
+        let mut lines = body(&context, height.saturating_sub(picker_height));
+        lines = pad_to(lines, height.saturating_sub(picker_height));
+        lines.extend(picker);
+        return ComposedFrame {
+            lines: pad_to(lines, height),
+            graph: None,
+            scrollbar: None,
+            suggestion_rows: None,
+            targets: Vec::new(),
+            caret: None,
+        };
+    }
     if matches!(model.screen, Screen::Models | Screen::Settings) && model.overlay.is_none() {
         let picker = if model.screen == Screen::Settings {
             settings::screen(model, settings::screen_height(model).min(height))
@@ -1228,6 +1249,9 @@ pub fn permission_cycle_chord(model: &Model, key: KeyEvent, data: &str) -> bool 
 pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     if key.kind == KeyEventKind::Release {
         return Flow::Continue;
+    }
+    if model.theme_picker.is_some() {
+        return super::views::theme_picker::handle_key(model, key);
     }
     // ? in an empty conversation composer opens the shortcuts panel. Any
     // other key closes it and is then handled normally.

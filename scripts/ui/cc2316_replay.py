@@ -98,6 +98,7 @@ class Capture:
     proxy_attempts: list = field(default_factory=list)
     connection_samples: list = field(default_factory=list)
     exit: str = ""
+    agent_settings: dict = field(default_factory=dict)  # the isolated agent dir's settings.json at exit
 
     @property
     def ok(self) -> bool:
@@ -538,6 +539,10 @@ def replay(binary, scenario, profile, *, out_dir) -> Capture:
         cap.status, cap.reason = FAIL, f"{type(exc).__name__}: {exc}"
     finally:
         cap.exit = _end(harness, pid, bool(scenario.get("graceful", True)), problems)
+        try:
+            cap.agent_settings = json.loads((agent / "settings.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
         if timer is not None:
             timer.cancel()
         watch_stop.set()

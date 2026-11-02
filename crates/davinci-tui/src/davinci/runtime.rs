@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Stdout, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Once, OnceLock};
+use std::sync::{Arc, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -32,6 +32,7 @@ use unicode_width::UnicodeWidthChar;
 use super::app::{self, Flow};
 use super::model::Model;
 use super::model::TerminalTask;
+use super::named_sgr::NamedSgr;
 use super::views::scrollbar::Scrollbar;
 use super::views::viewer::ViewerTask;
 
@@ -404,7 +405,10 @@ impl PasteFilter {
 
 /// The terminal, for as long as the TUI owns it.
 pub struct Session {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: Terminal<CrosstermBackend<NamedSgr<Stdout>>>,
+    /// Whether frames write named colours as `30-37` rather than `38;5;N`:
+    /// the reference shell at ANSI depth. Set before each frame.
+    named_sgr: Arc<AtomicBool>,
     generation: Generation,
     keyboard: Keyboard,
     /// `tui.reference` (or `PI_DAVINCI_REFERENCE`), fixed when the session opened.
@@ -520,6 +524,7 @@ impl Session {
         );
         install_panic_hook();
         let generation = Generation::begin();
+        let named_sgr = Arc::new(AtomicBool::new(false));
         let opened = (|| {
             enable_raw_mode()?;
             HELD.store(true, Ordering::SeqCst);
@@ -540,7 +545,8 @@ impl Session {
                 )?;
                 DISAMBIGUATED.store(true, Ordering::SeqCst);
             }
-            let terminal = Terminal::new(CrosstermBackend::new(out))?;
+            let terminal =
+                Terminal::new(CrosstermBackend::new(NamedSgr::new(out, named_sgr.clone())))?;
             Ok::<_, io::Error>((terminal, disambiguated))
         })();
         let (terminal, disambiguated) = match opened {
@@ -552,6 +558,7 @@ impl Session {
         };
         Ok(Self {
             terminal,
+            named_sgr,
             generation,
             keyboard: Keyboard { disambiguated },
             reference,
@@ -581,6 +588,11 @@ impl Session {
             focused: true,
             output: Output::from_env(|name| std::env::var(name).ok()),
         })
+    }
+
+    /// Whether the reference shell is on for this session.
+    pub fn reference(&self) -> bool {
+        self.reference
     }
 
     /// Use the terminal's own cursor at the caret (the `showHardwareCursor`
@@ -808,6 +820,12 @@ impl Session {
         }
         pin_unless_auto_scroll(model, self.scrollbar, self.drawn_entries);
         self.drawn_entries = model.transcript.len();
+        // The theme in force decides, so a live switch through the picker
+        // changes how the very next frame is written.
+        self.named_sgr.store(
+            self.reference && model.theme.depth_hint() == super::theme::ColorDepth::Basic,
+            Ordering::SeqCst,
+        );
         model.terminal_focused = self.focused;
         model.native_cursor = self.output.native_cursor;
         let model: &Model = model;
@@ -2116,6 +2134,52 @@ mod tests {
             KeyCode::Char('a'),
             KeyModifiers::NONE,
         ))));
+    }
+
+    #[test]
+    fn the_mouse_changes_nothing_behind_the_theme_picker() {
+        use super::super::model::{Entry, HitCache};
+        let theme = super::super::theme::Theme::reference(
+            super::super::theme::ColorDepth::TrueColor,
+            false,
+        );
+        let mut model = Model::new(theme, 80, 14, false);
+        model.reference = true;
+        for n in 0..40 {
+            model.transcript.push(Entry::user(&format!("row {n}")));
+        }
+        model.composer.set_text("draft");
+        assert!(app::scroll_transcript(&mut model, 6));
+        let top = model.transcript_scroll.get().top;
+        assert!(top.is_some());
+        assert!(super::super::views::theme_picker::open(&mut model, "dark"));
+        // What the draw that showed the picker leaves for the next event.
+        let composed = app::compose_frame(&model, model.height);
+        *model.hit_cache.borrow_mut() = Some(HitCache {
+            targets: composed.targets.clone(),
+            suggestion_rows: composed.suggestion_rows.clone(),
+        });
+        let mut grab = None;
+        for row in 0..model.height {
+            for kind in [
+                event::MouseEventKind::ScrollUp,
+                event::MouseEventKind::ScrollDown,
+                event::MouseEventKind::Down(event::MouseButton::Left),
+            ] {
+                let mouse = event::MouseEvent {
+                    kind,
+                    column: 3,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                };
+                route_scroll_mouse(&mut model, &mut grab, composed.scrollbar, mouse);
+                route_click_target(&mut model, mouse);
+            }
+        }
+        assert_eq!(model.transcript_scroll.get().top, top);
+        assert_eq!(model.composer.editor().get_text(), "draft");
+        assert!(model.theme_picker.is_some());
+        assert_eq!(model.theme, theme);
     }
 
     #[test]

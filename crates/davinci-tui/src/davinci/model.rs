@@ -237,6 +237,18 @@ pub struct Ask {
     pub items: Vec<PickerItem>,
 }
 
+/// The `/theme` picker (reference shell). The theme in force before it opened
+/// is kept so `esc` can put it back; moving the highlight previews each theme.
+#[derive(Debug, Clone)]
+pub struct ThemePicker {
+    pub index: usize,
+    /// The setting value in force when it opened: the row with the check mark.
+    pub applied: String,
+    pub previous: Theme,
+    /// Whether the preview is highlighted code. `ctrl+t` flips it; it is not saved.
+    pub syntax: bool,
+}
+
 /// What enter meant while an instrument was open. The shell knows which row
 /// was highlighted; only the caller knows what to do about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,6 +265,8 @@ pub enum Choice {
     Catalog(usize),
     /// A setting to advance to its next value (`3b`).
     Setting(usize),
+    /// A theme picked in the `/theme` picker, by its setting value.
+    Theme(String),
     /// A thinking level (`3c`), as an index into `thinking_rows`.
     ThinkingLevel(usize),
     /// A provider to sign in to (`3d`), as an index into `providers`.
@@ -3000,6 +3014,11 @@ pub struct Model {
     pub catalog_query: String,
     pub catalog_session_only: bool,
     pub catalog_search: bool,
+    /// `tui.reference`, fixed when the session opened. Only the reference
+    /// shell opens `/theme` as a picker.
+    pub reference: bool,
+    /// The `/theme` picker, while it is open.
+    pub theme_picker: Option<ThemePicker>,
     /// `3b` — the settings sheet.
     pub settings_rows: Vec<SettingRow>,
     pub settings_index: usize,
@@ -3579,6 +3598,8 @@ impl Model {
             catalog_query: String::new(),
             catalog_session_only: false,
             catalog_search: false,
+            reference: false,
+            theme_picker: None,
             settings_rows: Vec::new(),
             settings_index: 0,
             settings_query: String::new(),
@@ -4123,6 +4144,11 @@ impl Model {
     /// composer — the block was pasted, not typed, so none of them is a
     /// submit — and are flattened in a query, which is one line by definition.
     pub fn paste(&mut self, text: &str) {
+        // The `/theme` picker takes every key, so it takes the paste a fast
+        // typist's burst becomes on Windows; the draft is left as it was.
+        if self.theme_picker.is_some() {
+            return;
+        }
         // Selectors own their search input independently of the conversation.
         // Bracketed paste must not silently replace a preserved chat draft.
         if self.overlay.is_none() && !self.codex_open() {

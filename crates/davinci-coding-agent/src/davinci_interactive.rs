@@ -1528,6 +1528,7 @@ fn double_escape(
         && key.modifiers.is_empty()
         && model.viewing_worker().is_none()
         && model.overlay.is_none()
+        && model.theme_picker.is_none()
         && model.suggestions.is_none()
         && model.screen == davinci_tui::davinci::model::Screen::Agent
         && !model.codex_open()
@@ -1669,8 +1670,7 @@ fn run_turns(shell: &mut Shell<'_>) -> Next {
     if let Err(err) = run_turn(shell.parsed, shell.agent, shell.model, shell.terminal, host) {
         return Next::Fail(err.to_string());
     }
-    while !shell.model.queued.is_empty() {
-        let line = shell.model.queued.remove(0);
+    while let Some(line) = next_queued(shell.model) {
         // What the composer's own submit pushes before a line is routed.
         shell.model.transcript.push(Entry::Gap);
         shell.model.transcript.push(Entry::user(&line));
@@ -1683,6 +1683,32 @@ fn run_turns(shell: &mut Shell<'_>) -> Next {
         }
     }
     Next::Go
+}
+
+/// The reference shell's `/theme`: a picker, not a line for the agent. `true`
+/// when `line` was it. `stored` is read only then.
+fn theme_line(model: &mut Model, line: &str, stored: impl FnOnce() -> Option<String>) -> bool {
+    if !model.reference || line.trim() != "/theme" {
+        return false;
+    }
+    // A queued line reaches here with the shell marked busy; no turn runs.
+    model.running = false;
+    let stored = stored();
+    davinci_tui::davinci::views::theme_picker::open(model, stored.as_deref().unwrap_or("dark"));
+    true
+}
+
+/// The next queued line. In the reference shell `/theme` waits behind every
+/// line that will start a turn: a picker open while a turn runs would take the
+/// keys of its approval prompts. Everywhere else the queue is first in, first out.
+fn next_queued(model: &mut Model) -> Option<String> {
+    let waits = |line: &String| model.reference && line.trim() == "/theme";
+    let index = model
+        .queued
+        .iter()
+        .position(|line| !waits(line))
+        .unwrap_or(0);
+    (index < model.queued.len()).then(|| model.queued.remove(index))
 }
 
 fn interrupted_recovery_aftermath() -> Vec<(State, String)> {
@@ -5122,6 +5148,11 @@ pub fn run(
         &crate::default_agent_dir(),
     ) {
         model.push_toast(hint);
+    }
+    if terminal.reference() {
+        model.reference = true;
+        model.theme = model.theme.with_reference(true);
+        apply_theme_setting(&mut model, &stored_settings);
     }
     terminal.set_native_cursor(stored_settings.show_hardware_cursor.unwrap_or(false));
     terminal.set_copy_on_select(stored_settings.fullscreen_copy_on_select.unwrap_or(true));
@@ -9637,6 +9668,13 @@ fn on_line(shell: &mut Shell<'_>, line: &str) -> Next {
             }
         }
     }
+    // The reference shell opens `/theme` as a picker; otherwise the line goes
+    // on exactly as before.
+    if theme_line(shell.model, line, || {
+        crate::settings::load_merged_settings(&crate::default_agent_dir(), &shell.agent.cwd).theme
+    }) {
+        return Next::Go;
+    }
     match classify(line) {
         Sent::Quit => {
             run_stop_hooks(shell);
@@ -9856,6 +9894,14 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
         }
         // `3b` — advance the setting to its next value and persist it.
         Choice::Setting(index) => cycle_setting(shell, index),
+        // `/theme` picker — the same `theme=` write the settings row makes.
+        Choice::Theme(name) => {
+            if let Err(err) = crate::persist_interactive_setting(&format!("theme={name}")) {
+                // The preview stays on screen; say that it was not saved.
+                shell.note(&err);
+            }
+            Next::Go
+        }
         // `3c` — a thinking level.
         Choice::ThinkingLevel(index) => {
             let Some(level) = shell

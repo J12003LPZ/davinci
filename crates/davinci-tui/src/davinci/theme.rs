@@ -118,7 +118,58 @@ impl Variant {
     }
 }
 
+/// Whether the reference has a palette for this built-in theme name. `auto`
+/// resolves to dark or light, so it does too; `vox` and anything unknown stay
+/// DaVinci's own.
+fn reference_name(name: &str) -> bool {
+    matches!(
+        name.strip_suffix("-daltonized").unwrap_or(name),
+        "auto" | "ansi" | "daltonized" | "dark" | "light"
+    )
+}
+
 impl Cc {
+    /// The ground under the changed words of an added line. Where the palette
+    /// has no measured shade the row's own tint stands in.
+    pub fn add_word_bg(&self) -> Color {
+        if self.diff_add_word_bg == Color::Reset {
+            self.diff_add_bg
+        } else {
+            self.diff_add_word_bg
+        }
+    }
+
+    /// [`Cc::add_word_bg`] for a removed line.
+    pub fn del_word_bg(&self) -> Color {
+        if self.diff_del_word_bg == Color::Reset {
+            self.diff_del_bg
+        } else {
+            self.diff_del_word_bg
+        }
+    }
+
+    /// The ink of a function name in highlighted code; plain diff text where
+    /// the palette has no measured one.
+    pub fn function_ink(&self) -> Color {
+        if self.code_function == Color::Reset {
+            self.diff_text
+        } else {
+            self.code_function
+        }
+    }
+
+    /// The reference's colorblind-friendly dark inks, as captured: blue
+    /// instead of green for success and added lines. Removed lines keep their
+    /// red. The mark's colour is DaVinci's own and is not taken.
+    fn reference_daltonized(mut self) -> Self {
+        self.permission = rgb(0x99CCFF);
+        self.success = rgb(0x3399FF);
+        self.diff_add = rgb(0x51A0C8);
+        self.diff_add_bg = rgb(0x001B29);
+        self.diff_add_word_bg = rgb(0x003047);
+        self
+    }
+
     /// Success and diff-add inks to blue, error and diff-del to orange.
     fn daltonized(mut self, depth: ColorDepth) -> Self {
         let (blue, orange, add_bg, del_bg) = match depth {
@@ -180,6 +231,17 @@ pub struct Theme {
     /// Green and red are traded for blue and orange, which colour-blind
     /// readers tell apart.
     pub daltonized: bool,
+    /// The captured reference palette stands in for the native one. Never set
+    /// under `NO_COLOR`, nor for a theme the reference has no counterpart to.
+    pub reference: bool,
+    /// The session asked for the reference (`tui.reference`) and the terminal
+    /// allows colour. Unlike `reference` it survives a theme with no
+    /// counterpart, such as `vox`, so a later built-in theme gets it back.
+    pub wants_reference: bool,
+    /// The colour depth the terminal negotiated. A theme can narrow itself
+    /// below it (`ansi`); this is where the next theme starts from. Read only
+    /// while `wants_reference` is set.
+    pub negotiated: ColorDepth,
 }
 
 pub fn css_color(color: Color) -> Option<String> {
@@ -569,6 +631,14 @@ pub struct Cc {
     pub code_keyword: Color,
     pub code_string: Color,
     pub code_macro: Color,
+    /// Function names in highlighted code. Reset where unmeasured.
+    pub code_function: Color,
+    /// Background under the changed words of an added or removed line.
+    pub diff_add_word_bg: Color,
+    pub diff_del_word_bg: Color,
+    /// What the reference adds to quiet text: `DIM` where 16-colour grey has
+    /// no shade of its own.
+    pub inactive_modifier: Modifier,
     /// One ink per `/context` category, in `ContextKind` order: system
     /// prompt, system tools, MCP tools, custom agents, memory files, messages.
     /// Six hues no other slot has to share, so two categories never look
@@ -605,6 +675,10 @@ const CC_DARK: Cc = Cc {
     code_keyword: Color::Blue,
     code_string: Color::Red,
     code_macro: Color::Cyan,
+    code_function: Color::Reset,
+    diff_add_word_bg: Color::Reset,
+    diff_del_word_bg: Color::Reset,
+    inactive_modifier: Modifier::empty(),
     category: [
         rgb(0x82AAFF),
         rgb(0xF2D45C),
@@ -641,6 +715,10 @@ const CC_DARK_256: Cc = Cc {
     code_keyword: Color::Blue,
     code_string: Color::Red,
     code_macro: Color::Cyan,
+    code_function: Color::Reset,
+    diff_add_word_bg: Color::Reset,
+    diff_del_word_bg: Color::Reset,
+    inactive_modifier: Modifier::empty(),
     category: [
         Color::Indexed(111),
         Color::Indexed(221),
@@ -677,6 +755,10 @@ const CC_LIGHT: Cc = Cc {
     code_keyword: Color::Blue,
     code_string: Color::Red,
     code_macro: Color::Cyan,
+    code_function: Color::Reset,
+    diff_add_word_bg: Color::Reset,
+    diff_del_word_bg: Color::Reset,
+    inactive_modifier: Modifier::empty(),
     category: [
         rgb(0x3B5BDB),
         rgb(0xB8860B),
@@ -713,6 +795,10 @@ const CC_LIGHT_256: Cc = Cc {
     code_keyword: Color::Blue,
     code_string: Color::Red,
     code_macro: Color::Cyan,
+    code_function: Color::Reset,
+    diff_add_word_bg: Color::Reset,
+    diff_del_word_bg: Color::Reset,
+    inactive_modifier: Modifier::empty(),
     category: [
         Color::Indexed(62),
         Color::Indexed(136),
@@ -751,6 +837,10 @@ const CC_VOX: Cc = Cc {
     code_keyword: rgb(0xC45ADF),
     code_string: rgb(0xEABC34),
     code_macro: rgb(0x20C9D6),
+    code_function: Color::Reset,
+    diff_add_word_bg: Color::Reset,
+    diff_del_word_bg: Color::Reset,
+    inactive_modifier: Modifier::empty(),
     category: [
         rgb(0x4A7BF0),
         rgb(0xEABC34),
@@ -787,6 +877,10 @@ const CC_VOX_256: Cc = Cc {
     code_keyword: Color::Indexed(176),
     code_string: Color::Indexed(179),
     code_macro: Color::Indexed(44),
+    code_function: Color::Reset,
+    diff_add_word_bg: Color::Reset,
+    diff_del_word_bg: Color::Reset,
+    inactive_modifier: Modifier::empty(),
     category: [
         Color::Indexed(69),
         Color::Indexed(179),
@@ -823,6 +917,10 @@ const CC_BASIC: Cc = Cc {
     code_keyword: Color::Blue,
     code_string: Color::Red,
     code_macro: Color::Cyan,
+    code_function: Color::Reset,
+    diff_add_word_bg: Color::Reset,
+    diff_del_word_bg: Color::Reset,
+    inactive_modifier: Modifier::empty(),
     category: [
         Color::LightBlue,
         Color::Yellow,
@@ -859,8 +957,54 @@ const CC_NONE: Cc = Cc {
     code_keyword: Color::Reset,
     code_string: Color::Reset,
     code_macro: Color::Reset,
+    code_function: Color::Reset,
+    diff_add_word_bg: Color::Reset,
+    diff_del_word_bg: Color::Reset,
+    inactive_modifier: Modifier::empty(),
     category: [Color::Reset; 6],
     selection_bg: Color::Reset,
+};
+
+/// The reference, dark, measured from the 2.1.316 captures. Only what differs
+/// from the older frames behind `CC_DARK` is restated: the diff tints with
+/// syntax highlighting on, and the highlighted code inks.
+const CC_REF_DARK: Cc = Cc {
+    diff_add_bg: rgb(0x022800),
+    diff_add_word_bg: rgb(0x044700),
+    diff_del_bg: rgb(0x3D0100),
+    diff_del_word_bg: rgb(0x5C0200),
+    code_keyword: rgb(0x66D9EF),
+    code_string: rgb(0xE6DB74),
+    code_function: rgb(0xA6E22E),
+    ..CC_DARK
+};
+
+/// The reference, light. Its footer rules are a shade darker than the old
+/// frames showed; its diff with syntax on was never captured.
+const CC_REF_LIGHT: Cc = Cc {
+    prompt_border: rgb(0x8A8A8A),
+    ..CC_LIGHT
+};
+
+/// The reference's ANSI-only themes: named colours alone, grey made quiet
+/// with the dim attribute, and bright yellow for the mode line.
+const CC_REF_BASIC: Cc = Cc {
+    auto_mode: Color::LightYellow,
+    inactive_modifier: Modifier::DIM,
+    ..CC_BASIC
+};
+
+/// The reference light ground is whatever the terminal paints: the app emits
+/// no background, and its ink is the terminal's. Only the inks measured on the
+/// captures differ from the native light ramp.
+const LIGHT_REF: Ramp = Ramp {
+    background: Color::Reset,
+    surface: Color::Reset,
+    surface_alt: Color::Reset,
+    border: rgb(0x8A8A8A),
+    text: Color::Reset,
+    primary: rgb(0x5769F7),
+    ..LIGHT
 };
 
 impl Theme {
@@ -869,17 +1013,27 @@ impl Theme {
         if self.no_color {
             return CC_NONE;
         }
-        let base = match (self.depth_hint(), self.variant) {
-            (ColorDepth::TrueColor, Variant::Dark) => CC_DARK,
-            (ColorDepth::TrueColor, Variant::Light) => CC_LIGHT,
-            (ColorDepth::TrueColor, Variant::Vox) => CC_VOX,
-            (ColorDepth::Ansi256, Variant::Dark) => CC_DARK_256,
-            (ColorDepth::Ansi256, Variant::Light) => CC_LIGHT_256,
-            (ColorDepth::Ansi256, Variant::Vox) => CC_VOX_256,
-            (ColorDepth::Basic, _) => CC_BASIC,
+        let base = match (self.depth_hint(), self.variant, self.reference) {
+            (ColorDepth::TrueColor, Variant::Dark, true) => CC_REF_DARK,
+            (ColorDepth::TrueColor, Variant::Light, true) => CC_REF_LIGHT,
+            (ColorDepth::Basic, _, true) => CC_REF_BASIC,
+            (ColorDepth::TrueColor, Variant::Dark, _) => CC_DARK,
+            (ColorDepth::TrueColor, Variant::Light, _) => CC_LIGHT,
+            (ColorDepth::TrueColor, Variant::Vox, _) => CC_VOX,
+            (ColorDepth::Ansi256, Variant::Dark, _) => CC_DARK_256,
+            (ColorDepth::Ansi256, Variant::Light, _) => CC_LIGHT_256,
+            (ColorDepth::Ansi256, Variant::Vox, _) => CC_VOX_256,
+            (ColorDepth::Basic, _, _) => CC_BASIC,
         };
         let base = if self.daltonized && !self.no_color {
-            base.daltonized(self.depth_hint())
+            if self.reference
+                && self.variant == Variant::Dark
+                && self.depth_hint() == ColorDepth::TrueColor
+            {
+                base.reference_daltonized()
+            } else {
+                base.daltonized(self.depth_hint())
+            }
         } else {
             base
         };
@@ -944,6 +1098,100 @@ impl Theme {
     /// Apply the built-in setting while retaining terminal capabilities.
     /// Legacy/custom names retain the native dark palette.
     pub fn with_name(&self, name: &str) -> Self {
+        let themed = self.named(name);
+        if !self.wants_reference {
+            return themed;
+        }
+        // What the session asked for outlives the theme it started on.
+        let themed = Self {
+            wants_reference: true,
+            negotiated: self.negotiated,
+            ..themed
+        };
+        // The reference palette follows only the names it has a measured
+        // counterpart for. DaVinci's own `vox`, a custom or legacy name
+        // and `NO_COLOR` keep exactly what they resolve to today.
+        if themed.no_color || !reference_name(name) {
+            return themed;
+        }
+        let themed = Self {
+            reference: true,
+            ..themed
+        };
+        if themed.variant != Variant::Light || themed.depth_hint() != ColorDepth::TrueColor {
+            return themed;
+        }
+        let light = Self {
+            variant: Variant::Light,
+            reference: true,
+            wants_reference: true,
+            negotiated: themed.negotiated,
+            ..Self::from_ramp(&LIGHT_REF, false, false)
+        };
+        if themed.daltonized {
+            light.daltonize()
+        } else {
+            light
+        }
+    }
+
+    /// The same theme with the captured reference palette on or off. `NO_COLOR`
+    /// has no reference capture, so it never turns on.
+    pub fn with_reference(self, on: bool) -> Self {
+        let wants = on && !self.no_color;
+        Self {
+            reference: wants && !self.is_vox(),
+            wants_reference: wants,
+            ..self
+        }
+    }
+
+    /// Build the reference theme for a negotiated colour depth. `NO_COLOR` is
+    /// the plain DaVinci greyscale: there is no capture to match.
+    pub fn reference(depth: ColorDepth, no_color: bool) -> Self {
+        Self::da_vinci(depth, no_color).with_reference(true)
+    }
+
+    /// The conversation palette for a diff drawn with syntax highlighting on
+    /// or off. Only the reference distinguishes the two: its plain diff uses
+    /// stronger tints and one ink for the code.
+    pub fn diff_palette(&self, syntax: bool) -> Cc {
+        let cc = self.cc();
+        if syntax || !self.reference || self.no_color || self.depth_hint() != ColorDepth::TrueColor
+        {
+            return cc;
+        }
+        match (self.variant, self.daltonized) {
+            (Variant::Dark, false) => Cc {
+                diff_add_bg: rgb(0x225C2B),
+                diff_add_word_bg: rgb(0x38A660),
+                diff_del_bg: rgb(0x7A2936),
+                diff_del_word_bg: rgb(0xB3596B),
+                diff_text: rgb(0xFFFFFF),
+                ..cc
+            },
+            (Variant::Dark, true) => Cc {
+                diff_add_bg: rgb(0x004466),
+                diff_add_word_bg: rgb(0x0077B3),
+                diff_del_bg: rgb(0x660000),
+                diff_del_word_bg: rgb(0xB30000),
+                diff_text: rgb(0xFFFFFF),
+                ..cc
+            },
+            (Variant::Light, false) => Cc {
+                diff_add_bg: rgb(0x69DB7C),
+                diff_add_word_bg: rgb(0x2F9D44),
+                diff_del_bg: rgb(0xFFA8B4),
+                diff_del_word_bg: rgb(0xD1454B),
+                diff_text: rgb(0x000000),
+                ..cc
+            },
+            // Light colorblind and Vox have no capture.
+            _ => cc,
+        }
+    }
+
+    fn named(&self, name: &str) -> Self {
         // `auto` follows the terminal's own light or dark setting as far as
         // the environment reveals it; `ansi` keeps to the 16 named colours.
         if name == "auto" {
@@ -960,7 +1208,13 @@ impl Theme {
         if let Some(base) = name.strip_suffix("-daltonized") {
             return self.with_name(base).daltonize();
         }
-        let depth = self.depth_hint();
+        // A built-in name starts from the terminal's own depth, not from the
+        // depth the current theme narrowed itself to (`ansi`).
+        let depth = if self.wants_reference {
+            self.negotiated
+        } else {
+            self.depth_hint()
+        };
         let variant = Variant::from_name(name);
         if variant == Variant::Vox {
             // NO_COLOR outranks a palette choice: vox drops to the greyscale ramp.
@@ -1096,6 +1350,9 @@ impl Theme {
             (ColorDepth::TrueColor, false) => &TRUECOLOR_DIM,
         };
         let mut dimmed = Self::from_ramp(ramp, self.no_color, true);
+        dimmed.reference = self.reference;
+        dimmed.wants_reference = self.wants_reference;
+        dimmed.negotiated = self.negotiated;
         // Nothing is emphasised behind a modal; the modal is what is in hand.
         dimmed.emphasis = Modifier::empty();
         dimmed
@@ -1172,20 +1429,28 @@ impl Theme {
             dimmed,
             variant: Variant::Dark,
             daltonized: false,
+            reference: false,
+            wants_reference: false,
+            negotiated: depth_of(ramp.primary),
         }
     }
 
     /// Which encoding this theme was built in, recovered from its own tokens so
     /// `dim` does not need the depth passed back in.
-    fn depth_hint(&self) -> ColorDepth {
+    pub fn depth_hint(&self) -> ColorDepth {
         // The reference theme deliberately leaves the terminal foreground as
         // Color::Reset. Infer capability from the authored accent instead:
         // every built-in ramp keeps primary in its negotiated encoding.
-        match self.primary {
-            Color::Rgb(..) => ColorDepth::TrueColor,
-            Color::Indexed(..) => ColorDepth::Ansi256,
-            _ => ColorDepth::Basic,
-        }
+        depth_of(self.primary)
+    }
+}
+
+/// The colour depth an authored accent colour was written in.
+fn depth_of(primary: Color) -> ColorDepth {
+    match primary {
+        Color::Rgb(..) => ColorDepth::TrueColor,
+        Color::Indexed(..) => ColorDepth::Ansi256,
+        _ => ColorDepth::Basic,
     }
 }
 

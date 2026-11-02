@@ -441,6 +441,61 @@ fn model() -> Model {
 }
 
 #[test]
+fn the_theme_line_opens_the_picker_only_in_the_reference_shell() {
+    let mut off = model();
+    assert!(!super::theme_line(&mut off, "/theme", || {
+        panic!("settings were read with the setting off")
+    }));
+    assert!(off.theme_picker.is_none());
+
+    let mut on = model();
+    on.reference = true;
+    on.running = true;
+    for other in ["/themes", "/theme dark", "theme", "make a theme"] {
+        assert!(!super::theme_line(&mut on, other, || None), "{other}");
+    }
+    assert!(on.theme_picker.is_none());
+    let before = on.transcript.len();
+    assert!(super::theme_line(&mut on, " /theme ", || Some(
+        "light".into()
+    )));
+    let picker = on.theme_picker.as_ref().expect("opened");
+    assert_eq!(
+        davinci_tui::davinci::views::theme_picker::ENTRIES[picker.index].0,
+        "light"
+    );
+    assert_eq!(picker.applied, "light");
+    // Nothing was added to the conversation, and a queued line that ran it no
+    // longer leaves the shell looking busy.
+    assert_eq!(on.transcript.len(), before);
+    assert!(!on.running);
+    // An unset theme means the default.
+    on.theme_picker = None;
+    assert!(super::theme_line(&mut on, "/theme", || None));
+    assert_eq!(on.theme_picker.as_ref().unwrap().applied, "dark");
+}
+
+#[test]
+fn a_queued_theme_line_waits_behind_the_lines_that_start_a_turn() {
+    let queue = |lines: &[&str]| lines.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let drain =
+        |model: &mut Model| std::iter::from_fn(|| super::next_queued(model)).collect::<Vec<_>>();
+    let mut on = model();
+    on.reference = true;
+    on.queued = queue(&["/theme", "fix it", "/theme", "then test"]);
+    assert_eq!(
+        drain(&mut on),
+        queue(&["fix it", "then test", "/theme", "/theme"])
+    );
+    on.queued = queue(&["/theme"]);
+    assert_eq!(drain(&mut on), queue(&["/theme"]));
+    // Off: first in, first out, as before.
+    let mut off = model();
+    off.queued = queue(&["/theme", "fix it", "/theme"]);
+    assert_eq!(drain(&mut off), queue(&["/theme", "fix it", "/theme"]));
+}
+
+#[test]
 fn mid_turn_shift_tab_updates_the_footer_at_once_and_cycles_from_the_displayed_mode() {
     let mut agent = Agent::new("base prompt");
     let mut m = model();
@@ -4981,4 +5036,33 @@ fn audit_wp06_b062_malformed_marketplace_registry_is_visible() {
     assert!(super::marketplace_rows(&agent_dir)
         .iter()
         .all(|row| row.state != davinci_tui::davinci::theme::State::Failed));
+}
+
+#[test]
+fn an_esc_the_theme_picker_consumed_never_counts_toward_a_double_escape() {
+    // Closing the picker does not arm the timer, so the next Esc is a first.
+    let mut model = self::model();
+    model.reference = true;
+    let mut last = None;
+    assert!(davinci_tui::davinci::views::theme_picker::open(
+        &mut model, "dark"
+    ));
+    assert!(!idle_esc(&mut model, &mut last));
+    assert!(model.theme_picker.is_none(), "Esc closes the picker");
+    assert!(last.is_none(), "the closing Esc armed the timer");
+    assert!(!idle_esc(&mut model, &mut last));
+
+    // An Esc from before the picker opened does not pair with one inside it.
+    let mut second = self::model();
+    second.reference = true;
+    let mut last = None;
+    assert!(!idle_esc(&mut second, &mut last));
+    assert!(last.is_some());
+    assert!(davinci_tui::davinci::views::theme_picker::open(
+        &mut second,
+        "dark"
+    ));
+    assert!(!idle_esc(&mut second, &mut last));
+    assert!(second.theme_picker.is_none());
+    assert!(!idle_esc(&mut second, &mut last), "pair spanned the picker");
 }
