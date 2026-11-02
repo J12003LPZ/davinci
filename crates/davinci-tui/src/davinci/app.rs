@@ -804,6 +804,9 @@ fn composer_rows(model: &Model) -> (Vec<Line<'static>>, Option<(usize, u16)>) {
     if model.overlay.is_some() {
         return (Vec::new(), None);
     }
+    if model.reference && model.history_search.is_some() {
+        return chrome::history_box(model);
+    }
     // Conversation hints stay close to the prompt and abbreviate on narrow
     // windows. Overlays and the Codex split own their keyboard guidance.
     // A command sheet says what sits under it; its hint row is the only hint
@@ -1224,6 +1227,8 @@ fn handle_history_search_key(model: &mut Model, key: KeyEvent) -> Flow {
         KeyCode::Up => model.history_search_move(1),
         KeyCode::Down => model.history_search_move(-1),
         KeyCode::Char('r') if ctrl => model.history_search_move(1),
+        // The reference's ctrl+s changes whose prompts are searched.
+        KeyCode::Char('s') if ctrl && model.reference => model.history_search_scope(),
         KeyCode::Char('s') if ctrl => model.history_search_move(-1),
         KeyCode::Backspace => {
             if let Some(search) = &mut model.history_search {
@@ -1368,6 +1373,12 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
         InputOwner::Composer => {}
     }
 
+    if model.reference && model.vim.is_some() && model.composer_owns_focus() {
+        if let Some(flow) = vim_key(model, key) {
+            return flow;
+        }
+    }
+
     if let Some(data) = data.as_deref() {
         // Active surfaces get first refusal above. Autocomplete may decline
         // this chord without losing its suggestions or changing the draft.
@@ -1417,7 +1428,7 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
             return Flow::Continue;
         }
         if model.keybindings.matches(data, "tui.input.submit") {
-            let sent = model.composer.editor().get_expanded_text();
+            let sent = model.composer.expanded_text();
             if sent.trim().is_empty() {
                 return Flow::Continue;
             }
@@ -1444,6 +1455,90 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     Flow::Continue
 }
 
+/// Vim editing of the draft. INSERT types as usual and `esc` leaves it; NORMAL takes
+/// `i a I A o` (back to INSERT), `h l 0 ^ $ w b j k`, `x`, `u`, and `d` with `w d $`.
+/// Any other plain key does nothing there. Chords, Enter and the arrows go on to the
+/// composer's own keys; `None` hands the key back.
+fn vim_key(model: &mut Model, key: KeyEvent) -> Option<Flow> {
+    use super::model::VimMode;
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    let vim = model.vim.as_mut()?;
+    if vim.mode == VimMode::Insert {
+        if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+            vim.mode = VimMode::Normal;
+            vim.pending = None;
+            model.mark_caret_moved();
+            return Some(Flow::Continue);
+        }
+        return None;
+    }
+    let KeyCode::Char(ch) = key.code else {
+        vim.pending = None;
+        return None;
+    };
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        vim.pending = None;
+        return None;
+    }
+    let pending = vim.pending.take();
+    let editor = model.composer.editor_mut();
+    let mut insert = false;
+    match (pending, ch) {
+        (Some('d'), 'w') => model.composer.delete_word_vim(),
+        (Some('d'), 'd') => model.composer.delete_line_vim(),
+        (Some('d'), '$') => editor.delete_to_line_end(),
+        (Some(_), _) => {}
+        (None, 'd') => {
+            if let Some(vim) = model.vim.as_mut() {
+                vim.pending = Some('d');
+            }
+        }
+        (None, 'i') => insert = true,
+        (None, 'a') => {
+            editor.move_right();
+            insert = true;
+        }
+        (None, 'I') => {
+            editor.move_line_start();
+            insert = true;
+        }
+        (None, 'A') => {
+            editor.move_line_end();
+            insert = true;
+        }
+        (None, 'o') => {
+            editor.move_line_end();
+            model.composer.push('\n');
+            insert = true;
+        }
+        (None, 'h') => editor.move_left(),
+        (None, 'l') => editor.move_right(),
+        (None, '0' | '^') => editor.move_line_start(),
+        (None, '$') => editor.move_line_end(),
+        (None, 'w') => editor.move_word_forwards(),
+        (None, 'b') => editor.move_word_backwards(),
+        (None, 'j') => editor.cursor_down(),
+        (None, 'k') => editor.cursor_up(),
+        (None, 'x') => editor.delete_forward(),
+        (None, 'u') => editor.undo(),
+        (None, 'D') => editor.delete_to_line_end(),
+        _ => {}
+    }
+    if insert {
+        if let Some(vim) = model.vim.as_mut() {
+            vim.mode = VimMode::Insert;
+        }
+    }
+    model.refresh_suggestions();
+    model.mark_caret_moved();
+    Some(Flow::Continue)
+}
+
 /// `esc` over a draft arms a clear; a second `esc` within
 /// `DOUBLE_ESCAPE_MS` empties the composer, as in Claude Code. The draft goes
 /// to history first, so `↑` brings it back. Only on the conversation, at rest
@@ -1458,13 +1553,13 @@ fn clear_draft_on_double_escape(model: &mut Model) -> bool {
         return false;
     }
     let now = std::time::Instant::now();
-    let window = std::time::Duration::from_millis(crate::DOUBLE_ESCAPE_MS);
+    let window = model.double_escape_window();
     if model
         .clear_armed
         .is_some_and(|armed| now.duration_since(armed) < window)
     {
         model.clear_armed = None;
-        let _ = model.composer.editor_mut().submit();
+        let _ = model.composer.submit();
         model.refresh_suggestions();
     } else {
         model.clear_armed = Some(now);
@@ -1497,12 +1592,7 @@ fn handle_suggestion_key(model: &mut Model, data: Option<&str>) -> Option<Flow> 
         }
         if model.accept_suggestion() || tab {
             if run {
-                let sent = model
-                    .composer
-                    .editor()
-                    .get_expanded_text()
-                    .trim_end()
-                    .to_string();
+                let sent = model.composer.expanded_text().trim_end().to_string();
                 model.dismiss_suggestions();
                 model.submit();
                 return Some(Flow::Submit(sent));
@@ -1553,6 +1643,12 @@ fn handle_global_key(model: &mut Model, data: &str) -> Option<Flow> {
         }
         if model.keybindings.matches(data, "davinci.editor.chordStart") {
             model.chord_x = Some(std::time::Instant::now());
+            return Some(Flow::Continue);
+        }
+        // The reference's ctrl+s sets the draft aside (or brings it back) where
+        // the Sessions overlay would otherwise open.
+        if model.reference && model.keybindings.matches(data, "davinci.sessions.toggle") {
+            model.toggle_stash();
             return Some(Flow::Continue);
         }
     }

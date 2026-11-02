@@ -324,6 +324,12 @@ impl Editor {
         self.last_action = None;
     }
 
+    /// Forget every undo step. A draft handed to another place must not be
+    /// brought back into this one by undo.
+    pub fn clear_undo(&mut self) {
+        self.undo_stack.clear();
+    }
+
     pub fn jump_mode(&self) -> Option<bool> {
         match self.jump_mode {
             Some(JumpMode::Forward) => Some(true),

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Replay a scenario against a DaVinci binary and capture styled cells (task P03).
 
 ``replay(binary, scenario, profile, out_dir=...) -> Capture`` starts an interactive
@@ -58,9 +58,12 @@ BASE_ENV_KEYS = ("PATH", "SystemRoot", "WINDIR", "TEMP", "TMP")
 # setting (a scenario can also pass the setting in ``davinci_settings``).
 # ``PI_DAVINCI_PANIC_FIXTURE`` makes the shell panic right after it takes the terminal,
 # to prove the terminal is given back; it adds no reach.
+# ``PI_CLIPBOARD_IMAGE`` names a PNG the shell reads as the clipboard's image. Every run also
+# sets ``PI_CLIPBOARD_DRY_RUN``, so the machine's own clipboard is never read.
 PROFILE_ENV_KEYS = ("NO_COLOR", "FORCE_COLOR", "COLORFGBG", "PI_DAVINCI_REFERENCE",
-                    "PI_DAVINCI_PANIC_FIXTURE")
-ACTIONS = ("key", "wait", "snapshot", "resize", "mouse", "click_text", "release")
+                    "PI_DAVINCI_PANIC_FIXTURE", "PI_CLIPBOARD_IMAGE")
+ACTIONS = ("key", "wait", "wait_for", "snapshot", "resize", "mouse", "click_text", "release")
+WAIT_FOR_MAX_MS = 1_800_000
 SCENARIO_KEYS = ("name", "cols", "rows", "wait_ms", "actions", "graceful", "timeout", "turns",
                  "files", "davinci_settings", "expect_requests", "first_run")
 CLI_ARGS = ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-mcp",
@@ -95,6 +98,8 @@ class Capture:
     raw_path: Path | None = None                    # full, untrimmed recording
     events_path: Path | None = None
     request_count: int = 0
+    requests: list = field(default_factory=list)   # the decoded JSON body of each provider POST
+    waits: list = field(default_factory=list)      # (text, milliseconds) of each wait_for that succeeded
     proxy_attempts: list = field(default_factory=list)
     connection_samples: list = field(default_factory=list)
     exit: str = ""
@@ -223,6 +228,12 @@ def check_scenario(scenario) -> str:
         kind = action.get("type") if isinstance(action, dict) else None
         if kind not in ACTIONS:
             return f"action {i} has unknown type {kind!r}"
+        if kind == "wait_for":
+            text, ceiling = action.get("text"), action.get("timeout_ms", 10000)
+            if not isinstance(text, str) or not text:
+                return f"action {i}: wait_for needs the non-empty text to wait for"
+            if not isinstance(ceiling, int) or isinstance(ceiling, bool) or not 0 < ceiling <= WAIT_FOR_MAX_MS:
+                return f"action {i}: wait_for timeout_ms must be an integer from 1 to {WAIT_FOR_MAX_MS}"
         if kind == "snapshot":
             name = action.get("name")
             if not isinstance(name, str) or not NAME_RE.match(name) or name in seen:
@@ -311,6 +322,7 @@ def build_env(home: Path, agent: Path, proxy_port: int, extra: dict, first_run: 
     proxy = f"http://127.0.0.1:{proxy_port}"
     env.update({
         "PI_DISABLE_NETWORK": "1", "PI_SKIP_VERSION_CHECK": "1", "PI_CATALOG_DRY_RUN": "1",
+        "PI_CLIPBOARD_DRY_RUN": "1",
         "PI_LEARNING_DISABLE_BACKGROUND": "1", "PI_HOOKS_DRY_RUN": "1",
         "TERM": "xterm-256color", "COLORTERM": "truecolor",
         "HOME": str(home), "USERPROFILE": str(home),
@@ -485,7 +497,7 @@ def replay(binary, scenario, profile, *, out_dir) -> Capture:
         (agent / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
     (agent / "models.json").write_text(json.dumps({"providers": {"local": {
         "baseUrl": mock.base_url, "api": "openai-responses", "apiKey": "sk-test",
-        "models": [{"id": "demo", "name": "Demo"}]}}}), encoding="utf-8")
+        "models": [{"id": "demo", "name": "Demo", "input": ["text", "image"]}]}}}), encoding="utf-8")
 
     # The profile sets the size; a scenario's own cols/rows are ignored.
     scratch = root / "scratch"
@@ -515,12 +527,25 @@ def replay(binary, scenario, profile, *, out_dir) -> Capture:
         _settle(harness, float(scenario.get("wait_ms", 6000)) / 1000.0)
         actions = scenario.get("actions", [])
         mid = len(actions) // 2
+        mid_sampler = None
         for i, a in enumerate(actions):
             if i == mid:
-                cap.connection_samples.append(sample_connections(pid, "mid"))
+                # Off the action path: the sample takes most of a second, which would
+                # stretch whatever pause the scenario put around this action.
+                mid_sampler = threading.Thread(
+                    target=lambda: cap.connection_samples.append(sample_connections(pid, "mid")),
+                    daemon=True)
+                mid_sampler.start()
             kind = a["type"]
             if kind == "wait":
                 harness.wait(a.get("ms", 500))
+            elif kind == "wait_for":
+                found, last, waited = wait_for(harness, a["text"], a.get("timeout_ms", 10000))
+                if not found:
+                    cap.reason = wait_failure(i, a["text"], waited, last)
+                    cap.status = FAIL
+                    break
+                cap.waits.append((a["text"], waited))
             elif kind == "key":
                 harness.wait(a.get("delay_ms", 0))
                 harness.key(a.get("text", ""))
@@ -542,6 +567,8 @@ def replay(binary, scenario, profile, *, out_dir) -> Capture:
                 _snapshot(harness, styled_xterm, out, a["name"], binary, cap)
         else:
             cap.status = PASS
+        if mid_sampler is not None:
+            mid_sampler.join(timeout=30)
         if not any(s["label"] == "mid" for s in cap.connection_samples):
             cap.connection_samples.append(sample_connections(pid, "mid"))
         cap.connection_samples.append(sample_connections(pid, "exit"))
@@ -560,6 +587,7 @@ def replay(binary, scenario, profile, *, out_dir) -> Capture:
             watcher.join(35)
         cap.connection_samples = sorted(cap.connection_samples + watched, key=lambda s: s["t"])
         cap.request_count = len(mock.post_requests())
+        cap.requests = [r["body"] for r in mock.post_requests()]
         mock.stop()
         proxy.stop()
         cap.proxy_attempts = list(proxy.attempts)
@@ -594,6 +622,30 @@ def replay(binary, scenario, profile, *, out_dir) -> Capture:
         "request_count": cap.request_count, "proxy_attempts": cap.proxy_attempts,
         "connection_samples": cap.connection_samples}, indent=1), encoding="utf-8")
     return cap
+
+
+def wait_for(harness, text: str, timeout_ms: int, poll_ms: int = 100):
+    """Poll the replayed screen until ``text`` is on it or ``timeout_ms`` passes.
+
+    Returns ``(found, last_screen, milliseconds_waited)``. It reads only the harness's own
+    screen, never the machine's clipboard, and does not retry anything: it ends at the first
+    read that shows the text, or at the ceiling.
+    """
+    started = time.monotonic()
+    ceiling = started + timeout_ms / 1000.0
+    while True:
+        screen = harness.display()
+        waited = round((time.monotonic() - started) * 1000)
+        if text in screen:
+            return True, screen, waited
+        if time.monotonic() >= ceiling:
+            return False, screen, waited
+        time.sleep(poll_ms / 1000.0)
+
+
+def wait_failure(index: int, text: str, waited_ms: int, screen: str) -> str:
+    return (f"action {index}: wait_for {text!r} found nothing on the screen after "
+            f"{waited_ms} ms; the last screen was:\n{screen}")
 
 
 def _without_mark(display: str) -> str:
@@ -670,3 +722,4 @@ def _end(harness, pid, graceful: bool, problems: list) -> str:
         if pid_alive(pid):
             problems.append(f"process {pid} is still running after the kill")
     return how
+

@@ -185,6 +185,44 @@ class LiveTerminalTest(unittest.TestCase):
                 if reference:
                     self.assertLessEqual({1000, 1002, 1003, 1006}, ever_on(raw))
 
+    def first_run(self, actions, env, cols=120, rows=44):
+        """A first run (no settings file) in the reference shell, through the environment."""
+        self.count += 1
+        scenario = {"expect_requests": 0, "wait_ms": 8000, "first_run": True, "actions": actions}
+        env = {"PI_DAVINCI_REFERENCE": "1", **env}
+        return replay.replay(BINARY, scenario, replay.Profile(cols, rows, env=env),
+                             out_dir=Path(self.root) / f"run{self.count}")
+
+    def test_a_panic_during_the_first_run_leaves_every_mode_off_and_no_alternate_screen(self):
+        cap = self.first_run([], {"PI_DAVINCI_PANIC_FIXTURE": "1"})
+        self.assertEqual(cap.status, replay.PASS, cap.reason)
+        raw = self.raw(cap)
+        self.assertIn(b"PI_DAVINCI_PANIC_FIXTURE", raw, "the shell did not panic")
+        self.assertEqual(cap.exit, "exited")
+        reached = ever_on(raw)
+        self.assert_modes_off(raw, reached)
+        # The welcome steps live on the main screen: if the alternate screen was entered
+        # anyway, it was left, and no mouse or keyboard state outlived it.
+        self.assertFalse(final_modes(raw).get(1049), "the alternate screen was left on")
+        self.assertEqual([m for m in (1000, 1002, 1003, 1006) if final_modes(raw).get(m)], [])
+
+    def test_a_resize_during_the_first_run_steps_keeps_the_main_screen_and_restores_on_exit(self):
+        steps = [{"type": "wait", "ms": 1500}, {"type": "key", "text": "\r", "delay_ms": 300},
+                 {"type": "resize", "cols": 60, "rows": 20}, {"type": "wait", "ms": 400},
+                 {"type": "resize", "cols": 100, "rows": 30}, {"type": "wait", "ms": 400},
+                 {"type": "snapshot", "name": "resized"},
+                 {"type": "key", "text": "\x1b", "delay_ms": 300}, {"type": "wait", "ms": 500},
+                 *QUIT]
+        cap = self.first_run(steps, {})
+        self.assertEqual(cap.status, replay.PASS, cap.reason)
+        shot = json.loads(cap.snapshots["resized"].read_text(encoding="utf-8"))
+        self.assertEqual(shot["buffer"]["type"], "normal", "the steps left the main screen")
+        self.assertEqual(shot["dimensions"], {"cols": 100, "rows": 30})
+        raw = self.raw(cap)
+        self.assertEqual(cap.exit, "exited")
+        self.assert_modes_off(raw, ever_on(raw))
+        self.assertFalse(final_modes(raw).get(1049))
+
     def test_the_environment_alone_turns_the_reference_on_and_restore_follows_it(self):
         # The stored setting says off; PI_DAVINCI_REFERENCE=1 wins, and restore does not
         # look at the setting either way.

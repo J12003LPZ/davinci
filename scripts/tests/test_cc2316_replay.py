@@ -289,6 +289,52 @@ class ClickTextTest(unittest.TestCase):
         self.assertFalse(h.click_text("missing"))
 
 
+class ScreenSequence:
+    """A harness whose screen is the next of ``frames`` on each read, then the last for good."""
+
+    def __init__(self, frames):
+        self.frames, self.reads = list(frames), 0
+
+    def display(self):
+        self.reads += 1
+        return self.frames[min(self.reads, len(self.frames)) - 1]
+
+
+class WaitForTest(unittest.TestCase):
+    def test_it_is_a_known_action_with_a_checked_shape(self):
+        self.assertIn("wait_for", replay.ACTIONS)
+        ok = {"type": "wait_for", "text": "[Pasted text #1]", "timeout_ms": 5000}
+        self.assertEqual(replay.check_scenario({"actions": [ok]}), "")
+        self.assertEqual(replay.check_scenario({"actions": [{"type": "wait_for", "text": "x"}]}), "")
+        for bad in ({"type": "wait_for"}, {"type": "wait_for", "text": ""},
+                    {"type": "wait_for", "text": 3}, {"type": "wait_for", "text": "x", "timeout_ms": 0},
+                    {"type": "wait_for", "text": "x", "timeout_ms": "9"},
+                    {"type": "wait_for", "text": "x", "timeout_ms": True}):
+            self.assertIn("wait_for", replay.check_scenario({"actions": [bad]}), bad)
+
+    def test_it_returns_as_soon_as_the_text_is_on_the_screen(self):
+        screen = ScreenSequence(["00|", "00|", "00|[Pasted text #1]", "00|never read"])
+        found, last, waited = replay.wait_for(screen, "[Pasted text #1]", 5000, poll_ms=1)
+        self.assertTrue(found)
+        self.assertEqual(screen.reads, 3)
+        self.assertIn("[Pasted text #1]", last)
+        self.assertLess(waited, 5000)
+
+    def test_it_gives_up_at_the_ceiling_and_hands_back_the_last_screen(self):
+        screen = ScreenSequence(["00|first", "00|the last screen"])
+        found, last, waited = replay.wait_for(screen, "absent", 60, poll_ms=5)
+        self.assertFalse(found)
+        self.assertEqual(last, "00|the last screen")
+        self.assertGreaterEqual(waited, 60)
+
+    def test_the_replay_reports_a_timeout_as_a_failure_with_the_screen(self):
+        reason = replay.wait_failure(2, "x", 60, "00|screen")
+        self.assertIn("action 2", reason)
+        self.assertIn("'x'", reason)
+        self.assertIn("60 ms", reason)
+        self.assertIn("00|screen", reason)
+
+
 def live_skip_reason():
     if not BINARY.is_file():
         return f"no binary at {BINARY}"
@@ -315,6 +361,11 @@ class LiveReplayTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.out, True)
 
     def run_scenario(self, scenario):
+        # ``wait_ms`` is the ceiling on the wait for the first screen to hold still, not a
+        # pause: the wait ends as soon as two reads agree. Six seconds was short of a start
+        # on a loaded machine ("the screen did not settle within 6 s"), which is a slow
+        # start rather than a fault, so the ceiling sits well above any start.
+        scenario = {"wait_ms": 45000, **scenario}
         cap = replay.replay(BINARY, scenario, replay.Profile(120, 44), out_dir=self.out)
         self.assertEqual(cap.status, replay.PASS, cap.reason)
         self.assertEqual(cap.proxy_attempts, [])

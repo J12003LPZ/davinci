@@ -2663,6 +2663,79 @@ fn first_run_asks_only_what_davinci_cannot_decide_for_itself() {
 }
 
 #[test]
+fn the_first_run_question_waits_for_an_open_approval_and_neither_is_lost() {
+    let agent = davinci_agent::Agent::new("test");
+    let mut model = model();
+    model.reference = true;
+    // An approval is on screen when the welcome ends.
+    model.ask = Question::Trust {
+        path: r"C:\work".into(),
+        options: Vec::new(),
+    }
+    .ask(&agent);
+    model.overlay = Some(Overlay::Ask);
+    let approval = model.ask.title.clone();
+    let mut pending = None;
+
+    super::ask_first_run(&mut model, &agent, &mut pending);
+    assert_eq!(model.ask.title, approval, "the approval was replaced");
+    assert!(pending.is_none() && model.first_run_due);
+    // Still open: nothing is put up over it.
+    super::release_first_run(&mut model, &agent, &mut pending);
+    assert_eq!(model.ask.title, approval);
+
+    // It closes; the question follows, once.
+    model.overlay = None;
+    super::release_first_run(&mut model, &agent, &mut pending);
+    assert_eq!(model.ask.title, "Welcome");
+    assert_eq!(model.overlay, Some(Overlay::Ask));
+    assert!(matches!(pending, Some(Question::FirstRun)) && !model.first_run_due);
+
+    // With nothing open it is put up at once, as before.
+    let mut model = self::model();
+    let mut pending = None;
+    super::ask_first_run(&mut model, &agent, &mut pending);
+    assert_eq!(model.ask.title, "Welcome");
+    assert!(!model.first_run_due);
+}
+
+#[test]
+fn an_editor_that_hands_the_draft_back_leaves_it_alone_whatever_it_holds() {
+    // Line endings, a BOM and the newline an editor adds do not make a change; a
+    // change in a character does, also in text a console could not carry.
+    for draft in [
+        "plain",
+        "crlf\r\nlines\r\nhere",
+        "emoji \u{1f642} and e\u{301} and \u{4f60}\u{597d}",
+        "ends with a newline\n",
+        "[Pasted text #1] and more",
+        "",
+    ] {
+        assert!(super::editor_left_draft_alone(draft, draft), "{draft:?}");
+        assert!(
+            super::editor_left_draft_alone(draft, &format!("{draft}\n")),
+            "{draft:?}"
+        );
+        assert!(
+            super::editor_left_draft_alone(draft, &draft.replace("\r\n", "\n")),
+            "{draft:?}"
+        );
+        assert!(
+            super::editor_left_draft_alone(draft, &format!("\u{feff}{draft}")),
+            "{draft:?}"
+        );
+        assert!(
+            !super::editor_left_draft_alone(draft, &format!("{draft}!")),
+            "{draft:?}"
+        );
+    }
+    assert!(
+        !super::editor_left_draft_alone("e\u{301}", "\u{e9}"),
+        "a different encoding is a change"
+    );
+}
+
+#[test]
 fn the_question_after_the_welcome_steps_is_the_analytics_one_and_grants_no_trust() {
     // The steps end in this question and nothing else: it offers no trust,
     // permission or credential choice, and it is unchanged by the steps.

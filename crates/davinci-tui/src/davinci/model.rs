@@ -31,6 +31,120 @@ pub const SUGGESTION_ROWS: usize = 5;
 #[derive(Debug, Clone, Default)]
 pub struct Composer {
     editor: Editor,
+    /// Pastes the reference shell collapsed to a chip in the draft, and the
+    /// last chip number given. Empty with the reference setting off.
+    chips: Vec<PasteChip>,
+    chip_seq: usize,
+}
+
+/// A draft set aside (another view's, or the Ctrl+S stash): its text and the
+/// collapsed pastes behind its markers, which belong to it and to no other draft.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ComposerDraft {
+    text: String,
+    chips: Vec<PasteChip>,
+    chip_seq: usize,
+}
+
+impl ComposerDraft {
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+}
+
+/// A paste above [`PASTE_COLLAPSE_CHARS`], held out of the draft behind its chip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PasteChip {
+    marker: String,
+    text: String,
+    /// The cut middle of a long paste put in the draft, behind its
+    /// `[...Truncated text...]` marker; not a chip a second paste can open.
+    cut_middle: bool,
+}
+
+/// The mode of the reference shell's vim editing (`editorMode: "vim"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VimMode {
+    Insert,
+    Normal,
+}
+
+/// Vim editing of the draft: the mode, and an operator (`d`) waiting for its motion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VimState {
+    pub mode: VimMode,
+    pub pending: Option<char>,
+}
+
+impl Default for VimState {
+    /// The editor starts in INSERT.
+    fn default() -> Self {
+        Self {
+            mode: VimMode::Insert,
+            pending: None,
+        }
+    }
+}
+
+/// The reference's window for the second `esc` that clears a draft. Its goldens
+/// show a second `esc` 500 ms and more after the first still clearing.
+pub const REFERENCE_DOUBLE_ESCAPE_MS: u64 = 800;
+
+/// A paste of more characters than this collapses to a chip. The count is of
+/// Unicode scalar values after cleaning (CRLF is one newline, a wide glyph or an
+/// emoji is one, a combining mark is one), never of bytes.
+pub const PASTE_COLLAPSE_CHARS: usize = 10_000;
+/// When a collapsed paste is expanded in the draft, a text above
+/// [`PASTE_TRUNCATE_ABOVE`] keeps this many characters at each end.
+const PASTE_KEEP_CHARS: usize = 500;
+const PASTE_TRUNCATE_ABOVE: usize = 1_000;
+
+/// A paste as the draft takes it: CRLF and CR are newlines, a tab is four
+/// spaces, and terminal escape sequences and control characters are dropped so a
+/// paste can never carry a command into the terminal or the model's text.
+pub fn clean_paste(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            '\n' => out.push('\n'),
+            '\t' => out.push_str("    "),
+            '\u{1b}' => match chars.peek() {
+                // CSI: parameters, then one final byte.
+                Some('[') => {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                // OSC and the other string commands end at BEL or ST.
+                Some(']' | 'P' | '_' | '^' | 'X') => {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if next == '\u{7}' {
+                            break;
+                        }
+                        if next == '\u{1b}' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            ch if ch.is_control() => {}
+            ch => out.push(ch),
+        }
+    }
+    out
 }
 
 impl Composer {
@@ -43,7 +157,120 @@ impl Composer {
     }
 
     pub fn set_text(&mut self, text: impl Into<String>) {
+        // Chips stay until the draft is sent, cleared or set aside: undo and
+        // history can bring a marker back.
         self.editor.set_text(text);
+    }
+
+    /// A paste in the reference shell. Above [`PASTE_COLLAPSE_CHARS`] it is a
+    /// chip (`[Pasted text #N]`, with `+K lines` when it has any); pasting the
+    /// same text again puts it in the draft in place of its chip, middle cut out
+    /// when it is long. Anything shorter goes in whole.
+    pub fn paste_reference(&mut self, raw: &str) {
+        let text = clean_paste(raw);
+        if text.is_empty() {
+            return;
+        }
+        let held = self.chips.iter().position(|chip| {
+            !chip.cut_middle && chip.text == text && self.editor.buffer.contains(&chip.marker)
+        });
+        if let Some(index) = held {
+            self.chip_seq += 1;
+            let chip = self.chips.remove(index);
+            let (shown, cut) = expand_for_draft(&text, self.chip_seq);
+            if let Some(cut) = cut {
+                self.chips.push(cut);
+            }
+            let at = self.editor.buffer.find(&chip.marker).unwrap_or_default();
+            let mut buffer = self.editor.buffer.clone();
+            buffer.replace_range(at..at + chip.marker.len(), &shown);
+            self.editor.set_text(buffer);
+            self.editor.cursor = at + shown.len();
+            return;
+        }
+        if text.chars().count() > PASTE_COLLAPSE_CHARS {
+            self.chip_seq += 1;
+            let lines = text.matches('\n').count();
+            let marker = if lines > 0 {
+                format!("[Pasted text #{} +{lines} lines]", self.chip_seq)
+            } else {
+                format!("[Pasted text #{}]", self.chip_seq)
+            };
+            self.editor.insert_text_at_cursor(&marker);
+            self.chips.push(PasteChip {
+                marker,
+                text,
+                cut_middle: false,
+            });
+            return;
+        }
+        self.editor.insert_text_at_cursor(&text);
+    }
+
+    /// Whether a collapsed paste is still in the draft.
+    pub fn has_collapsed_paste(&self) -> bool {
+        self.chips
+            .iter()
+            .any(|chip| !chip.cut_middle && self.editor.buffer.contains(&chip.marker))
+    }
+
+    /// What is sent: the draft with every chip replaced by its text.
+    pub fn expanded_text(&self) -> String {
+        let draft = self.editor.get_expanded_text();
+        let mut text = String::with_capacity(draft.len());
+        let mut rest = draft.as_str();
+        // One left-to-right scan: what a chip puts in is never looked at again,
+        // and a marker with no chip behind it stays as typed.
+        while !rest.is_empty() {
+            match self
+                .chips
+                .iter()
+                .find(|chip| rest.starts_with(chip.marker.as_str()))
+            {
+                Some(chip) => {
+                    text.push_str(&chip.text);
+                    rest = &rest[chip.marker.len()..];
+                }
+                None => {
+                    let step = rest.chars().next().map_or(1, char::len_utf8);
+                    text.push_str(&rest[..step]);
+                    rest = &rest[step..];
+                }
+            }
+        }
+        text
+    }
+
+    /// Send the draft: recorded in the history and cleared, as
+    /// [`Editor::submit`] does, with its chips already expanded.
+    pub fn submit(&mut self) -> String {
+        if !self.chips.is_empty() {
+            let full = self.expanded_text();
+            // Every chip belongs to the draft being sent (a parked draft carries
+            // its own), so none may outlive it: a marker typed later is text.
+            self.chips.clear();
+            self.editor.set_text(full);
+        }
+        self.chip_seq = 0;
+        self.editor.submit()
+    }
+
+    /// Set the draft aside with its chips. The text stays in the composer until
+    /// [`Composer::put_draft`] replaces it, as when a view is parked.
+    pub fn take_draft(&mut self) -> ComposerDraft {
+        ComposerDraft {
+            text: self.editor.get_text().to_string(),
+            chips: std::mem::take(&mut self.chips),
+            chip_seq: std::mem::take(&mut self.chip_seq),
+        }
+    }
+
+    /// Make `draft` the composer's, chips included. Undo does not cross it.
+    pub fn put_draft(&mut self, draft: ComposerDraft) {
+        self.editor.set_text(draft.text);
+        self.editor.clear_undo();
+        self.chips = draft.chips;
+        self.chip_seq = draft.chip_seq;
     }
 
     pub fn push_str(&mut self, text: &str) {
@@ -56,6 +283,49 @@ impl Composer {
 
     pub fn clear(&mut self) {
         self.editor.set_text(String::new());
+        self.chips.clear();
+        self.chip_seq = 0;
+    }
+
+    /// Put `text` after the caret and leave the caret where it was, so what is
+    /// typed next lands in front of it (the reference's image token).
+    pub fn insert_after_cursor(&mut self, text: &str) {
+        let at = self.editor.cursor;
+        self.editor.insert_text_at_cursor(text);
+        self.editor.cursor = at.min(self.editor.buffer.len());
+    }
+
+    /// Vim `dw`: from the caret to the start of the next word, within the line.
+    pub fn delete_word_vim(&mut self) {
+        let start = self.editor.cursor.min(self.editor.buffer.len());
+        let rest = &self.editor.buffer[start..];
+        let word = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let spaces = rest[word..].len() - rest[word..].trim_start_matches([' ', '\t']).len();
+        self.cut(start, start + word + spaces);
+    }
+
+    /// Vim `dd`: the caret's line, with one of its newlines.
+    pub fn delete_line_vim(&mut self) {
+        let buffer = &self.editor.buffer;
+        let at = self.editor.cursor.min(buffer.len());
+        let mut start = buffer[..at].rfind('\n').map_or(0, |i| i + 1);
+        let mut end = buffer[at..].find('\n').map_or(buffer.len(), |i| at + i + 1);
+        if end == buffer.len() && start > 0 && !buffer.ends_with('\n') {
+            start -= 1;
+        } else if end == buffer.len() && start > 0 {
+            end = buffer.len();
+        }
+        self.cut(start, end);
+    }
+
+    fn cut(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let mut text = self.editor.buffer.clone();
+        text.replace_range(from..to, "");
+        self.editor.set_text(text);
+        self.editor.cursor = from.min(self.editor.buffer.len());
     }
 
     pub fn cursor(&self) -> usize {
@@ -74,6 +344,34 @@ impl Composer {
     pub fn into_string(self) -> String {
         self.editor.buffer
     }
+}
+
+/// A paste's text for the draft: whole, or its first and last characters with the
+/// cut middle named (`[...Truncated text #N +K lines...]`).
+/// The middle goes back as a chip of its own, so what is sent is still the paste.
+fn expand_for_draft(text: &str, id: usize) -> (String, Option<PasteChip>) {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= PASTE_TRUNCATE_ABOVE {
+        return (text.to_owned(), None);
+    }
+    let middle: String = chars[PASTE_KEEP_CHARS..chars.len() - PASTE_KEEP_CHARS]
+        .iter()
+        .collect();
+    let lines = middle.matches('\n').count();
+    let marker = format!("[...Truncated text #{id} +{lines} lines...]");
+    let shown = format!(
+        "{}{marker}{}",
+        chars[..PASTE_KEEP_CHARS].iter().collect::<String>(),
+        chars[chars.len() - PASTE_KEEP_CHARS..]
+            .iter()
+            .collect::<String>()
+    );
+    let chip = PasteChip {
+        marker,
+        text: middle,
+        cut_middle: true,
+    };
+    (shown, Some(chip))
 }
 
 impl Deref for Composer {
@@ -3026,12 +3324,19 @@ pub struct Model {
     /// `tui.reference`, fixed when the session opened. Only the reference
     /// shell opens `/theme` as a picker.
     pub reference: bool,
+    /// Vim editing of the draft (`editorMode: "vim"`), in the reference shell only.
+    pub vim: Option<VimState>,
+    /// The `externalEditor` command, read by the reference shell's Ctrl+G.
+    pub external_editor: Option<String>,
     /// The `/theme` picker, while it is open.
     pub theme_picker: Option<ThemePicker>,
     /// The first-run welcome step on screen, in the reference shell.
     pub onboarding: Option<OnboardStep>,
     /// The theme chosen in the welcome, held until the first-run answer is saved.
     pub first_run_theme: Option<String>,
+    /// The welcome ended while an overlay (an approval) was open: the first-run
+    /// question waits for it to close and is then put up.
+    pub first_run_due: bool,
     /// `3b` — the settings sheet.
     pub settings_rows: Vec<SettingRow>,
     pub settings_index: usize,
@@ -3123,6 +3428,8 @@ pub struct Model {
     pub checklist_open: bool,
     /// `ctrl+x` pressed: a following `ctrl+e` edits the draft in `$EDITOR`.
     pub chord_x: Option<std::time::Instant>,
+    /// The draft Ctrl+S set aside (reference shell), shown on the effort row.
+    pub stash: Option<ComposerDraft>,
     /// The draft is to be edited in `$VISUAL`/`$EDITOR`; the shell, which
     /// owns the terminal, takes this and runs the editor.
     pub external_edit_requested: bool,
@@ -3444,6 +3751,15 @@ impl HistoryScope {
             Self::All => "all projects",
         }
     }
+
+    /// The reference search's title for the scope.
+    pub fn reference_label(self) -> &'static str {
+        match self {
+            Self::Session => "this session",
+            Self::Project => "this project",
+            Self::All => "everywhere",
+        }
+    }
 }
 
 /// Matches shown at once.
@@ -3612,9 +3928,12 @@ impl Model {
             catalog_session_only: false,
             catalog_search: false,
             reference: false,
+            vim: None,
+            external_editor: None,
             theme_picker: None,
             onboarding: None,
             first_run_theme: None,
+            first_run_due: false,
             settings_rows: Vec::new(),
             settings_index: 0,
             settings_query: String::new(),
@@ -3672,6 +3991,7 @@ impl Model {
             footer_stop_armed: None,
             checklist_open: false,
             chord_x: None,
+            stash: None,
             external_edit_requested: false,
             pr_badge: None,
             quit_armed: None,
@@ -4125,7 +4445,8 @@ impl Model {
     /// resumes blinking a full phase after the composer goes still. A caret
     /// that winks out mid-motion reads as a dropped keystroke.
     pub fn blink(&self) -> bool {
-        if !self.animate || !self.caret_blink {
+        // The reference's caret is a steady reversed cell: it never winks out.
+        if !self.animate || !self.caret_blink || self.reference {
             return true;
         }
         (self.tick.wrapping_sub(self.caret_moved_at) / 4) % 2 == 0
@@ -4205,7 +4526,11 @@ impl Model {
             self.type_char(&text.replace('\n', " "));
         } else {
             self.mark_caret_moved();
-            self.composer.editor_mut().handle_paste(&text);
+            if self.reference {
+                self.composer.paste_reference(&text);
+            } else {
+                self.composer.editor_mut().handle_paste(&text);
+            }
             self.refresh_suggestions();
         }
     }
@@ -4528,12 +4853,23 @@ impl Model {
         if self.screen != Screen::Agent
             || self.overlay.is_some()
             || self.history_search.is_some()
-            || (self.composer.editor().history.is_empty() && self.session_history.is_empty())
+            // The reference opens its search over no history too, and says so.
+            || (!self.reference
+                && self.composer.editor().history.is_empty()
+                && self.session_history.is_empty())
         {
             return false;
         }
         self.dismiss_suggestions();
-        self.history_search = Some(HistorySearch::default());
+        let mut search = HistorySearch::default();
+        if self.reference {
+            // The reference searches every project at first.
+            search.scope = HistoryScope::All;
+            if self.history_all.is_none() {
+                self.history_all = self.history_store.as_ref().map(|store| store.load_all());
+            }
+        }
+        self.history_search = Some(search);
         true
     }
 
@@ -4614,6 +4950,21 @@ impl Model {
         }
     }
 
+    /// Ctrl+S in the reference shell. With no stash, the draft is set aside and
+    /// the composer is left empty. With one, it comes back; a draft already
+    /// typed is not lost but takes its place in the stash (the two swap).
+    pub fn toggle_stash(&mut self) {
+        if self.stash.is_none() && self.composer.is_empty() {
+            return;
+        }
+        let current = self.composer.take_draft();
+        let held = self.stash.take().unwrap_or_default();
+        self.composer.put_draft(held);
+        self.stash = (!current.is_empty()).then_some(current);
+        self.dismiss_suggestions();
+        self.mark_caret_moved();
+    }
+
     /// Enter sends. An empty composer sends nothing.
     ///
     /// The line goes through [`Editor::submit`], which is what records it in
@@ -4624,7 +4975,7 @@ impl Model {
             return;
         }
         self.mark_caret_moved();
-        let text = self.composer.editor_mut().submit();
+        let text = self.composer.submit();
         self.remember(&text);
         self.dismiss_suggestions();
         // Sending a turn returns to the newest, where its answer lands.
@@ -4692,7 +5043,7 @@ impl Model {
             return false;
         }
         self.mark_caret_moved();
-        let text = self.composer.editor_mut().submit();
+        let text = self.composer.submit();
         self.remember(&text);
         self.queued.push(text);
         self.dismiss_suggestions();
@@ -4747,8 +5098,17 @@ impl Model {
 
     /// Whether a first `esc` over a draft is still waiting for its second.
     pub fn clear_pending(&self) -> bool {
-        self.clear_armed.is_some_and(|armed| {
-            armed.elapsed() < std::time::Duration::from_millis(crate::DOUBLE_ESCAPE_MS)
+        self.clear_armed
+            .is_some_and(|armed| armed.elapsed() < self.double_escape_window())
+    }
+
+    /// How long a first `esc` over a draft waits for its second. The
+    /// reference's is longer than the shell's own.
+    pub fn double_escape_window(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(if self.reference {
+            REFERENCE_DOUBLE_ESCAPE_MS
+        } else {
+            crate::DOUBLE_ESCAPE_MS
         })
     }
 

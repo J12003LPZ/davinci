@@ -487,6 +487,9 @@ pub struct Settings {
     pub tui: TuiSettings,
     #[serde(default, rename = "externalEditor")]
     pub external_editor: Option<String>,
+    /// `"vim"` gives the reference shell's draft vim INSERT and NORMAL modes.
+    #[serde(default, rename = "editorMode")]
+    pub editor_mode: Option<String>,
     #[serde(default, rename = "modelThinkingLevels")]
     pub model_thinking_levels: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default, rename = "npmCommand")]

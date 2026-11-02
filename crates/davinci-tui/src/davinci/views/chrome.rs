@@ -138,8 +138,12 @@ fn conversation_status(model: &Model) -> Line<'static> {
     {
         return Line::from(span("  Press Ctrl-D again to exit", cc.inactive));
     }
-    if model.clear_pending() {
+    if model.clear_pending() && !model.reference {
         return Line::from(span("  Esc again to clear", cc.inactive));
+    }
+    // A collapsed paste says how to open it, in place of the mode hints.
+    if model.reference && model.composer.has_collapsed_paste() {
+        return Line::from(span("  paste again to expand", cc.inactive));
     }
     if model.screen == Screen::Agent && model.composer.starts_with('!') {
         return Line::from(vec![
@@ -157,7 +161,16 @@ fn conversation_status(model: &Model) -> Line<'static> {
         "always-approve" => ("⏵⏵ always approve on · no prompts", cc.error, cycle_note),
         _ => ("⏸ manual mode on", cc.inactive, String::new()),
     };
-    let mut left = vec![span("  ", cc.inactive), span(label, color)];
+    let mut left = vec![span("  ", cc.inactive)];
+    // Vim INSERT says so ahead of the mode; NORMAL shows nothing.
+    if model.reference
+        && model
+            .vim
+            .is_some_and(|vim| vim.mode == crate::davinci::model::VimMode::Insert)
+    {
+        left.push(span("-- INSERT -- ", cc.inactive));
+    }
+    left.push(span(label, color));
     if !tail.is_empty() {
         left.push(span(tail, cc.inactive));
     }
@@ -295,6 +308,12 @@ pub(super) fn key_label(model: &Model, action: &str) -> Option<String> {
 
 /// Rows below the conversation composer: the regular status or the shortcuts panel.
 pub fn footer(model: &Model) -> Vec<Line<'static>> {
+    if model.reference && model.history_search.is_some() {
+        return vec![Line::from(span(
+            "  ↑/↓ to navigate · Enter to use · Esc to cancel · ctrl+s to scope",
+            model.theme.cc().inactive,
+        ))];
+    }
     if model.shortcuts_open && model.screen == Screen::Agent && model.overlay.is_none() {
         return shortcut_rows(model);
     }
@@ -624,6 +643,19 @@ pub fn effort_line(model: &Model) -> Line<'static> {
             )],
         );
     }
+    // The first Esc over a draft says so where the effort label sits.
+    if model.reference && model.clear_pending() {
+        return spread(
+            model.width,
+            Vec::new(),
+            vec![Span::styled(
+                "Esc again to clear  ",
+                Style::default()
+                    .fg(cc.inactive)
+                    .add_modifier(cc.inactive_modifier),
+            )],
+        );
+    }
     if let Some(label) = model.reference.then(|| effort_label(model)).flatten() {
         // Two columns in from the edge, where the reference ends it.
         return spread(
@@ -647,13 +679,19 @@ pub fn effort_line(model: &Model) -> Line<'static> {
 fn effort_label(model: &Model) -> Option<String> {
     let level = model.thinking_level.to_lowercase();
     let glyph = match level.as_str() {
-        "" | "off" => return None,
-        "minimal" | "low" => "○",
-        "medium" => "◐",
-        "high" => "●",
-        _ => "◉",
+        "" | "off" => None,
+        "minimal" | "low" => Some("○"),
+        "medium" => Some("◐"),
+        "high" => Some("●"),
+        _ => Some("◉"),
     };
-    Some(format!("{glyph} {level} · /effort"))
+    let label = glyph.map(|glyph| format!("{glyph} {level} · /effort"));
+    // A draft set aside with ctrl+s is named at the label's right end.
+    match (label, model.stash.is_some()) {
+        (Some(label), true) => Some(format!("{label} · › stashed")),
+        (None, true) => Some("› stashed".to_string()),
+        (label, false) => label,
+    }
 }
 
 pub fn effort_rule(model: &Model) -> Line<'static> {
@@ -744,12 +782,15 @@ pub fn composer_with_caret(
                 .transcript
                 .iter()
                 .any(|entry| matches!(entry, super::super::model::Entry::User(_)));
-            (model.screen == Screen::Agent && lines.is_none() && fresh).then(|| {
-                format!(
-                    "Try \"{}\"",
-                    PLACEHOLDERS[model.placeholder % PLACEHOLDERS.len()]
-                )
-            })
+            // The reference's empty composer is a bare caret: it suggests nothing.
+            (model.screen == Screen::Agent && lines.is_none() && fresh && !model.reference).then(
+                || {
+                    format!(
+                        "Try \"{}\"",
+                        PLACEHOLDERS[model.placeholder % PLACEHOLDERS.len()]
+                    )
+                },
+            )
         });
 
     let lit = model.caret_lit();
@@ -758,7 +799,14 @@ pub fn composer_with_caret(
     } else {
         th.text
     };
-    let caret_style = if lit {
+    let caret_style = if model.reference {
+        // The reference's caret is a reversed cell in the terminal's own colours.
+        if lit {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        }
+    } else if lit {
         Style::default().bg(caret_color).fg(th.background)
     } else {
         Style::default().bg(th.background).fg(th.background)
@@ -768,12 +816,24 @@ pub fn composer_with_caret(
     } else {
         None
     };
-    let map = lines.is_none().then(|| editor.visual_rows(wrap));
+    let map = lines.is_none().then(|| {
+        if model.reference {
+            reference_rows(&entries, wrap)
+        } else {
+            editor.visual_rows(wrap)
+        }
+    });
     let (entries, caret_at) = wrap_rows(&entries, wrap, caret_at, map);
     let last = entries.len().saturating_sub(1);
     let caret_row = caret_at.map_or(last, |(row, _)| row.min(last));
     let mut caret_cell: Option<(usize, u16)> = None;
-    let visible = (model.height as usize / 3).clamp(1, 8);
+    // The reference shows at least nine rows of a long draft; the shell's own
+    // composer stops at eight.
+    let visible = if model.reference {
+        (model.height as usize / 3).max(1)
+    } else {
+        (model.height as usize / 3).clamp(1, 8)
+    };
     let start = caret_row
         .saturating_sub(visible - 1)
         .min(entries.len().saturating_sub(visible));
@@ -914,6 +974,60 @@ pub fn composer_with_caret(
         rows.push(hint_line(model, hint, rows_typed));
     }
     (rows, caret_cell)
+}
+
+/// The reference's wrapping of the draft: a word that fits goes to the next row
+/// when it does not fit this one, and a word wider than a row fills what is left of
+/// this one and runs on over the next rows, cut at the row's width. Every byte of a
+/// line lands in exactly one row; spaces stay at the end of the row they follow.
+/// `(line, start byte, length)` per row, as the editor's own row map.
+fn reference_rows(lines: &[String], width: usize) -> Vec<(usize, usize, usize)> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for (line, text) in lines.iter().enumerate() {
+        let mut row_start = 0;
+        let mut used = 0;
+        let mut at = 0;
+        while at < text.len() {
+            // One word and the spaces after it.
+            let rest = &text[at..];
+            let word_len = rest.find(' ').unwrap_or(rest.len());
+            let spaces = rest[word_len..].len() - rest[word_len..].trim_start_matches(' ').len();
+            let token_end = at + word_len + spaces;
+            let word_cells: usize = text[at..at + word_len]
+                .chars()
+                .map(|ch| ch.width().unwrap_or(0))
+                .sum();
+            if word_cells <= width {
+                if used > 0 && used + word_cells > width {
+                    rows.push((line, row_start, at - row_start));
+                    row_start = at;
+                    used = 0;
+                }
+                used += word_cells + spaces;
+                at = token_end;
+                continue;
+            }
+            // A word wider than a row: cut it where the row fills.
+            for (offset, ch) in text[at..at + word_len].char_indices() {
+                let cells = ch.width().unwrap_or(0);
+                if used + cells > width {
+                    rows.push((line, row_start, at + offset - row_start));
+                    row_start = at + offset;
+                    used = 0;
+                }
+                used += cells;
+            }
+            used += spaces;
+            at = token_end;
+        }
+        rows.push((line, row_start, text.len() - row_start));
+    }
+    if rows.is_empty() {
+        rows.push((0, 0, 0));
+    }
+    rows
 }
 
 /// Logical lines as visual rows `width` cells wide, with the caret moved
@@ -1383,7 +1497,103 @@ pub fn checklist_rows(model: &Model, height: usize) -> Vec<Line<'static>> {
     rows
 }
 
+/// The reference's prompt search takes the bottom of the screen: a rule, a title,
+/// a list this tall, then the query in a rounded box and the keys under it.
+const REFERENCE_HISTORY_LIST: usize = 8;
+
+/// The query box of the reference's prompt search, and where its caret sits.
+pub fn history_box(model: &Model) -> (Vec<Line<'static>>, Option<(usize, u16)>) {
+    let Some(search) = &model.history_search else {
+        return (Vec::new(), None);
+    };
+    let cc = model.theme.cc();
+    let inner = usize::from(model.width).saturating_sub(6);
+    let edge = |left: &str, right: &str| {
+        Line::from(vec![
+            span("  ", model.theme.text),
+            span(format!("{left}{}{right}", "─".repeat(inner)), cc.permission),
+        ])
+    };
+    let typed = format!(" ⌕ {}", search.query);
+    let room = inner.saturating_sub(UnicodeWidthStr::width(typed.as_str()) + 1);
+    let caret = if model.caret_lit() {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    };
+    let middle = Line::from(vec![
+        span("  ", model.theme.text),
+        span("│", cc.permission),
+        span(typed.clone(), model.theme.text),
+        Span::styled(" ", caret),
+        span(" ".repeat(room), model.theme.text),
+        span("│", cc.permission),
+    ]);
+    let column = 3 + UnicodeWidthStr::width(typed.as_str());
+    (
+        vec![edge("╭", "╮"), middle, edge("╰", "╯")],
+        Some((1, column as u16)),
+    )
+}
+
+fn reference_history_rows(model: &Model) -> (Vec<Line<'static>>, Vec<usize>) {
+    let Some(search) = &model.history_search else {
+        return (Vec::new(), Vec::new());
+    };
+    let cc = model.theme.cc();
+    let matches = model.history_matches();
+    let mut rows = vec![
+        Line::from(span("─".repeat(usize::from(model.width)), cc.permission)),
+        Line::from(vec![
+            span("  ", model.theme.text),
+            Span::styled(
+                format!("Search prompts · {}", search.scope.reference_label()),
+                Style::default()
+                    .fg(cc.permission)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ];
+    let mut owners = vec![usize::MAX, usize::MAX];
+    if matches.is_empty() {
+        rows.push(Line::from(vec![
+            span("  ", model.theme.text),
+            span("No matching prompts", cc.inactive),
+        ]));
+        owners.push(usize::MAX);
+    } else {
+        let selected = search.selected.min(matches.len() - 1);
+        let first = (selected + 1).saturating_sub(REFERENCE_HISTORY_LIST);
+        for (index, entry) in matches
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(REFERENCE_HISTORY_LIST)
+        {
+            let marked = index == selected;
+            let ink = if marked { cc.permission } else { cc.inactive };
+            let flat = entry.replace('\n', " ⏎ ");
+            rows.push(Line::from(crate::davinci::ui::truncate_run(
+                vec![
+                    span(if marked { "  ❯ " } else { "    " }, ink),
+                    span(flat, ink),
+                ],
+                model.width,
+            )));
+            owners.push(index);
+        }
+    }
+    while rows.len() < 2 + REFERENCE_HISTORY_LIST {
+        rows.push(crate::davinci::ui::blank());
+        owners.push(usize::MAX);
+    }
+    (rows, owners)
+}
+
 pub fn history_search_rows(model: &Model) -> (Vec<Line<'static>>, Vec<usize>) {
+    if model.reference {
+        return reference_history_rows(model);
+    }
     let Some(search) = &model.history_search else {
         return (Vec::new(), Vec::new());
     };

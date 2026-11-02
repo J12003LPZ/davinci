@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use super::model::{AgentRow, Model};
+use super::model::{AgentRow, ComposerDraft, Model};
 
 /// Activity lines kept per worker.
 pub const WORKER_RING: usize = 200;
@@ -68,8 +68,8 @@ pub struct WorkerViewState {
     pub lines: VecDeque<WorkerLine>,
     /// Lines the host or this ring dropped; shown as a gap marker.
     pub dropped: u64,
-    /// Composer text kept while another scope is shown.
-    pub draft: String,
+    /// Composer text, and its collapsed pastes, kept while another scope is shown.
+    pub draft: ComposerDraft,
     pub receipts: VecDeque<Receipt>,
     /// Read-only changed files of the worker's worktree, when probed.
     pub changed_paths: Vec<String>,
@@ -92,8 +92,8 @@ pub struct RosterState {
     /// Keyboard focus in the roster list: 0 is main, then the workers.
     pub focus: Option<usize>,
     pub views: HashMap<String, WorkerViewState>,
-    /// The main composer's text while a worker is shown.
-    pub main_draft: String,
+    /// The main composer's draft while a worker is shown.
+    pub main_draft: ComposerDraft,
     pub outbox: Vec<WorkerOutbound>,
     next_local: u64,
     /// Agent ids of the roster rows drawn last frame, in row order. A click
@@ -109,7 +109,7 @@ impl Default for RosterState {
             workers: Vec::new(),
             focus: None,
             views: HashMap::new(),
-            main_draft: String::new(),
+            main_draft: ComposerDraft::default(),
             outbox: Vec::new(),
             next_local: 0,
             hit: std::cell::RefCell::new(Vec::new()),
@@ -202,7 +202,7 @@ impl Model {
             })
             .draft
             .clone();
-        self.composer.set_text(draft);
+        self.composer.put_draft(draft);
         self.dismiss_suggestions();
         self.dirty = true;
     }
@@ -216,19 +216,19 @@ impl Model {
         self.park_composer();
         self.roster.scope = ViewScope::Main;
         let draft = std::mem::take(&mut self.roster.main_draft);
-        self.composer.set_text(draft);
+        self.composer.put_draft(draft);
         self.dismiss_suggestions();
         self.dirty = true;
     }
 
     /// Put the composer's text where it belongs for the scope being left.
     fn park_composer(&mut self) {
-        let text = self.composer.editor().get_text().to_string();
+        let draft = self.composer.take_draft();
         match self.roster.scope.clone() {
-            ViewScope::Main => self.roster.main_draft = text,
+            ViewScope::Main => self.roster.main_draft = draft,
             ViewScope::Worker(id) => {
                 if let Some(view) = self.roster.views.get_mut(&id) {
-                    view.draft = text;
+                    view.draft = draft;
                 }
             }
         }
@@ -350,11 +350,11 @@ impl Model {
         let Some(id) = self.viewing_worker().map(str::to_string) else {
             return false;
         };
-        let text = self.composer.editor().get_expanded_text();
+        let text = self.composer.expanded_text();
         if text.trim().is_empty() || text.trim_start().starts_with('/') {
             return false;
         }
-        self.composer.editor_mut().submit();
+        self.composer.submit();
         self.dismiss_suggestions();
         self.roster.next_local += 1;
         let local = self.roster.next_local;

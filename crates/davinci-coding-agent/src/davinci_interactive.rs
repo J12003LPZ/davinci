@@ -1698,6 +1698,42 @@ fn theme_line(model: &mut Model, line: &str, stored: impl FnOnce() -> Option<Str
     true
 }
 
+/// Whether the text an editor handed back is the draft it was given: the same
+/// characters, line endings and BOM aside, trailing newlines aside (editors add
+/// one, and `ExternalEditor` strips them). Then the draft is left exactly as it was.
+fn editor_left_draft_alone(draft: &str, returned: &str) -> bool {
+    let strip = |text: &str| {
+        text.strip_prefix('\u{feff}')
+            .unwrap_or(text)
+            .replace("\r\n", "\n")
+            .trim_end_matches(['\r', '\n'])
+            .to_owned()
+    };
+    strip(draft) == strip(returned)
+}
+
+/// Put the first-run question up. An overlay already open (an approval that
+/// a turn raised) keeps the screen and its question; the first-run question
+/// waits behind it (`first_run_due`) and neither is lost.
+fn ask_first_run(model: &mut Model, agent: &Agent, pending: &mut Option<Question>) {
+    if model.overlay.is_some() {
+        model.first_run_due = true;
+        return;
+    }
+    model.first_run_due = false;
+    model.ask = Question::FirstRun.ask(agent);
+    open_ask_overlay(model);
+    *pending = Some(Question::FirstRun);
+}
+
+/// Once the overlay that held the first-run question back has closed, put it up.
+fn release_first_run(model: &mut Model, agent: &Agent, pending: &mut Option<Question>) {
+    if model.first_run_due && model.overlay.is_none() {
+        ask_first_run(model, agent, pending);
+        model.dirty = true;
+    }
+}
+
 /// The reference shell's welcome steps, opened on the theme the merged
 /// settings store so the highlight and the live theme agree from the first
 /// frame. `false` elsewhere: the first run is asked at once.
@@ -5169,6 +5205,10 @@ pub fn run(
     }
     if terminal.reference() {
         model.reference = true;
+        model.external_editor = stored_settings.external_editor.clone();
+        if stored_settings.editor_mode.as_deref() == Some("vim") {
+            model.vim = Some(davinci_tui::davinci::model::VimState::default());
+        }
         model.theme = model.theme.with_reference(true);
         apply_theme_setting(&mut model, &stored_settings);
     }
@@ -5491,14 +5531,21 @@ pub fn run(
         if std::mem::take(&mut first_frame) {
             crate::startup_mark("shell: first frame");
         }
+        release_first_run(&mut model, agent, &mut pending);
         // The draft goes to `$VISUAL`/`$EDITOR` and comes back as typed text.
         if std::mem::take(&mut model.external_edit_requested) {
             let draft = model.composer.to_string();
             let edited = terminal.run_external(|| {
-                crate::external_editor::ExternalEditor::new(None, &draft)
-                    .and_then(|editor| editor.edit())
+                crate::external_editor::ExternalEditor::new(
+                    model.external_editor.as_deref(),
+                    &draft,
+                )
+                .and_then(|editor| editor.edit())
             });
             match edited {
+                // An editor that changed nothing leaves the draft as it was, byte for
+                // byte (the editor hands text back without its trailing newlines).
+                Ok(Ok(text)) if model.reference && editor_left_draft_alone(&draft, &text) => {}
                 Ok(Ok(text)) => {
                     model.replace_composer(text.trim_end_matches(['\r', '\n']));
                     model.push_toast("draft edited in your editor".into());
@@ -5652,7 +5699,14 @@ pub fn run(
                                     .get(..cursor)
                                     .and_then(|head| head.chars().next_back());
                                 let spaced = attachments::spaced_chip(&chip, before);
-                                model.paste(&spaced);
+                                if model.reference && model.composer_owns_focus() {
+                                    // The token trails the draft; what is typed next lands
+                                    // in front of it.
+                                    model.composer.insert_after_cursor(&spaced);
+                                    model.refresh_suggestions();
+                                } else {
+                                    model.paste(&spaced);
+                                }
                                 // The chip in the composer is the only sign of the paste.
                                 if !model.composer.to_string().contains(&chip) {
                                     // The composer is not taking input (a sheet or
@@ -5738,7 +5792,7 @@ pub fn run(
                                     Next::Leave
                                 } else {
                                     if !model.composer.trim().is_empty() {
-                                        let _ = model.composer.editor_mut().submit();
+                                        let _ = model.composer.submit();
                                     }
                                     last_ctrl_c = Some(now);
                                     model.exit_armed = true;
@@ -9929,9 +9983,7 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
         // The last welcome step ended: the analytics question comes next. The
         // theme chosen stays in the model until that answer is saved.
         Choice::OnboardingDone => {
-            shell.model.ask = Question::FirstRun.ask(shell.agent);
-            open_ask_overlay(shell.model);
-            *shell.pending = Some(Question::FirstRun);
+            ask_first_run(shell.model, shell.agent, shell.pending);
             Next::Go
         }
         // `3c` — a thinking level.
