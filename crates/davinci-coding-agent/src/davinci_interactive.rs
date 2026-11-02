@@ -5065,6 +5065,15 @@ pub fn run(
     sync_permission_state(agent, &mut model);
     let startup_settings =
         crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd);
+    // `/theme` is a picker command in this shell, so it is not a built-in; the
+    // reference lists it, so the completion list gets it while the setting is on.
+    model.slash_commands = crate::with_reference_commands(
+        std::mem::take(&mut model.slash_commands),
+        davinci_tui::davinci::runtime::reference_enabled(
+            std::env::var("PI_DAVINCI_REFERENCE").ok().as_deref(),
+            startup_settings.tui.reference.unwrap_or(false),
+        ),
+    );
     model.show_tool_output = startup_settings.show_tool_output.unwrap_or(false);
     model.roster.enabled = startup_settings.agent_focus_ui.unwrap_or(true);
     model.context_bar = davinci_tui::davinci::model::ContextBarMode::parse(
@@ -6151,7 +6160,10 @@ fn apply_host_effects(shell: &mut Shell<'_>) -> Next {
     if calls.iter().any(|call| op_of(call) == "reload") {
         crate::clear_model_runtime_cache();
         crate::apply_discovered_resources(shell.parsed, shell.agent);
-        shell.model.slash_commands = crate::interactive_slash_commands(shell.agent, shell.parsed);
+        shell.model.slash_commands = crate::with_reference_commands(
+            crate::interactive_slash_commands(shell.agent, shell.parsed),
+            shell.model.reference,
+        );
     }
     for call in &calls {
         if op_of(call) != "unregisterProvider" {
@@ -6867,7 +6879,10 @@ fn apply_extension_action(
     // next session.
     if changed && tab != ExtensionTab::Mcp {
         crate::apply_discovered_resources(shell.parsed, shell.agent);
-        shell.model.slash_commands = crate::interactive_slash_commands(shell.agent, shell.parsed);
+        shell.model.slash_commands = crate::with_reference_commands(
+            crate::interactive_slash_commands(shell.agent, shell.parsed),
+            shell.model.reference,
+        );
         shell.model.corpus = corpus(
             shell.agent,
             &shell.model.slash_commands,
@@ -6915,7 +6930,10 @@ fn refresh_after_change(shell: &mut Shell<'_>, tab: ExtensionTab) {
         return;
     }
     crate::apply_discovered_resources(shell.parsed, shell.agent);
-    shell.model.slash_commands = crate::interactive_slash_commands(shell.agent, shell.parsed);
+    shell.model.slash_commands = crate::with_reference_commands(
+        crate::interactive_slash_commands(shell.agent, shell.parsed),
+        shell.model.reference,
+    );
     shell.model.corpus = corpus(
         shell.agent,
         &shell.model.slash_commands,

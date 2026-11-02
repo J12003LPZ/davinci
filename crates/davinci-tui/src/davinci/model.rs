@@ -4595,6 +4595,7 @@ impl Model {
             extra_providers: &self.extra_autocomplete,
             cwd: Path::new(&self.cwd),
             force_path: false,
+            reference: self.reference,
         });
         // The whole list is kept: the composer window shows a slice of it
         // around the selection, so a provider past the fold is still

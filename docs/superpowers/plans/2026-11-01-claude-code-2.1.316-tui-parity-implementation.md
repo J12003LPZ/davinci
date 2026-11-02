@@ -2,7 +2,7 @@
 
 **Goal:** Match the observable Claude Code CLI 2.1.316 Windows terminal experience in DaVinci: exact layout, colours, terminal behaviour and interactions, with DaVinci's own name, mark, wording and real provider data.
 
-**Status (2026-11-02):** P00–P08 are done; `paste_large__03_unicode` keeps the emoji the console drops and `image_paste__02_after_typing` keeps the caret cell, both recorded in the ledger, and the footer row is P12b's. P09–P20 have not started. No DaVinci parity is claimed.
+**Status (2026-11-02):** P00–P09 are done; `slash_only__01_slash` keeps its list rows as a recorded content difference (DaVinci's own commands, D2), `paste_large__03_unicode` keeps the emoji the console drops and `image_paste__02_after_typing` keeps the caret cell, all recorded in the ledger, and the footer row is P12b's. P09b–P20 have not started. No DaVinci parity is claimed.
 
 **Replaces** the earlier version of this plan. Where `docs/superpowers/specs/2026-11-01-claude-code-2.1.316-tui-parity-design.md` conflicts with the decisions below, this plan wins.
 

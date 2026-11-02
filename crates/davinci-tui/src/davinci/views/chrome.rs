@@ -838,11 +838,15 @@ pub fn composer_with_caret(
         .saturating_sub(visible - 1)
         .min(entries.len().saturating_sub(visible));
     let end = (start + visible).min(entries.len());
+    let reference_list = model.reference && model.suggestions.is_some();
     let mut rows = if model.screen == Screen::Agent && model.overlay.is_none() {
-        vec![
-            effort_line(model),
-            composer_rule(model, border, start, "above"),
-        ]
+        let mut rows = Vec::new();
+        // The reference's list takes the effort row's place while it is open.
+        if !reference_list {
+            rows.push(effort_line(model));
+        }
+        rows.push(composer_rule(model, border, start, "above"));
+        rows
     } else {
         vec![composer_rule(model, border, start, "above")]
     };
@@ -1379,22 +1383,38 @@ pub fn suggestions_with_items(model: &Model) -> (Vec<Line<'static>>, Vec<usize>)
     }
 
     let cc = model.theme.cc();
-    let name_column = ((model.width as usize * 2 / 5).max(20)) as u16;
+    let reference = model.reference;
+    // The reference puts the description two columns in from the marker's row: the name
+    // starts at column 4 and the description at column 32.
+    let name_column = if reference {
+        28
+    } else {
+        ((model.width as usize * 2 / 5).max(20)) as u16
+    };
+    let selected = model.suggestion_index.min(found.items.len() - 1);
+    // Only a slash list draws the selection marker; the reference's file list does not.
+    let marked = found.prefix.starts_with('/');
+    // Five rows: the length the captured reference list shows. Its spec allows a larger
+    // cap for a broader query, but no frame evidences one, so none is claimed.
+    let max_rows = 5;
     let items: Vec<Vec<(String, String)>> = found
         .items
         .iter()
-        .map(|item| {
+        .enumerate()
+        .map(|(index, item)| {
             let label = suggestion_label(&found.prefix, model, &item.label);
             suggestion_item_rows(
                 &label,
                 item.description.as_deref(),
                 name_column,
                 model.width,
+                reference,
+                marked && index == selected,
             )
         })
         .collect();
     let heights: Vec<usize> = items.iter().map(Vec::len).collect();
-    let selected = model.suggestion_index.min(items.len() - 1);
+
     // Only a slash command name being typed is marked; paths and arguments
     // are not.
     let needle = if found.prefix.starts_with('/') && !model.composer.contains(' ') {
@@ -1402,7 +1422,7 @@ pub fn suggestions_with_items(model: &Model) -> (Vec<Line<'static>>, Vec<usize>)
     } else {
         String::new()
     };
-    let (start, end) = visible_items(&heights, selected, 5);
+    let (start, end) = visible_items(&heights, selected, max_rows);
     let mut out = Vec::new();
     let mut owners = Vec::new();
     for (index, rows) in items.iter().enumerate().take(end).skip(start) {
@@ -1712,7 +1732,23 @@ fn suggestion_item_rows(
     description: Option<&str>,
     name_column: u16,
     width: u16,
+    reference: bool,
+    selected: bool,
 ) -> Vec<(String, String)> {
+    if reference {
+        // 4 columns for the marker (two blanks, `❯`, a space) or plain indent; the name
+        // takes the row up to column 32, where its description starts.
+        let prefix = if selected { "  ❯ " } else { "    " };
+        let label = clip_ellipsis(label, 28);
+        let mut left = format!("{prefix}{label}");
+        let used = UnicodeWidthStr::width(left.as_str());
+        left.push_str(&" ".repeat(32usize.saturating_sub(used)));
+        let description = description.map(str::trim).filter(|d| !d.is_empty());
+        let room = usize::from(width).saturating_sub(32);
+        let description =
+            description.map_or_else(String::new, |text| clip_ellipsis(text, room as u16));
+        return vec![(left, description)];
+    }
     let label = clip_ellipsis(label, name_column.saturating_sub(2));
     let description = description.map(str::trim).filter(|d| !d.is_empty());
     let Some(description) = description else {

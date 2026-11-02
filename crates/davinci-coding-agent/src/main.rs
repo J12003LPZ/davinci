@@ -9260,6 +9260,24 @@ fn interactive_slash_commands(agent: &Agent, parsed: &Args) -> Vec<SlashCommandS
     interactive_slash_commands_from(agent, &loaded_extension_host(parsed))
 }
 
+/// The command list the shell completes. The reference lists `/theme`, which this
+/// shell opens as a picker and keeps out of the built-ins, so every rebuild of the
+/// list in the reference shell adds it back.
+fn with_reference_commands(
+    mut commands: Vec<SlashCommandSpec>,
+    reference: bool,
+) -> Vec<SlashCommandSpec> {
+    if reference && !commands.iter().any(|command| command.name == "theme") {
+        commands.push(SlashCommandSpec {
+            name: "theme".into(),
+            description: "Change the theme".into(),
+            argument_hint: None,
+            argument_items: Vec::new(),
+        });
+    }
+    commands
+}
+
 /// [`interactive_slash_commands`] from a host already loaded with the same
 /// extensions. Loading one builds the whole native host (~300ms), so the
 /// shell's first frame reuses its own.
