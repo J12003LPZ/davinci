@@ -902,6 +902,37 @@ fn context_overhead_triggers_pruning_before_the_provider_request() {
 }
 
 #[test]
+fn forced_prune_keeps_a_late_needle_retrievable() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new("x".repeat(24_000));
+    agent.tools.clear();
+    agent.tools.push("read".into());
+    agent.evidence = Some(EvidenceStore::new(dir.path()));
+    agent.context_window = 10_000;
+    agent.prune_settings.keep_recent = 0;
+    let needle = "NEEDLE: the failure is in the parser";
+    let body = format!("{} {} {}", "filler ".repeat(4_000), needle, "tail");
+    let mut result = ChatMessage::text("toolResult", body);
+    result.tool_call_id = Some("needle-call".into());
+    result.is_error = Some(false);
+    agent.messages.push(result);
+    agent.prune_context();
+    assert!(agent.pruned_tool_results().contains("needle-call"));
+    let projected = agent.messages_for_provider();
+    let placeholder = content_text(&projected[0].content);
+    assert!(placeholder.contains("outcome completed"), "{placeholder}");
+    assert!(placeholder.contains("needle-call"), "{placeholder}");
+    let path = std::fs::read_dir(dir.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let stored = std::fs::read_to_string(path).unwrap();
+    assert!(stored.contains(needle), "stored body lost the needle");
+}
+
+#[test]
 fn pruning_requires_readable_evidence_and_recovers_after_expiry() {
     let dir = tempfile::tempdir().unwrap();
     let mut agent = Agent::new("");
