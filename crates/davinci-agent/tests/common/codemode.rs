@@ -2821,6 +2821,126 @@ fn failed_script_marks_the_omitted_class_as_error() {
 }
 
 #[test]
+fn codemode_retained_body_is_recoverable_through_the_read_tool() {
+    use crate::codemode::{
+        CodeModeBroker, CodeModeHost, CodeModeMode, CodeModeOutcome, CodeModeRequest,
+        CodeModeRunContext, CodeModeStatus,
+    };
+    use crate::{
+        PermissionMode, PermissionPolicy, PermissionRule, PermissionState, ReadOutsideRootPolicy,
+    };
+
+    struct TruncatedHost;
+    impl CodeModeHost for TruncatedHost {
+        fn admits_controlled_mode(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            _: &CodeModeRequest,
+            _: &CodeModeRunContext,
+            _: Arc<dyn CodeModeBroker>,
+        ) -> CodeModeOutcome {
+            CodeModeOutcome {
+                status: CodeModeStatus::Partial,
+                script_completed: true,
+                output_text: "HEAD\n[... 10 bytes omitted ...]\nTAIL".into(),
+                output_complete: false,
+                output_artifact: None,
+                children: vec![],
+                host_notes: vec![],
+                operation_ref: "fixture".into(),
+                error: None,
+                retained_output: Some("HEAD\nNEEDLE-E2E\nTAIL".into()),
+                omitted_bytes: 10,
+                omitted_start_line: Some(2),
+            }
+        }
+    }
+
+    let (mut agent, workspace, _) = configured_agent();
+    let evidence = tempfile::tempdir().unwrap();
+    let store = crate::EvidenceStore::new(evidence.path());
+    agent.evidence = Some(store.clone());
+    agent.permissions = Arc::new(PermissionState::new(PermissionPolicy::new(
+        PermissionMode::Ask,
+    )));
+    {
+        let mut policy = agent.permissions.lock().unwrap();
+        policy.set_worktree_boundary(workspace.path(), None);
+        policy.set_read_outside_root_policy(ReadOutsideRootPolicy::Deny);
+    }
+    agent
+        .enable_codemode(Arc::new(TruncatedHost), CodeModeMode::Controlled)
+        .unwrap();
+    let result = agent.run_codemode("call-e2e", &json!({"code":"return 1"}), None);
+    let artifact = result.details.as_ref().unwrap()["codemode"]["outputArtifact"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut events = Vec::new();
+    let messages = agent.execute_tool_batch(
+        workspace.path(),
+        vec![("read-e2e".into(), "read".into(), json!({"path": artifact}))],
+        &mut events,
+    );
+    assert_eq!(messages[0].is_error, Some(false), "{messages:?}");
+    assert!(
+        davinci_ai::content_text(&messages[0].content).contains("NEEDLE-E2E"),
+        "{messages:?}"
+    );
+
+    // Expired: the sweep removes the retained body, so the read must fail.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    store.sweep(std::time::Duration::from_millis(1));
+    assert!(!std::path::Path::new(&artifact).exists());
+    let messages = agent.execute_tool_batch(
+        workspace.path(),
+        vec![(
+            "read-expired".into(),
+            "read".into(),
+            json!({"path": artifact}),
+        )],
+        &mut events,
+    );
+    assert_eq!(messages[0].is_error, Some(true), "{messages:?}");
+
+    // Missing: a path that was never retained.
+    let missing = store
+        .store_in_session("sessionless", "script-output", "MISSING")
+        .unwrap();
+    std::fs::remove_file(&missing).unwrap();
+    let messages = agent.execute_tool_batch(
+        workspace.path(),
+        vec![(
+            "read-missing".into(),
+            "read".into(),
+            json!({"path": missing}),
+        )],
+        &mut events,
+    );
+    assert_eq!(messages[0].is_error, Some(true), "{messages:?}");
+
+    // Denied: the evidence exception still yields to an explicit deny rule.
+    let denied = store
+        .store_in_session("sessionless", "script-output", "DENIED")
+        .unwrap();
+    agent
+        .permissions
+        .lock()
+        .unwrap()
+        .deny
+        .push(PermissionRule::bare("read"));
+    let messages = agent.execute_tool_batch(
+        workspace.path(),
+        vec![("read-denied".into(), "read".into(), json!({"path": denied}))],
+        &mut events,
+    );
+    assert_eq!(messages[0].is_error, Some(true), "{messages:?}");
+}
+
+#[test]
 fn read_can_open_agent_evidence_under_deny_outside_root() {
     use crate::{PermissionMode, PermissionPolicy, PermissionState, ReadOutsideRootPolicy};
     let (mut agent, workspace, _) = configured_agent();
