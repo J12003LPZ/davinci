@@ -175,10 +175,18 @@ fn is_large_json_object(content: &str) -> bool {
     };
     map.iter().any(|(key, value)| {
         value.as_array().is_some_and(|items| items.len() > 5)
-            || DIAGNOSTIC_MARKERS
-                .iter()
-                .any(|marker| key.to_ascii_lowercase().contains(marker))
+            || is_object_field_hint(key)
     })
+}
+
+/// Object keys worth routing and retaining. This is wider than the text-log
+/// markers: `expected` and `actual` are ordinary data for diagnostic
+/// classification, but a large object keyed on them still needs its view.
+fn is_object_field_hint(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("expected")
+        || key.contains("actual")
+        || DIAGNOSTIC_MARKERS.iter().any(|marker| key.contains(marker))
 }
 
 fn is_ndjson(content: &str) -> bool {
@@ -493,9 +501,7 @@ fn build_json_object_view(content: &str, output_id: &str) -> Option<String> {
                     serde_json::to_string(&items[*index]).ok()?
                 ));
             }
-        } else if DIAGNOSTIC_MARKERS
-            .iter()
-            .any(|marker| key.to_ascii_lowercase().contains(marker))
+        } else if is_object_field_hint(key)
             || value.is_string()
             || value.is_number()
             || value.is_boolean()
@@ -963,6 +969,40 @@ mod tests {
         let view = json_array_view(items);
         assert!(view.contains("item[25]"), "{view}");
         assert!(view.contains("diagnostics kept: 1, omitted: 0"), "{view}");
+    }
+
+    fn object_view(object: serde_json::Value) -> String {
+        let content = object.to_string();
+        let kind = classify_content("bash", &serde_json::json!({}), &content);
+        assert_eq!(kind, ContentKind::JsonObject, "{content}");
+        build_specialized_view(
+            kind,
+            "bash",
+            &serde_json::json!({}),
+            &content,
+            "out-0123456789ab",
+        )
+        .unwrap()
+        .content
+    }
+
+    #[test]
+    fn objects_keyed_on_expected_actual_keep_their_structured_view() {
+        let scalar = object_view(serde_json::json!({
+            "expected": 1,
+            "actual": 2,
+            "payload": "x".repeat(4000),
+        }));
+        assert!(scalar.contains("expected: 1"), "{scalar}");
+        assert!(scalar.contains("actual: 2"), "{scalar}");
+
+        let nested = object_view(serde_json::json!({
+            "expected": {"rows": [1, 2, 3]},
+            "actual": {"rows": [1, 2, 4]},
+            "payload": "x".repeat(4000),
+        }));
+        assert!(nested.contains(r#"expected: {"rows":[1,2,3]}"#), "{nested}");
+        assert!(nested.contains(r#"actual: {"rows":[1,2,4]}"#), "{nested}");
     }
 
     #[test]
