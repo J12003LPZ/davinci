@@ -3,6 +3,9 @@
 # whose executable lives in the cargo target directory, then kill them and the
 # command, and fail with exit code 124.
 #
+# The script ends the process with [Environment]::Exit: when GitHub Actions runs a
+# step as `pwsh -command ". step.ps1"`, `exit N` inside a script is reported as 1.
+#
 # Usage (call with & from pwsh; -File mis-parses the command's own flags such as -p):
 #   & scripts/ci/run_with_hang_capture.ps1 -DeadlineSeconds 600 -- cargo test ...
 #
@@ -98,7 +101,7 @@ $psi.UseShellExecute = $false   # no redirection: stdout and stderr go straight 
 $process = [System.Diagnostics.Process]::Start($psi)
 $null = $process.Handle          # keep the handle so ExitCode stays readable
 if ($process.WaitForExit($DeadlineSeconds * 1000)) {
-    exit $process.ExitCode
+    [Environment]::Exit($process.ExitCode)
 }
 
 Write-Host "Deadline of $DeadlineSeconds seconds passed for pid $($process.Id) ($($exe.Source))."
@@ -119,5 +122,5 @@ finally {
     try { Stop-HungProcesses } catch { Write-Host "kill failed: $($_.Exception.Message)" }
     [void]$process.WaitForExit(15000)
     Write-Host "HANG: '$($CommandLine[0])' did not finish within the $DeadlineSeconds-second deadline. This is a hang, not a test failure."
-    exit $HangExitCode
+    [Environment]::Exit($HangExitCode)
 }
