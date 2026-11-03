@@ -113,21 +113,27 @@ pub fn catalog(model: &Model) -> Vec<Line<'static>> {
             "No matching models. Backspace to edit the search.",
         );
     }
-    let name_width = indices
-        .iter()
-        .map(|index| {
-            let entry = &model.catalog[*index];
-            text_width(if entry.id.is_empty() {
-                &entry.name
-            } else {
-                &entry.id
-            }) + 4
-        })
-        .max()
-        .unwrap_or(0)
-        .saturating_add(indices.len().to_string().len().saturating_sub(1) as u16)
-        .min(38)
-        .min(model.width.saturating_sub(12));
+    let name_width = if model.reference {
+        // The reference's description column is 31: 5 for the marker, 3 for the
+        // number, a 21-cell name field and two spaces.
+        21
+    } else {
+        indices
+            .iter()
+            .map(|index| {
+                let entry = &model.catalog[*index];
+                text_width(if entry.id.is_empty() {
+                    &entry.name
+                } else {
+                    &entry.id
+                }) + 4
+            })
+            .max()
+            .unwrap_or(0)
+            .saturating_add(indices.len().to_string().len().saturating_sub(1) as u16)
+            .min(38)
+            .min(model.width.saturating_sub(12))
+    };
     let digits = indices.len().to_string().len();
     indices
         .iter()
@@ -224,10 +230,22 @@ fn picker_panel(model: &Model, height: usize) -> Vec<Line<'static>> {
                     None => String::new(),
                 }
             };
+            // The reference's glyph family marks the effort; medium is the
+            // product default and says so.
+            let (glyph, default) = if !model.reference {
+                ("● ", "")
+            } else {
+                match level {
+                    "minimal" | "low" => ("○ ", ""),
+                    "medium" => ("◐ ", " (default)"),
+                    "high" => ("● ", ""),
+                    _ => ("◉ ", ""),
+                }
+            };
             footer.push(bounded(vec![
                 span("   ", cc.inactive),
-                span("● ", cc.claude),
-                span(format!("{display_level} effort"), cc.inactive),
+                span(glyph, cc.claude),
+                span(format!("{display_level} effort{default}"), cc.inactive),
                 span(" ←/→ to adjust", cc.subtle),
             ]));
         }
@@ -253,6 +271,7 @@ fn picker_panel(model: &Model, height: usize) -> Vec<Line<'static>> {
         picker_keys(
             model.width.saturating_sub(3),
             model.catalog_search || !model.catalog_query.is_empty(),
+            model.reference,
         )
         .into(),
         cc.inactive,
@@ -288,10 +307,23 @@ fn picker_panel(model: &Model, height: usize) -> Vec<Line<'static>> {
 }
 
 /// The widest key legend that fits, so `Esc` is never the part cut off.
-fn picker_keys(room: u16, searching: bool) -> &'static str {
+fn picker_keys(room: u16, searching: bool, reference: bool) -> &'static str {
     if searching {
         return [
             "Enter to set as default · Backspace to edit · Esc to cancel",
+            "Enter · Esc",
+        ]
+        .into_iter()
+        .find(|keys| text_width(keys) <= room)
+        .unwrap_or("Enter · Esc");
+    }
+    if reference {
+        // The reference's model sheet has no search, so its legend does not
+        // advertise one; the filter still works for DaVinci's own catalog.
+        return [
+            "Enter to set as default · s to use this session only · Esc to cancel",
+            "Enter set default · s this session · Esc cancel",
+            "Enter default · s session · Esc cancel",
             "Enter · Esc",
         ]
         .into_iter()
@@ -397,8 +429,16 @@ fn catalog_row(
         spans.push(span(check, cc.success));
     }
     if model.width >= 60 {
-        let used_name = fixed.saturating_add(text_width(&clipped_name));
-        let padding = name_width.saturating_sub(used_name) + 2;
+        let padding = if model.reference {
+            // The description starts at column 31; the check mark sits inside the
+            // name field, as in the reference's selected row.
+            name_width
+                .saturating_sub(text_width(&clipped_name) + text_width(check))
+                .saturating_add(2)
+        } else {
+            let used_name = fixed.saturating_add(text_width(&clipped_name));
+            name_width.saturating_sub(used_name) + 2
+        };
         spans.push(span(" ".repeat(usize::from(padding)), cc.inactive));
         spans.push(span(model_description(entry), cc.inactive));
     }

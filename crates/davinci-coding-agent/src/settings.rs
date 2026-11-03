@@ -418,6 +418,9 @@ pub struct Settings {
     pub fullscreen_copy_on_select: Option<bool>,
     #[serde(default, rename = "showImages")]
     pub show_images: Option<bool>,
+    /// `reduceMotion`: static frames instead of the animated spinner.
+    #[serde(default, rename = "reduceMotion")]
+    pub reduce_motion: Option<bool>,
     #[serde(default, rename = "imageWidthCells")]
     pub image_width_cells: Option<u32>,
     #[serde(default, rename = "autoResizeImages")]
@@ -1953,6 +1956,7 @@ pub fn to_interactive_config(
             .clone()
             .unwrap_or_else(|| "auto".into()),
         fullscreen_copy_on_select: settings.fullscreen_copy_on_select.unwrap_or(true),
+        reduce_motion: settings.reduce_motion.unwrap_or(false),
         show_images: settings.show_images(),
         image_width_cells: settings.image_width_cells(),
         auto_resize_images: settings.image_auto_resize(),

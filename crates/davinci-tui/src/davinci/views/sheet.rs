@@ -135,11 +135,25 @@ pub fn chrome(model: &Model) -> Option<SheetChrome> {
         chrome.composer = Composer::Hidden;
     }
     chrome.echo = None;
+    // The permissions sheet names its own keys in the reference; return before
+    // the generic close hint overwrites them.
+    if model.screen == Screen::Permissions && model.reference {
+        chrome.composer = Composer::Hidden;
+        return Some(chrome);
+    }
     // `/login` names its own keys, and what esc will do (clear, then close).
     let own_escape = (model.screen == Screen::Login)
         .then_some(chrome.escape)
         .flatten();
     chrome.escape = Some("esc close");
+    // The Help sheet is the reference's: one tab bar, one Esc hint, no scroll
+    // legend. Its lists still scroll with the arrows and page keys.
+    if model.screen == Screen::Keys && model.help_tab.is_some() {
+        chrome.hints.clear();
+        chrome.escape = Some("Esc to cancel");
+        return Some(chrome);
+    }
+    // The permissions sheet names its own keys in the reference.
     if let Some(escape) = own_escape {
         chrome.escape = Some(escape);
         return Some(chrome);
@@ -217,6 +231,25 @@ pub fn chrome(model: &Model) -> Option<SheetChrome> {
 
 /// The hint row for this sheet, if it has one.
 pub fn hint_row(model: &Model, chrome: &SheetChrome) -> Option<Line<'static>> {
+    // The reference's Help and Permissions footers keep the keys on one line,
+    // Esc included, instead of pushing Esc to the right edge.
+    if model.reference
+        && ((model.screen == Screen::Keys && model.help_tab.is_some())
+            || model.screen == Screen::Permissions)
+    {
+        let mut spans = vec![span("   ", model.theme.muted)];
+        for (index, hint) in chrome.hints.iter().enumerate() {
+            if index > 0 {
+                spans.push(span(" · ", model.theme.muted));
+            }
+            spans.extend(hint.iter().cloned());
+        }
+        if let Some(escape) = chrome.escape {
+            spans.push(span(" · ", model.theme.muted));
+            spans.push(span(escape, model.theme.muted));
+        }
+        return Some(Line::from(spans));
+    }
     chrome
         .escape
         .map(|esc| ui::hint_row(model.width, &chrome.hints, Some(esc), &model.theme))
@@ -228,6 +261,43 @@ pub fn sheet_title(model: &Model) -> &'static str {
         (Screen::Extensions, Some(sheet)) => sheet.tab.label(),
         (screen, _) => title(screen),
     }
+}
+
+/// The Permissions sheet's tab bar in the reference's filled style.
+pub fn permissions_tabs(model: &Model) -> Option<Vec<Span<'static>>> {
+    (model.screen == Screen::Permissions && model.reference).then(|| permissions::tabs(model).spans)
+}
+
+/// The Help sheet's tab bar: `Help` and the three tabs, the active one filled
+/// in the reference's accent. `None` for every other sheet.
+pub fn help_tabs(model: &Model) -> Option<Vec<Span<'static>>> {
+    let active = model.help_tab?;
+    if model.screen != Screen::Keys {
+        return None;
+    }
+    let accent = ratatui::style::Color::Rgb(0x6A, 0x9B, 0xCC);
+    // Columns are fixed in the reference: Help 3, General 9, Commands 19,
+    // Custom commands 30. The active tab also takes the cell before/after it.
+    let base = "   Help  General   Commands   Custom commands";
+    let (start, end) = match active {
+        0 => (8, 17),
+        1 => (18, 28),
+        _ => (29, 45),
+    };
+    let mut help = span("Help", accent);
+    help.style = help.style.add_modifier(ratatui::style::Modifier::BOLD);
+    let mut tab = span(base[start..end].to_string(), ratatui::style::Color::Black);
+    tab.style = tab
+        .style
+        .bg(accent)
+        .add_modifier(ratatui::style::Modifier::BOLD);
+    Some(vec![
+        span(&base[..3], model.theme.muted),
+        help,
+        span(&base[7..start], model.theme.text),
+        tab,
+        span(&base[end..], model.theme.text),
+    ])
 }
 
 /// Human-readable section names; domain-specific content keeps its own structure.

@@ -3,6 +3,7 @@ mod chrome;
 mod completion;
 mod editor;
 mod keys;
+mod panels;
 mod permissions;
 mod review;
 mod terminal;

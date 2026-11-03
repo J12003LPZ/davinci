@@ -7757,12 +7757,10 @@ fn handle_user_line(
         SlashAction::Prompt(prompt) => {
             submit_user_message(parsed, agent, session, &prompt, &[], tui)
         }
-        SlashAction::Status(message) => {
-            if let Some(name) = message.strip_prefix("Unknown command /") {
-                if try_extension_slash(parsed, agent, session, name, "")? {
-                    return Ok(true);
-                }
-            }
+        SlashAction::Help => {
+            // The legacy shell keeps the plain command list `/help` printed
+            // before the tabbed sheet existed.
+            let message = slash::help_lines().join("\n");
             session.chrome.status = message.clone();
             println!("{message}");
             Ok(true)
@@ -8609,6 +8607,7 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
         "fullscreen-scrollbar" => stored.fullscreen_scrollbar = Some(value.to_string()),
         "fullscreen-copy-on-select" => stored.fullscreen_copy_on_select = Some(value == "true"),
         "show-images" => stored.show_images = Some(value == "true"),
+        "reduce-motion" => stored.reduce_motion = Some(value == "true"),
         "image-width-cells" => stored.image_width_cells = value.parse().ok(),
         "auto-resize-images" => stored.auto_resize_images = Some(value == "true"),
         "block-images" => stored.block_images = Some(value == "true"),

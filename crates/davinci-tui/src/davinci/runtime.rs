@@ -1180,12 +1180,39 @@ impl Session {
             }
             return false;
         }
-        if model.screen == Screen::Agent && !model.show_tool_output && row.contains("to expand)") {
+        if model.screen == Screen::Agent
+            && !model.show_tool_output
+            && (row.contains("to expand)") || Self::is_collapsed_tool_summary(row))
+        {
             model.show_tool_output = true;
             model.dirty = true;
             return true;
         }
         false
+    }
+
+    /// The one-row summary of a collapsed tool group (`Read 1 file`, `Ran 2 shell
+    /// commands`). Clicking it opens the group's tool output, as the reference does.
+    fn is_collapsed_tool_summary(row: &str) -> bool {
+        let text = row.trim_start();
+        [
+            "Read ",
+            "Reading ",
+            "Searched for ",
+            "Searching for ",
+            "Listed ",
+            "Listing ",
+            "Ran ",
+            "Running ",
+            "Made ",
+            "Making ",
+        ]
+        .iter()
+        .any(|prefix| {
+            text.strip_prefix(prefix)
+                .and_then(|rest| rest.split_whitespace().next())
+                .is_some_and(|count| count.parse::<usize>().is_ok())
+        })
     }
 
     /// Open the link under a Ctrl- or Cmd-click. `true` when there was one.

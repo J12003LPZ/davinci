@@ -61,11 +61,12 @@ BASE_ENV_KEYS = ("PATH", "SystemRoot", "WINDIR", "TEMP", "TMP")
 # ``PI_CLIPBOARD_IMAGE`` names a PNG the shell reads as the clipboard's image. Every run also
 # sets ``PI_CLIPBOARD_DRY_RUN``, so the machine's own clipboard is never read.
 PROFILE_ENV_KEYS = ("NO_COLOR", "FORCE_COLOR", "COLORFGBG", "PI_DAVINCI_REFERENCE",
-                    "PI_DAVINCI_PANIC_FIXTURE", "PI_CLIPBOARD_IMAGE")
-ACTIONS = ("key", "wait", "wait_for", "snapshot", "resize", "mouse", "click_text", "release")
+                    "PI_DAVINCI_PANIC_FIXTURE", "PI_CLIPBOARD_IMAGE", "DAVINCI_INPUT_TRACE")
+ACTIONS = ("key", "wait", "wait_for", "snapshot", "resize", "timed_resize", "timed_key",
+           "metrics", "mouse", "click_text", "release")
 WAIT_FOR_MAX_MS = 1_800_000
 SCENARIO_KEYS = ("name", "cols", "rows", "wait_ms", "actions", "graceful", "timeout", "turns",
-                 "files", "davinci_settings", "expect_requests", "first_run")
+                 "files", "davinci_settings", "expect_requests", "first_run", "args")
 CLI_ARGS = ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-mcp",
             "--provider", "local", "--model", "demo"]
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -102,6 +103,8 @@ class Capture:
     waits: list = field(default_factory=list)      # (text, milliseconds) of each wait_for that succeeded
     proxy_attempts: list = field(default_factory=list)
     connection_samples: list = field(default_factory=list)
+    pid: int | None = None
+    metrics: list = field(default_factory=list)   # sampled idle CPU/RSS and resize latency
     exit: str = ""
     agent_settings: dict = field(default_factory=dict)  # the isolated agent dir's settings.json at exit
 
@@ -444,6 +447,25 @@ def relabel(json_path: Path, binary: str):
 
 # -------------------------------------------------------------------- replay
 
+def sample_metrics(pid: int, label: str) -> dict:
+    """Idle CPU and RSS for the shell tree, sampled off the action path."""
+    import psutil
+
+    try:
+        process = psutil.Process(pid)
+        cpu = process.cpu_percent(interval=2.0)
+        total = process.memory_info().rss
+        for child in process.children(recursive=True):
+            try:
+                total += child.memory_info().rss
+            except Exception:  # noqa: BLE001 - a child may exit while sampled
+                pass
+        return {"label": label, "idle_cpu_pct": round(cpu, 2),
+                "rss_mb": round(total / 1e6, 1)}
+    except Exception as exc:  # noqa: BLE001
+        return {"label": label, "error": str(exc)}
+
+
 def replay(binary, scenario, profile, *, out_dir) -> Capture:
     """Run ``scenario`` against ``binary``. ``out_dir`` must be outside the repository."""
     profile = Profile.of(profile)
@@ -500,15 +522,19 @@ def replay(binary, scenario, profile, *, out_dir) -> Capture:
         (agent / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
     (agent / "models.json").write_text(json.dumps({"providers": {"local": {
         "baseUrl": mock.base_url, "api": "openai-responses", "apiKey": "sk-test",
-        "models": [{"id": "demo", "name": "Demo", "input": ["text", "image"]}]}}}), encoding="utf-8")
+        # The reference's models expose reasoning effort; the fixture's model does
+        # too, so the model picker's <-/-> effort control is exercised for real.
+        "models": [{"id": "demo", "name": "Demo", "input": ["text", "image"],
+                    "reasoning": True}]}}}), encoding="utf-8")
 
     # The profile sets the size; a scenario's own cols/rows are ignored.
     scratch = root / "scratch"
     scratch.mkdir()
     harness_class = make_harness_class(tui_harness, styled_xterm, scratch)
+    cli_args = list(CLI_ARGS) + [str(arg) for arg in (scenario.get("args") or [])]
     harness = harness_class(profile.cols, profile.rows, str(work),
                             build_env(home, agent, proxy.port, profile.env, first_run),
-                            str(binary), CLI_ARGS)
+                            str(binary), cli_args)
     timer = None
     raw_path = out / "full.raw"
     events_path = out / "events.jsonl"
@@ -519,6 +545,7 @@ def replay(binary, scenario, profile, *, out_dir) -> Capture:
     try:
         harness.start()
         pid = harness.proc.pid
+        cap.pid = pid
         timer = threading.Timer(float(scenario.get("timeout", 120)),
                                 lambda: (timed_out.set(), kill_tree(pid)))
         timer.daemon = True
@@ -555,6 +582,37 @@ def replay(binary, scenario, profile, *, out_dir) -> Capture:
             elif kind == "resize":
                 harness.resize(a["cols"], a["rows"])
                 harness.wait(a.get("settle_ms", 800))
+            elif kind == "timed_resize":
+                before = len(harness.raw())
+                started = time.perf_counter()
+                harness.resize(a["cols"], a["rows"])
+                elapsed = None
+                while time.perf_counter() - started < float(a.get("timeout_s", 5)):
+                    if len(harness.raw()) > before + int(a.get("threshold", 40)):
+                        elapsed = (time.perf_counter() - started) * 1000
+                        break
+                    time.sleep(0.02)
+                harness.wait(a.get("settle_ms", 800))
+                cap.metrics.append({"label": a.get("label", "resize"),
+                                    "resize_ms": elapsed,
+                                    "output_bytes": len(harness.raw()) - before})
+            elif kind == "metrics":
+                harness.wait(a.get("settle_ms", 1000))
+                cap.metrics.append(sample_metrics(pid, a.get("label", "idle")))
+            elif kind == "timed_key":
+                harness.wait(a.get("delay_ms", 0))
+                before = len(harness.raw())
+                started = time.perf_counter()
+                harness.key(a.get("text", ""))
+                elapsed = None
+                while time.perf_counter() - started < float(a.get("timeout_s", 3)):
+                    if len(harness.raw()) > before + int(a.get("threshold", 1)):
+                        elapsed = (time.perf_counter() - started) * 1000
+                        break
+                    time.sleep(0.01)
+                cap.metrics.append({"label": a.get("label", "key"),
+                                    "render_ms": elapsed,
+                                    "output_bytes": len(harness.raw()) - before})
             elif kind == "mouse":
                 harness.mouse(a.get("action", "left"), a.get("x", 10), a.get("y", 10),
                               a.get("button", 0))

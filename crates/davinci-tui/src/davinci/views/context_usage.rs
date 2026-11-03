@@ -30,6 +30,8 @@ pub const BUFFER: &str = "▒";
 const COLUMNS: usize = 10;
 const ROWS: usize = 10;
 const CELLS: usize = COLUMNS * ROWS;
+/// The reference's grid is twenty columns wide; the shell's own is ten.
+const REF_COLUMNS: usize = 20;
 /// Lines up with the text after the elbow.
 const INDENT: &str = "     ";
 /// Below this the legend moves under the grid.
@@ -71,10 +73,14 @@ fn percent(tokens: u64, window: u64) -> f64 {
 /// (at least one cell, the last of them partial when the share is not
 /// whole), the buffer takes the end, and free space takes what is between.
 pub fn cells(view: &ContextUsageView) -> Vec<Cell> {
+    grid_cells(view, CELLS)
+}
+
+fn grid_cells(view: &ContextUsageView, cells: usize) -> Vec<Cell> {
     let window = view.window.max(1) as f64;
-    let mut grid = Vec::with_capacity(CELLS);
+    let mut grid = Vec::with_capacity(cells);
     for category in view.categories.iter().filter(|c| c.tokens > 0) {
-        let exact = category.tokens as f64 * CELLS as f64 / window;
+        let exact = category.tokens as f64 * cells as f64 / window;
         let full = exact.floor() as usize;
         let partial = exact - exact.floor() > 0.0 || full == 0;
         grid.extend(std::iter::repeat_n(Cell::Full(category.kind), full));
@@ -82,14 +88,14 @@ pub fn cells(view: &ContextUsageView) -> Vec<Cell> {
             grid.push(Cell::Partial(category.kind));
         }
     }
-    grid.truncate(CELLS);
+    grid.truncate(cells);
     let buffer = if view.buffer == 0 {
         0
     } else {
-        ((view.buffer as f64 * CELLS as f64 / window).round() as usize).max(1)
+        ((view.buffer as f64 * cells as f64 / window).round() as usize).max(1)
     };
-    let buffer = buffer.min(CELLS - grid.len());
-    let free = CELLS - grid.len() - buffer;
+    let buffer = buffer.min(cells - grid.len());
+    let free = cells - grid.len() - buffer;
     grid.extend(std::iter::repeat_n(Cell::Free, free));
     grid.extend(std::iter::repeat_n(Cell::Buffer, buffer));
     grid
@@ -119,12 +125,15 @@ pub const fn kind_glyph(kind: ContextKind) -> &'static str {
     }
 }
 
-fn cell_span(cc: &Cc, cell: Cell) -> Span<'static> {
+fn cell_span(cc: &Cc, cell: Cell, reference: bool) -> Span<'static> {
     match cell {
-        Cell::Full(kind) => span(kind_glyph(kind), kind_color(cc, kind)),
-        Cell::Partial(kind) => partial_span(cc, kind),
-        Cell::Free => span(FREE, cc.subtle),
-        Cell::Buffer => span(BUFFER, cc.inactive),
+        Cell::Full(kind) => span(
+            if reference { "⛀" } else { kind_glyph(kind) },
+            kind_color(cc, kind),
+        ),
+        Cell::Partial(kind) => partial_span(cc, kind, reference),
+        Cell::Free => span(if reference { "⛶" } else { FREE }, cc.subtle),
+        Cell::Buffer => span(if reference { "⛃" } else { BUFFER }, cc.inactive),
     }
 }
 
@@ -132,14 +141,12 @@ fn cell_span(cc: &Cc, cell: Cell) -> Span<'static> {
 /// two RGB inks and otherwise returns one of them whole, which on a 256-colour
 /// or basic palette would draw every partial cell in `subtle` grey. There the
 /// category's own ink is kept and the terminal's faint attribute dims it.
-fn partial_span(cc: &Cc, kind: ContextKind) -> Span<'static> {
+fn partial_span(cc: &Cc, kind: ContextKind, reference: bool) -> Span<'static> {
     let ink = kind_color(cc, kind);
+    let glyph = if reference { "⛁" } else { kind_glyph(kind) };
     match (ink, cc.subtle) {
-        (Color::Rgb(..), Color::Rgb(..)) => span(kind_glyph(kind), mix(ink, cc.subtle, 0.55)),
-        _ => Span::styled(
-            kind_glyph(kind),
-            Style::default().fg(ink).add_modifier(Modifier::DIM),
-        ),
+        (Color::Rgb(..), Color::Rgb(..)) => span(glyph, mix(ink, cc.subtle, 0.55)),
+        _ => Span::styled(glyph, Style::default().fg(ink).add_modifier(Modifier::DIM)),
     }
 }
 
@@ -180,7 +187,14 @@ fn legend(theme: &Theme, view: &ContextUsageView) -> Vec<Vec<Span<'static>>> {
     for category in &view.categories {
         rows.push(vec![
             span(
-                format!("{} ", kind_glyph(category.kind)),
+                format!(
+                    "{} ",
+                    if theme.reference {
+                        "⛁"
+                    } else {
+                        kind_glyph(category.kind)
+                    }
+                ),
                 kind_color(&cc, category.kind),
             ),
             span(format!("{}: ", category.label), theme.text),
@@ -195,7 +209,10 @@ fn legend(theme: &Theme, view: &ContextUsageView) -> Vec<Vec<Span<'static>>> {
         ]);
     }
     rows.push(vec![
-        span(format!("{FREE} "), cc.subtle),
+        span(
+            format!("{} ", if theme.reference { "⛶" } else { FREE }),
+            cc.subtle,
+        ),
         span("Free space: ", theme.text),
         span(
             format!(
@@ -208,7 +225,10 @@ fn legend(theme: &Theme, view: &ContextUsageView) -> Vec<Vec<Span<'static>>> {
     ]);
     if view.buffer > 0 {
         rows.push(vec![
-            span(format!("{BUFFER} "), cc.inactive),
+            span(
+                format!("{} ", if theme.reference { "⛃" } else { BUFFER }),
+                cc.inactive,
+            ),
             span("Autocompact buffer: ", theme.text),
             span(
                 format!(
@@ -224,7 +244,12 @@ fn legend(theme: &Theme, view: &ContextUsageView) -> Vec<Vec<Span<'static>>> {
 }
 
 pub fn lines(theme: &Theme, view: &ContextUsageView, width: u16) -> Vec<Line<'static>> {
-    render(theme, view, width, Some(SECTION_ROWS))
+    render(
+        theme,
+        view,
+        width,
+        if view.all { None } else { Some(SECTION_ROWS) },
+    )
 }
 
 fn item_row(cc: &Cc, theme: &Theme, name: String, tokens: u64, width: u16) -> Line<'static> {
@@ -252,22 +277,34 @@ fn render(
         bold("Context Usage", theme.text),
     ])];
 
-    let grid = cells(view);
+    let grid = grid_cells(
+        view,
+        if theme.reference {
+            REF_COLUMNS * ROWS
+        } else {
+            CELLS
+        },
+    );
+    let columns = if theme.reference {
+        REF_COLUMNS
+    } else {
+        COLUMNS
+    };
     let grid_rows: Vec<Vec<Span<'static>>> = grid
-        .chunks(COLUMNS)
+        .chunks(columns)
         .map(|row| {
-            let mut spans = Vec::with_capacity(COLUMNS * 2);
+            let mut spans = Vec::with_capacity(columns * 2);
             for (index, cell) in row.iter().enumerate() {
                 if index > 0 {
                     spans.push(Span::raw(" "));
                 }
-                spans.push(cell_span(&cc, *cell));
+                spans.push(cell_span(&cc, *cell, theme.reference));
             }
             spans
         })
         .collect();
     let legend = legend(theme, view);
-    let grid_width = COLUMNS * 2 - 1;
+    let grid_width = columns * 2 - 1;
 
     if width >= SIDE_BY_SIDE {
         for index in 0..grid_rows.len().max(legend.len()) {
@@ -328,6 +365,16 @@ fn render(
             ));
         }
     }
+    if theme.reference && !view.all && !view.sections.is_empty() {
+        out.push(Line::default());
+        out.push(Line::from(truncate_run(
+            vec![
+                Span::raw(INDENT),
+                span("/context all to expand", cc.inactive),
+            ],
+            width,
+        )));
+    }
     out
 }
 
@@ -356,6 +403,7 @@ mod tests {
 
     fn view() -> ContextUsageView {
         ContextUsageView {
+            all: false,
             model: "claude-opus-5-5".into(),
             window: 200_000,
             categories: vec![
@@ -608,11 +656,11 @@ mod tests {
                 let cc = Theme::da_vinci(depth, false).with_name(name).cc();
                 let partials: Vec<Style> = CATEGORIES
                     .iter()
-                    .map(|kind| cell_span(&cc, Cell::Partial(*kind)).style)
+                    .map(|kind| cell_span(&cc, Cell::Partial(*kind), false).style)
                     .collect();
                 for (index, kind) in CATEGORIES.iter().enumerate() {
-                    let full = cell_span(&cc, Cell::Full(*kind));
-                    let partial = cell_span(&cc, Cell::Partial(*kind));
+                    let full = cell_span(&cc, Cell::Full(*kind), false);
+                    let partial = cell_span(&cc, Cell::Partial(*kind), false);
                     assert_eq!(partial.content, full.content, "{depth:?} {name} {kind:?}");
                     assert_ne!(partial.style, full.style, "{depth:?} {name} {kind:?}");
                     assert_ne!(
@@ -628,8 +676,8 @@ mod tests {
         }
         // With no colour at all a partial cell is still drawn faint.
         let cc = Theme::da_vinci(ColorDepth::TrueColor, true).cc();
-        let partial = cell_span(&cc, Cell::Partial(ContextKind::Messages));
-        let full = cell_span(&cc, Cell::Full(ContextKind::Messages));
+        let partial = cell_span(&cc, Cell::Partial(ContextKind::Messages), false);
+        let full = cell_span(&cc, Cell::Full(ContextKind::Messages), false);
         assert_ne!(partial.style, full.style);
     }
 

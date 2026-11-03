@@ -2815,6 +2815,16 @@ pub struct AgentsSheet {
     pub selected_index: usize,
     /// The agent profiles that can be launched, listed under the live workers.
     pub profiles: Vec<AgentProfileRow>,
+    /// Pinned agent ids, shown in their own group.
+    pub pinned: Vec<String>,
+    /// The find filter.
+    pub query: String,
+    /// Whether Ctrl+F put the find field in input mode.
+    pub finding: bool,
+    /// A rename in progress: the row id and the new name being typed.
+    pub renaming: Option<(String, String)>,
+    /// The row whose first Ctrl+X armed deletion.
+    pub delete_armed: Option<String>,
 }
 
 /// One launchable agent profile on the `/agents` sheet.
@@ -2900,6 +2910,9 @@ pub struct ContextUsageView {
     pub free: u64,
     pub buffer: u64,
     pub sections: Vec<ContextSection>,
+    /// `/context all`: list every item instead of folding each section after
+    /// five rows, as the reference's expand command does.
+    pub all: bool,
 }
 
 impl ContextUsageView {
@@ -3157,6 +3170,8 @@ pub struct Model {
 
     pub screen: Screen,
     pub overlay: Option<Overlay>,
+    /// Text-only, line-oriented rendering for screen readers.
+    pub screen_reader: bool,
     pub codex: bool,
 
     pub composer: Composer,
@@ -3328,6 +3343,9 @@ pub struct Model {
     pub catalog_query: String,
     pub catalog_session_only: bool,
     pub catalog_search: bool,
+    /// The Help sheet's active tab: 0 General, 1 Commands, 2 Custom commands.
+    /// `None` while the sheet is the keymap (`/hotkeys`), `Some` for `/help`.
+    pub help_tab: Option<usize>,
     /// `tui.reference`, fixed when the session opened. Only the reference
     /// shell opens `/theme` as a picker.
     pub reference: bool,
@@ -3407,6 +3425,10 @@ pub struct Model {
     /// `/permissions` — mode and rules.
     pub permission_rows: Vec<PermissionRow>,
     pub permission_index: usize,
+    /// The permissions sheet's tab: 0 Permissions, 1 Recently blocked, 2 Allow,
+    /// 3 Ask, 4 Deny, 5 Auto mode, 6 Workspace.
+    pub permission_tab: usize,
+    pub permission_query: String,
     /// `5e` — deterministic agent workflows (`/workflows`).
     pub workflows: Option<WorkflowsSheet>,
     pub workflow_index: usize,
@@ -3853,6 +3875,7 @@ impl Model {
             theme,
             screen: Screen::Agent,
             overlay: None,
+            screen_reader: false,
             codex: false,
             composer: Composer::default(),
             placeholder: 0,
@@ -3935,6 +3958,7 @@ impl Model {
             catalog_query: String::new(),
             catalog_session_only: false,
             catalog_search: false,
+            help_tab: None,
             reference: false,
             vim: None,
             external_editor: None,
@@ -3984,6 +4008,8 @@ impl Model {
             extension_manager: None,
             permission_rows: Vec::new(),
             permission_index: 0,
+            permission_tab: 0,
+            permission_query: String::new(),
             workflows: None,
             workflow_index: 0,
             task_board: None,

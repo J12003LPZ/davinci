@@ -2690,8 +2690,6 @@ fn tool_summary(name: &str) -> String {
 pub enum Sent {
     Prompt(String),
     Quit,
-    /// Say something back without asking the model.
-    Say(String),
     /// A command that needs the agent and the session to carry it out.
     Command(crate::slash::SlashAction),
 }
@@ -2702,17 +2700,9 @@ pub fn classify(line: &str) -> Sent {
     match crate::slash::parse_line(line) {
         SlashAction::Prompt(text) => Sent::Prompt(text),
         SlashAction::Quit => Sent::Quit,
-        // The transcript renders markdown, where bare lines merge into one
-        // paragraph; the legacy chrome prints the same text verbatim.
-        SlashAction::Status(text) => Sent::Say(
-            text.lines()
-                .map(|line| format!("- {line}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
-        // Everything else — including /model, /config, /hotkeys, /resume —
+        // Everything else - including /model, /config, /hotkeys, /resume -
         // reaches `perform`, which opens the sheet each one designs
-        // (screens 3a–6d) with live data behind it.
+        // (screens 3a-6d) with live data behind it.
         other => Sent::Command(other),
     }
 }
@@ -4205,7 +4195,23 @@ pub fn perform(
         // Routed by `classify`; carried here only so the match is total.
         SlashAction::Prompt(text) => Ok(Done::Said(text)),
         SlashAction::Quit => Ok(Done::Said("goodbye".into())),
-        SlashAction::Status(text) => Ok(Done::Said(text)),
+        SlashAction::Help => {
+            if model.reference {
+                open_keys_sheet(model);
+                model.help_tab = Some(0);
+                Ok(Done::Opened)
+            } else {
+                // Off the reference `/help` keeps its transcript list, with the
+                // same bulleted shape the text path printed before.
+                Ok(Done::Said(
+                    crate::slash::help_lines()
+                        .iter()
+                        .map(|line| format!("- {line}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ))
+            }
+        }
         SlashAction::OpenModel => {
             open_models_sheet(parsed, agent, model);
             Ok(Done::Opened)
@@ -4418,7 +4424,7 @@ pub fn perform(
                 model: agent.model_id.clone(),
             });
             adopt_model(parsed, agent, model);
-            Ok(model_set(model, Some(persist_model_choice(agent))))
+            Ok(model_set(model, Some(persist_model_choice(agent)), None))
         }
         // Bare `/effort`: the model picker opens on the current model, whose
         // effort row adjusts with ←/→.
@@ -4693,6 +4699,12 @@ pub fn perform(
         )),
         SlashAction::Workflow(args) => Ok(Done::Said(workflow_command_text(agent, &args))),
         SlashAction::Agents(args) => {
+            // In the reference shell `/agents` is the dashboard; the text
+            // team summary stays for the setting off and for subcommands.
+            if model.reference && args.trim().is_empty() {
+                open_agents_sheet(agent, model);
+                return Ok(Done::Opened);
+            }
             let settings =
                 crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd);
             let trusted =
@@ -4743,7 +4755,11 @@ pub fn perform(
         },
         SlashAction::Context(args) => match args.as_str() {
             "" => {
-                push_context_usage(agent, model);
+                push_context_usage(agent, model, false);
+                Ok(Done::Opened)
+            }
+            "all" => {
+                push_context_usage(agent, model, true);
                 Ok(Done::Opened)
             }
             "inspect" | "manifest" => {
@@ -4945,12 +4961,18 @@ fn supported_thinking_choice(
 /// The elbow row under `/model` once the switch is made: the model's name in
 /// the accent ink, and where the choice was kept. `saved` is `None` for a
 /// switch that was only for this session.
-fn model_set(model: &Model, saved: Option<Result<(), String>>) -> Done {
+fn model_set(model: &Model, saved: Option<Result<(), String>>, effort: Option<&str>) -> Done {
     let title = model.model_title.clone();
+    let effort = effort
+        .filter(|level| !level.is_empty())
+        .map(|level| format!(" with {level} effort"))
+        .unwrap_or_default();
     let text = match saved {
-        Some(Ok(())) => format!("Set model to {title} and saved as your default for new sessions"),
-        Some(Err(err)) => format!("Set model to {title} for this run only ({err})"),
-        None => format!("Set model to {title} for this session only"),
+        Some(Ok(())) => {
+            format!("Set model to {title} and saved as your default for new sessions{effort}")
+        }
+        Some(Err(err)) => format!("Set model to {title} for this run only ({err}){effort}"),
+        None => format!("Set model to {title} for this session only{effort}"),
     };
     Done::Set {
         text,
@@ -5073,6 +5095,7 @@ pub fn run(
     let cwd = agent.cwd.clone();
     let mut model = davinci_tui::davinci::boot(raw, 100, 44);
     model.placeholder = (std::process::id() as usize) % 3;
+    model.screen_reader = parsed.screen_reader;
     let session_dir = davinci_session::default_session_dir();
     model.cwd = cwd.display().to_string();
     model.startup = crate::davinci_sources::startup(&cwd, "", !agent.messages.is_empty());
@@ -5128,6 +5151,8 @@ pub fn run(
     sync_permission_state(agent, &mut model);
     let startup_settings =
         crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd);
+    // The reduced-motion setting stops the spinner animation from the first frame.
+    model.animate = !startup_settings.reduce_motion.unwrap_or(false);
     // `/theme` is a picker command in this shell, so it is not a built-in; the
     // reference lists it, so the completion list gets it while the setting is on.
     model.slash_commands = crate::with_reference_commands(
@@ -7519,6 +7544,7 @@ fn open_keys_sheet(model: &mut Model) {
     model.facts.keys_surfaces = groups.len();
     model.keymap = groups;
     model.keys_offset = 0;
+    model.help_tab = None;
     open_sheet(model, Screen::Keys);
 }
 
@@ -9839,10 +9865,6 @@ fn on_line(shell: &mut Shell<'_>, line: &str) -> Next {
             run_stop_hooks(shell);
             Next::Leave
         }
-        Sent::Say(text) => {
-            shell.say(&text);
-            Next::Go
-        }
         Sent::Command(crate::slash::SlashAction::Compact(instructions)) => {
             shell.compact(instructions)
         }
@@ -9973,7 +9995,7 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
             );
             adopt_model(shell.parsed, shell.agent, shell.model);
             let saved = persist_model_choice(shell.agent);
-            shell.finish(model_set(shell.model, Some(saved)))
+            shell.finish(model_set(shell.model, Some(saved), None))
         }
         Choice::Ask(index) => {
             let Some(question) = shell.pending.take() else {
@@ -10022,6 +10044,7 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
                 return Next::Go;
             }
             let session_only = shell.model.catalog_session_only;
+            let previous_level = shell.agent.thinking_level.as_str().to_string();
             shell.model.close();
             shell.agent.provider = row.provider.clone();
             shell.agent.model_id = row.id.clone();
@@ -10047,7 +10070,9 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
                 sync_thinking_state(shell.agent, shell.model);
             }
             let saved = (!session_only).then(|| persist_model_choice(shell.agent));
-            shell.finish(model_set(shell.model, saved));
+            let applied = shell.agent.thinking_level.as_str().to_string();
+            let effort = (shell.model.reference && applied != previous_level).then_some(applied);
+            shell.finish(model_set(shell.model, saved, effort.as_deref()));
             refresh_thinking_sheet(shell.agent, shell.model);
             Next::Go
         }
@@ -10303,6 +10328,14 @@ fn cycle_setting(shell: &mut Shell<'_>, index: usize) -> Next {
     }
 
     crate::sync_agent_from_settings(shell.agent);
+    if key == "reduce-motion" {
+        let reduced = shell
+            .model
+            .settings_rows
+            .get(index)
+            .is_some_and(|row| row.value == "true");
+        shell.model.animate = !reduced;
+    }
     if key == "codemode" {
         match crate::sync_codemode_from_settings(shell.agent) {
             Ok(()) if shell.agent.has_staged_codemode() => {
@@ -11043,6 +11076,7 @@ fn open_agents_sheet(agent: &Agent, model: &mut Model) {
                 },
             )
             .collect(),
+        ..Default::default()
     });
     open_sheet(model, Screen::Agents);
 }
@@ -11215,7 +11249,7 @@ fn open_context_inspector_sheet(agent: &mut davinci_agent::Agent, model: &mut Mo
 /// `/context`: the window by category, hanging from the command line the
 /// composer echoed, as in Claude Code. The turn anchor the composer pushed
 /// after it is dropped; nothing streams into this block.
-fn push_context_usage(agent: &Agent, model: &mut Model) {
+fn push_context_usage(agent: &Agent, model: &mut Model, all: bool) {
     let anchor = model
         .transcript
         .iter()
@@ -11226,7 +11260,8 @@ fn push_context_usage(agent: &Agent, model: &mut Model) {
         }
         _ => model.transcript.push(Entry::Gap),
     }
-    let view = crate::davinci_surfaces::context_usage_view(&agent.context_usage());
+    let mut view = crate::davinci_surfaces::context_usage_view(&agent.context_usage());
+    view.all = all;
     model.transcript.push(Entry::ContextUsage(view));
     // The block is taller than a short screen. Following the newest row would
     // open it on its last section; read it from "Context Usage" down.

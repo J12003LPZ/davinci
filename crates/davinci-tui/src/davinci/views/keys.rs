@@ -7,6 +7,65 @@ use crate::davinci::ui::{section_detail, section_heading, span};
 use ratatui::text::Line;
 
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
+    if let Some(tab) = model.help_tab {
+        return help_lines(model, tab);
+    }
+    keymap_lines(model)
+}
+
+/// The Help sheet's three tabs. General is the loaded keymap; Commands is the
+/// slash corpus; Custom is every extension/skill/prompt command (a name with a
+/// `kind:` prefix). Text is DaVinci's own; the reference only fixes the frame.
+fn help_lines(model: &Model, tab: usize) -> Vec<Line<'static>> {
+    let th = &model.theme;
+    let width = model.width;
+    match tab {
+        0 => keymap_lines(model),
+        1 => command_rows(model, "Browse default commands", |name, _| {
+            !name.contains(':')
+        }),
+        _ => {
+            let mut rows = command_rows(model, "Custom commands", |name, _| name.contains(':'));
+            if rows.len() <= 3 {
+                rows = section_detail(width, th, "No custom commands found");
+            }
+            rows
+        }
+    }
+}
+
+fn command_rows(
+    model: &Model,
+    heading: &str,
+    keep: impl Fn(&str, &str) -> bool,
+) -> Vec<Line<'static>> {
+    let th = &model.theme;
+    let cc = th.cc();
+    let mut rows = section_heading(model.width, th, heading);
+    rows.push(crate::davinci::ui::blank());
+    let mut first = true;
+    for command in &model.slash_commands {
+        if !keep(&command.name, &command.description) {
+            continue;
+        }
+        let marker = if first { "   ❯ " } else { "     " };
+        rows.push(Line::from(vec![
+            span(marker, cc.permission),
+            span(
+                format!("/{}", command.name),
+                if first { cc.permission } else { th.text },
+            ),
+        ]));
+        rows.push(Line::from(vec![
+            span("     ", th.muted),
+            span(command.description.clone(), th.muted),
+        ]));
+        first = false;
+    }
+    rows
+}
+
+fn keymap_lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
     let width = model.width;
     if model.keymap.is_empty() {
@@ -30,6 +89,16 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
 
 pub fn chrome(model: &Model) -> SheetChrome {
     let th = &model.theme;
+    if model.help_tab.is_some() {
+        return SheetChrome {
+            header_right: Vec::new(),
+            status_third: None,
+            hints: Vec::new(),
+            escape: Some("Esc to cancel"),
+            composer: Composer::Hidden,
+            ..SheetChrome::default()
+        };
+    }
     let bindings = model
         .facts
         .keys_count

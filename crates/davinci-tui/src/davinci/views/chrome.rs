@@ -2273,6 +2273,7 @@ mod tests {
         };
         let mut m = model(width);
         m.context_meter = Some(ContextUsageView {
+            all: false,
             model: "gpt-6-luna".into(),
             window: 272_000,
             categories: vec![ContextCategory {

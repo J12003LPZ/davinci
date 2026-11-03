@@ -13,6 +13,7 @@ use ratatui::text::Line;
 use crate::interaction::{apply_editor_key, input_owner, key_event_bytes, InputOwner};
 
 use super::model::{Choice, ContextBarMode, Entry, Model, Overlay, Screen};
+use super::theme::State;
 use super::ui::{self, blank, pad_to, tail};
 use super::views::chrome::{self, Hint};
 use super::views::scrollbar::{self, Scrollbar};
@@ -51,6 +52,35 @@ pub fn next_mode_index(index: usize) -> usize {
 /// command sheets and overlays retain their full-height frame.
 pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
     compose_frame(model, height).lines
+}
+
+/// The screen-reader mode: plain lines in reading order, no box art or rules.
+fn screen_reader_lines(model: &Model, height: usize) -> Vec<Line<'static>> {
+    let mode = match model.permission_mode.as_str() {
+        "edits" => "accept edits on",
+        "read-only" => "plan mode on",
+        "auto" => "auto mode on",
+        "always-approve" => "always approve on",
+        _ => "manual mode on",
+    };
+    let mut rows = vec![
+        Line::from("[Screen Reader Mode: on via flag]"),
+        Line::from(format!("DaVinci v{}", env!("CARGO_PKG_VERSION"))),
+        Line::from(format!("{} · {}", model.model_title, model.provider_title)),
+        Line::from(model.cwd.clone()),
+    ];
+    let conversation = transcript::lines(model, &model.transcript, model.width);
+    let room = height.saturating_sub(7);
+    for line in conversation.iter().rev().take(room).rev() {
+        rows.push(Line::from(line.to_string()));
+    }
+    rows.push(Line::from(format!("{mode} (shift+tab to cycle)")));
+    rows.push(Line::from(format!(
+        "effort: {} · /effort",
+        model.thinking_level
+    )));
+    rows.push(Line::from(format!("$ {}", model.composer)));
+    pad_to(rows, height)
 }
 
 pub struct ComposedFrame {
@@ -94,6 +124,16 @@ pub struct HitTarget {
 
 pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     let height = height as usize;
+    if model.screen_reader {
+        return ComposedFrame {
+            targets: Vec::new(),
+            lines: screen_reader_lines(model, height),
+            graph: None,
+            scrollbar: None,
+            suggestion_rows: None,
+            caret: None,
+        };
+    }
     if height == 0 {
         return ComposedFrame {
             lines: Vec::new(),
@@ -745,10 +785,14 @@ fn command_panel_frame(
         rows.push(chrome::effort_rule(model));
     }
     rows.push(Line::from(ui::truncate_run(
-        vec![
-            ui::span("   ", cc.inactive),
-            ui::span_strong(sheet::sheet_title(model), cc.permission, th),
-        ],
+        sheet::help_tabs(model)
+            .or_else(|| sheet::permissions_tabs(model))
+            .unwrap_or_else(|| {
+                vec![
+                    ui::span("   ", cc.inactive),
+                    ui::span_strong(sheet::sheet_title(model), cc.permission, th),
+                ]
+            }),
         model.width,
     )));
     rows.push(blank());
@@ -1351,7 +1395,7 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
 
     match input_owner(
         model.overlay.is_some(),
-        model.suggestions.is_some(),
+        model.suggestions.is_some() && model.composer_owns_focus(),
         !model.composer_owns_focus(),
     ) {
         InputOwner::Modal => {
@@ -1839,7 +1883,114 @@ fn handle_graph_resume_key(model: &mut Model, key: KeyEvent) -> Flow {
     Flow::Continue
 }
 
+/// The agents dashboard's own keys: rename, pin, find and the two-step delete
+/// on the selected row. `None` leaves ordinary arrows and Enter to the sheet.
+fn handle_agents_control(model: &mut Model, key: KeyEvent) -> Option<Flow> {
+    if model.screen != Screen::Agents {
+        return None;
+    }
+    let sheet = model.agents.as_mut()?;
+    if let Some((id, name)) = sheet.renaming.as_mut() {
+        match key.code {
+            KeyCode::Enter => {
+                let name = name.trim().to_string();
+                let id = id.clone();
+                sheet.renaming = None;
+                if !name.is_empty() {
+                    if let Some(agent) = sheet.agents.iter_mut().find(|agent| agent.id == id) {
+                        agent.name = name;
+                    }
+                }
+            }
+            KeyCode::Esc => sheet.renaming = None,
+            KeyCode::Backspace => {
+                name.pop();
+            }
+            KeyCode::Char(ch) if key.modifiers.is_empty() => name.push(ch),
+            _ => {}
+        }
+        return Some(Flow::Continue);
+    }
+    if sheet.finding {
+        match key.code {
+            KeyCode::Esc => {
+                sheet.finding = false;
+                sheet.query.clear();
+            }
+            KeyCode::Enter => sheet.finding = false,
+            KeyCode::Backspace => {
+                sheet.query.pop();
+            }
+            KeyCode::Char(ch) if key.modifiers.is_empty() => sheet.query.push(ch),
+            _ => return None,
+        }
+        return Some(Flow::Continue);
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let chord = match key.code {
+        KeyCode::Char('f') if ctrl => Some('f'),
+        KeyCode::Char('r') if ctrl => Some('r'),
+        KeyCode::Char('t') if ctrl => Some('t'),
+        KeyCode::Char('x') if ctrl => Some('x'),
+        // Some terminals deliver a control byte as its C0 character.
+        KeyCode::Char('\u{6}') => Some('f'),
+        KeyCode::Char('\u{12}') => Some('r'),
+        KeyCode::Char('\u{14}') => Some('t'),
+        KeyCode::Char('\u{18}') => Some('x'),
+        _ => None,
+    };
+    if let Some(chord) = chord {
+        match chord {
+            'r' => {
+                if let Some(agent) = sheet.agents.get(sheet.selected_index) {
+                    sheet.renaming = Some((agent.id.clone(), agent.name.clone()));
+                }
+            }
+            't' => {
+                if let Some(agent) = sheet.agents.get(sheet.selected_index) {
+                    let id = agent.id.clone();
+                    if let Some(index) = sheet.pinned.iter().position(|pinned| pinned == &id) {
+                        sheet.pinned.remove(index);
+                    } else {
+                        sheet.pinned.push(id);
+                    }
+                }
+            }
+            'f' => {
+                sheet.finding = true;
+                sheet.query.clear();
+            }
+            'x' => {
+                if let Some(agent) = sheet.agents.get(sheet.selected_index) {
+                    let id = agent.id.clone();
+                    let removable = !matches!(
+                        agent.state,
+                        State::Active | State::Queued | State::Attention
+                    );
+                    if removable && sheet.delete_armed.as_deref() == Some(id.as_str()) {
+                        sheet.delete_armed = None;
+                        if let Some(index) = sheet.agents.iter().position(|row| row.id == id) {
+                            sheet.agents.remove(index);
+                            sheet.selected_index = sheet
+                                .selected_index
+                                .min(sheet.agents.len().saturating_sub(1));
+                        }
+                    } else {
+                        sheet.delete_armed = Some(id);
+                    }
+                }
+            }
+            _ => {}
+        }
+        return Some(Flow::Continue);
+    }
+    None
+}
+
 fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Flow {
+    if let Some(flow) = handle_agents_control(model, key) {
+        return flow;
+    }
     if model.screen == Screen::GraphResume {
         return handle_graph_resume_key(model, key);
     }
@@ -1879,6 +2030,40 @@ fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Fl
         if key.code == KeyCode::Enter {
             model.catalog_session_only = false;
         }
+    }
+    if model.screen == Screen::Keys && key.kind == KeyEventKind::Press {
+        if let Some(tab) = model.help_tab {
+            if key.code == KeyCode::Tab {
+                model.help_tab = Some((tab + 1) % 3);
+                return Flow::Continue;
+            }
+            if key.code == KeyCode::BackTab {
+                model.help_tab = Some((tab + 2) % 3);
+                return Flow::Continue;
+            }
+        }
+    }
+    if model.screen == Screen::Permissions
+        && model.reference
+        && key.modifiers.is_empty()
+        && matches!(key.code, KeyCode::Left | KeyCode::Right)
+    {
+        let tab = model.permission_tab;
+        model.permission_tab = if key.code == KeyCode::Left {
+            (tab + 6) % 7
+        } else {
+            (tab + 1) % 7
+        };
+        model.permission_index = 0;
+        return Flow::Continue;
+    }
+    if model.screen == Screen::Permissions
+        && model.reference
+        && key.code == KeyCode::Esc
+        && !model.permission_query.is_empty()
+    {
+        model.permission_query.clear();
+        return Flow::Continue;
     }
     if handle_picker_search(model, &key) {
         return Flow::Continue;
@@ -2227,8 +2412,11 @@ mod graph_input_tests {
 fn handle_picker_search(model: &mut Model, key: &KeyEvent) -> bool {
     if !matches!(
         model.screen,
-        Screen::Models | Screen::Settings | Screen::Login
+        Screen::Models | Screen::Settings | Screen::Login | Screen::Permissions | Screen::Agents
     ) || key.kind == KeyEventKind::Release
+        || (model.screen == Screen::Permissions && !model.reference)
+        || (model.screen == Screen::Agents
+            && !model.agents.as_ref().is_some_and(|sheet| sheet.finding))
         || key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -2244,6 +2432,11 @@ fn handle_picker_search(model: &mut Model, key: &KeyEvent) -> bool {
     let query = match model.screen {
         Screen::Models => &mut model.catalog_query,
         Screen::Login => &mut model.login_query,
+        Screen::Permissions => &mut model.permission_query,
+        Screen::Agents => match model.agents.as_mut() {
+            Some(sheet) => &mut sheet.query,
+            None => return false,
+        },
         _ => &mut model.settings_query,
     };
     match key.code {
@@ -2262,6 +2455,7 @@ fn handle_picker_search(model: &mut Model, key: &KeyEvent) -> bool {
     let (indices, selected) = match model.screen {
         Screen::Models => (cogitator::visible_indices(model), &mut model.catalog_index),
         Screen::Login => (login::visible_indices(model), &mut model.login_index),
+        Screen::Permissions | Screen::Agents => return true,
         _ => (settings::visible_indices(model), &mut model.settings_index),
     };
     if !indices.contains(selected) {
@@ -2706,9 +2900,10 @@ fn screen_accept(model: &Model) -> Option<Choice> {
             .map(|_| Choice::TreeEntry(model.tree_index)),
         // The sheet is for reading; enter moves on to the decision.
         Screen::Trust => model.project_trust.as_ref().map(|_| Choice::TrustDecide),
-        Screen::Permissions => {
-            pick(model.permission_index, model.permission_rows.len()).map(Choice::Permission)
-        }
+        Screen::Permissions => (model.permission_tab == 0 && model.permission_query.is_empty())
+            .then(|| pick(model.permission_index, model.permission_rows.len()))
+            .flatten()
+            .map(Choice::Permission),
         Screen::Agents => {
             let len = model.agents.as_ref().map(|s| s.agents.len()).unwrap_or(0);
             (len > 0).then(|| Choice::AgentAction {
@@ -5366,6 +5561,7 @@ mod working_line_spacing_tests {
         model.working = Some(Working::new());
         model.context_bar = ContextBarMode::Full;
         model.context_meter = Some(ContextUsageView {
+            all: false,
             model: "gpt-6-luna".into(),
             window: 200_000,
             free: 150_000,
@@ -5415,6 +5611,7 @@ mod scroll_to_entry_tests {
 
     fn usage(sections: usize) -> ContextUsageView {
         ContextUsageView {
+            all: false,
             model: "gpt-6-luna".into(),
             window: 200_000,
             free: 150_000,

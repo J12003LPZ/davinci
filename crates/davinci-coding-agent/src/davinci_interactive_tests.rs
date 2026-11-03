@@ -900,16 +900,12 @@ fn hotkey_rows_name_the_surface_they_toggle() {
 
 #[test]
 fn help_is_one_list_row_per_command_in_the_shell_only() {
-    let Sent::Say(text) = classify("/help") else {
-        panic!("help asked the model");
+    let Sent::Command(crate::slash::SlashAction::Help) = classify("/help") else {
+        panic!("help is not the help sheet");
     };
-    assert!(text.lines().all(|line| line.starts_with("- /")), "{text}");
-    assert!(text.contains("- /effort"), "{text}");
-    // The shared parser stays plain for the legacy chrome's println.
-    let crate::slash::SlashAction::Status(plain) = crate::slash::parse_line("/help") else {
-        panic!("help is not a status");
-    };
-    assert!(plain.lines().all(|line| line.starts_with('/')), "{plain}");
+    let text = crate::slash::help_lines().join("\n");
+    assert!(text.lines().all(|line| line.starts_with('/')), "{text}");
+    assert!(text.contains("/effort"), "{text}");
 }
 
 #[test]
@@ -2533,8 +2529,11 @@ fn commands_with_a_home_reach_perform_which_opens_their_sheet() {
 }
 
 #[test]
-fn help_answers_without_asking_the_model() {
-    assert!(matches!(classify("/help"), Sent::Say(text) if text.contains('/')));
+fn help_is_classified_for_the_shell_not_the_model() {
+    assert!(matches!(
+        classify("/help"),
+        Sent::Command(crate::slash::SlashAction::Help)
+    ));
 }
 
 #[test]
@@ -3695,17 +3694,17 @@ fn a_model_switch_is_confirmed_as_the_elbow_row_under_its_command() {
     let mut m = model();
     m.model_title = "Opus 5.5".into();
     assert_eq!(
-        model_set(&m, Some(Ok(()))),
+        model_set(&m, Some(Ok(())), None),
         Done::Set {
             text: "Set model to Opus 5.5 and saved as your default for new sessions".into(),
             accent: Some("Opus 5.5".into()),
         }
     );
-    let Done::Set { text, .. } = model_set(&m, None) else {
+    let Done::Set { text, .. } = model_set(&m, None, None) else {
         panic!("a session-only switch is still a confirmation");
     };
     assert_eq!(text, "Set model to Opus 5.5 for this session only");
-    let Done::Set { text, .. } = model_set(&m, Some(Err("read-only".into()))) else {
+    let Done::Set { text, .. } = model_set(&m, Some(Err("read-only".into())), None) else {
         panic!("a switch that could not be saved is still a confirmation");
     };
     assert_eq!(text, "Set model to Opus 5.5 for this run only (read-only)");
@@ -3732,7 +3731,7 @@ fn a_confirmed_change_lands_under_the_slash_command_that_asked_for_it() {
     m.model_title = "Opus 5.5".into();
     m.composer.push_str("/model opus-5-5");
     m.submit();
-    let Done::Set { text, accent } = model_set(&m, Some(Ok(()))) else {
+    let Done::Set { text, accent } = model_set(&m, Some(Ok(())), None) else {
         panic!("a confirmation");
     };
     m.confirm(&text, accent.as_deref());

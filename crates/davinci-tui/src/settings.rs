@@ -157,6 +157,8 @@ pub struct InteractiveSettingsConfig {
     pub fullscreen_exit_output: String,
     pub fullscreen_scrollbar: String,
     pub fullscreen_copy_on_select: bool,
+    /// Static frames instead of the animated spinner.
+    pub reduce_motion: bool,
     pub show_images: bool,
     pub image_width_cells: u32,
     pub auto_resize_images: bool,
@@ -207,6 +209,7 @@ impl Default for InteractiveSettingsConfig {
             fullscreen_exit_output: "transcript".into(),
             fullscreen_scrollbar: "auto".into(),
             fullscreen_copy_on_select: true,
+            reduce_motion: false,
             show_images: true,
             image_width_cells: 80,
             auto_resize_images: true,
@@ -294,6 +297,12 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 "Show images",
                 "Render images inline in terminal",
                 config.show_images,
+            ),
+            bool_item(
+                "reduce-motion",
+                "Reduce motion",
+                "Static frames; no animated spinner",
+                config.reduce_motion,
             ),
             SettingItem {
                 id: "image-width-cells".into(),

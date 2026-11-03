@@ -45,6 +45,7 @@ fn context_usage() -> ContextUsageView {
         tokens,
     };
     ContextUsageView {
+        all: false,
         model: "gpt-5.6-luna".into(),
         window: 272_000,
         categories: vec![

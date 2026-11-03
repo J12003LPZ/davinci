@@ -212,22 +212,24 @@ pub fn render(model: &Model, viewer: &TranscriptViewer, height: usize) -> Vec<Li
     let body = TranscriptViewer::body(height);
     let last = (viewer.top + body).min(viewer.lines.len());
     let mut out = Vec::with_capacity(height);
-    out.push(Line::from(vec![
-        ui::span("  Transcript", cc.permission),
-        ui::span(
-            format!(
-                "  rows {}–{} of {}",
-                if viewer.lines.is_empty() {
-                    0
-                } else {
-                    viewer.top + 1
-                },
-                last,
-                viewer.lines.len()
-            ),
-            cc.inactive,
+    let mut title = vec![ui::span("  Transcript", cc.permission)];
+    if model.reference {
+        title.push(ui::span(format!("  {}", model.model_title), cc.inactive));
+    }
+    title.push(ui::span(
+        format!(
+            "  rows {}–{} of {}",
+            if viewer.lines.is_empty() {
+                0
+            } else {
+                viewer.top + 1
+            },
+            last,
+            viewer.lines.len()
         ),
-    ]));
+        cc.inactive,
+    ));
+    out.push(Line::from(title));
     for (offset, line) in viewer.lines[viewer.top.min(viewer.lines.len())..last]
         .iter()
         .enumerate()
@@ -269,7 +271,11 @@ pub fn render(model: &Model, viewer: &TranscriptViewer, height: usize) -> Vec<Li
             cc.inactive,
         )],
         None => vec![ui::span(
-            "  q close · j/k space/b scroll · / search · { } prompts · [ scrollback · v editor",
+            if model.reference {
+                "  Showing detailed transcript · q/ctrl+o close · ↑↓ scroll · / search · g/G ends · v editor"
+            } else {
+                "  q close · j/k space/b scroll · / search · { } prompts · [ scrollback · v editor"
+            },
             cc.inactive,
         )],
     }));
