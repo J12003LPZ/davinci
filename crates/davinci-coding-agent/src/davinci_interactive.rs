@@ -1466,7 +1466,19 @@ fn apply(model: &mut Model, turn: &mut Turn, event: &AgentEvent) {
                     .map(|usage| usage.output)
                     .unwrap_or_default();
                 let estimated = estimate_tokens(&davinci_ai::content_text(&message.content));
-                working.tokens = turn.streamed + reported.max(estimated);
+                // Delta events in this stream carry no whole message, so the counter
+                // also reads the block being streamed: the reference shows its token
+                // count from the first delta, not only when the message ends.
+                let live = model
+                    .transcript
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match entry {
+                        Entry::Prose(text) => Some(estimate_tokens(text)),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                working.tokens = turn.streamed + reported.max(estimated).max(live);
             }
         }
 
@@ -1573,6 +1585,31 @@ fn mid_turn_key(
         return false;
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // The reference's send-now chord is `ctrl+x ctrl+s`; ctrl+enter is the same action
+    // where the terminal can deliver a modified Enter (CSI-u), which the byte harness
+    // and this console path cannot.
+    if ctrl && key.code == KeyCode::Char('x') {
+        model.chord_x = Some(std::time::Instant::now());
+        return false;
+    }
+    if ctrl && key.code == KeyCode::Char('s') {
+        let chord = model
+            .chord_x
+            .take()
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(1500));
+        if chord && model.send_now() {
+            abort.store(true, Ordering::Relaxed);
+            model.interrupt();
+        }
+        return false;
+    }
+    // Up restores the newest queued line for editing, taking it out of the queue.
+    if key.code == KeyCode::Up && model.composer.is_empty() && !model.queued.is_empty() {
+        if let Some(line) = model.queued.pop() {
+            model.composer.set_text(line);
+        }
+        return false;
+    }
     if let Some(data) = davinci_tui::key_event_bytes(&key) {
         if model.keybindings.matches(&data, "davinci.tools.expand") {
             model.show_tool_output = !model.show_tool_output;
@@ -1603,6 +1640,10 @@ fn mid_turn_key(
             if model.viewing_worker().is_some() {
                 model.push_toast("interrupting main".into());
             }
+            // A second Ctrl+C within the window leaves; the first one also holds
+            // the queued line, so an exit never starts a request.
+            model.ctrl_c_armed = Some(std::time::Instant::now());
+            model.exit_armed = true;
             let again = abort.swap(true, Ordering::Relaxed);
             model.interrupt();
             return again;
@@ -1611,6 +1652,14 @@ fn mid_turn_key(
         // Tool output can be opened while the turn still runs: that is when
         // a long read is most worth seeing.
         KeyCode::Char(_) if ctrl => {}
+        // Ctrl+Enter sends now: the draft preempts the running turn, whose partial
+        // text stays, and becomes the next request.
+        KeyCode::Enter if ctrl => {
+            if model.send_now() {
+                abort.store(true, Ordering::Relaxed);
+                model.interrupt();
+            }
+        }
         KeyCode::Enter
             if key.modifiers.contains(KeyModifiers::SHIFT)
                 || key.modifiers.contains(KeyModifiers::ALT) =>
@@ -1669,6 +1718,12 @@ fn run_turns(shell: &mut Shell<'_>) -> Next {
     let host = shell.host.clone();
     if let Err(err) = run_turn(shell.parsed, shell.agent, shell.model, shell.terminal, host) {
         return Next::Fail(err.to_string());
+    }
+    // Ctrl+C is the exit gesture: the line queued behind the turn waits for the
+    // user's next action instead of starting a request they may be leaving from.
+    // Esc is the soft interrupt, and the reference sends the queue after it.
+    if shell.model.ctrl_c_armed.is_some() {
+        return Next::Go;
     }
     while let Some(line) = next_queued(shell.model) {
         // What the composer's own submit pushes before a line is routed.
@@ -5785,6 +5840,8 @@ pub fn run(
                                 let doubled = last_ctrl_c.is_some_and(|prev| {
                                     now.duration_since(prev)
                                         < Duration::from_millis(DOUBLE_CTRL_C_MS)
+                                }) || model.ctrl_c_armed.take().is_some_and(|at| {
+                                    now.duration_since(at) < Duration::from_millis(DOUBLE_CTRL_C_MS)
                                 });
                                 if doubled {
                                     run_stop_hooks(&mut Shell {

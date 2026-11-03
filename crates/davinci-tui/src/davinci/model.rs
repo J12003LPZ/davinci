@@ -3192,6 +3192,10 @@ pub struct Model {
     /// A `ctrl+c` at rest was pressed once; the next one within the window
     /// leaves. The hint row says so while it is up.
     pub exit_armed: bool,
+    /// When `ctrl+c` last ended a running turn. A second `ctrl+c` within the
+    /// double-press window leaves, and the queued line is held rather than sent
+    /// into an exit.
+    pub ctrl_c_armed: Option<std::time::Instant>,
     /// When `esc` was pressed once over a draft; a second `esc` within
     /// `DOUBLE_ESCAPE_MS` clears the composer. The hint row says so while it
     /// is up.
@@ -3862,6 +3866,7 @@ impl Model {
             transcript: EntryLog::default(),
             running: false,
             exit_armed: false,
+            ctrl_c_armed: None,
             clear_armed: None,
             working: None,
             shell_runs: Vec::new(),
@@ -5055,6 +5060,21 @@ impl Model {
     /// was waiting to be sent stays: it was shown as queued, so dropping it
     /// would be an acknowledged instruction vanishing without a word. The
     /// queue is sent, in order, once the interrupted turn has ended.
+    /// Ctrl+Enter during a turn: the draft goes to the front of the queue and the
+    /// running turn is interrupted, so the next request is the one just typed.
+    /// Returns whether anything was moved.
+    pub fn send_now(&mut self) -> bool {
+        if self.composer.trim().is_empty() {
+            return false;
+        }
+        self.mark_caret_moved();
+        let text = self.composer.submit();
+        self.remember(&text);
+        self.queued.insert(0, text);
+        self.dismiss_suggestions();
+        true
+    }
+
     pub fn interrupt(&mut self) {
         self.running = false;
         if let Some(working) = self.working.as_mut() {

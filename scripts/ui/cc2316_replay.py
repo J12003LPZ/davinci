@@ -323,6 +323,9 @@ def build_env(home: Path, agent: Path, proxy_port: int, extra: dict, first_run: 
     env.update({
         "PI_DISABLE_NETWORK": "1", "PI_SKIP_VERSION_CHECK": "1", "PI_CATALOG_DRY_RUN": "1",
         "PI_CLIPBOARD_DRY_RUN": "1",
+        # The package-update check would otherwise run npm, whose child process reaches
+        # the npm registry: a real network connection in a run that must stay isolated.
+        "PI_PACKAGE_UPDATES_REPLY": "",
         "PI_LEARNING_DISABLE_BACKGROUND": "1", "PI_HOOKS_DRY_RUN": "1",
         "TERM": "xterm-256color", "COLORTERM": "truecolor",
         "HOME": str(home), "USERPROFILE": str(home),

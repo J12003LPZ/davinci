@@ -5252,3 +5252,117 @@ fn an_esc_the_theme_picker_consumed_never_counts_toward_a_double_escape() {
     assert!(second.theme_picker.is_none());
     assert!(!idle_esc(&mut second, &mut last), "pair spanned the picker");
 }
+
+#[test]
+fn ctrl_enter_sends_the_draft_now_ahead_of_queued_lines() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut m = model();
+    m.running = true;
+    m.queued.push("later".into());
+    m.type_char("now");
+    let abort = std::sync::Arc::new(AtomicBool::new(false));
+    let pending = std::sync::Mutex::new(None);
+    super::mid_turn_key(
+        &mut m,
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::CONTROL,
+        ),
+        &abort,
+        &pending,
+    );
+    assert_eq!(m.queued, vec!["now".to_string(), "later".to_string()]);
+    assert_eq!(m.composer.to_string(), "", "the draft stayed behind");
+    assert!(
+        abort.load(Ordering::Relaxed),
+        "the running turn was not aborted"
+    );
+    assert!(!m.running, "the turn still reads as running");
+}
+
+#[test]
+fn ctrl_enter_on_an_empty_draft_leaves_the_turn_alone() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut m = model();
+    m.running = true;
+    let abort = std::sync::Arc::new(AtomicBool::new(false));
+    let pending = std::sync::Mutex::new(None);
+    super::mid_turn_key(
+        &mut m,
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::CONTROL,
+        ),
+        &abort,
+        &pending,
+    );
+    assert!(m.queued.is_empty());
+    assert!(!abort.load(Ordering::Relaxed));
+    assert!(m.running);
+}
+
+#[test]
+fn the_permission_panel_enter_and_a_digit_choose_an_option() {
+    use davinci_tui::davinci::app::{self, Flow};
+    use davinci_tui::davinci::model::Overlay;
+    let enter = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let mut m = model();
+    m.ask = permission_ask(&approval("bash", "git status --short", false), true);
+    m.overlay = Some(Overlay::Ask);
+    m.ask_index = 0;
+    assert!(
+        matches!(
+            app::handle_key(&mut m, enter),
+            Flow::Choose(davinci_tui::davinci::model::Choice::Ask(0))
+        ),
+        "Enter did not choose the first option"
+    );
+
+    let mut m = model();
+    m.ask = permission_ask(&approval("bash", "git status --short", false), true);
+    m.overlay = Some(Overlay::Ask);
+    m.ask_index = 0;
+    let two = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('2'),
+        crossterm::event::KeyModifiers::NONE,
+    );
+    assert!(matches!(app::handle_key(&mut m, two), Flow::Continue));
+    assert_eq!(m.ask_index, 1, "the digit did not move the choice");
+    assert!(
+        matches!(
+            app::handle_key(&mut m, enter),
+            Flow::Choose(davinci_tui::davinci::model::Choice::Ask(1))
+        ),
+        "Enter did not take the digit's option"
+    );
+}
+
+#[test]
+fn the_approval_answer_path_turns_enter_into_an_allow_once_decision() {
+    use std::sync::atomic::AtomicBool;
+    let request = approval("write", "..\\outside.txt", true);
+    let choices = request.host_choices(true);
+    let mut m = model();
+    m.ask = permission_ask(&request, true);
+    m.overlay = Some(davinci_tui::davinci::model::Overlay::Ask);
+    m.ask_index = 0;
+    let abort = std::sync::Arc::new(AtomicBool::new(false));
+    let answer = super::approval_answer_key(
+        &mut m,
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ),
+        &choices,
+        &request,
+        &abort,
+    );
+    assert_eq!(
+        answer.map(|answer| answer.decision),
+        Some(ToolApprovalDecision::AllowOnce),
+        "Enter did not become AllowOnce"
+    );
+}
