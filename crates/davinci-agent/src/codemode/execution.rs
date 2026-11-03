@@ -784,6 +784,21 @@ impl Agent {
                 .session_id
                 .as_deref()
                 .unwrap_or("sessionless");
+            let omission_error = outcome.error.is_some()
+                || matches!(
+                    outcome.status,
+                    super::CodeModeStatus::Failed
+                        | super::CodeModeStatus::Cancelled
+                        | super::CodeModeStatus::RecoveryRequired
+                )
+                || outcome.children.iter().any(|child| {
+                    child.error.is_some()
+                        || matches!(
+                            child.status,
+                            super::CodeModeChildStatus::Failed
+                                | super::CodeModeChildStatus::RecoveryRequired
+                        )
+                });
             if let Some(body) = outcome.retained_output.take() {
                 let omitted_bytes = outcome.omitted_bytes;
                 let omitted_line = outcome.omitted_start_line.unwrap_or(1);
@@ -796,8 +811,9 @@ impl Agent {
                                 bytes: body.len() as u64,
                             });
                             outcome.host_notes.push(format!(
-                                "Full output retained at {}; {} bytes omitted; the omitted region begins at line {}; call read with path: {}, offset: {}, limit: 2000.",
+                                "Full output retained at {}; class: script_output; error: {}; {} bytes omitted; the omitted region begins at line {}; call read with path: {}, offset: {}, limit: 2000.",
                                 path.display(),
+                                omission_error,
                                 omitted_bytes,
                                 omitted_line,
                                 path.display(),
@@ -805,14 +821,14 @@ impl Agent {
                             ));
                         }
                         Err(_) => outcome.host_notes.push(format!(
-                            "Full output not retained: evidence store write failed; {} bytes omitted beginning at line {}.",
-                            omitted_bytes, omitted_line
+                            "Full output not retained: evidence store write failed; class: script_output; error: {}; {} bytes omitted beginning at line {}.",
+                            omission_error, omitted_bytes, omitted_line
                         )),
                     }
                 } else {
                     outcome.host_notes.push(format!(
-                        "Full output not retained: no evidence store in this agent; {} bytes omitted beginning at line {}; rerun with a narrower script or smaller output.",
-                        omitted_bytes, omitted_line
+                        "Full output not retained: no evidence store in this agent; class: script_output; error: {}; {} bytes omitted beginning at line {}; rerun with a narrower script or smaller output.",
+                        omission_error, omitted_bytes, omitted_line
                     ));
                 }
             }

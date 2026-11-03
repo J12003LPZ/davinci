@@ -7689,6 +7689,13 @@ mod hybrid_fold_economics {
         agent
             .fold_context(runtime::context_vm::FoldReason::Manual, None)
             .unwrap();
+        let notices = agent.take_context_vm_notices();
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("Context VM folded (manual)")),
+            "manual fold did not expose its notice: {notices:?}"
+        );
         for turn in 6..12 {
             agent.prompt(&format!("step {turn} {}", "x".repeat(1_600)));
             agent.record_assistant(&format!("done {turn}"));

@@ -737,7 +737,9 @@ fn retrieval_trailer(
     diagnostics: Option<(usize, usize)>,
 ) -> String {
     let diagnostic_note = diagnostics
-        .map(|(kept, omitted)| format!("; diagnostics kept: {kept}, omitted: {omitted}"))
+        .map(|(kept, omitted)| {
+            format!("; class: diagnostic; diagnostics kept: {kept}, omitted: {omitted}")
+        })
         .unwrap_or_default();
     format!("[… {kind} compact view: showing {shown} of {total}{diagnostic_note}; full exact output is saved as {output_id}. Call retrieve_output with id \"{output_id}\" to inspect omitted data.]", kind = kind.as_str())
 }
@@ -920,6 +922,11 @@ mod tests {
         )
         .unwrap();
         assert!(view.content.contains("item[25]"), "{}", view.content);
+        assert!(
+            view.content.contains("class: diagnostic"),
+            "{}",
+            view.content
+        );
         assert!(
             view.content.contains("diagnostics kept: 1, omitted: 0"),
             "{}",

@@ -2637,6 +2637,13 @@ fn retained_script_body_is_stored_and_named_in_the_completion_note() {
         "{notes:?}"
     );
     assert!(
+        notes.iter().any(|note| note
+            .as_str()
+            .unwrap()
+            .contains("class: script_output; error: false")),
+        "{notes:?}"
+    );
+    assert!(
         notes
             .iter()
             .any(|note| note.as_str().unwrap().contains("begins at line 2")),
@@ -2695,6 +2702,13 @@ fn no_store_marks_only_truncated_script_output_as_unretained() {
             .contains("no evidence store in this agent")),
         "{notes:?}"
     );
+    assert!(
+        notes.iter().any(|note| note
+            .as_str()
+            .unwrap()
+            .contains("class: script_output; error: false")),
+        "{notes:?}"
+    );
     assert_eq!(details["codemode"]["status"], "partial");
 }
 
@@ -2751,6 +2765,59 @@ fn complete_no_store_script_output_has_no_omission_marker() {
         .unwrap_or(false);
     assert!(!notes);
     assert_eq!(details["codemode"]["status"], "completed");
+}
+
+#[test]
+fn failed_script_marks_the_omitted_class_as_error() {
+    use crate::codemode::{
+        CodeModeBroker, CodeModeError, CodeModeHost, CodeModeMode, CodeModeOutcome,
+        CodeModeRequest, CodeModeRunContext, CodeModeStatus,
+    };
+
+    struct FailedHost;
+    impl CodeModeHost for FailedHost {
+        fn admits_controlled_mode(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            _: &CodeModeRequest,
+            _: &CodeModeRunContext,
+            _: Arc<dyn CodeModeBroker>,
+        ) -> CodeModeOutcome {
+            CodeModeOutcome {
+                status: CodeModeStatus::Failed,
+                script_completed: false,
+                output_text: "HEAD\n[... 10 bytes omitted ...]\nTAIL".into(),
+                output_complete: false,
+                output_artifact: None,
+                children: vec![],
+                host_notes: vec![],
+                operation_ref: "fixture".into(),
+                error: Some(CodeModeError::new("FAILED", "boom")),
+                retained_output: Some("HEAD\nNEEDLE\nTAIL".into()),
+                omitted_bytes: 10,
+                omitted_start_line: Some(2),
+            }
+        }
+    }
+
+    let (mut agent, _workspace, _) = configured_agent();
+    let evidence = tempfile::tempdir().unwrap();
+    agent.evidence = Some(crate::EvidenceStore::new(evidence.path()));
+    agent
+        .enable_codemode(Arc::new(FailedHost), CodeModeMode::Controlled)
+        .unwrap();
+    let result = agent.run_codemode("call-failed", &json!({"code":"throw new Error('x')"}), None);
+    let details = result.details.as_ref().unwrap();
+    let notes = details["codemode"]["hostNotes"].as_array().unwrap();
+    assert!(
+        notes.iter().any(|note| note
+            .as_str()
+            .unwrap()
+            .contains("class: script_output; error: true")),
+        "{notes:?}"
+    );
 }
 
 #[test]
