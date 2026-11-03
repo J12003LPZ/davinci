@@ -541,8 +541,8 @@ const BASIC_GREY: Ramp = Ramp {
     error: Color::White,
 };
 
-/// Claude Code conversation colors, measured on the reference frames in
-/// docs/ui/claude-code-reference. Views access these only through Theme::cc().
+/// Claude Code conversation colors, measured on captured reference frames
+/// (kept outside this repository). Views access these only through Theme::cc().
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cc {
     pub claude: Color,

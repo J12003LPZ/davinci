@@ -2,8 +2,8 @@
 
 ## Claude Code conversation contract (September 2026)
 
-The default conversation UI follows the captured Claude Code 2.1.281 frames in
-`docs/ui/claude-code-reference/`. Those frames are the visual ground truth for
+The default conversation UI follows the captured Claude Code 2.1.281 frames,
+which are kept outside this repository. Those frames are the visual ground truth for
 the composer, completion list, footer, transcript rows, working line, permission
 panel, and picker panels. The implementation keeps DaVinci's own product identity
 and behavior where the reference contract explicitly differs.

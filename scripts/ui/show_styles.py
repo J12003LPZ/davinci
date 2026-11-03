@@ -1,6 +1,6 @@
 """Print the style runs of one captured frame.
 
-    python scripts/ui/show_styles.py docs/ui/claude-code-reference/ui 03-slash-all [substring]
+    python scripts/ui/show_styles.py <frames dir>/ui 03-slash-all [substring]
 
 Each output row is `<row> [fg,bg=…,bold,dim,…]'text' …`. Blank rows are skipped.
 """
