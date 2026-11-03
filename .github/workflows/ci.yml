@@ -70,8 +70,18 @@ jobs:
         run: |
           cargo test -p davinci-agent --locked --lib process_manager::socket_owner
           cargo clippy -p davinci-agent --locked --lib --tests -- -D warnings
+      - name: Build test planning and filesystem observation tests
+        if: runner.os == 'Windows'
+        run: cargo test -p davinci-coding-agent --locked --test test_impact --test test_impact_observation --no-run
       - name: Test planning and filesystem observation
+        if: runner.os != 'Windows'
         run: cargo test -p davinci-coding-agent --locked --test test_impact --test test_impact_observation
+      - name: Test planning and filesystem observation (hang capture)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & scripts/ci/run_with_hang_capture.ps1 -DeadlineSeconds 600 -- cargo test -p davinci-coding-agent --locked --test test_impact --test test_impact_observation
+          exit $LASTEXITCODE
       - name: Normal agent edit and verification path
         run: cargo test -p davinci-coding-agent --locked --bin davinci test_impact_integration_tests
       - name: Offline test selection evaluation
