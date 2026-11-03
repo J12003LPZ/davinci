@@ -2841,19 +2841,38 @@ fn codemode_retained_body_is_recoverable_through_the_read_tool() {
             _: &CodeModeRunContext,
             _: Arc<dyn CodeModeBroker>,
         ) -> CodeModeOutcome {
+            // The real script-output path: a long body whose needle sits past
+            // the omitted start, so only the retained body holds it.
+            let body = (0..400)
+                .map(|i| {
+                    if i == 249 {
+                        format!("NEEDLE-E2E{}\n", "x".repeat(89))
+                    } else {
+                        format!("{:0>99}\n", i)
+                    }
+                })
+                .collect::<String>();
+            let items = vec![json!({"type": "text", "text": body})];
+            let output = crate::codemode::projection::assemble_script_output(
+                &items,
+                16 * 1024,
+                1024 * 1024,
+            )
+            .unwrap();
+            assert!(!output.text.contains("NEEDLE-E2E"));
             CodeModeOutcome {
                 status: CodeModeStatus::Partial,
                 script_completed: true,
-                output_text: "HEAD\n[... 10 bytes omitted ...]\nTAIL".into(),
+                output_text: output.text,
                 output_complete: false,
                 output_artifact: None,
                 children: vec![],
                 host_notes: vec![],
                 operation_ref: "fixture".into(),
                 error: None,
-                retained_output: Some("HEAD\nNEEDLE-E2E\nTAIL".into()),
-                omitted_bytes: 10,
-                omitted_start_line: Some(2),
+                retained_output: output.retained_body,
+                omitted_bytes: output.omitted_bytes,
+                omitted_start_line: output.omitted_start_line,
             }
         }
     }
@@ -2879,10 +2898,34 @@ fn codemode_retained_body_is_recoverable_through_the_read_tool() {
         .unwrap()
         .to_string();
 
+    // Read at the line the marker reports, as the model would.
+    let notes = result.details.as_ref().unwrap()["codemode"]["hostNotes"]
+        .as_array()
+        .unwrap();
+    let marker = notes
+        .iter()
+        .filter_map(|note| note.as_str())
+        .find(|note| note.contains("the omitted region begins at line"))
+        .unwrap();
+    let offset: u64 = marker
+        .rsplit("offset: ")
+        .next()
+        .unwrap()
+        .split(',')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(offset, 110, "{marker}");
+
     let mut events = Vec::new();
     let messages = agent.execute_tool_batch(
         workspace.path(),
-        vec![("read-e2e".into(), "read".into(), json!({"path": artifact}))],
+        vec![(
+            "read-e2e".into(),
+            "read".into(),
+            json!({"path": artifact, "offset": offset, "limit": 2000}),
+        )],
         &mut events,
     );
     assert_eq!(messages[0].is_error, Some(false), "{messages:?}");

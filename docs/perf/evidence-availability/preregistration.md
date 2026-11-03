@@ -24,7 +24,7 @@ Does protecting task-relevant evidence improve verified task success without an 
 
 ## Primary metric
 
-**Needle survival and first recovery per layer.** The deterministic harness places a labeled error at Governor index 25 and a labeled failure at Code mode line 250, then asserts the first survives in the visible view and the second survives in the retained body with `omitted_start_line == 110`. It then performs the first recovery and asserts the needle is returned, recording a token estimate for that recovery.
+**Needle survival and first recovery per layer.** The deterministic harness places a labeled error at Governor index 25 and a labeled failure at Code mode line 250, then asserts the first survives in the visible view and the second survives in the retained body with `omitted_start_line == 110`. It then performs the first recovery and asserts the needle is returned, recording a token estimate for that recovery. In `evidence_availability.rs` the Governor recovery goes through `retrieve`, and the Code mode recovery slices the retained body in memory from the reported line. The `read` tool path is proved separately by `codemode_retained_body_is_recoverable_through_the_read_tool` in `davinci-agent`, which reads the stored body at the marker's offset.
 
 Pass: every assertion passes. This is CI-runnable, deterministic, and requires no model call.
 
