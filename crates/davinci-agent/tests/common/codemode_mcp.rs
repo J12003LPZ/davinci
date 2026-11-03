@@ -212,6 +212,9 @@ impl crate::codemode::CodeModeHost for CatchingHost {
             host_notes: vec![],
             operation_ref: "fixture".into(),
             error: None,
+            retained_output: None,
+            omitted_bytes: 0,
+            omitted_start_line: None,
         }
     }
 }

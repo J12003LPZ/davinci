@@ -96,6 +96,7 @@ fn host_limit_reaches_the_wire_and_cannot_be_replaced_by_a_worker_scope() {
                 Err(error) => panic!("{error}"),
             }
         };
+        socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();

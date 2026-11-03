@@ -33,7 +33,29 @@ impl EvidenceStore {
     /// path the model can `read`. Failure is reported, not hidden: the
     /// caller then keeps the truncation note without a path.
     pub fn store(&self, tag: &str, text: &str) -> Result<PathBuf, String> {
+        self.store_named("", tag, text)
+    }
+
+    /// Write evidence bound to one session. The file name carries a hash of
+    /// the session id so the read-boundary exception can admit the current
+    /// session's artifacts without admitting another session's.
+    pub fn store_in_session(
+        &self,
+        session_id: &str,
+        tag: &str,
+        text: &str,
+    ) -> Result<PathBuf, String> {
+        self.store_named(&format!("s{}-", session_token(session_id)), tag, text)
+    }
+
+    fn store_named(&self, prefix: &str, tag: &str, text: &str) -> Result<PathBuf, String> {
         std::fs::create_dir_all(&self.dir).map_err(|err| err.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|err| err.to_string())?;
+        }
         let safe_tag: String = tag
             .chars()
             .map(|c| {
@@ -46,11 +68,27 @@ impl EvidenceStore {
             .take(40)
             .collect();
         let name = format!(
-            "{safe_tag}-{}.txt",
+            "{prefix}{safe_tag}-{}.txt",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         );
         let path = self.dir.join(name);
-        std::fs::write(&path, text).map_err(|err| err.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .map_err(|err| err.to_string())?;
+            file.write_all(text.as_bytes())
+                .map_err(|err| err.to_string())?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&path, text).map_err(|err| err.to_string())?;
+        }
         Ok(path)
     }
 
@@ -122,6 +160,16 @@ impl EvidenceStore {
     }
 }
 
+/// Stable, non-reversible token for a session's evidence filenames. The raw
+/// session id never appears in a path the model can read.
+pub fn session_token(session_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(session_id.as_bytes());
+    let digest = format!("{:x}", davinci_sys::hex::Lower(&hasher.finalize()));
+    digest[..12].to_string()
+}
+
 /// Cut `text` at a char boundary at or before `cap` bytes.
 pub fn cut_at_char_boundary(text: &str, cap: usize) -> &str {
     if text.len() <= cap {
@@ -155,6 +203,19 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(store.sweep(Duration::from_millis(1)), 1);
         assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stored_evidence_is_private_to_the_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvidenceStore::new(dir.path().join("evidence"));
+        let path = store.store("script-output", "secret").unwrap();
+        let dir_mode = std::fs::metadata(store.dir()).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
     }
 
     #[test]

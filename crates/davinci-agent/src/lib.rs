@@ -2531,6 +2531,25 @@ impl Agent {
         Some(mode)
     }
 
+    /// Keep the read-boundary exception pointed at the active evidence store.
+    /// The store can be replaced between turns, so this is re-synced before a
+    /// tool batch rather than captured once at construction.
+    fn sync_evidence_root(&self) {
+        let session = self
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.session_id.clone())
+            .unwrap_or_else(|| "sessionless".into());
+        self.permissions.set_evidence_access(
+            self.evidence
+                .as_ref()
+                .map(|store| store.dir().to_path_buf()),
+            self.evidence
+                .as_ref()
+                .map(|_| crate::evidence::session_token(&session)),
+        );
+    }
+
     pub fn cycle_permission_mode(&mut self) -> PermissionMode {
         let mode = self.permission_mode().next();
         self.set_permission_mode(mode);
@@ -5015,6 +5034,7 @@ impl Agent {
             .collect::<Vec<_>>();
         let mut parent = parent;
         let mut chunks = 0usize;
+        let mut omitted_events = 0usize;
         // Oldest first, in chunks that each fit the summarizer's window, so
         // every unfolded event reaches the ledger. Each chunk is committed and
         // checkpointed before the next is asked for: a failure part-way keeps
@@ -5041,6 +5061,7 @@ impl Agent {
                     &self.provider,
                     &self.model_id,
                 ) {
+                    omitted_events += chunk.omitted;
                     chunk_len = chunk.covered;
                     request = Some(chunk.request);
                 }
@@ -5143,14 +5164,19 @@ impl Agent {
                 .load_state_from_root()
                 .unwrap_or_default();
         };
-        if reason != runtime::context_vm::FoldReason::Manual {
-            runtime.context_vm.push_notice(format!(
-                "Context VM folded ({}): epoch {}, checkpoint ~{before_tokens} -> ~{after_tokens} \
-                 tokens. Folded episodes stay recoverable with retrieve_context.",
-                reason.as_str(),
-                root.epoch
-            ));
-        }
+        let omitted_note = if omitted_events == 0 {
+            String::new()
+        } else {
+            format!(
+                "; {omitted_events} event(s) could not be represented and remain retrievable by source reference"
+            )
+        };
+        runtime.context_vm.push_notice(format!(
+            "Context VM folded ({}): epoch {}, checkpoint ~{before_tokens} -> ~{after_tokens} \
+             tokens{omitted_note}. Folded episodes stay recoverable with retrieve_context.",
+            reason.as_str(),
+            root.epoch
+        ));
         runtime.emit_observe(crate::RuntimeEvent::ContextVmFolded {
             epoch: root.epoch,
             reason: reason.as_str().into(),

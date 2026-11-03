@@ -118,6 +118,31 @@ fn script_output_is_bounded_and_marked() {
 }
 
 #[test]
+fn truncated_output_retains_the_full_body_and_first_omitted_line() {
+    let body = (0..400)
+        .map(|i| {
+            if i == 249 {
+                format!("NEEDLE{}\n", "x".repeat(93))
+            } else {
+                format!("{:0>99}\n", i)
+            }
+        })
+        .collect::<String>();
+    let items = vec![json!({"type":"text","text":body})];
+    let output = assemble_script_output(&items, 16 * 1024, 1024 * 1024).unwrap();
+    assert!(!output.complete);
+    assert!(output.text.contains("bytes omitted"), "{}", output.text);
+    assert!(!output.text.contains("NEEDLE"), "{}", output.text);
+    assert!(output.retained_body.as_deref().unwrap().contains("NEEDLE"));
+    assert_eq!(output.omitted_start_line, Some(110));
+
+    let complete = assemble_script_output(&items[..1], 1024 * 1024, 1024 * 1024).unwrap();
+    assert!(complete.complete);
+    assert!(complete.retained_body.is_none());
+    assert!(complete.omitted_start_line.is_none());
+}
+
+#[test]
 fn truncated_and_image_reads_are_not_complete() {
     let with = |details| ToolResult {
         content: "partial".into(),

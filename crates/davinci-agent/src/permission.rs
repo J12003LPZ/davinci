@@ -829,6 +829,13 @@ pub struct FilesystemBoundaryPolicy {
     pub enforce_root_for_mutations: bool,
     /// If true, git metadata operations (such as under `repo_root/.git`) are permitted.
     pub allow_git_metadata: bool,
+    /// The agent's own evidence directory. A read under it is a narrow
+    /// read-boundary exception, like git metadata, so recovered tool output is
+    /// reachable even when reads outside the workspace are denied.
+    pub evidence_root: Option<PathBuf>,
+    /// Hash of the active session id. Only evidence files whose names carry
+    /// this token are admitted by the exception.
+    pub evidence_session_token: Option<String>,
     /// Canonical directories the user made writable beside `root`
     /// (`--add-dir`, `permissions.additionalDirectories`). A path inside one
     /// is not outside the project, but its rule subject stays absolute.
@@ -1028,6 +1035,12 @@ impl PermissionPolicy {
         self.filesystem_boundary.read_outside_root = policy;
     }
 
+    /// Point the read-boundary exception at the agent's own evidence store.
+    pub fn set_evidence_access(&mut self, root: Option<PathBuf>, session_token: Option<String>) {
+        self.filesystem_boundary.evidence_root = root;
+        self.filesystem_boundary.evidence_session_token = session_token;
+    }
+
     /// Whether reads may follow a hard link out of the workspace. The link
     /// refusal exists because a path check cannot see the other name; once the
     /// policy lets the agent read outside the workspace anyway, refusing the
@@ -1069,6 +1082,40 @@ impl PermissionPolicy {
         }
 
         false
+    }
+
+    /// A read under the agent's own evidence directory. This is a narrow
+    /// exception to the workspace read boundary, not a bypass of deny rules.
+    /// The path is canonicalized so a symlink cannot escape the store, and the
+    /// filename must carry the active session's token so another session's
+    /// artifact is not admitted.
+    fn is_evidence_target(&self, cwd: &Path, targets: &[permission_risk::FileTarget]) -> bool {
+        let (Some(root), Some(token)) = (
+            self.filesystem_boundary.evidence_root.as_deref(),
+            self.filesystem_boundary.evidence_session_token.as_deref(),
+        ) else {
+            return false;
+        };
+        let Ok(root) = root.canonicalize() else {
+            return false;
+        };
+        let prefix = format!("s{token}-");
+        targets.iter().any(|target| {
+            let given = Path::new(&target.subject);
+            let joined = if given.is_absolute() {
+                given.to_path_buf()
+            } else {
+                cwd.join(given)
+            };
+            let Ok(canonical) = joined.canonicalize() else {
+                return false;
+            };
+            canonical.starts_with(&root)
+                && canonical
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+        })
     }
 
     /// Add deny rules preventing any mutation or tool execution targeting the parent checkout.
@@ -1235,6 +1282,8 @@ impl PermissionPolicy {
         // Git metadata is a narrow read-boundary exception, never a deny-rule
         // exception or permission to write outside an isolated root.
         let is_git_meta = class == ToolClass::Read && self.is_git_metadata_call(tool, args, cwd);
+        let is_evidence_read =
+            tool == "read" && class == ToolClass::Read && self.is_evidence_target(cwd, &targets);
         let subjects = if !targets.is_empty() {
             targets
                 .iter()
@@ -1332,6 +1381,7 @@ impl PermissionPolicy {
         if class == ToolClass::Read
             && outside_project
             && !is_git_meta
+            && !is_evidence_read
             && self.filesystem_boundary.read_outside_root == ReadOutsideRootPolicy::Deny
         {
             return PermissionVerdict::Deny {
@@ -1411,6 +1461,7 @@ impl PermissionPolicy {
 
         let read_needs_approval = outside_project
             && !is_git_meta
+            && !is_evidence_read
             && (self.filesystem_boundary.read_outside_root == ReadOutsideRootPolicy::Ask
                 || self.mode == PermissionMode::Auto);
         if class == ToolClass::Read && !secret && !read_needs_approval {

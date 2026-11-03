@@ -2,7 +2,7 @@
 
 Drives the program in a Windows pseudo console (pywinpty), replays its output
 on a pyte screen, and writes one plain-text grid and one style-run JSON file
-per snapshot. Used to build docs/ui/claude-code-reference/.
+per snapshot. Captured frames must be kept outside this repository.
 
     python scripts/ui/capture_tui.py --phase ui --out <dir> --sandbox <dir>
     python scripts/ui/capture_tui.py --phase ui --bin davinci --out <dir> --sandbox <dir>

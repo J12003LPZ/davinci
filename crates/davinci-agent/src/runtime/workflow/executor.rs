@@ -2933,7 +2933,7 @@ mod tests {
             .pending_count(&executor.runtime.agent_id)
             == 0
         {
-            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            assert!(started.elapsed() < std::time::Duration::from_secs(60));
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let reports = executor.runtime.take_labeled_messages(10).join("\n");

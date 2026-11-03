@@ -94,6 +94,18 @@ pub struct ScriptOutput {
     pub text: String,
     pub complete: bool,
     pub omitted_bytes: usize,
+    pub omitted_start_line: Option<usize>,
+    pub retained_body: Option<String>,
+}
+
+/// The truncated text plus what was cut, so a caller can name the recovery
+/// location without re-deriving the cut.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Truncated {
+    pub text: String,
+    pub omitted_bytes: usize,
+    /// 1-based line in the full body. `0` when nothing was omitted.
+    pub omitted_start_line: usize,
 }
 
 /// Fixed bytes of the omission marker, excluding the digits of `N`.
@@ -101,6 +113,14 @@ const OMISSION_MARKER_FIXED_BYTES: usize = "\n[...  bytes omitted ...]\n".len();
 
 fn omission_marker(omitted: usize) -> String {
     format!("\n[... {omitted} bytes omitted ...]\n")
+}
+
+fn line_of_byte(text: &str, byte: usize) -> usize {
+    text[..byte.min(text.len())]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1
 }
 
 /// Keep the head and the tail of an over-budget text, separated by an explicit
@@ -111,9 +131,13 @@ fn omission_marker(omitted: usize) -> String {
 /// - both cuts land on a `char` boundary, so the result is valid UTF-8;
 /// - the head is a prefix and the tail a suffix of the input;
 /// - short input is returned unchanged with `0` omitted.
-pub fn truncate_head_and_tail(text: &str, limit: usize) -> (String, usize) {
+pub fn truncate_head_and_tail(text: &str, limit: usize) -> Truncated {
     if text.len() <= limit {
-        return (text.to_owned(), 0);
+        return Truncated {
+            text: text.to_owned(),
+            omitted_bytes: 0,
+            omitted_start_line: 0,
+        };
     }
     // The marker's length depends on the digits of N, and N depends on how much
     // room the marker leaves, so iterate to a fixed point.
@@ -126,7 +150,11 @@ pub fn truncate_head_and_tail(text: &str, limit: usize) -> (String, usize) {
             while end > 0 && !text.is_char_boundary(end) {
                 end -= 1;
             }
-            return (text[..end].to_owned(), text.len() - end);
+            return Truncated {
+                text: text[..end].to_owned(),
+                omitted_bytes: text.len() - end,
+                omitted_start_line: line_of_byte(text, end),
+            };
         }
         let remaining = limit - marker_len;
         // Head keeps two thirds of the remaining budget, the tail one third.
@@ -142,15 +170,16 @@ pub fn truncate_head_and_tail(text: &str, limit: usize) -> (String, usize) {
         }
         let omitted = tail_start - head_end;
         if omitted.to_string().len() == digits {
-            return (
-                format!(
+            return Truncated {
+                text: format!(
                     "{}{}{}",
                     &text[..head_end],
                     omission_marker(omitted),
                     &text[tail_start..]
                 ),
-                omitted,
-            );
+                omitted_bytes: omitted,
+                omitted_start_line: line_of_byte(text, head_end),
+            };
         }
         digits = omitted.to_string().len();
     }
@@ -200,15 +229,19 @@ pub fn assemble_script_output(
             text: collected,
             complete: true,
             omitted_bytes: 0,
+            omitted_start_line: None,
+            retained_body: None,
         });
     }
     // Keep the head and the tail, separated by an explicit marker naming the
     // bytes dropped in between (Stage 0 behavior).
-    let (text, omitted) = truncate_head_and_tail(&collected, limit);
+    let truncated = truncate_head_and_tail(&collected, limit);
     Ok(ScriptOutput {
-        text,
+        text: truncated.text,
         complete: false,
-        omitted_bytes: omitted,
+        omitted_bytes: truncated.omitted_bytes,
+        omitted_start_line: Some(truncated.omitted_start_line),
+        retained_body: Some(collected),
     })
 }
 

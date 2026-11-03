@@ -155,6 +155,9 @@ impl crate::codemode::CodeModeHost for ReadOnlyFixtureHost {
             host_notes: vec![],
             operation_ref: "forged".into(),
             error: None,
+            retained_output: None,
+            omitted_bytes: 0,
+            omitted_start_line: None,
         }
     }
 }
@@ -508,6 +511,9 @@ fn in_flight_child_is_awaited_before_parent_evidence_is_taken() {
                 host_notes: vec![],
                 operation_ref: "fixture".into(),
                 error: Some(CodeModeError::new("LIMIT_EXCEEDED", "fixture early error")),
+                retained_output: None,
+                omitted_bytes: 0,
+                omitted_start_line: None,
             }
         }
     }
@@ -584,6 +590,9 @@ fn undrained_child_makes_the_run_recovery_required() {
                 host_notes: vec![],
                 operation_ref: "fixture".into(),
                 error: None,
+                retained_output: None,
+                omitted_bytes: 0,
+                omitted_start_line: None,
             }
         }
     }
@@ -1411,6 +1420,9 @@ impl crate::codemode::CodeModeHost for TruncatedReadHost {
             host_notes: vec![],
             operation_ref: "forged".into(),
             error: None,
+            retained_output: None,
+            omitted_bytes: 0,
+            omitted_start_line: None,
         }
     }
 }
@@ -1531,6 +1543,9 @@ impl crate::codemode::CodeModeHost for EmptyAfterReadHost {
             host_notes: vec![],
             operation_ref: "forged".into(),
             error: None,
+            retained_output: None,
+            omitted_bytes: 0,
+            omitted_start_line: None,
         }
     }
 }
@@ -2537,6 +2552,9 @@ impl crate::codemode::CodeModeHost for SlowScriptHost {
                     host_notes: vec![],
                     operation_ref: "fixture".into(),
                     error: Some(CodeModeError::new("CANCELLED", "worker cancelled")),
+                    retained_output: None,
+                    omitted_bytes: 0,
+                    omitted_start_line: None,
                 };
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2551,8 +2569,451 @@ impl crate::codemode::CodeModeHost for SlowScriptHost {
             host_notes: vec![],
             operation_ref: "fixture".into(),
             error: None,
+            retained_output: None,
+            omitted_bytes: 0,
+            omitted_start_line: None,
         }
     }
+}
+
+#[test]
+fn retained_script_body_is_stored_and_named_in_the_completion_note() {
+    use crate::codemode::{
+        CodeModeBroker, CodeModeHost, CodeModeMode, CodeModeOutcome, CodeModeRequest,
+        CodeModeRunContext, CodeModeStatus,
+    };
+
+    struct TruncatedHost;
+    impl CodeModeHost for TruncatedHost {
+        fn admits_controlled_mode(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            _: &CodeModeRequest,
+            _: &CodeModeRunContext,
+            _: Arc<dyn CodeModeBroker>,
+        ) -> CodeModeOutcome {
+            CodeModeOutcome {
+                status: CodeModeStatus::Partial,
+                script_completed: true,
+                output_text: "HEAD\n[... 100 bytes omitted ...]\nTAIL".into(),
+                output_complete: false,
+                output_artifact: None,
+                children: vec![],
+                host_notes: vec![],
+                operation_ref: "fixture".into(),
+                error: None,
+                retained_output: Some("HEAD\nNEEDLE\nTAIL".into()),
+                omitted_bytes: 100,
+                omitted_start_line: Some(2),
+            }
+        }
+    }
+
+    let (mut agent, _workspace, _) = configured_agent();
+    let evidence = tempfile::tempdir().unwrap();
+    let store = crate::EvidenceStore::new(evidence.path());
+    agent.evidence = Some(store.clone());
+    agent
+        .enable_codemode(Arc::new(TruncatedHost), CodeModeMode::Controlled)
+        .unwrap();
+    let result = agent.run_codemode("call-retained", &json!({"code":"return 1"}), None);
+    let details = result.details.as_ref().unwrap();
+    let artifact_id = details["codemode"]["outputArtifact"]["id"]
+        .as_str()
+        .unwrap();
+    assert!(
+        artifact_id.starts_with(store.dir().to_string_lossy().as_ref()),
+        "{artifact_id}"
+    );
+    let body = std::fs::read_to_string(artifact_id).unwrap();
+    assert!(body.contains("NEEDLE"), "{body}");
+    let notes = details["codemode"]["hostNotes"].as_array().unwrap();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.as_str().unwrap().contains("Full output retained at")),
+        "{notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| note
+            .as_str()
+            .unwrap()
+            .contains("class: script_output; error: false")),
+        "{notes:?}"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.as_str().unwrap().contains("begins at line 2")),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn no_store_marks_only_truncated_script_output_as_unretained() {
+    use crate::codemode::{
+        CodeModeBroker, CodeModeHost, CodeModeMode, CodeModeOutcome, CodeModeRequest,
+        CodeModeRunContext, CodeModeStatus,
+    };
+
+    struct TruncatedHost;
+    impl CodeModeHost for TruncatedHost {
+        fn admits_controlled_mode(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            _: &CodeModeRequest,
+            _: &CodeModeRunContext,
+            _: Arc<dyn CodeModeBroker>,
+        ) -> CodeModeOutcome {
+            CodeModeOutcome {
+                status: CodeModeStatus::Partial,
+                script_completed: true,
+                output_text: "HEAD\n[... 100 bytes omitted ...]\nTAIL".into(),
+                output_complete: false,
+                output_artifact: None,
+                children: vec![],
+                host_notes: vec![],
+                operation_ref: "fixture".into(),
+                error: None,
+                retained_output: Some("HEAD\nNEEDLE\nTAIL".into()),
+                omitted_bytes: 100,
+                omitted_start_line: Some(2),
+            }
+        }
+    }
+
+    let (mut agent, _workspace, _) = configured_agent();
+    agent.evidence = None;
+    agent
+        .enable_codemode(Arc::new(TruncatedHost), CodeModeMode::Controlled)
+        .unwrap();
+    let result = agent.run_codemode("call-no-store", &json!({"code":"return 1"}), None);
+    let details = result.details.as_ref().unwrap();
+    assert!(details["codemode"]["outputArtifact"].is_null());
+    let notes = details["codemode"]["hostNotes"].as_array().unwrap();
+    assert!(
+        notes.iter().any(|note| note
+            .as_str()
+            .unwrap()
+            .contains("no evidence store in this agent")),
+        "{notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| note
+            .as_str()
+            .unwrap()
+            .contains("class: script_output; error: false")),
+        "{notes:?}"
+    );
+    assert_eq!(details["codemode"]["status"], "partial");
+}
+
+#[test]
+fn complete_no_store_script_output_has_no_omission_marker() {
+    use crate::codemode::{
+        CodeModeBroker, CodeModeHost, CodeModeMode, CodeModeOutcome, CodeModeRequest,
+        CodeModeRunContext, CodeModeStatus,
+    };
+
+    struct CompleteHost;
+    impl CodeModeHost for CompleteHost {
+        fn admits_controlled_mode(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            _: &CodeModeRequest,
+            _: &CodeModeRunContext,
+            _: Arc<dyn CodeModeBroker>,
+        ) -> CodeModeOutcome {
+            CodeModeOutcome {
+                status: CodeModeStatus::Completed,
+                script_completed: true,
+                output_text: "complete".into(),
+                output_complete: true,
+                output_artifact: None,
+                children: vec![],
+                host_notes: vec![],
+                operation_ref: "fixture".into(),
+                error: None,
+                retained_output: None,
+                omitted_bytes: 0,
+                omitted_start_line: None,
+            }
+        }
+    }
+
+    let (mut agent, _workspace, _) = configured_agent();
+    agent.evidence = None;
+    agent
+        .enable_codemode(Arc::new(CompleteHost), CodeModeMode::Controlled)
+        .unwrap();
+    let result = agent.run_codemode("call-complete", &json!({"code":"return 1"}), None);
+    let details = result.details.as_ref().unwrap();
+    assert!(details["codemode"]["outputArtifact"].is_null());
+    let notes = details["codemode"]["hostNotes"]
+        .as_array()
+        .map(|notes| {
+            notes
+                .iter()
+                .any(|note| note.as_str().unwrap().contains("not retained"))
+        })
+        .unwrap_or(false);
+    assert!(!notes);
+    assert_eq!(details["codemode"]["status"], "completed");
+}
+
+#[test]
+fn failed_script_marks_the_omitted_class_as_error() {
+    use crate::codemode::{
+        CodeModeBroker, CodeModeError, CodeModeHost, CodeModeMode, CodeModeOutcome,
+        CodeModeRequest, CodeModeRunContext, CodeModeStatus,
+    };
+
+    struct FailedHost;
+    impl CodeModeHost for FailedHost {
+        fn admits_controlled_mode(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            _: &CodeModeRequest,
+            _: &CodeModeRunContext,
+            _: Arc<dyn CodeModeBroker>,
+        ) -> CodeModeOutcome {
+            CodeModeOutcome {
+                status: CodeModeStatus::Failed,
+                script_completed: false,
+                output_text: "HEAD\n[... 10 bytes omitted ...]\nTAIL".into(),
+                output_complete: false,
+                output_artifact: None,
+                children: vec![],
+                host_notes: vec![],
+                operation_ref: "fixture".into(),
+                error: Some(CodeModeError::new("FAILED", "boom")),
+                retained_output: Some("HEAD\nNEEDLE\nTAIL".into()),
+                omitted_bytes: 10,
+                omitted_start_line: Some(2),
+            }
+        }
+    }
+
+    let (mut agent, _workspace, _) = configured_agent();
+    let evidence = tempfile::tempdir().unwrap();
+    agent.evidence = Some(crate::EvidenceStore::new(evidence.path()));
+    agent
+        .enable_codemode(Arc::new(FailedHost), CodeModeMode::Controlled)
+        .unwrap();
+    let result = agent.run_codemode("call-failed", &json!({"code":"throw new Error('x')"}), None);
+    let details = result.details.as_ref().unwrap();
+    let notes = details["codemode"]["hostNotes"].as_array().unwrap();
+    assert!(
+        notes.iter().any(|note| note
+            .as_str()
+            .unwrap()
+            .contains("class: script_output; error: true")),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn codemode_retained_body_is_recoverable_through_the_read_tool() {
+    use crate::codemode::{
+        CodeModeBroker, CodeModeHost, CodeModeMode, CodeModeOutcome, CodeModeRequest,
+        CodeModeRunContext, CodeModeStatus,
+    };
+    use crate::{
+        PermissionMode, PermissionPolicy, PermissionRule, PermissionState, ReadOutsideRootPolicy,
+    };
+
+    struct TruncatedHost;
+    impl CodeModeHost for TruncatedHost {
+        fn admits_controlled_mode(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            _: &CodeModeRequest,
+            _: &CodeModeRunContext,
+            _: Arc<dyn CodeModeBroker>,
+        ) -> CodeModeOutcome {
+            // The real script-output path: a long body whose needle sits past
+            // the omitted start, so only the retained body holds it.
+            let body = (0..400)
+                .map(|i| {
+                    if i == 249 {
+                        format!("NEEDLE-E2E{}\n", "x".repeat(89))
+                    } else {
+                        format!("{:0>99}\n", i)
+                    }
+                })
+                .collect::<String>();
+            let items = vec![json!({"type": "text", "text": body})];
+            let output =
+                crate::codemode::projection::assemble_script_output(&items, 16 * 1024, 1024 * 1024)
+                    .unwrap();
+            assert!(!output.text.contains("NEEDLE-E2E"));
+            CodeModeOutcome {
+                status: CodeModeStatus::Partial,
+                script_completed: true,
+                output_text: output.text,
+                output_complete: false,
+                output_artifact: None,
+                children: vec![],
+                host_notes: vec![],
+                operation_ref: "fixture".into(),
+                error: None,
+                retained_output: output.retained_body,
+                omitted_bytes: output.omitted_bytes,
+                omitted_start_line: output.omitted_start_line,
+            }
+        }
+    }
+
+    let (mut agent, workspace, _) = configured_agent();
+    let evidence = tempfile::tempdir().unwrap();
+    let store = crate::EvidenceStore::new(evidence.path());
+    agent.evidence = Some(store.clone());
+    agent.permissions = Arc::new(PermissionState::new(PermissionPolicy::new(
+        PermissionMode::Ask,
+    )));
+    {
+        let mut policy = agent.permissions.lock().unwrap();
+        policy.set_worktree_boundary(workspace.path(), None);
+        policy.set_read_outside_root_policy(ReadOutsideRootPolicy::Deny);
+    }
+    agent
+        .enable_codemode(Arc::new(TruncatedHost), CodeModeMode::Controlled)
+        .unwrap();
+    let result = agent.run_codemode("call-e2e", &json!({"code":"return 1"}), None);
+    let artifact = result.details.as_ref().unwrap()["codemode"]["outputArtifact"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Read at the line the marker reports, as the model would.
+    let notes = result.details.as_ref().unwrap()["codemode"]["hostNotes"]
+        .as_array()
+        .unwrap();
+    let marker = notes
+        .iter()
+        .filter_map(|note| note.as_str())
+        .find(|note| note.contains("the omitted region begins at line"))
+        .unwrap();
+    let offset: u64 = marker
+        .rsplit("offset: ")
+        .next()
+        .unwrap()
+        .split(',')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(offset, 110, "{marker}");
+
+    let mut events = Vec::new();
+    let messages = agent.execute_tool_batch(
+        workspace.path(),
+        vec![(
+            "read-e2e".into(),
+            "read".into(),
+            json!({"path": artifact, "offset": offset, "limit": 2000}),
+        )],
+        &mut events,
+    );
+    assert_eq!(messages[0].is_error, Some(false), "{messages:?}");
+    assert!(
+        davinci_ai::content_text(&messages[0].content).contains("NEEDLE-E2E"),
+        "{messages:?}"
+    );
+
+    // Expired: the sweep removes the retained body, so the read must fail.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    store.sweep(std::time::Duration::from_millis(1));
+    assert!(!std::path::Path::new(&artifact).exists());
+    let messages = agent.execute_tool_batch(
+        workspace.path(),
+        vec![(
+            "read-expired".into(),
+            "read".into(),
+            json!({"path": artifact}),
+        )],
+        &mut events,
+    );
+    assert_eq!(messages[0].is_error, Some(true), "{messages:?}");
+
+    // Missing: a path that was never retained.
+    let missing = store
+        .store_in_session("sessionless", "script-output", "MISSING")
+        .unwrap();
+    std::fs::remove_file(&missing).unwrap();
+    let messages = agent.execute_tool_batch(
+        workspace.path(),
+        vec![(
+            "read-missing".into(),
+            "read".into(),
+            json!({"path": missing}),
+        )],
+        &mut events,
+    );
+    assert_eq!(messages[0].is_error, Some(true), "{messages:?}");
+
+    // Denied: the evidence exception still yields to an explicit deny rule.
+    let denied = store
+        .store_in_session("sessionless", "script-output", "DENIED")
+        .unwrap();
+    agent
+        .permissions
+        .lock()
+        .unwrap()
+        .deny
+        .push(PermissionRule::bare("read"));
+    let messages = agent.execute_tool_batch(
+        workspace.path(),
+        vec![("read-denied".into(), "read".into(), json!({"path": denied}))],
+        &mut events,
+    );
+    assert_eq!(messages[0].is_error, Some(true), "{messages:?}");
+}
+
+#[test]
+fn read_can_open_agent_evidence_under_deny_outside_root() {
+    use crate::{PermissionMode, PermissionPolicy, PermissionState, ReadOutsideRootPolicy};
+    let (mut agent, workspace, _) = configured_agent();
+    let evidence = tempfile::tempdir().unwrap();
+    let store = crate::EvidenceStore::new(evidence.path());
+    let path = store
+        .store_in_session("sessionless", "script-output", "RECOVERED EVIDENCE")
+        .unwrap();
+    agent.evidence = Some(store);
+    agent.permissions = Arc::new(PermissionState::new(PermissionPolicy::new(
+        PermissionMode::Ask,
+    )));
+    {
+        let mut policy = agent.permissions.lock().unwrap();
+        policy.set_worktree_boundary(workspace.path(), None);
+        policy.set_read_outside_root_policy(ReadOutsideRootPolicy::Deny);
+    }
+    let mut events = Vec::new();
+    let messages = agent.execute_tool_batch(
+        workspace.path(),
+        vec![(
+            "evidence-read".into(),
+            "read".into(),
+            json!({"path": path.to_string_lossy().to_string()}),
+        )],
+        &mut events,
+    );
+    let message = &messages[0];
+    assert_eq!(message.is_error, Some(false), "{message:?}");
+    assert!(
+        davinci_ai::content_text(&message.content).contains("RECOVERED EVIDENCE"),
+        "{message:?}"
+    );
 }
 
 /// Guards come before the agent so they drop after it: the workspace and

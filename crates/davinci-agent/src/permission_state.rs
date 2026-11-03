@@ -33,6 +33,23 @@ impl PermissionState {
             })),
         }
     }
+
+    /// Point the read-boundary exception at the agent's own evidence store.
+    /// This is a trusted path pointer, not a user grant, so it must not
+    /// invalidate pending approvals by advancing the revision.
+    pub fn set_evidence_access(
+        &self,
+        root: Option<std::path::PathBuf>,
+        session_token: Option<String>,
+    ) {
+        match self.0.lock() {
+            Ok(mut state) => state.policy.set_evidence_access(root, session_token),
+            Err(err) => err
+                .into_inner()
+                .policy
+                .set_evidence_access(root, session_token),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -66,6 +83,16 @@ impl DerefMut for PermissionGuard<'_> {
 mod tests {
     use super::*;
     use crate::PermissionMode;
+
+    #[test]
+    fn evidence_root_does_not_advance_the_revision() {
+        let state = PermissionState::new(PermissionPolicy::new(PermissionMode::Ask));
+        state.set_evidence_access(
+            Some(std::env::temp_dir().join("evidence")),
+            Some("token".into()),
+        );
+        assert_eq!(state.lock().unwrap().revision(), Some(0));
+    }
 
     #[test]
     fn reads_preserve_revision_and_replacement_cannot_reset_it() {
