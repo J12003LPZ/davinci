@@ -2531,6 +2531,25 @@ impl Agent {
         Some(mode)
     }
 
+    /// Keep the read-boundary exception pointed at the active evidence store.
+    /// The store can be replaced between turns, so this is re-synced before a
+    /// tool batch rather than captured once at construction.
+    fn sync_evidence_root(&self) {
+        let session = self
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.session_id.clone())
+            .unwrap_or_else(|| "sessionless".into());
+        self.permissions.set_evidence_access(
+            self.evidence
+                .as_ref()
+                .map(|store| store.dir().to_path_buf()),
+            self.evidence
+                .as_ref()
+                .map(|_| crate::evidence::session_token(&session)),
+        );
+    }
+
     pub fn cycle_permission_mode(&mut self) -> PermissionMode {
         let mode = self.permission_mode().next();
         self.set_permission_mode(mode);

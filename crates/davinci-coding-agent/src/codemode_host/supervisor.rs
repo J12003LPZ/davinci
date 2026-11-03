@@ -947,6 +947,9 @@ impl NodeCodeModeHost {
                         .clone()
                         .unwrap_or_else(|| format!("ephemeral:{run_id}")),
                     error: (!ok).then(|| sandbox_failure(result)),
+                    retained_output: output.retained_body,
+                    omitted_bytes: output.omitted_bytes,
+                    omitted_start_line: output.omitted_start_line,
                 });
             }
             let id = frame["requestId"]
@@ -1105,6 +1108,9 @@ impl CodeModeHost for NodeCodeModeHost {
                     .clone()
                     .unwrap_or_else(|| format!("ephemeral:{}", context.identity.invocation_id)),
                 error: Some(error),
+                retained_output: None,
+                omitted_bytes: 0,
+                omitted_start_line: None,
             })
     }
 }
@@ -1491,12 +1497,15 @@ mod tests {
         let text = "short output".to_string();
         let limit = 64;
         let complete = text.len() <= limit;
-        let (output, omitted) =
-            davinci_agent::codemode::projection::truncate_head_and_tail(&text, limit);
+        let truncated = davinci_agent::codemode::projection::truncate_head_and_tail(&text, limit);
         assert!(complete, "the caller still sees a complete result");
-        assert_eq!(output, text);
-        assert_eq!(omitted, 0);
-        assert!(!output.contains("bytes omitted"), "{output:?}");
+        assert_eq!(truncated.text, text);
+        assert_eq!(truncated.omitted_bytes, 0);
+        assert!(
+            !truncated.text.contains("bytes omitted"),
+            "{}",
+            truncated.text
+        );
     }
 
     #[test]
@@ -1507,16 +1516,33 @@ mod tests {
             text.push_str(&format!("filler line {i}\n"));
         }
         text.push_str("ERROR: tail-failure");
-        let (output, omitted) =
-            davinci_agent::codemode::projection::truncate_head_and_tail(&text, limit);
-        assert!(output.contains("ERROR: tail-failure"), "{output:?}");
-        assert!(output.contains("\n[... "), "{output:?}");
-        assert!(output.contains(" bytes omitted ...]\n"), "{output:?}");
-        assert!(output.len() <= limit, "{} > {limit}", output.len());
-        assert!(omitted > 0, "expected a non-zero omitted count");
+        let truncated = davinci_agent::codemode::projection::truncate_head_and_tail(&text, limit);
         assert!(
-            output.contains(&format!(" {omitted} bytes omitted ")),
-            "{output:?}"
+            truncated.text.contains("ERROR: tail-failure"),
+            "{}",
+            truncated.text
+        );
+        assert!(truncated.text.contains("\n[... "), "{}", truncated.text);
+        assert!(
+            truncated.text.contains(" bytes omitted ...]\n"),
+            "{}",
+            truncated.text
+        );
+        assert!(
+            truncated.text.len() <= limit,
+            "{} > {limit}",
+            truncated.text.len()
+        );
+        assert!(
+            truncated.omitted_bytes > 0,
+            "expected a non-zero omitted count"
+        );
+        assert!(
+            truncated
+                .text
+                .contains(&format!(" {} bytes omitted ", truncated.omitted_bytes)),
+            "{}",
+            truncated.text
         );
     }
 
@@ -1524,22 +1550,33 @@ mod tests {
     fn multibyte_output_cuts_on_char_boundaries_at_an_unaligned_limit() {
         let text = "æ—¥æœ¬èªž".repeat(4000); // 36_000 bytes, three bytes per char
         let limit = 10_000; // 10_000 % 3 != 0: a naive byte cut would split a char
-        let (output, omitted) =
-            davinci_agent::codemode::projection::truncate_head_and_tail(&text, limit);
-        assert!(output.len() <= limit, "{} > {limit}", output.len());
-        assert!(omitted > 0);
+        let truncated = davinci_agent::codemode::projection::truncate_head_and_tail(&text, limit);
+        assert!(
+            truncated.text.len() <= limit,
+            "{} > {limit}",
+            truncated.text.len()
+        );
+        assert!(truncated.omitted_bytes > 0);
         // A String is valid UTF-8 by construction; rebuilding from its bytes
         // proves the cuts did not slice through a multi-byte character.
-        assert_eq!(std::str::from_utf8(output.as_bytes()), Ok(output.as_str()));
+        assert_eq!(
+            std::str::from_utf8(truncated.text.as_bytes()),
+            Ok(truncated.text.as_str())
+        );
     }
 
     #[test]
     fn truncated_output_head_is_a_prefix_of_the_input() {
         let text = "æ—¥æœ¬èªž".repeat(4000);
         let limit = 10_000;
-        let (output, _omitted) =
-            davinci_agent::codemode::projection::truncate_head_and_tail(&text, limit);
-        let marker = output.find("\n[... ").expect("omission marker present");
-        assert!(text.starts_with(&output[..marker]), "head is not a prefix");
+        let truncated = davinci_agent::codemode::projection::truncate_head_and_tail(&text, limit);
+        let marker = truncated
+            .text
+            .find("\n[... ")
+            .expect("omission marker present");
+        assert!(
+            text.starts_with(&truncated.text[..marker]),
+            "head is not a prefix"
+        );
     }
 }

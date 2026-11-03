@@ -952,6 +952,8 @@ pub struct KindRetrievalStats {
     pub original_bytes: u64,
     pub model_view_bytes: u64,
     pub retrievals: u64,
+    #[serde(default)]
+    pub rejected: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1389,17 +1391,24 @@ impl TokenGovernor {
         };
         let original_bytes = generic.info.original_bytes;
         let original_lines = generic.info.original_lines;
+        let specialized_present = specialized.is_some();
         let (chosen_content, strategy) = match specialized {
             Some(view)
-                if clears_specialized_threshold(
-                    view.content.len(),
-                    generic.content.len(),
-                    self.config.specialized_min_reduction_pct,
-                ) =>
+                if (view.has_diagnostics && view.content.len() < original_bytes)
+                    || clears_specialized_threshold(
+                        view.content.len(),
+                        generic.content.len(),
+                        self.config.specialized_min_reduction_pct,
+                    ) =>
             {
                 (view.content, "specialized")
             }
-            _ => (generic.content, "generic"),
+            _ => {
+                if specialized_present {
+                    self.content_routing.by_kind.get_mut(kind).rejected += 1;
+                }
+                (generic.content, "generic")
+            }
         };
         let view_bytes = chosen_content.len();
         let content_hash = file_content_hash(&result.content);
@@ -2823,6 +2832,102 @@ mod tests {
                 .as_f64()
                 .unwrap()
                 > 0.0
+        );
+        assert_eq!(
+            status["contentRouting"]["byKind"]["jsonArray"]["rejected"],
+            0
+        );
+    }
+
+    #[test]
+    fn governor_keeps_a_diagnostic_view_when_it_fails_the_reduction_gate() {
+        let dir = tempdir().unwrap();
+        let config = TokenGovernorConfig {
+            compress_threshold_bytes: 1,
+            compress_threshold_lines: 1,
+            content_aware: true,
+            specialized_min_reduction_pct: 99,
+            ..Default::default()
+        };
+        let mut governor =
+            TokenGovernor::with_store("diag-gate", config, OutputStore::new(dir.path()));
+        let json = serde_json::Value::Array(
+            (0..30)
+                .map(|i| {
+                    if i == 25 {
+                        serde_json::json!({"id": i, "status": "error", "message": "boom"})
+                    } else {
+                        serde_json::json!({"id": i, "status": "ok", "payload": "repetitive payload"})
+                    }
+                })
+                .collect(),
+        )
+        .to_string();
+        let result = governor.after_tool("bash", &json!({"command": "printf json"}), ok(&json));
+        assert_eq!(
+            result.details.as_ref().unwrap()["tokenGovernor"]["strategy"],
+            "specialized"
+        );
+        assert!(result.content.contains("item[25]"), "{}", result.content);
+    }
+
+    #[test]
+    fn governor_keeps_a_top_level_object_error_between_long_arrays() {
+        let dir = tempdir().unwrap();
+        let config = TokenGovernorConfig {
+            compress_threshold_bytes: 1,
+            compress_threshold_lines: 1,
+            content_aware: true,
+            specialized_min_reduction_pct: 99,
+            ..Default::default()
+        };
+        let mut governor =
+            TokenGovernor::with_store("object-error", config, OutputStore::new(dir.path()));
+        let value = serde_json::json!({
+            "items": (0..40)
+                .map(|i| serde_json::json!({"id": i, "status": "ok", "payload": "repetitive payload"}))
+                .collect::<Vec<_>>(),
+            "error": "top-level assertion failed",
+            "others": (0..40)
+                .map(|i| serde_json::json!({"id": i, "status": "ok", "payload": "repetitive payload"}))
+                .collect::<Vec<_>>()
+        });
+        let pretty = serde_json::to_string_pretty(&value).unwrap();
+        let result = governor.after_tool("bash", &json!({"command": "printf json"}), ok(&pretty));
+        assert_eq!(
+            result.details.as_ref().unwrap()["tokenGovernor"]["strategy"],
+            "specialized"
+        );
+        assert!(
+            result.content.contains("top-level assertion failed"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn governor_records_a_rejected_specialized_view() {
+        let dir = tempdir().unwrap();
+        let config = TokenGovernorConfig {
+            compress_threshold_bytes: 1,
+            compress_threshold_lines: 1,
+            content_aware: true,
+            ..Default::default()
+        };
+        let mut governor =
+            TokenGovernor::with_store("rejected", config, OutputStore::new(dir.path()));
+        let json = serde_json::Value::Array(
+            (0..6)
+                .map(|i| serde_json::json!({"id": i, "status": "ok"}))
+                .collect(),
+        )
+        .to_string();
+        let _ = governor.after_tool("bash", &json!({"command": "printf json"}), ok(&json));
+        let status = governor.status();
+        assert_eq!(status["contentRouting"]["specializedViews"], 0);
+        assert_eq!(
+            status["contentRouting"]["byKind"]["jsonArray"]["rejected"],
+            1
         );
     }
 
