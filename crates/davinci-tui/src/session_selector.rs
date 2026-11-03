@@ -768,6 +768,14 @@ mod tests {
     }
 
     #[test]
+    fn js_like_regex_hex_escape_above_ascii_matches_the_code_point() {
+        // fancy-regex 0.20 reads a Unicode-mode `\xHH` as the code point, not a byte.
+        assert!(regex_is_match(r"\xFF", "\u{ff}"));
+        assert!(regex_is_match(r"^\xE9$", "\u{e9}"));
+        assert!(!regex_is_match(r"\xFF", "y"));
+    }
+
+    #[test]
     fn path_sort_and_rename_match_ts() {
         let mut selector = SessionSelector::new(sample());
         let rendered = selector.render(80).join("\n");
