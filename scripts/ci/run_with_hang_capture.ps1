@@ -20,27 +20,70 @@ $HangExitCode = 124
 if ($CommandLine -and $CommandLine[0] -eq '--') { $CommandLine = $CommandLine[1..($CommandLine.Count - 1)] }
 if (-not $CommandLine) { throw 'no command given' }
 
-function Get-ProcessTree([int]$RootId) {
-    $all = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name)
-    $found = [System.Collections.Generic.List[object]]::new()
-    $queue = [System.Collections.Generic.Queue[int]]::new()
-    $seen = [System.Collections.Generic.HashSet[int]]::new()
-    $queue.Enqueue($RootId); [void]$seen.Add($RootId)
-    while ($queue.Count -gt 0) {
-        $id = $queue.Dequeue()
-        $self = $all | Where-Object ProcessId -eq $id
-        if ($self) { $found.Add($self) }
-        foreach ($child in ($all | Where-Object ParentProcessId -eq $id)) {
-            if ($seen.Add([int]$child.ProcessId)) { $queue.Enqueue([int]$child.ProcessId) }
-        }
-    }
-    return , $found
+# Never captured and never killed, whatever the walk returns.
+$ProtectedProcessNames = @(
+    'smss', 'csrss', 'wininit', 'winlogon', 'services', 'lsass', 'LsaIso', 'svchost',
+    'fontdrvhost', 'dwm', 'MsMpEng', 'MpDefenderCoreService', 'Runner.Listener',
+    'Runner.Worker', 'System', 'Registry'
+)
+# A real cargo test tree is a handful of processes; more means the walk is wrong.
+$MaxTreeSize = 32
+
+function Get-ProcessRecords {
+    @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name, CreationDate)
 }
 
-function Stop-ProcessTree([int]$RootId) {
-    # Two passes: the second catches anything spawned while the first ran.
-    foreach ($pass in 1, 2) {
-        foreach ($p in (Get-ProcessTree $RootId | Sort-Object ProcessId -Descending)) {
+# Windows keeps ParentProcessId after the parent exits and reuses pids, so a record
+# only counts as a child if it was created at or after its parent.
+function Test-IsChildOf($Child, $Parent) {
+    $Child.ParentProcessId -eq $Parent.ProcessId -and $Child.CreationDate -ge $Parent.CreationDate
+}
+
+# Ids of $SelfId and its real ancestors (Runner.Worker, Runner.Listener, ...).
+function Get-ProtectedIds([int]$SelfId, $All) {
+    $ids = [System.Collections.Generic.HashSet[int]]::new()
+    $cur = $All | Where-Object ProcessId -eq $SelfId | Select-Object -First 1
+    while ($cur -and $ids.Add([int]$cur.ProcessId)) {
+        $child = $cur
+        $cur = $All | Where-Object { $_.ProcessId -eq $child.ParentProcessId -and (Test-IsChildOf $child $_) } | Select-Object -First 1
+    }
+    return , $ids
+}
+
+# Returns Members (root first, each with Depth) and Excluded (Process, Reason).
+# Excluded processes are not entered, so their descendants are not reached either.
+function Get-ProcessTree([int]$RootId, $All, $ProtectedIds) {
+    $members = [System.Collections.Generic.List[object]]::new()
+    $excluded = [System.Collections.Generic.List[object]]::new()
+    $root = $All | Where-Object ProcessId -eq $RootId | Select-Object -First 1
+    if ($root) {
+        $members.Add(($root | Select-Object *, @{ n = 'Depth'; e = { 0 } }))
+        $queue = [System.Collections.Generic.Queue[object]]::new()
+        $seen = [System.Collections.Generic.HashSet[int]]::new()
+        $queue.Enqueue($members[0]); [void]$seen.Add($RootId)
+        while ($queue.Count -gt 0) {
+            $parent = $queue.Dequeue()
+            foreach ($child in ($All | Where-Object { Test-IsChildOf $_ $parent })) {
+                if (-not $seen.Add([int]$child.ProcessId)) { continue }
+                $reason = $null
+                if ($ProtectedIds -and $ProtectedIds.Contains([int]$child.ProcessId)) { $reason = 'this script or one of its ancestors' }
+                elseif ($ProtectedProcessNames -contains ($child.Name -replace '\.exe$', '')) { $reason = 'protected process name' }
+                if ($reason) { $excluded.Add([pscustomobject]@{ Process = $child; Reason = $reason }); continue }
+                $node = $child | Select-Object *, @{ n = 'Depth'; e = { $parent.Depth + 1 } }
+                $members.Add($node)
+                $queue.Enqueue($node)
+            }
+        }
+    }
+    return [pscustomobject]@{ Members = $members; Excluded = $excluded }
+}
+
+# Kills only processes that are still the ones recorded (same pid and creation time),
+# children before parents.
+function Stop-ProcessList($Processes) {
+    foreach ($p in ($Processes | Sort-Object Depth -Descending)) {
+        $now = Get-CimInstance Win32_Process -Filter "ProcessId = $($p.ProcessId)" -ErrorAction SilentlyContinue
+        if ($now -and $now.CreationDate -eq $p.CreationDate) {
             Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
         }
     }
@@ -98,18 +141,41 @@ if ($process.WaitForExit($DeadlineSeconds * 1000)) {
 }
 
 Write-Host "Deadline of $DeadlineSeconds seconds passed; capturing process tree of pid $($process.Id) ($($exe.Source))."
-$tree = Get-ProcessTree $process.Id
-Write-Host ("Process tree: " + (($tree | ForEach-Object { "$($_.Name)($($_.ProcessId))" }) -join ', '))
-
-$cdb = Find-Cdb
-if (-not $cdb) {
-    Write-Host 'cdb.exe was not found on PATH or under Windows Kits\10\Debuggers\x64; no stacks or handles can be captured.'
+$records = Get-ProcessRecords
+$protected = Get-ProtectedIds $PID $records
+$walk = Get-ProcessTree $process.Id $records $protected
+foreach ($e in $walk.Excluded) {
+    Write-Host "Excluded $($e.Process.Name)($($e.Process.ProcessId)): $($e.Reason)"
+}
+$toKill = [System.Collections.Generic.List[object]]::new()
+if ($walk.Members.Count -gt $MaxTreeSize) {
+    Write-Host "Process walk returned $($walk.Members.Count) processes (limit $MaxTreeSize); treating it as broken. Nothing captured; killing only pid $($process.Id)."
+    $toKill.Add([pscustomobject]@{ ProcessId = $process.Id; CreationDate = $walk.Members[0].CreationDate; Depth = 0 })
 }
 else {
-    Write-Host "Using $cdb with symbol path $(Get-SymbolPath)"
-    foreach ($p in $tree) { Capture-Process $cdb $p (Get-SymbolPath) }
+    $tree = $walk.Members
+    $toKill.AddRange($tree)
+    Write-Host ("Process tree: " + (($tree | ForEach-Object { "$($_.Name)($($_.ProcessId))" }) -join ', '))
+
+    $cdb = Find-Cdb
+    if (-not $cdb) {
+        Write-Host 'cdb.exe was not found on PATH or under Windows Kits\10\Debuggers\x64; no stacks or handles can be captured.'
+    }
+    else {
+        Write-Host "Using $cdb with symbol path $(Get-SymbolPath)"
+        foreach ($p in $tree) { Capture-Process $cdb $p (Get-SymbolPath) }
+    }
+
+    # Second snapshot catches children spawned during capture. Once the root has
+    # died, orphans can no longer be found through it, so do not walk again.
+    if (-not $process.HasExited) {
+        $after = Get-ProcessTree $process.Id (Get-ProcessRecords) $protected
+        foreach ($m in $after.Members) {
+            if (-not ($toKill | Where-Object { $_.ProcessId -eq $m.ProcessId -and $_.CreationDate -eq $m.CreationDate })) { $toKill.Add($m) }
+        }
+    }
 }
 
-Stop-ProcessTree $process.Id
+Stop-ProcessList $toKill
 Write-Host "HANG: '$($CommandLine[0])' did not finish within the $DeadlineSeconds-second deadline. This is a hang, not a test failure."
 exit $HangExitCode
