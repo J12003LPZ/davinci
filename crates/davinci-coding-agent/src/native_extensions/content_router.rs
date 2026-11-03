@@ -174,8 +174,7 @@ fn is_large_json_object(content: &str) -> bool {
         return false;
     };
     map.iter().any(|(key, value)| {
-        value.as_array().is_some_and(|items| items.len() > 5)
-            || is_object_field_hint(key)
+        value.as_array().is_some_and(|items| items.len() > 5) || is_object_field_hint(key)
     })
 }
 

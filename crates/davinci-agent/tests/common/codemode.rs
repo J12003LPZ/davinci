@@ -2853,12 +2853,9 @@ fn codemode_retained_body_is_recoverable_through_the_read_tool() {
                 })
                 .collect::<String>();
             let items = vec![json!({"type": "text", "text": body})];
-            let output = crate::codemode::projection::assemble_script_output(
-                &items,
-                16 * 1024,
-                1024 * 1024,
-            )
-            .unwrap();
+            let output =
+                crate::codemode::projection::assemble_script_output(&items, 16 * 1024, 1024 * 1024)
+                    .unwrap();
             assert!(!output.text.contains("NEEDLE-E2E"));
             CodeModeOutcome {
                 status: CodeModeStatus::Partial,
