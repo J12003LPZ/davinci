@@ -227,6 +227,16 @@ def check_scenario(scenario) -> str:
             continue
         return f"scenario key {key!r} is not supported by the DaVinci fixture"
     seen = set()
+    args = scenario.get("args")
+    if args:
+        if not isinstance(args, list) or any(not isinstance(arg, str) for arg in args):
+            return "args must be a list of strings"
+        for arg in args:
+            if arg.split("=", 1)[0] in ("--resume", "-r", "--continue", "-c", "--fork"):
+                return (
+                    f"argument {arg!r} is not supported by the DaVinci fixture: "
+                    "there is no Claude session fixture to resume"
+                )
     for i, action in enumerate(scenario.get("actions", [])):
         kind = action.get("type") if isinstance(action, dict) else None
         if kind not in ACTIONS:
