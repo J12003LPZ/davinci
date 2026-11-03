@@ -1,0 +1,3315 @@
+{
+ "version": 1,
+ "goldens": {
+  "boot__02_settled": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "keys_panels__08_ctrl_c": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "layout_sizes__01_120x44": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "layout_sizes__02_100x30": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     10
+    ],
+    "transcript": [
+     5,
+     24
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "layout_sizes__03_80x24": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     10
+    ],
+    "transcript": [
+     5,
+     18
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "layout_sizes__04_60x20": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     11
+    ],
+    "transcript": [
+     5,
+     14
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "layout_sizes__05_160x50": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     44
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "layout_sizes__06_120x18": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     12
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "ansi_theme__02_settled": [
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   }
+  ],
+  "context_cmd__02_context_empty": [
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     40
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "context_cmd__03_context_settled": [
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     40
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "esc_clear__01_esc1": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "esc_clear__02_esc2": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "external_editor__01_after_editor": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "help_tabs__01_general": [
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     23
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "help_tabs__03_custom": [
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     34
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "image_paste__02_after_typing": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "keys_panels__01_mode1": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "keys_panels__02_mode2": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "keys_panels__03_mode3": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "keys_panels__04_mode4": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "keys_panels__05_todos": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "keys_panels__06_history": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     28
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "model_nav__01_model": [
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     30
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "model_nav__02_effort_right": [
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     30
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "model_nav__03_session_only": [
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     40
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "paste_large__01_paste_12k": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "paste_large__03_unicode": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     30
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "paste_only__01_paste": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "permissions_tabs__01_perms": [
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     33
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "permissions_tabs__03_tab4": [
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     22
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "slash_only__01_slash": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     34
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "slash_only__02_tab": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "theme_apply__01_light_selected": [
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     19
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "region": {
+     "rows": [
+      24,
+      24
+     ],
+     "cols": [
+      3,
+      58
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sentence under the title is DaVinci's own (D2); it takes the same 56 cells, bold."
+   },
+   {
+    "region": {
+     "rows": [
+      33,
+      33
+     ],
+     "cols": [
+      7,
+      23
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own Vox entry stands in the last row, where the reference lists its custom-theme entry (D2); only its text differs."
+   },
+   {
+    "region": {
+     "rows": [
+      36,
+      36
+     ],
+     "cols": [
+      3,
+      24
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's first line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      37,
+      37
+     ],
+     "cols": [
+      3,
+      37
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's removed line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      38,
+      38
+     ],
+     "cols": [
+      3,
+      38
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's added line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      39,
+      39
+     ],
+     "cols": [
+      3,
+      7
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's last line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   }
+  ],
+  "theme_apply__02_light_main": [
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   }
+  ],
+  "theme_nav__01_theme": [
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     21
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "region": {
+     "rows": [
+      26,
+      26
+     ],
+     "cols": [
+      3,
+      58
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sentence under the title is DaVinci's own (D2); it takes the same 56 cells, bold."
+   },
+   {
+    "region": {
+     "rows": [
+      35,
+      35
+     ],
+     "cols": [
+      7,
+      23
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own Vox entry stands in the last row, where the reference lists its custom-theme entry (D2); only its text differs."
+   },
+   {
+    "region": {
+     "rows": [
+      38,
+      38
+     ],
+     "cols": [
+      3,
+      24
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's first line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      39,
+      39
+     ],
+     "cols": [
+      3,
+      37
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's removed line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      40,
+      40
+     ],
+     "cols": [
+      3,
+      38
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's added line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      41,
+      41
+     ],
+     "cols": [
+      3,
+      7
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's last line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      43,
+      43
+     ],
+     "cols": [
+      3,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Monokai Extended": "DaVinci"
+    },
+    "reason": "The footer names the syntax theme; DaVinci names its own."
+   }
+  ],
+  "theme_nav__02_down2": [
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     21
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "region": {
+     "rows": [
+      26,
+      26
+     ],
+     "cols": [
+      3,
+      58
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sentence under the title is DaVinci's own (D2); it takes the same 56 cells, bold."
+   },
+   {
+    "region": {
+     "rows": [
+      35,
+      35
+     ],
+     "cols": [
+      7,
+      23
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own Vox entry stands in the last row, where the reference lists its custom-theme entry (D2); only its text differs."
+   },
+   {
+    "region": {
+     "rows": [
+      38,
+      38
+     ],
+     "cols": [
+      3,
+      24
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's first line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      39,
+      39
+     ],
+     "cols": [
+      3,
+      37
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's removed line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      40,
+      40
+     ],
+     "cols": [
+      3,
+      38
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's added line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      41,
+      41
+     ],
+     "cols": [
+      3,
+      7
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's last line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      43,
+      43
+     ],
+     "cols": [
+      3,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Monokai Extended": "DaVinci"
+    },
+    "reason": "The footer names the syntax theme; DaVinci names its own."
+   }
+  ],
+  "theme_nav__03_syntax_toggle": [
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     21
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "region": {
+     "rows": [
+      26,
+      26
+     ],
+     "cols": [
+      3,
+      58
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sentence under the title is DaVinci's own (D2); it takes the same 56 cells, bold."
+   },
+   {
+    "region": {
+     "rows": [
+      35,
+      35
+     ],
+     "cols": [
+      7,
+      23
+     ]
+    },
+    "kind": "structure",
+    "reason": "DaVinci's own Vox entry stands in the last row, where the reference lists its custom-theme entry (D2); only its text differs."
+   },
+   {
+    "region": {
+     "rows": [
+      38,
+      38
+     ],
+     "cols": [
+      3,
+      24
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's first line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      39,
+      39
+     ],
+     "cols": [
+      3,
+      37
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's removed line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      40,
+      40
+     ],
+     "cols": [
+      3,
+      38
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's added line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      41,
+      41
+     ],
+     "cols": [
+      3,
+      7
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample's last line is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   }
+  ],
+  "tui_panel__02_tui_panel": [
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "vim_mode__04_dw": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
+    "kind": "compact",
+    "rows": [
+     5,
+     9
+    ],
+    "transcript": [
+     5,
+     38
+    ],
+    "reason": "D6: the release notice announces a Claude Code change and has no DaVinci purpose. It and its separator are removed from the expected frame and the conversation closes the gap; the rows this vacates at the bottom of the scrolling region must be blank."
+   }
+  ],
+  "onboarding__01_onboarding": [
+   {
+    "region": {
+     "rows": [
+      0,
+      0
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's, as in the header."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      0,
+      57
+     ]
+    },
+    "kind": "structure",
+    "reason": "The band of dots is DaVinci's own (D2); only its text is left out."
+   },
+   {
+    "kind": "art",
+    "region": {
+     "rows": [
+      10,
+      15
+     ],
+     "cols": [
+      0,
+      57
+     ]
+    },
+    "band": {
+     "rows": [
+      2,
+      15
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "lines": [
+     "         ▄▄███▀▄▄   ▄▄",
+     "        ▀▀▀▀▀▀▀▀▀▀  █",
+     "       ███████████ █",
+     "      ▄▄ ▀▀▀▀▀▀▀▄▄▀",
+     "     ▀▀▀▀ ▀▀▀▀▀▀",
+     "··························································"
+    ],
+    "reason": "DaVinci's own welcome art (D2): the reference's star field and mark are not drawn. The rectangle holds DaVinci's painter sprite on rows 10-14 and its dot row 15 (0-based); nothing else is drawn in the band between the title and the steps."
+   },
+   {
+    "region": {
+     "rows": [
+      17,
+      17
+     ],
+     "cols": [
+      1,
+      18
+     ]
+    },
+    "kind": "structure",
+    "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
+   },
+   {
+    "kind": "copy",
+    "region": {
+     "rows": [
+      19,
+      19
+     ],
+     "cols": [
+      1,
+      56
+     ]
+    },
+    "entries": [
+     {
+      "row": 19,
+      "col": 1,
+      "text": "Pick the colour palette that reads best in your terminal"
+     }
+    ],
+    "reason": "DaVinci's own wording (D2): same words as the manifest says, same foreground and modifier combinations as the row it stands for."
+   },
+   {
+    "kind": "copy",
+    "region": {
+     "rows": [
+      20,
+      20
+     ],
+     "cols": [
+      1,
+      32
+     ]
+    },
+    "entries": [
+     {
+      "row": 20,
+      "col": 1,
+      "text": "So switch when wanted via /theme"
+     }
+    ],
+    "reason": "DaVinci's own wording (D2): same words as the manifest says, same foreground and modifier combinations as the row it stands for."
+   },
+   {
+    "region": {
+     "rows": [
+      31,
+      31
+     ],
+     "cols": [
+      1,
+      22
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      32,
+      32
+     ],
+     "cols": [
+      1,
+      35
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      33,
+      33
+     ],
+     "cols": [
+      1,
+      36
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   },
+   {
+    "region": {
+     "rows": [
+      34,
+      34
+     ],
+     "cols": [
+      1,
+      5
+     ]
+    },
+    "kind": "structure",
+    "reason": "The sample is DaVinci's own text (D2), in tokens as wide as the reference's, so every cell keeps its style."
+   }
+  ],
+  "onboarding__03_after_enter": [
+   {
+    "region": {
+     "rows": [
+      0,
+      0
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's, as in the header."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      0,
+      57
+     ]
+    },
+    "kind": "structure",
+    "reason": "The band of dots is DaVinci's own (D2); only its text is left out."
+   },
+   {
+    "kind": "art",
+    "region": {
+     "rows": [
+      10,
+      15
+     ],
+     "cols": [
+      0,
+      57
+     ]
+    },
+    "band": {
+     "rows": [
+      2,
+      15
+     ],
+     "cols": [
+      0,
+      119
+     ]
+    },
+    "lines": [
+     "         ▄▄███▀▄▄   ▄▄",
+     "        ▀▀▀▀▀▀▀▀▀▀  █",
+     "       ███████████ █",
+     "      ▄▄ ▀▀▀▀▀▀▀▄▄▀",
+     "     ▀▀▀▀ ▀▀▀▀▀▀",
+     "··························································"
+    ],
+    "reason": "DaVinci's own welcome art (D2): the reference's star field and mark are not drawn. The rectangle holds DaVinci's painter sprite on rows 10-14 and its dot row 15 (0-based); nothing else is drawn in the band between the title and the steps."
+   },
+   {
+    "region": {
+     "rows": [
+      17,
+      17
+     ],
+     "cols": [
+      1,
+      15
+     ]
+    },
+    "kind": "structure",
+    "reason": "Onboarding copy is DaVinci's own (D2); the same row, structure only."
+   },
+   {
+    "kind": "copy",
+    "region": {
+     "rows": [
+      19,
+      19
+     ],
+     "cols": [
+      1,
+      32
+     ]
+    },
+    "entries": [
+     {
+      "row": 19,
+      "col": 1,
+      "text": "1. DaVinci can get things wrong."
+     }
+    ],
+    "reason": "DaVinci's own wording (D2): same words as the manifest says, same foreground and modifier combinations as the row it stands for."
+   },
+   {
+    "kind": "copy",
+    "region": {
+     "rows": [
+      20,
+      20
+     ],
+     "cols": [
+      1,
+      60
+     ]
+    },
+    "entries": [
+     {
+      "row": 20,
+      "col": 4,
+      "text": "You decide what runs: read each change and each command"
+     }
+    ],
+    "reason": "DaVinci's own wording (D2): same words as the manifest says, same foreground and modifier combinations as the row it stands for."
+   },
+   {
+    "kind": "copy",
+    "region": {
+     "rows": [
+      21,
+      21
+     ],
+     "cols": [
+      1,
+      61
+     ]
+    },
+    "entries": [
+     {
+      "row": 21,
+      "col": 4,
+      "text": "before you approve it, most of all when code will execute."
+     }
+    ],
+    "reason": "DaVinci's own wording (D2): same words as the manifest says, same foreground and modifier combinations as the row it stands for."
+   },
+   {
+    "kind": "copy",
+    "region": {
+     "rows": [
+      23,
+      23
+     ],
+     "cols": [
+      1,
+      107
+     ]
+    },
+    "entries": [
+     {
+      "row": 23,
+      "col": 1,
+      "text": "2. Files and web pages can hide instructions for the agent (prompt injection), so open only code you trust."
+     }
+    ],
+    "reason": "DaVinci's own wording (D2): same words as the manifest says, same foreground and modifier combinations as the row it stands for."
+   },
+   {
+    "kind": "dropped",
+    "region": {
+     "rows": [
+      24,
+      24
+     ],
+     "cols": [
+      4,
+      55
+     ]
+    },
+    "reason": "D7: the reference's link line (a caption and an underlined documentation link) is not drawn; these cells must be blank."
+   },
+   {
+    "region": {
+     "rows": [
+      26,
+      26
+     ],
+     "cols": [
+      1,
+      24
+     ]
+    },
+    "kind": "structure",
+    "reason": "The press-Enter line is DaVinci's own wording (D2); structure only."
+   }
+  ]
+ }
+}

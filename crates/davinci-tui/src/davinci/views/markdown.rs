@@ -633,14 +633,26 @@ fn visit_block(block: &Block, width: u16, ctx: &Ctx, emit: &mut dyn FnMut(Line<'
         Block::Paragraph(inlines) => visit_inlines(inlines, measure(width), false, ctx, emit),
         Block::Heading { inlines, .. } => visit_inlines(inlines, measure(width), true, ctx, emit),
         Block::Code { lang, text } => visit_code_rows(lang.as_deref(), text, width, ctx, emit),
-        Block::Quote(children) => visit_blocks(
-            children,
-            width.saturating_sub(2),
-            &ctx.muted(),
-            true,
-            &mut |line| emit(prefixed(vec![span("│ ", ctx.theme.muted)], line)),
-        ),
+        Block::Quote(children) => {
+            // The reference marks a quote with a left quarter block in the text colour;
+            // the shell's own markdown keeps its vertical bar in the muted ink.
+            let (mark, ink) = if ctx.theme.reference {
+                ("▎ ", ctx.base)
+            } else {
+                ("│ ", ctx.theme.muted)
+            };
+            visit_blocks(
+                children,
+                width.saturating_sub(2),
+                &ctx.muted(),
+                true,
+                &mut |line| emit(prefixed(vec![span(mark, ink)], line)),
+            )
+        }
         Block::List { start, items } => visit_list_rows(*start, items, width, ctx, emit),
+        Block::Rule if ctx.theme.reference => {
+            emit(Line::from(vec![span("---", ctx.base)]));
+        }
         Block::Rule => emit(hair_rule(width, ctx.theme, "")),
         Block::Html(text) => {
             for line in text.lines() {
@@ -865,6 +877,10 @@ fn visit_table_rows(
     ctx: &Ctx,
     emit: &mut dyn FnMut(Line<'static>),
 ) {
+    if ctx.theme.reference {
+        visit_table_rows_reference(header, rows, width, ctx, emit);
+        return;
+    }
     let columns = header
         .len()
         .max(rows.iter().map(Vec::len).max().unwrap_or(0));
@@ -902,6 +918,69 @@ fn visit_table_rows(
     for row in rows {
         emit(Line::from(vec![span(join(row), ctx.base)]));
     }
+}
+
+/// The reference's Markdown table: box-drawn, one row per line, a rule between every
+/// pair of rows, and a numeric cell right-aligned in its column.
+fn visit_table_rows_reference(
+    header: &[String],
+    rows: &[Vec<String>],
+    width: u16,
+    ctx: &Ctx,
+    emit: &mut dyn FnMut(Line<'static>),
+) {
+    let columns = header
+        .len()
+        .max(rows.iter().map(Vec::len).max().unwrap_or(0));
+    if columns == 0 {
+        return;
+    }
+    let mut widths = vec![0usize; columns];
+    for row in std::iter::once(header).chain(rows.iter().map(Vec::as_slice)) {
+        for (column, cell) in row.iter().enumerate().take(columns) {
+            widths[column] = widths[column].max(UnicodeWidthStr::width(cell.trim()));
+        }
+    }
+    let rule = |left: &str, middle: &str, right: &str| {
+        let mut out = String::from(left);
+        for (column, width) in widths.iter().enumerate() {
+            if column > 0 {
+                out.push_str(middle);
+            }
+            out.push_str(&"─".repeat(width + 2));
+        }
+        out.push_str(right);
+        clip_ellipsis(&out, width)
+    };
+    let row_line = |cells: &[String]| {
+        let mut out = String::from("│");
+        for (column, width) in widths.iter().enumerate() {
+            let cell = cells.get(column).map_or("", |text| text.trim());
+            let pad = width.saturating_sub(UnicodeWidthStr::width(cell));
+            out.push(' ');
+            if !cell.is_empty() && cell.parse::<f64>().is_ok() {
+                out.push_str(&" ".repeat(pad));
+                out.push_str(cell);
+            } else {
+                out.push_str(cell);
+                out.push_str(&" ".repeat(pad));
+            }
+            out.push_str(" │");
+        }
+        clip_ellipsis(&out, width)
+    };
+    emit(Line::from(vec![span(rule("┌", "┬", "┐"), ctx.base)]));
+    if !header.is_empty() {
+        emit(Line::from(vec![span(row_line(header), ctx.base)]));
+        emit(Line::from(vec![span(rule("├", "┼", "┤"), ctx.base)]));
+    }
+    for (index, row) in rows.iter().enumerate() {
+        emit(Line::from(vec![span(row_line(row), ctx.base)]));
+        if index + 1 < rows.len() {
+            emit(Line::from(vec![span(rule("├", "┼", "┤"), ctx.base)]));
+        }
+    }
+    emit(Line::from(vec![span(rule("└", "┴", "┘"), ctx.base)]));
 }
 
 #[cfg(test)]

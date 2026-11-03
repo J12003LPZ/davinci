@@ -27,6 +27,11 @@ pub fn copy_text_dry_run() -> bool {
     matches!(
         std::env::var("PI_COPY_DRY_RUN").as_deref(),
         Ok("1") | Ok("true") | Ok("yes")
+    ) || matches!(
+        // The replay's clipboard switch covers both directions: a run that must
+        // not read the machine's clipboard must not write it either.
+        std::env::var("PI_CLIPBOARD_DRY_RUN").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
     ) || open_browser_dry_run()
 }
 

@@ -797,6 +797,7 @@ impl InteractiveSession {
             extra_providers: &self.extra_autocomplete,
             cwd: &self.cwd,
             force_path,
+            reference: false,
         });
         if let Some(mut found) = found {
             found.items.truncate(self.autocomplete_max_visible);

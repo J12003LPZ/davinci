@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Stdout, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Once, OnceLock};
+use std::sync::{Arc, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -32,6 +32,7 @@ use unicode_width::UnicodeWidthChar;
 use super::app::{self, Flow};
 use super::model::Model;
 use super::model::TerminalTask;
+use super::named_sgr::NamedSgr;
 use super::views::scrollbar::Scrollbar;
 use super::views::viewer::ViewerTask;
 
@@ -88,8 +89,13 @@ fn supports_keyboard_enhancement() -> bool {
 /// so the terminal can be given back from a panic hook, which has no `Session`
 /// to ask.
 static DISAMBIGUATED: AtomicBool = AtomicBool::new(false);
-/// Whether the alternate screen is currently ours.
+/// Whether the terminal is currently ours (raw mode and the modes set at open).
 static HELD: AtomicBool = AtomicBool::new(false);
+/// Whether the alternate screen is currently ours.
+static ALTERNATE: AtomicBool = AtomicBool::new(false);
+/// Whether the main screen is ours instead: the reference's first-run steps, which run
+/// off the alternate screen until they end.
+static INLINE: AtomicBool = AtomicBool::new(false);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static MAIN_THREAD: OnceLock<std::thread::ThreadId> = OnceLock::new();
 
@@ -112,6 +118,92 @@ fn panic_restores_terminal() -> bool {
         .is_some_and(|main| *main == std::thread::current().id())
 }
 static MOUSE: AtomicBool = AtomicBool::new(false);
+/// Whether this process asked the terminal for the reference's extra modes.
+/// Restore reads this, never the setting, so a session that started with the
+/// reference on gives it back whatever the setting says by then.
+static REFERENCE: AtomicBool = AtomicBool::new(false);
+/// Whether the reference's mouse modes were actually written: with
+/// `DAVINCI_DISABLE_MOUSE` they never are, and restore must not turn them off.
+static REFERENCE_MOUSE: AtomicBool = AtomicBool::new(false);
+
+/// Mouse click, drag, move and SGR coordinates, as the reference asks for at
+/// fullscreen. Written as text on every platform: crossterm's Windows mouse
+/// capture sets a console flag and puts nothing in the output stream.
+pub const REFERENCE_MODES_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+/// The matching offs, plus synchronized output so a frame cut short by a
+/// panic cannot leave the terminal holding its display.
+pub const REFERENCE_MODES_OFF: &str = "\x1b[?2026l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+/// What is left of [`REFERENCE_MODES_OFF`] when the mouse modes were never enabled.
+pub const REFERENCE_SYNC_OFF: &str = "\x1b[?2026l";
+
+/// What restore writes for the reference: the mouse offs only if the mouse was turned on.
+pub fn reference_modes_off(mouse_enabled: bool) -> &'static str {
+    if mouse_enabled {
+        REFERENCE_MODES_OFF
+    } else {
+        REFERENCE_SYNC_OFF
+    }
+}
+
+/// Whether the reference shell is on: `PI_DAVINCI_REFERENCE` decides when it
+/// says yes (`1`, `true`, `yes`, `on`) or no (`0`, `false`, `no`, `off`); an
+/// empty or unreadable value leaves it to the `tui.reference` setting.
+pub fn reference_enabled(env: Option<&str>, setting: bool) -> bool {
+    match env
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        _ => setting,
+    }
+}
+
+/// Whether a session opens on the alternate screen, with the mouse on, at once. The
+/// reference's first run does not: its welcome steps run on the main screen with the mouse
+/// off, and the session goes fullscreen when they end. Everything else is fullscreen.
+pub fn fullscreen_at_open(reference: bool, defer_first_run: bool) -> bool {
+    !(reference && defer_first_run)
+}
+
+/// What a restore does with the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenExit {
+    /// Leave the alternate screen.
+    Alternate,
+    /// The main screen was ours: start a fresh line under the last frame.
+    Inline,
+    /// The screen was never taken.
+    Nothing,
+}
+
+/// What to undo for the screen, from what was entered.
+pub fn screen_exit(alternate: bool, inline: bool) -> ScreenExit {
+    if alternate {
+        ScreenExit::Alternate
+    } else if inline {
+        ScreenExit::Inline
+    } else {
+        ScreenExit::Nothing
+    }
+}
+
+/// What the reference adds for the mouse: nothing unless it is on and the
+/// mouse has not been turned off with `DAVINCI_DISABLE_MOUSE`.
+pub fn reference_mouse_on(reference: bool, mouse: bool) -> &'static str {
+    if reference && mouse {
+        REFERENCE_MODES_ON
+    } else {
+        ""
+    }
+}
+
+fn write_reference_modes(out: &mut impl Write) {
+    let on = reference_mouse_on(true, !env_flag("DAVINCI_DISABLE_MOUSE"));
+    REFERENCE_MOUSE.store(!on.is_empty(), Ordering::SeqCst);
+    let _ = out.write_all(on.as_bytes());
+    let _ = out.flush();
+}
 
 #[cfg(unix)]
 const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
@@ -120,6 +212,16 @@ const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
 fn event_marks_dirty(event: &Event) -> bool {
     !matches!(event, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved)
+}
+
+/// The reference's part of [`restore`]: its terminal modes off, the mouse ones
+/// only if they were turned on.
+fn write_reference_restore(out: &mut impl Write) {
+    if REFERENCE.swap(false, Ordering::SeqCst) {
+        let mouse = REFERENCE_MOUSE.swap(false, Ordering::SeqCst);
+        let _ = out.write_all(reference_modes_off(mouse).as_bytes());
+        let _ = out.flush();
+    }
 }
 
 /// Undo everything [`Session::open`] did, from anywhere, at most once.
@@ -144,8 +246,24 @@ pub fn restore() -> io::Result<()> {
             let _ = execute!(io::stdout(), event::DisableMouseCapture);
         }
     }
+    write_reference_restore(&mut io::stdout());
     let _ = execute!(io::stdout(), DisableFocusChange, DisableBracketedPaste);
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+    match screen_exit(
+        ALTERNATE.swap(false, Ordering::SeqCst),
+        INLINE.swap(false, Ordering::SeqCst),
+    ) {
+        ScreenExit::Alternate => {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        }
+        ScreenExit::Inline => {
+            let mut out = io::stdout();
+            let _ = out.write_all(b"\x1b[0m\r\n");
+            let _ = execute!(out, Show);
+        }
+        ScreenExit::Nothing => {
+            let _ = execute!(io::stdout(), Show);
+        }
+    }
     let _ = disable_raw_mode();
     io::stdout().flush()
 }
@@ -357,9 +475,17 @@ impl PasteFilter {
 
 /// The terminal, for as long as the TUI owns it.
 pub struct Session {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: Terminal<CrosstermBackend<NamedSgr<Stdout>>>,
+    /// Whether frames write named colours as `30-37` rather than `38;5;N`:
+    /// the reference shell at ANSI depth. Set before each frame.
+    named_sgr: Arc<AtomicBool>,
     generation: Generation,
     keyboard: Keyboard,
+    /// `tui.reference` (or `PI_DAVINCI_REFERENCE`), fixed when the session opened.
+    reference: bool,
+    /// The reference's first run: still on the main screen, mouse off, until the welcome
+    /// steps end.
+    deferred: bool,
     paste: PasteFilter,
     rendered_lines: Vec<String>,
     selector: super::selection::Selector,
@@ -459,14 +585,44 @@ impl Session {
     /// Take the terminal: raw mode, alternate screen, and the kitty keyboard
     /// protocol when the terminal supports it.
     pub fn open() -> io::Result<Self> {
+        Self::open_with(false)
+    }
+
+    /// [`Session::open`] with the `tui.reference` setting. The setting and
+    /// `PI_DAVINCI_REFERENCE` are read here, once, and never again.
+    pub fn open_with(reference_setting: bool) -> io::Result<Self> {
+        Self::open_deferring(reference_setting, false)
+    }
+
+    /// [`Session::open_with`] for a first run that may be due. With the reference on and
+    /// `first_run` set, the session starts on the main screen with the mouse off, as the
+    /// reference's welcome steps do, and [`Session::draw`] takes the alternate screen and
+    /// the mouse when the steps end. With the reference off nothing differs from
+    /// [`Session::open_with`].
+    pub fn open_deferring(reference_setting: bool, first_run: bool) -> io::Result<Self> {
+        let reference = reference_enabled(
+            std::env::var("PI_DAVINCI_REFERENCE").ok().as_deref(),
+            reference_setting,
+        );
+        let deferred = !fullscreen_at_open(reference, first_run);
         install_panic_hook();
         let generation = Generation::begin();
+        let named_sgr = Arc::new(AtomicBool::new(false));
         let opened = (|| {
             enable_raw_mode()?;
             HELD.store(true, Ordering::SeqCst);
+            REFERENCE.store(reference && !deferred, Ordering::SeqCst);
             let mut out = io::stdout();
-            execute!(out, EnterAlternateScreen)?;
+            if deferred {
+                INLINE.store(true, Ordering::SeqCst);
+            } else {
+                ALTERNATE.store(true, Ordering::SeqCst);
+                execute!(out, EnterAlternateScreen)?;
+            }
             let _ = execute!(out, EnableBracketedPaste, EnableFocusChange);
+            if reference && !deferred {
+                write_reference_modes(&mut out);
+            }
             let disambiguated = supports_keyboard_enhancement();
             if disambiguated {
                 execute!(
@@ -477,7 +633,13 @@ impl Session {
                 )?;
                 DISAMBIGUATED.store(true, Ordering::SeqCst);
             }
-            let terminal = Terminal::new(CrosstermBackend::new(out))?;
+            let mut terminal =
+                Terminal::new(CrosstermBackend::new(NamedSgr::new(out, named_sgr.clone())))?;
+            if deferred {
+                // The main screen holds the shell's own text; the first frame only
+                // writes the cells it fills.
+                terminal.clear()?;
+            }
             Ok::<_, io::Error>((terminal, disambiguated))
         })();
         let (terminal, disambiguated) = match opened {
@@ -489,8 +651,11 @@ impl Session {
         };
         Ok(Self {
             terminal,
+            named_sgr,
             generation,
             keyboard: Keyboard { disambiguated },
+            reference,
+            deferred,
             paste: PasteFilter {
                 burst: cfg!(windows).then(super::paste_burst::PasteBurst::default),
                 ..PasteFilter::default()
@@ -519,6 +684,35 @@ impl Session {
         })
     }
 
+    /// Whether the reference shell is on for this session.
+    pub fn reference(&self) -> bool {
+        self.reference
+    }
+
+    /// Whether the session is still on the main screen with the mouse off (the
+    /// reference's first-run steps).
+    pub fn deferred(&self) -> bool {
+        self.deferred
+    }
+
+    /// Take the alternate screen and the reference's modes, once the first-run steps
+    /// have ended. Does nothing when the session was never deferred.
+    pub fn enter_fullscreen(&mut self) -> io::Result<()> {
+        if !self.deferred {
+            return Ok(());
+        }
+        self.deferred = false;
+        INLINE.store(false, Ordering::SeqCst);
+        ALTERNATE.store(true, Ordering::SeqCst);
+        let mut out = io::stdout();
+        execute!(out, EnterAlternateScreen)?;
+        if self.reference {
+            REFERENCE.store(true, Ordering::SeqCst);
+            write_reference_modes(&mut out);
+        }
+        self.forget_screen()
+    }
+
     /// Use the terminal's own cursor at the caret (the `showHardwareCursor`
     /// setting); the environment can turn it on but a setting cannot turn
     /// the environment's choice off.
@@ -537,9 +731,18 @@ impl Session {
         }
         enable_raw_mode()?;
         HELD.store(true, Ordering::SeqCst);
+        REFERENCE.store(self.reference && !self.deferred, Ordering::SeqCst);
         let mut out = io::stdout();
-        execute!(out, EnterAlternateScreen)?;
+        if self.deferred {
+            INLINE.store(true, Ordering::SeqCst);
+        } else {
+            ALTERNATE.store(true, Ordering::SeqCst);
+            execute!(out, EnterAlternateScreen)?;
+        }
         let _ = execute!(out, EnableBracketedPaste, EnableFocusChange);
+        if self.reference && !self.deferred {
+            write_reference_modes(&mut out);
+        }
         if self.keyboard.disambiguated {
             let _ = execute!(
                 out,
@@ -712,6 +915,10 @@ impl Session {
         if !HELD.load(Ordering::SeqCst) {
             return Ok(());
         }
+        // The first-run steps ended (finished, left or answered): fullscreen from here on.
+        if self.deferred && model.onboarding.is_none() {
+            self.enter_fullscreen()?;
+        }
         if let Some(task) = model.viewer_task.take() {
             self.run_viewer_task(task, model)?;
         }
@@ -720,7 +927,7 @@ impl Session {
             Some(TerminalTask::Suspend) => self.suspend()?,
             None => {}
         }
-        let mouse = !env_flag("DAVINCI_DISABLE_MOUSE");
+        let mouse = !self.deferred && !env_flag("DAVINCI_DISABLE_MOUSE");
         if mouse != MOUSE.load(Ordering::SeqCst) {
             #[cfg(unix)]
             {
@@ -740,6 +947,12 @@ impl Session {
         }
         pin_unless_auto_scroll(model, self.scrollbar, self.drawn_entries);
         self.drawn_entries = model.transcript.len();
+        // The theme in force decides, so a live switch through the picker
+        // changes how the very next frame is written.
+        self.named_sgr.store(
+            self.reference && model.theme.depth_hint() == super::theme::ColorDepth::Basic,
+            Ordering::SeqCst,
+        );
         model.terminal_focused = self.focused;
         model.native_cursor = self.output.native_cursor;
         let model: &Model = model;
@@ -988,12 +1201,36 @@ impl Session {
             }
             return false;
         }
-        if model.screen == Screen::Agent && !model.show_tool_output && row.contains("to expand)") {
+        if click_expands_tool_output(model, row) {
             model.show_tool_output = true;
             model.dirty = true;
             return true;
         }
         false
+    }
+
+    /// The one-row summary of a collapsed tool group (`Read 1 file`, `Ran 2 shell
+    /// commands`). Clicking it opens the group's tool output, as the reference does.
+    fn is_collapsed_tool_summary(row: &str) -> bool {
+        let text = row.trim_start();
+        [
+            "Read ",
+            "Reading ",
+            "Searched for ",
+            "Searching for ",
+            "Listed ",
+            "Listing ",
+            "Ran ",
+            "Running ",
+            "Made ",
+            "Making ",
+        ]
+        .iter()
+        .any(|prefix| {
+            text.strip_prefix(prefix)
+                .and_then(|rest| rest.split_whitespace().next())
+                .is_some_and(|count| count.parse::<usize>().is_ok())
+        })
     }
 
     /// Open the link under a Ctrl- or Cmd-click. `true` when there was one.
@@ -1127,6 +1364,15 @@ impl Session {
             Ok(())
         }
     }
+}
+
+/// Whether a click on `row` opens the collapsed tool output. A `to expand)` row
+/// does everywhere; the one-row group summary only in the reference shell.
+fn click_expands_tool_output(model: &Model, row: &str) -> bool {
+    model.screen == super::model::Screen::Agent
+        && !model.show_tool_output
+        && (row.contains("to expand)")
+            || (model.reference && Session::is_collapsed_tool_summary(row)))
 }
 
 impl Drop for Session {
@@ -1712,7 +1958,52 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
 
 #[cfg(test)]
 mod tests {
+    use super::super::model::Model;
+    use super::super::theme::{ColorDepth, Theme};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn a_collapsed_tool_summary_click_expands_only_in_the_reference_shell() {
+        let mut model = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 80, 24, true);
+        model.screen = super::super::model::Screen::Agent;
+        assert!(super::click_expands_tool_output(
+            &model,
+            "Read 2 files (ctrl+o to expand)"
+        ));
+        assert!(!super::click_expands_tool_output(&model, "  Read 2 files"));
+        model.reference = true;
+        assert!(super::click_expands_tool_output(&model, "  Read 2 files"));
+    }
+
+    #[test]
+    fn restore_leaves_mouse_modes_alone_when_they_were_never_enabled() {
+        // The function `restore` calls, with a buffer for the terminal.
+        super::REFERENCE.store(true, Ordering::SeqCst);
+        super::REFERENCE_MOUSE.store(false, Ordering::SeqCst);
+        let mut off = Vec::new();
+        super::write_reference_restore(&mut off);
+        assert_eq!(off, b"\x1b[?2026l");
+        for mode in ["1000", "1002", "1003", "1006"] {
+            assert!(
+                !String::from_utf8_lossy(&off).contains(mode),
+                "{mode} written for a mouse never on"
+            );
+        }
+        assert!(!super::REFERENCE.load(Ordering::SeqCst));
+
+        super::REFERENCE.store(true, Ordering::SeqCst);
+        super::REFERENCE_MOUSE.store(true, Ordering::SeqCst);
+        let mut on = Vec::new();
+        super::write_reference_restore(&mut on);
+        assert_eq!(on, super::REFERENCE_MODES_OFF.as_bytes());
+        assert!(!super::REFERENCE_MOUSE.load(Ordering::SeqCst));
+
+        // Not a reference session: nothing is written.
+        let mut none = Vec::new();
+        super::write_reference_restore(&mut none);
+        assert!(none.is_empty());
+    }
+
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -2048,6 +2339,52 @@ mod tests {
             KeyCode::Char('a'),
             KeyModifiers::NONE,
         ))));
+    }
+
+    #[test]
+    fn the_mouse_changes_nothing_behind_the_theme_picker() {
+        use super::super::model::{Entry, HitCache};
+        let theme = super::super::theme::Theme::reference(
+            super::super::theme::ColorDepth::TrueColor,
+            false,
+        );
+        let mut model = Model::new(theme, 80, 14, false);
+        model.reference = true;
+        for n in 0..40 {
+            model.transcript.push(Entry::user(&format!("row {n}")));
+        }
+        model.composer.set_text("draft");
+        assert!(app::scroll_transcript(&mut model, 6));
+        let top = model.transcript_scroll.get().top;
+        assert!(top.is_some());
+        assert!(super::super::views::theme_picker::open(&mut model, "dark"));
+        // What the draw that showed the picker leaves for the next event.
+        let composed = app::compose_frame(&model, model.height);
+        *model.hit_cache.borrow_mut() = Some(HitCache {
+            targets: composed.targets.clone(),
+            suggestion_rows: composed.suggestion_rows.clone(),
+        });
+        let mut grab = None;
+        for row in 0..model.height {
+            for kind in [
+                event::MouseEventKind::ScrollUp,
+                event::MouseEventKind::ScrollDown,
+                event::MouseEventKind::Down(event::MouseButton::Left),
+            ] {
+                let mouse = event::MouseEvent {
+                    kind,
+                    column: 3,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                };
+                route_scroll_mouse(&mut model, &mut grab, composed.scrollbar, mouse);
+                route_click_target(&mut model, mouse);
+            }
+        }
+        assert_eq!(model.transcript_scroll.get().top, top);
+        assert_eq!(model.composer.editor().get_text(), "draft");
+        assert!(model.theme_picker.is_some());
+        assert_eq!(model.theme, theme);
     }
 
     #[test]

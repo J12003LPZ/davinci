@@ -64,6 +64,8 @@ pub struct SuggestionQuery<'a> {
     pub extra_providers: &'a [ExtraAutocompleteProvider],
     pub cwd: &'a Path,
     pub force_path: bool,
+    /// The reference shell also matches a command's description, as its list does.
+    pub reference: bool,
 }
 
 pub fn apply_completion(
@@ -163,7 +165,7 @@ pub fn suggestions(query: SuggestionQuery<'_>) -> Option<AutocompleteSuggestions
             // Command names use a stricter relevance pipeline than generic fuzzy lists.
             // Short slash queries intentionally reject weak interior/subsequence hits so
             // `/me` stays about memory commands instead of filling with model/name/resume.
-            let filtered = rank_slash_commands(rest, query.commands);
+            let filtered = rank_slash_commands(rest, query.commands, query.reference);
             if filtered.is_empty() {
                 return None;
             }
@@ -224,6 +226,7 @@ struct SlashMatch {
 fn rank_slash_commands<'a>(
     query: &str,
     commands: &'a [SlashCommandSpec],
+    reference: bool,
 ) -> Vec<&'a SlashCommandSpec> {
     if query.is_empty() {
         return commands.iter().collect();
@@ -235,16 +238,36 @@ fn rank_slash_commands<'a>(
         .enumerate()
         .filter_map(|(index, command)| {
             let name = command.name.to_lowercase();
-            slash_name_match(&query_lower, &name).map(|matched| {
+            if let Some(matched) = slash_name_match(&query_lower, &name) {
                 let description_hit = command.description.to_lowercase().contains(&query_lower);
-                (
+                return Some((
                     matched,
                     description_hit,
                     name.chars().count(),
                     index,
                     command,
-                )
-            })
+                ));
+            }
+            // The reference's list scores a command whose description carries what was
+            // typed, after every name match; the shell's own list stays name-only.
+            if reference {
+                let description = command.description.to_lowercase();
+                if let Some(position) = description.find(&query_lower) {
+                    return Some((
+                        SlashMatch {
+                            class: 9,
+                            distance: 0,
+                            position,
+                            fuzzy_score: 0.0,
+                        },
+                        true,
+                        name.chars().count(),
+                        index,
+                        command,
+                    ));
+                }
+            }
+            None
         })
         .collect::<Vec<_>>();
 
@@ -1274,6 +1297,7 @@ mod tests {
             extra_providers: &[],
             cwd,
             force_path: false,
+            reference: false,
         }
     }
 
@@ -1516,6 +1540,7 @@ mod slash_relevance_tests {
             extra_providers: &[],
             cwd: Path::new("."),
             force_path: false,
+            reference: false,
         }
     }
 
@@ -1749,6 +1774,7 @@ mod slash_source_visibility_tests {
             extra_providers: &[],
             cwd: Path::new("."),
             force_path: false,
+            reference: false,
         })
         .unwrap();
         let values = found

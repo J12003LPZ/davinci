@@ -717,6 +717,7 @@ pub fn context_usage_view(
         items,
     };
     ContextUsageView {
+        all: false,
         model: usage.model.clone(),
         window: usage.context_window,
         categories,

@@ -285,6 +285,7 @@ mod tests {
         ];
         let used: u64 = categories.iter().map(|c| c.tokens).sum();
         ContextUsageView {
+            all: false,
             model: "gpt-6-luna".into(),
             window,
             free: window.saturating_sub(used + buffer),

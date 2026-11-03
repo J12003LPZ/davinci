@@ -152,9 +152,13 @@ pub struct InteractiveSettingsConfig {
     pub install_telemetry: bool,
     pub default_project_trust: String,
     pub tui_mode: String,
+    /// `tui.reference`: the reference-style terminal modes, read at the next start.
+    pub tui_reference: bool,
     pub fullscreen_exit_output: String,
     pub fullscreen_scrollbar: String,
     pub fullscreen_copy_on_select: bool,
+    /// Static frames instead of the animated spinner.
+    pub reduce_motion: bool,
     pub show_images: bool,
     pub image_width_cells: u32,
     pub auto_resize_images: bool,
@@ -201,9 +205,11 @@ impl Default for InteractiveSettingsConfig {
             install_telemetry: false,
             default_project_trust: "Ask".into(),
             tui_mode: "regular".into(),
+            tui_reference: false,
             fullscreen_exit_output: "transcript".into(),
             fullscreen_scrollbar: "auto".into(),
             fullscreen_copy_on_select: true,
+            reduce_motion: false,
             show_images: true,
             image_width_cells: 80,
             auto_resize_images: true,
@@ -291,6 +297,12 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 "Show images",
                 "Render images inline in terminal",
                 config.show_images,
+            ),
+            bool_item(
+                "reduce-motion",
+                "Reduce motion",
+                "Static frames; no animated spinner",
+                config.reduce_motion,
             ),
             SettingItem {
                 id: "image-width-cells".into(),
@@ -532,6 +544,12 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 current_value: config.tui_mode.clone(),
                 values: vec!["regular".into(), "fullscreen".into()],
             },
+            bool_item(
+                "tui.reference",
+                "Reference interface (next start)",
+                "Match the reference terminal modes; takes effect on next start, PI_DAVINCI_REFERENCE=1 forces it on",
+                config.tui_reference,
+            ),
             SettingItem {
                 id: "fullscreen-exit-output".into(),
                 label: "Fullscreen exit output".into(),

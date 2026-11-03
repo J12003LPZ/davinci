@@ -41,6 +41,7 @@ pub fn group_rank(key: &str) -> usize {
         | "collapse-changelog"
         | "quiet-startup"
         | "tui-mode"
+        | "tui.reference"
         | "fullscreen-exit-output"
         | "fullscreen-scrollbar"
         | "fullscreen-copy-on-select"

@@ -1466,7 +1466,23 @@ fn apply(model: &mut Model, turn: &mut Turn, event: &AgentEvent) {
                     .map(|usage| usage.output)
                     .unwrap_or_default();
                 let estimated = estimate_tokens(&davinci_ai::content_text(&message.content));
-                working.tokens = turn.streamed + reported.max(estimated);
+                // Delta events in this stream carry no whole message, so the counter
+                // also reads the block being streamed: the reference shows its token
+                // count from the first delta, not only when the message ends.
+                let live = if model.reference {
+                    model
+                        .transcript
+                        .iter()
+                        .rev()
+                        .find_map(|entry| match entry {
+                            Entry::Prose(text) => Some(estimate_tokens(text)),
+                            _ => None,
+                        })
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                working.tokens = turn.streamed + reported.max(estimated).max(live);
             }
         }
 
@@ -1528,6 +1544,7 @@ fn double_escape(
         && key.modifiers.is_empty()
         && model.viewing_worker().is_none()
         && model.overlay.is_none()
+        && model.theme_picker.is_none()
         && model.suggestions.is_none()
         && model.screen == davinci_tui::davinci::model::Screen::Agent
         && !model.codex_open()
@@ -1545,18 +1562,64 @@ fn double_escape(
     doubled
 }
 
-/// Cycle the permission mode while a turn owns the agent. The next mode comes
-/// from what the footer shows (a queued one, else the model's), the footer
-/// changes at once, and the worker applies the queued mode before its next
-/// batch of tool calls.
+/// Cycle the permission mode while a turn owns the agent. The worker applies
+/// the queued mode before its next batch of tool calls.
+///
+/// With the reference shell on, the footer keeps showing the mode the agent
+/// holds until the worker has applied the request (`settle_requested_mode`), so
+/// a batch that started under Edits is never labelled Plan. The next mode comes
+/// from the queued slot, else the last request the worker already took, else the
+/// footer. With it off, the footer moves at once, as on main.
 fn cycle_permission_mode_mid_turn(model: &mut Model, pending: &Mutex<Option<PermissionMode>>) {
     let mut slot = pending.lock().unwrap_or_else(|err| err.into_inner());
     let shown = (*slot)
+        .or_else(|| {
+            model
+                .requested_permission_mode
+                .as_deref()
+                .and_then(PermissionMode::parse)
+        })
         .or_else(|| PermissionMode::parse(&model.permission_mode))
         .unwrap_or_default();
-    let next = shown.next();
+    let next = if model.reference {
+        shown.next_reference()
+    } else {
+        shown.next()
+    };
     *slot = Some(next);
-    model.permission_mode = next.as_str().to_string();
+    if model.reference {
+        model.requested_permission_mode = Some(next.as_str().to_string());
+    } else {
+        model.permission_mode = next.as_str().to_string();
+    }
+}
+
+/// On a UI tick of a running turn (reference shell only): the footer takes the
+/// mode the agent reported installing (`applied`, published after
+/// `set_permission_mode` returned), never a queued request or an emptied slot.
+/// `requested_permission_mode` is only the cycle position for the next press;
+/// it clears once nothing is outstanding: the slot is empty and the agent
+/// reported the requested mode.
+fn settle_requested_mode(
+    model: &mut Model,
+    pending: &Mutex<Option<PermissionMode>>,
+    applied: &Mutex<Option<PermissionMode>>,
+) {
+    if !model.reference {
+        return;
+    }
+    let installed = *applied.lock().unwrap_or_else(|err| err.into_inner());
+    let Some(installed) = installed else {
+        return;
+    };
+    model.permission_mode = installed.as_str().to_string();
+    let slot_empty = pending
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .is_none();
+    if slot_empty && model.requested_permission_mode.as_deref() == Some(installed.as_str()) {
+        model.requested_permission_mode = None;
+    }
 }
 
 fn mid_turn_key(
@@ -1572,6 +1635,37 @@ fn mid_turn_key(
         return false;
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // The reference's send-now chord is `ctrl+x ctrl+s`; ctrl+enter is the same action
+    // where the terminal can deliver a modified Enter (CSI-u), which the byte harness
+    // and this console path cannot.
+    if model.reference && ctrl && key.code == KeyCode::Char('x') {
+        model.chord_x = Some(std::time::Instant::now());
+        return false;
+    }
+    if model.reference && ctrl && key.code == KeyCode::Char('s') {
+        let chord = model
+            .chord_x
+            .take()
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(1500));
+        if chord && model.send_now() {
+            // The user sent this line on purpose: it starts even after a Ctrl+C hold.
+            release_queue_hold(model);
+            abort.store(true, Ordering::Relaxed);
+            model.interrupt();
+        }
+        return false;
+    }
+    // Up restores the newest queued line for editing, taking it out of the queue.
+    if model.reference
+        && key.code == KeyCode::Up
+        && model.composer.is_empty()
+        && !model.queued.is_empty()
+    {
+        if let Some(line) = model.queued.pop() {
+            model.composer.set_text(line);
+        }
+        return false;
+    }
     if let Some(data) = davinci_tui::key_event_bytes(&key) {
         if model.keybindings.matches(&data, "davinci.tools.expand") {
             model.show_tool_output = !model.show_tool_output;
@@ -1602,6 +1696,13 @@ fn mid_turn_key(
             if model.viewing_worker().is_some() {
                 model.push_toast("interrupting main".into());
             }
+            // A second Ctrl+C within the window leaves; the first one also holds
+            // the queued line, so an exit never starts a request.
+            if model.reference {
+                model.ctrl_c_armed = Some(std::time::Instant::now());
+                hold_queue_on_cancel(model);
+                model.exit_armed = true;
+            }
             let again = abort.swap(true, Ordering::Relaxed);
             model.interrupt();
             return again;
@@ -1610,6 +1711,15 @@ fn mid_turn_key(
         // Tool output can be opened while the turn still runs: that is when
         // a long read is most worth seeing.
         KeyCode::Char(_) if ctrl => {}
+        // Ctrl+Enter sends now: the draft preempts the running turn, whose partial
+        // text stays, and becomes the next request.
+        KeyCode::Enter if ctrl && model.reference => {
+            if model.send_now() {
+                release_queue_hold(model);
+                abort.store(true, Ordering::Relaxed);
+                model.interrupt();
+            }
+        }
         KeyCode::Enter
             if key.modifiers.contains(KeyModifiers::SHIFT)
                 || key.modifiers.contains(KeyModifiers::ALT) =>
@@ -1669,20 +1779,157 @@ fn run_turns(shell: &mut Shell<'_>) -> Next {
     if let Err(err) = run_turn(shell.parsed, shell.agent, shell.model, shell.terminal, host) {
         return Next::Fail(err.to_string());
     }
-    while !shell.model.queued.is_empty() {
-        let line = shell.model.queued.remove(0);
+    drain_queue(
+        shell,
+        |shell| &mut *shell.model,
+        |shell, line| on_line(shell, line),
+    )
+}
+
+/// A Ctrl+C that cancels a turn holds the queue (reference shell only), so a
+/// line queued behind it does not start by itself.
+fn hold_queue_on_cancel(model: &mut Model) {
+    if model.reference {
+        model.queue_hold = true;
+        if !model.queued.is_empty() {
+            model.push_toast("Queued lines are held; sending a new prompt resumes them.".into());
+        }
+    }
+}
+
+/// A Ctrl+C that cancels from an approval also arms the exit window, as the
+/// mid-turn Ctrl+C does, so the next press leaves even if the worker returned
+/// first. Esc cancels the question without arming it.
+fn arm_exit_on_ctrl_c(model: &mut Model, key: &crossterm::event::KeyEvent) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    if model.reference
+        && key.code == KeyCode::Char('c')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        model.ctrl_c_armed = Some(std::time::Instant::now());
+        model.exit_armed = true;
+    }
+}
+
+/// Whether the Ctrl+C hold keeps the queue from starting more requests.
+fn queue_held(model: &Model) -> bool {
+    model.reference && model.queue_hold
+}
+
+/// A deliberate submission ends the Ctrl+C hold, so held lines drain after it.
+fn release_queue_hold(model: &mut Model) {
+    model.queue_hold = false;
+}
+
+/// Release the hold when a palette pick will run a command line (`on_choice`
+/// sends it through `on_line`).
+fn release_hold_for_choice(model: &mut Model, choice: &Choice) {
+    if matches!(choice, Choice::Command { kind, .. } if kind == "command") {
+        release_queue_hold(model);
+    }
+}
+
+/// Start the queued lines one by one through `start`.
+///
+/// Ctrl+C is the exit gesture: the line queued behind the turn waits for the
+/// user's next action instead of starting a request they may be leaving from.
+/// Esc is the soft interrupt, and the reference sends the queue after it.
+/// `start` reaches a nested `run_turns`, which returns with the hold still set,
+/// so the check runs before every line and every draining level stops.
+fn drain_queue<S>(
+    state: &mut S,
+    model: impl Fn(&mut S) -> &mut Model,
+    mut start: impl FnMut(&mut S, &str) -> Next,
+) -> Next {
+    while !queue_held(model(state)) {
+        let Some(line) = next_queued(model(state)) else {
+            break;
+        };
         // What the composer's own submit pushes before a line is routed.
-        shell.model.transcript.push(Entry::Gap);
-        shell.model.transcript.push(Entry::user(&line));
-        shell.model.transcript.push(Entry::Gap);
-        shell.model.transcript.push(Entry::agent("davinci"));
-        shell.model.running = true;
-        match on_line(shell, &line) {
+        let m = model(state);
+        m.transcript.push(Entry::Gap);
+        m.transcript.push(Entry::user(&line));
+        m.transcript.push(Entry::Gap);
+        m.transcript.push(Entry::agent("davinci"));
+        m.running = true;
+        match start(state, &line) {
             Next::Go => {}
             other => return other,
         }
     }
     Next::Go
+}
+
+/// The reference shell's `/theme`: a picker, not a line for the agent. `true`
+/// when `line` was it. `stored` is read only then.
+fn theme_line(model: &mut Model, line: &str, stored: impl FnOnce() -> Option<String>) -> bool {
+    if !model.reference || line.trim() != "/theme" {
+        return false;
+    }
+    // A queued line reaches here with the shell marked busy; no turn runs.
+    model.running = false;
+    let stored = stored();
+    davinci_tui::davinci::views::theme_picker::open(model, stored.as_deref().unwrap_or("dark"));
+    true
+}
+
+/// Whether the text an editor handed back is the draft it was given: the same
+/// characters, line endings and BOM aside, trailing newlines aside (editors add
+/// one, and `ExternalEditor` strips them). Then the draft is left exactly as it was.
+fn editor_left_draft_alone(draft: &str, returned: &str) -> bool {
+    let strip = |text: &str| {
+        text.strip_prefix('\u{feff}')
+            .unwrap_or(text)
+            .replace("\r\n", "\n")
+            .trim_end_matches(['\r', '\n'])
+            .to_owned()
+    };
+    strip(draft) == strip(returned)
+}
+
+/// Put the first-run question up. An overlay already open (an approval that
+/// a turn raised) keeps the screen and its question; the first-run question
+/// waits behind it (`first_run_due`) and neither is lost.
+fn ask_first_run(model: &mut Model, agent: &Agent, pending: &mut Option<Question>) {
+    if model.overlay.is_some() {
+        model.first_run_due = true;
+        return;
+    }
+    model.first_run_due = false;
+    model.ask = Question::FirstRun.ask(agent);
+    open_ask_overlay(model);
+    *pending = Some(Question::FirstRun);
+}
+
+/// Once the overlay that held the first-run question back has closed, put it up.
+fn release_first_run(model: &mut Model, agent: &Agent, pending: &mut Option<Question>) {
+    if model.first_run_due && model.overlay.is_none() {
+        ask_first_run(model, agent, pending);
+        model.dirty = true;
+    }
+}
+
+/// The reference shell's welcome steps, opened on the theme the merged
+/// settings store so the highlight and the live theme agree from the first
+/// frame. `false` elsewhere: the first run is asked at once.
+fn begin_first_run(model: &mut Model, settings: &crate::settings::Settings) -> bool {
+    davinci_tui::davinci::views::onboarding::start(
+        model,
+        settings.theme.as_deref().unwrap_or("dark"),
+    )
+}
+
+/// The next queued line. In the reference shell `/theme` waits behind every
+/// line that will start a turn: a picker open while a turn runs would take the
+/// keys of its approval prompts. Everywhere else the queue is first in, first out.
+fn next_queued(model: &mut Model) -> Option<String> {
+    let waits = |line: &String| model.reference && line.trim() == "/theme";
+    let index = model
+        .queued
+        .iter()
+        .position(|line| !waits(line))
+        .unwrap_or(0);
+    (index < model.queued.len()).then(|| model.queued.remove(index))
 }
 
 fn interrupted_recovery_aftermath() -> Vec<(State, String)> {
@@ -1706,6 +1953,9 @@ fn run_turn(
     // left from an earlier turn was already applied at that turn's end.
     let pending_mode = agent.pending_permission_mode.clone();
     *pending_mode.lock().unwrap_or_else(|err| err.into_inner()) = None;
+    let applied_mode = agent.applied_permission_mode.clone();
+    *applied_mode.lock().unwrap_or_else(|err| err.into_inner()) = None;
+    model.requested_permission_mode = None;
     agent.event_sink = Some(EventSink(Arc::new(move |event: &AgentEvent| {
         let _ = event_tx.send(event.clone());
     })));
@@ -1805,6 +2055,7 @@ fn run_turn(
                 model.dirty = true;
                 last_tick = Instant::now();
                 poll_jobs(&jobs, model);
+                settle_requested_mode(model, &pending_mode, &applied_mode);
                 if let Some(runtime) = &roster_runtime {
                     roster_host.tick(runtime, model);
                 }
@@ -2557,8 +2808,6 @@ fn tool_summary(name: &str) -> String {
 pub enum Sent {
     Prompt(String),
     Quit,
-    /// Say something back without asking the model.
-    Say(String),
     /// A command that needs the agent and the session to carry it out.
     Command(crate::slash::SlashAction),
 }
@@ -2569,17 +2818,9 @@ pub fn classify(line: &str) -> Sent {
     match crate::slash::parse_line(line) {
         SlashAction::Prompt(text) => Sent::Prompt(text),
         SlashAction::Quit => Sent::Quit,
-        // The transcript renders markdown, where bare lines merge into one
-        // paragraph; the legacy chrome prints the same text verbatim.
-        SlashAction::Status(text) => Sent::Say(
-            text.lines()
-                .map(|line| format!("- {line}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
-        // Everything else — including /model, /config, /hotkeys, /resume —
+        // Everything else - including /model, /config, /hotkeys, /resume -
         // reaches `perform`, which opens the sheet each one designs
-        // (screens 3a–6d) with live data behind it.
+        // (screens 3a-6d) with live data behind it.
         other => Sent::Command(other),
     }
 }
@@ -3247,6 +3488,8 @@ fn permission_ask_at(request: &ToolApprovalRequest, trusted: bool, cwd: &std::pa
         preview,
         kind: if shell_tool {
             AskKind::Shell
+        } else if request.tool == "write" && !exists {
+            AskKind::Create
         } else if file_tool {
             AskKind::File
         } else {
@@ -3903,6 +4146,8 @@ fn approval_answer_key(
         model.approval_instructions = None;
         model.overlay = None;
         if key.code == KeyCode::Char('c') {
+            hold_queue_on_cancel(model);
+            arm_exit_on_ctrl_c(model, &key);
             abort.store(true, Ordering::Relaxed);
             model.interrupt();
         }
@@ -3974,6 +4219,8 @@ fn approval_key(
             Some(permission_choice(index, choices).unwrap_or(ToolApprovalDecision::Deny))
         }
         Flow::Interrupt | Flow::Quit => {
+            hold_queue_on_cancel(model);
+            arm_exit_on_ctrl_c(model, &key);
             abort.store(true, Ordering::Relaxed);
             model.interrupt();
             model.overlay = None;
@@ -4070,7 +4317,23 @@ pub fn perform(
         // Routed by `classify`; carried here only so the match is total.
         SlashAction::Prompt(text) => Ok(Done::Said(text)),
         SlashAction::Quit => Ok(Done::Said("goodbye".into())),
-        SlashAction::Status(text) => Ok(Done::Said(text)),
+        SlashAction::Help => {
+            if model.reference {
+                open_keys_sheet(model);
+                model.help_tab = Some(0);
+                Ok(Done::Opened)
+            } else {
+                // Off the reference `/help` keeps its transcript list, with the
+                // same bulleted shape the text path printed before.
+                Ok(Done::Said(
+                    crate::slash::help_lines()
+                        .iter()
+                        .map(|line| format!("- {line}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ))
+            }
+        }
         SlashAction::OpenModel => {
             open_models_sheet(parsed, agent, model);
             Ok(Done::Opened)
@@ -4283,7 +4546,7 @@ pub fn perform(
                 model: agent.model_id.clone(),
             });
             adopt_model(parsed, agent, model);
-            Ok(model_set(model, Some(persist_model_choice(agent))))
+            Ok(model_set(model, Some(persist_model_choice(agent)), None))
         }
         // Bare `/effort`: the model picker opens on the current model, whose
         // effort row adjusts with ←/→.
@@ -4558,6 +4821,12 @@ pub fn perform(
         )),
         SlashAction::Workflow(args) => Ok(Done::Said(workflow_command_text(agent, &args))),
         SlashAction::Agents(args) => {
+            // In the reference shell `/agents` is the dashboard; the text
+            // team summary stays for the setting off and for subcommands.
+            if model.reference && args.trim().is_empty() {
+                open_agents_sheet(agent, model);
+                return Ok(Done::Opened);
+            }
             let settings =
                 crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd);
             let trusted =
@@ -4608,7 +4877,11 @@ pub fn perform(
         },
         SlashAction::Context(args) => match args.as_str() {
             "" => {
-                push_context_usage(agent, model);
+                push_context_usage(agent, model, false);
+                Ok(Done::Opened)
+            }
+            "all" => {
+                push_context_usage(agent, model, true);
                 Ok(Done::Opened)
             }
             "inspect" | "manifest" => {
@@ -4810,12 +5083,18 @@ fn supported_thinking_choice(
 /// The elbow row under `/model` once the switch is made: the model's name in
 /// the accent ink, and where the choice was kept. `saved` is `None` for a
 /// switch that was only for this session.
-fn model_set(model: &Model, saved: Option<Result<(), String>>) -> Done {
+fn model_set(model: &Model, saved: Option<Result<(), String>>, effort: Option<&str>) -> Done {
     let title = model.model_title.clone();
+    let effort = effort
+        .filter(|level| !level.is_empty())
+        .map(|level| format!(" with {level} effort"))
+        .unwrap_or_default();
     let text = match saved {
-        Some(Ok(())) => format!("Set model to {title} and saved as your default for new sessions"),
-        Some(Err(err)) => format!("Set model to {title} for this run only ({err})"),
-        None => format!("Set model to {title} for this session only"),
+        Some(Ok(())) => {
+            format!("Set model to {title} and saved as your default for new sessions{effort}")
+        }
+        Some(Err(err)) => format!("Set model to {title} for this run only ({err}){effort}"),
+        None => format!("Set model to {title} for this session only{effort}"),
     };
     Done::Set {
         text,
@@ -4938,6 +5217,7 @@ pub fn run(
     let cwd = agent.cwd.clone();
     let mut model = davinci_tui::davinci::boot(raw, 100, 44);
     model.placeholder = (std::process::id() as usize) % 3;
+    model.screen_reader = parsed.screen_reader;
     let session_dir = davinci_session::default_session_dir();
     model.cwd = cwd.display().to_string();
     model.startup = crate::davinci_sources::startup(&cwd, "", !agent.messages.is_empty());
@@ -4993,6 +5273,17 @@ pub fn run(
     sync_permission_state(agent, &mut model);
     let startup_settings =
         crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd);
+    // The reduced-motion setting stops the spinner animation from the first frame.
+    model.animate = !startup_settings.reduce_motion.unwrap_or(false);
+    // `/theme` is a picker command in this shell, so it is not a built-in; the
+    // reference lists it, so the completion list gets it while the setting is on.
+    model.slash_commands = crate::with_reference_commands(
+        std::mem::take(&mut model.slash_commands),
+        davinci_tui::davinci::runtime::reference_enabled(
+            std::env::var("PI_DAVINCI_REFERENCE").ok().as_deref(),
+            startup_settings.tui.reference.unwrap_or(false),
+        ),
+    );
     model.show_tool_output = startup_settings.show_tool_output.unwrap_or(false);
     model.roster.enabled = startup_settings.agent_focus_ui.unwrap_or(true);
     model.context_bar = davinci_tui::davinci::model::ContextBarMode::parse(
@@ -5115,12 +5406,30 @@ pub fn run(
     // is reachable from this interface.
     let mut attached_images: Vec<davinci_ai::MessageContent> = Vec::new();
 
-    let mut terminal = Session::open().map_err(|err| err.to_string())?;
+    // The reference's welcome steps run on the main screen with the mouse off; the session
+    // goes fullscreen when they end. Everywhere else the first run is fullscreen at once.
+    let first_run_due = crate::settings::should_run_first_time_setup(
+        &crate::settings::settings_path(&crate::default_agent_dir()),
+    );
+    let mut terminal = Session::open_deferring(
+        stored_settings.tui.reference.unwrap_or(false),
+        first_run_due,
+    )
+    .map_err(|err| err.to_string())?;
     if let Some(hint) = terminal_hint(
         std::env::var_os("TMUX").is_some(),
         &crate::default_agent_dir(),
     ) {
         model.push_toast(hint);
+    }
+    if terminal.reference() {
+        model.reference = true;
+        model.external_editor = stored_settings.external_editor.clone();
+        if stored_settings.editor_mode.as_deref() == Some("vim") {
+            model.vim = Some(davinci_tui::davinci::model::VimState::default());
+        }
+        model.theme = model.theme.with_reference(true);
+        apply_theme_setting(&mut model, &stored_settings);
     }
     terminal.set_native_cursor(stored_settings.show_hardware_cursor.unwrap_or(false));
     terminal.set_copy_on_select(stored_settings.fullscreen_copy_on_select.unwrap_or(true));
@@ -5162,8 +5471,12 @@ pub fn run(
         &crate::default_agent_dir(),
     )) {
         pending = Some(Question::FirstRun);
-        model.ask = Question::FirstRun.ask(agent);
-        open_ask_overlay(&mut model);
+        // The reference shell walks the welcome steps first; the analytics
+        // question follows them. Everywhere else it is asked at once.
+        if !begin_first_run(&mut model, &stored_settings) {
+            model.ask = Question::FirstRun.ask(agent);
+            open_ask_overlay(&mut model);
+        }
     }
 
     // `pi "do the thing"` and `--file` open straight into a turn rather than
@@ -5437,14 +5750,21 @@ pub fn run(
         if std::mem::take(&mut first_frame) {
             crate::startup_mark("shell: first frame");
         }
+        release_first_run(&mut model, agent, &mut pending);
         // The draft goes to `$VISUAL`/`$EDITOR` and comes back as typed text.
         if std::mem::take(&mut model.external_edit_requested) {
             let draft = model.composer.to_string();
             let edited = terminal.run_external(|| {
-                crate::external_editor::ExternalEditor::new(None, &draft)
-                    .and_then(|editor| editor.edit())
+                crate::external_editor::ExternalEditor::new(
+                    model.external_editor.as_deref(),
+                    &draft,
+                )
+                .and_then(|editor| editor.edit())
             });
             match edited {
+                // An editor that changed nothing leaves the draft as it was, byte for
+                // byte (the editor hands text back without its trailing newlines).
+                Ok(Ok(text)) if model.reference && editor_left_draft_alone(&draft, &text) => {}
                 Ok(Ok(text)) => {
                     model.replace_composer(text.trim_end_matches(['\r', '\n']));
                     model.push_toast("draft edited in your editor".into());
@@ -5598,7 +5918,14 @@ pub fn run(
                                     .get(..cursor)
                                     .and_then(|head| head.chars().next_back());
                                 let spaced = attachments::spaced_chip(&chip, before);
-                                model.paste(&spaced);
+                                if model.reference && model.composer_owns_focus() {
+                                    // The token trails the draft; what is typed next lands
+                                    // in front of it.
+                                    model.composer.insert_after_cursor(&spaced);
+                                    model.refresh_suggestions();
+                                } else {
+                                    model.paste(&spaced);
+                                }
                                 // The chip in the composer is the only sign of the paste.
                                 if !model.composer.to_string().contains(&chip) {
                                     // The composer is not taking input (a sheet or
@@ -5668,6 +5995,8 @@ pub fn run(
                                 let doubled = last_ctrl_c.is_some_and(|prev| {
                                     now.duration_since(prev)
                                         < Duration::from_millis(DOUBLE_CTRL_C_MS)
+                                }) || model.ctrl_c_armed.take().is_some_and(|at| {
+                                    now.duration_since(at) < Duration::from_millis(DOUBLE_CTRL_C_MS)
                                 });
                                 if doubled {
                                     run_stop_hooks(&mut Shell {
@@ -5684,7 +6013,7 @@ pub fn run(
                                     Next::Leave
                                 } else {
                                     if !model.composer.trim().is_empty() {
-                                        let _ = model.composer.editor_mut().submit();
+                                        let _ = model.composer.submit();
                                     }
                                     last_ctrl_c = Some(now);
                                     model.exit_armed = true;
@@ -5705,34 +6034,45 @@ pub fn run(
                                 });
                                 Next::Leave
                             }
-                            Flow::Submit(line) => on_line(
-                                &mut Shell {
-                                    parsed,
-                                    agent,
-                                    model: &mut model,
-                                    terminal: &mut terminal,
-                                    host: &host,
-                                    pending: &mut pending,
-                                    cwd: &cwd,
-                                    dresser: &dresser,
-                                    images: &mut attached_images,
-                                },
-                                &line,
-                            ),
-                            Flow::Choose(choice) => on_choice(
-                                &mut Shell {
-                                    parsed,
-                                    agent,
-                                    model: &mut model,
-                                    terminal: &mut terminal,
-                                    host: &host,
-                                    pending: &mut pending,
-                                    cwd: &cwd,
-                                    dresser: &dresser,
-                                    images: &mut attached_images,
-                                },
-                                choice,
-                            ),
+                            Flow::Submit(line) => {
+                                // A deliberate submission ends the Ctrl+C hold on the queue.
+                                release_queue_hold(&mut model);
+                                on_line(
+                                    &mut Shell {
+                                        parsed,
+                                        agent,
+                                        model: &mut model,
+                                        terminal: &mut terminal,
+                                        host: &host,
+                                        pending: &mut pending,
+                                        cwd: &cwd,
+                                        dresser: &dresser,
+                                        images: &mut attached_images,
+                                    },
+                                    &line,
+                                )
+                            }
+                            Flow::Choose(choice) => {
+                                // A command picked from the palette runs through
+                                // `on_line` like a typed one, so it is as deliberate
+                                // as a submission; an Ask answer or a picker row
+                                // starts no turn and leaves the hold alone.
+                                release_hold_for_choice(&mut model, &choice);
+                                on_choice(
+                                    &mut Shell {
+                                        parsed,
+                                        agent,
+                                        model: &mut model,
+                                        terminal: &mut terminal,
+                                        host: &host,
+                                        pending: &mut pending,
+                                        cwd: &cwd,
+                                        dresser: &dresser,
+                                        images: &mut attached_images,
+                                    },
+                                    choice,
+                                )
+                            }
                             Flow::CyclePermissionMode => {
                                 cycle_permission_mode(agent, &mut model);
                                 Next::Go
@@ -6043,7 +6383,10 @@ fn apply_host_effects(shell: &mut Shell<'_>) -> Next {
     if calls.iter().any(|call| op_of(call) == "reload") {
         crate::clear_model_runtime_cache();
         crate::apply_discovered_resources(shell.parsed, shell.agent);
-        shell.model.slash_commands = crate::interactive_slash_commands(shell.agent, shell.parsed);
+        shell.model.slash_commands = crate::with_reference_commands(
+            crate::interactive_slash_commands(shell.agent, shell.parsed),
+            shell.model.reference,
+        );
     }
     for call in &calls {
         if op_of(call) != "unregisterProvider" {
@@ -6759,7 +7102,10 @@ fn apply_extension_action(
     // next session.
     if changed && tab != ExtensionTab::Mcp {
         crate::apply_discovered_resources(shell.parsed, shell.agent);
-        shell.model.slash_commands = crate::interactive_slash_commands(shell.agent, shell.parsed);
+        shell.model.slash_commands = crate::with_reference_commands(
+            crate::interactive_slash_commands(shell.agent, shell.parsed),
+            shell.model.reference,
+        );
         shell.model.corpus = corpus(
             shell.agent,
             &shell.model.slash_commands,
@@ -6807,7 +7153,10 @@ fn refresh_after_change(shell: &mut Shell<'_>, tab: ExtensionTab) {
         return;
     }
     crate::apply_discovered_resources(shell.parsed, shell.agent);
-    shell.model.slash_commands = crate::interactive_slash_commands(shell.agent, shell.parsed);
+    shell.model.slash_commands = crate::with_reference_commands(
+        crate::interactive_slash_commands(shell.agent, shell.parsed),
+        shell.model.reference,
+    );
     shell.model.corpus = corpus(
         shell.agent,
         &shell.model.slash_commands,
@@ -7328,6 +7677,7 @@ fn open_keys_sheet(model: &mut Model) {
     model.facts.keys_surfaces = groups.len();
     model.keymap = groups;
     model.keys_offset = 0;
+    model.help_tab = None;
     open_sheet(model, Screen::Keys);
 }
 
@@ -9636,14 +9986,17 @@ fn on_line(shell: &mut Shell<'_>, line: &str) -> Next {
             }
         }
     }
+    // The reference shell opens `/theme` as a picker; otherwise the line goes
+    // on exactly as before.
+    if theme_line(shell.model, line, || {
+        crate::settings::load_merged_settings(&crate::default_agent_dir(), &shell.agent.cwd).theme
+    }) {
+        return Next::Go;
+    }
     match classify(line) {
         Sent::Quit => {
             run_stop_hooks(shell);
             Next::Leave
-        }
-        Sent::Say(text) => {
-            shell.say(&text);
-            Next::Go
         }
         Sent::Command(crate::slash::SlashAction::Compact(instructions)) => {
             shell.compact(instructions)
@@ -9775,7 +10128,7 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
             );
             adopt_model(shell.parsed, shell.agent, shell.model);
             let saved = persist_model_choice(shell.agent);
-            shell.finish(model_set(shell.model, Some(saved)))
+            shell.finish(model_set(shell.model, Some(saved), None))
         }
         Choice::Ask(index) => {
             let Some(question) = shell.pending.take() else {
@@ -9824,6 +10177,7 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
                 return Next::Go;
             }
             let session_only = shell.model.catalog_session_only;
+            let previous_level = shell.agent.thinking_level.as_str().to_string();
             shell.model.close();
             shell.agent.provider = row.provider.clone();
             shell.agent.model_id = row.id.clone();
@@ -9849,12 +10203,30 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
                 sync_thinking_state(shell.agent, shell.model);
             }
             let saved = (!session_only).then(|| persist_model_choice(shell.agent));
-            shell.finish(model_set(shell.model, saved));
+            let applied = shell.agent.thinking_level.as_str().to_string();
+            let effort = (shell.model.reference && applied != previous_level).then_some(applied);
+            shell.finish(model_set(shell.model, saved, effort.as_deref()));
             refresh_thinking_sheet(shell.agent, shell.model);
             Next::Go
         }
         // `3b` — advance the setting to its next value and persist it.
         Choice::Setting(index) => cycle_setting(shell, index),
+        // `/theme` picker — the same `theme=` write the settings row makes.
+        Choice::Theme(name) => {
+            match crate::persist_interactive_setting(&format!("theme={name}")) {
+                // The result hangs from the `/theme` that asked for it.
+                Ok(()) => shell.model.confirm(&format!("Theme set to {name}"), None),
+                // The preview stays on screen; say that it was not saved.
+                Err(err) => shell.note(&err),
+            }
+            Next::Go
+        }
+        // The last welcome step ended: the analytics question comes next. The
+        // theme chosen stays in the model until that answer is saved.
+        Choice::OnboardingDone => {
+            ask_first_run(shell.model, shell.agent, shell.pending);
+            Next::Go
+        }
         // `3c` — a thinking level.
         Choice::ThinkingLevel(index) => {
             let Some(level) = shell
@@ -10089,6 +10461,14 @@ fn cycle_setting(shell: &mut Shell<'_>, index: usize) -> Next {
     }
 
     crate::sync_agent_from_settings(shell.agent);
+    if key == "reduce-motion" {
+        let reduced = shell
+            .model
+            .settings_rows
+            .get(index)
+            .is_some_and(|row| row.value == "true");
+        shell.model.animate = !reduced;
+    }
     if key == "codemode" {
         match crate::sync_codemode_from_settings(shell.agent) {
             Ok(()) if shell.agent.has_staged_codemode() => {
@@ -10414,8 +10794,13 @@ fn answer(shell: &mut Shell<'_>, question: &Question, index: usize) -> Result<St
             let mut stored = crate::settings::load_settings(&dir);
             let share = index == 0;
             crate::settings::set_enable_analytics(&mut stored, share);
+            // The welcome's theme goes out in this one write, so a first run
+            // left partway stores nothing and is asked again. A failed write
+            // is a message; the steps are over either way.
+            if let Some(theme) = shell.model.first_run_theme.take() {
+                stored.theme = Some(theme);
+            }
             crate::settings::save_settings(&dir, &stored)?;
-            let _ = shell;
             Ok(if share {
                 "sharing anonymous usage data. change it any time in settings.".into()
             } else {
@@ -10824,6 +11209,7 @@ fn open_agents_sheet(agent: &Agent, model: &mut Model) {
                 },
             )
             .collect(),
+        ..Default::default()
     });
     open_sheet(model, Screen::Agents);
 }
@@ -10883,6 +11269,10 @@ fn apply_agent_action(shell: &mut Shell<'_>, action: &str, index: usize) -> Next
     let Some(sheet) = shell.model.agents.as_ref() else {
         return Next::Go;
     };
+    // A row the find filter hides is never acted on.
+    if !shell.model.visible_agents().contains(&index) {
+        return Next::Go;
+    }
     let Some(agent_row) = sheet.agents.get(index).cloned() else {
         return Next::Go;
     };
@@ -10996,7 +11386,7 @@ fn open_context_inspector_sheet(agent: &mut davinci_agent::Agent, model: &mut Mo
 /// `/context`: the window by category, hanging from the command line the
 /// composer echoed, as in Claude Code. The turn anchor the composer pushed
 /// after it is dropped; nothing streams into this block.
-fn push_context_usage(agent: &Agent, model: &mut Model) {
+fn push_context_usage(agent: &Agent, model: &mut Model, all: bool) {
     let anchor = model
         .transcript
         .iter()
@@ -11007,7 +11397,8 @@ fn push_context_usage(agent: &Agent, model: &mut Model) {
         }
         _ => model.transcript.push(Entry::Gap),
     }
-    let view = crate::davinci_surfaces::context_usage_view(&agent.context_usage());
+    let mut view = crate::davinci_surfaces::context_usage_view(&agent.context_usage());
+    view.all = all;
     model.transcript.push(Entry::ContextUsage(view));
     // The block is taller than a short screen. Following the newest row would
     // open it on its last section; read it from "Context Usage" down.
@@ -11358,6 +11749,7 @@ fn run_stop_hooks(shell: &mut Shell<'_>) {
 /// tool rows rather than prose: `bash(git *)` is not markdown emphasis.
 fn sync_permission_state(agent: &Agent, model: &mut Model) {
     model.permission_mode = agent.permission_mode().as_str().to_string();
+    model.requested_permission_mode = None;
 }
 
 fn change_permission_mode(agent: &mut Agent, model: &mut Model, mode: PermissionMode) {
@@ -11366,7 +11758,12 @@ fn change_permission_mode(agent: &mut Agent, model: &mut Model, mode: Permission
 }
 
 fn cycle_permission_mode(agent: &mut Agent, model: &mut Model) {
-    let next = agent.permission_mode().next();
+    let current = agent.permission_mode();
+    let next = if model.reference {
+        current.next_reference()
+    } else {
+        current.next()
+    };
     change_permission_mode(agent, model, next);
 }
 

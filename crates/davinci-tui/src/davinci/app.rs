@@ -13,6 +13,7 @@ use ratatui::text::Line;
 use crate::interaction::{apply_editor_key, input_owner, key_event_bytes, InputOwner};
 
 use super::model::{Choice, ContextBarMode, Entry, Model, Overlay, Screen};
+use super::theme::State;
 use super::ui::{self, blank, pad_to, tail};
 use super::views::chrome::{self, Hint};
 use super::views::scrollbar::{self, Scrollbar};
@@ -51,6 +52,292 @@ pub fn next_mode_index(index: usize) -> usize {
 /// command sheets and overlays retain their full-height frame.
 pub fn compose(model: &Model, height: u16) -> Vec<Line<'static>> {
     compose_frame(model, height).lines
+}
+
+/// The screen-reader mode: plain lines in reading order, no box art or rules.
+fn screen_reader_lines(model: &Model, height: usize) -> Vec<Line<'static>> {
+    let mode = match model.permission_mode.as_str() {
+        "edits" => "accept edits on",
+        "read-only" => "plan mode on",
+        "auto" => "auto mode on",
+        "always-approve" => "always approve on",
+        _ => "manual mode on",
+    };
+    let mut rows = vec![
+        Line::from("[Screen Reader Mode: on via flag]"),
+        Line::from(format!("DaVinci v{}", env!("CARGO_PKG_VERSION"))),
+        Line::from(format!("{} · {}", model.model_title, model.provider_title)),
+        Line::from(model.cwd.clone()),
+    ];
+    let footer = [
+        Line::from(format!("{mode} (shift+tab to cycle)")),
+        Line::from(format!("effort: {} · /effort", model.thinking_level)),
+        Line::from(format!("$ {}", model.composer)),
+    ];
+    // An open overlay takes input, so its question and choices come first: they
+    // keep their rows at any height, and the header, conversation and footer
+    // give way to them.
+    let panel = model
+        .overlay
+        .map(|overlay| screen_reader_overlay(model, overlay, height))
+        .unwrap_or_default();
+    let mut room = height.saturating_sub(panel.len());
+    let keep_footer = panel.is_empty() || room >= footer.len();
+    if !panel.is_empty() {
+        room = room.saturating_sub(if keep_footer { footer.len() } else { 0 });
+        if room < rows.len() {
+            rows.clear();
+        }
+    }
+    let conversation = transcript::lines(model, &model.transcript, model.width);
+    let room = if panel.is_empty() {
+        height.saturating_sub(7)
+    } else {
+        room.saturating_sub(rows.len())
+    };
+    for line in conversation.iter().rev().take(room).rev() {
+        rows.push(Line::from(line.to_string()));
+    }
+    rows.extend(panel);
+    if keep_footer {
+        rows.extend(footer);
+    }
+    pad_to(rows, height)
+}
+
+/// The open overlay as plain lines. The one-question instrument names its
+/// question, subject, preview and choices; the other instruments print the rows
+/// they draw. At most `height` lines come back, windowed around the selected row
+/// (or `overlay_offset`, which PageUp/PageDown move), and the selected row of
+/// every overlay carries a `>` a screen reader can say.
+fn screen_reader_overlay(model: &Model, overlay: Overlay, height: usize) -> Vec<Line<'static>> {
+    if is_plain_ask(model, overlay) {
+        return screen_reader_ask(model, height);
+    }
+    let lines = overlay_rows(model, overlay);
+    let focused = ui::focused_row(&lines);
+    let rows: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let text = line.to_string();
+            if Some(index) == focused {
+                text.replacen('❯', ">", 1)
+            } else {
+                text
+            }
+        })
+        .collect();
+    let last_start = rows.len().saturating_sub(height);
+    let start = match (model.overlay_offset, focused) {
+        (Some(offset), _) => offset.min(last_start),
+        (None, Some(row)) => row.saturating_sub(height / 2).min(last_start),
+        // No selection (the rewind and decision dialogs): the end holds the
+        // input line and the keys.
+        (None, None) => last_start,
+    };
+    rows.into_iter()
+        .skip(start)
+        .take(height)
+        .map(Line::from)
+        .collect()
+}
+
+/// The physical lines of the plain question instrument, split once for both the
+/// drawing and the paging bound.
+struct AskText {
+    title: Option<String>,
+    question: Vec<String>,
+    subject: Vec<String>,
+    note: Vec<String>,
+    choices: Vec<String>,
+    preview: Vec<String>,
+    current: usize,
+}
+
+impl AskText {
+    /// Past their first line, the subject and the question join the preview and
+    /// the note as one pageable list, so whatever does not fit is reached by
+    /// paging.
+    fn pageable(&self) -> Vec<String> {
+        self.subject
+            .iter()
+            .skip(1)
+            .chain(self.question.iter().skip(1))
+            .chain(self.preview.iter())
+            .chain(self.note.iter())
+            .cloned()
+            .collect()
+    }
+}
+
+fn is_plain_ask(model: &Model, overlay: Overlay) -> bool {
+    overlay == Overlay::Ask
+        && model.rewind_modal.is_none()
+        && model.decision_modal.is_none()
+        && model.approval_instructions.is_none()
+}
+
+fn screen_reader_ask_text(model: &Model) -> AskText {
+    use super::model::{AskKind, HunkKind};
+    let ask = &model.ask;
+    let text_row = |text: &String| (!text.trim().is_empty()).then(|| text.clone());
+    // One entry per physical line (`\n`, `\r\n` and `\r`): a `Line` built from a
+    // string drops breaks, which would fold `a # c\nrm x` into one commented row.
+    let physical = |text: &String| -> Vec<String> {
+        if text.trim().is_empty() {
+            return Vec::new();
+        }
+        let mut lines: Vec<String> = text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .split('\n')
+            .map(str::to_string)
+            .collect();
+        while lines.last().is_some_and(|line| line.trim().is_empty()) {
+            lines.pop();
+        }
+        lines
+    };
+    let title = text_row(&ask.title);
+    let question = physical(&ask.question);
+    let subject = physical(&ask.subject);
+    let note = physical(&ask.note);
+    let current = model.selection(ask.items.len()).unwrap_or(usize::MAX);
+    let choices: Vec<String> = ask
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let marker = if index == current { ">" } else { " " };
+            let detail = if item.detail.is_empty() {
+                String::new()
+            } else {
+                format!(" - {}", item.detail)
+            };
+            format!("{marker} {}. {}{detail}", index + 1, item.label)
+        })
+        .collect();
+    let preview: Vec<String> = ask
+        .preview
+        .iter()
+        .map(|hunk| {
+            let sign = match (ask.kind, hunk.kind) {
+                (AskKind::Create, _) => "",
+                (_, HunkKind::Add) => "+ ",
+                (_, HunkKind::Del) => "- ",
+                (_, HunkKind::Context) => "  ",
+            };
+            let number = hunk.line.map_or(String::new(), |line| format!("{line} "));
+            format!("{sign}{number}{}", hunk.text)
+        })
+        .collect();
+    AskText {
+        title,
+        question,
+        subject,
+        note,
+        choices,
+        preview,
+        current,
+    }
+}
+
+/// The plain question instrument. The selected choice, the subject and the
+/// question keep their rows before anything else (at one row, the selected
+/// choice alone), so a choice is never shown without what it approves; the
+/// pageable list (subject, question, preview and note past their first lines)
+/// takes the height that is left, from `overlay_offset` when the reader pages,
+/// then the other choices. A plain line says how many rows are hidden.
+fn screen_reader_ask(model: &Model, height: usize) -> Vec<Line<'static>> {
+    let text = screen_reader_ask_text(model);
+    let pageable = text.pageable();
+    let AskText {
+        title,
+        question,
+        subject,
+        note,
+        choices,
+        preview,
+        current,
+    } = text;
+    let context = question.len() + subject.len() + note.len();
+    let body = context + preview.len() + choices.len();
+    // Everything fits: print it in reading order, title included.
+    if body + usize::from(title.is_some()) <= height {
+        let mut rows: Vec<String> = title
+            .into_iter()
+            .chain(question)
+            .chain(subject)
+            .chain(note)
+            .collect();
+        rows.extend(preview);
+        rows.extend(choices);
+        return rows.into_iter().map(Line::from).collect();
+    }
+    // The title is decoration: it goes first, without a hidden-rows line.
+    let hidden_line = body > height;
+    let room = std::cell::Cell::new(height - usize::from(hidden_line && height > 1));
+    let take = |row: Option<String>| match row {
+        Some(row) if room.get() > 0 => {
+            room.set(room.get() - 1);
+            Some(row)
+        }
+        _ => None,
+    };
+    // A reader who is paging keeps at least one row for the list: it outranks
+    // the question's first line, never the subject or the selected choice.
+    let reserve = usize::from(model.overlay_offset.is_some() && !pageable.is_empty());
+    // With one row to give, Enter acts on the selected choice: it wins.
+    let (subject_kept, selected_kept) = if room.get() == 1 {
+        let selected = take(choices.get(current).cloned());
+        (take(subject.first().cloned()), selected)
+    } else {
+        let subject_row = take(subject.first().cloned());
+        (subject_row, take(choices.get(current).cloned()))
+    };
+    let question_kept = if room.get() > reserve {
+        take(question.first().cloned())
+    } else {
+        None
+    };
+    let mut shown = [
+        subject_kept.is_some(),
+        selected_kept.is_some(),
+        question_kept.is_some(),
+    ]
+    .iter()
+    .filter(|kept| **kept)
+    .count();
+    // The list takes what is left, from the reader's offset; the other
+    // choices get whatever it does not use.
+    let page_rows = room.get().min(pageable.len());
+    room.set(room.get() - page_rows);
+    let first = model
+        .overlay_offset
+        .unwrap_or(0)
+        .min(pageable.len() - page_rows);
+    shown += page_rows;
+    let other_choices: Vec<usize> = (0..choices.len())
+        .filter(|&index| index != current)
+        .take(room.get())
+        .collect();
+    room.set(room.get() - other_choices.len());
+    shown += other_choices.len();
+    let mut rows: Vec<String> = Vec::new();
+    rows.extend(question_kept);
+    rows.extend(subject_kept);
+    rows.extend(pageable[first..first + page_rows].iter().cloned());
+    for (index, choice) in choices.iter().enumerate() {
+        if index == current || other_choices.contains(&index) {
+            rows.push(choice.clone());
+        }
+    }
+    if hidden_line {
+        rows.push(format!("[{} rows hidden]", body.saturating_sub(shown)));
+    }
+    rows.truncate(height);
+    rows.into_iter().map(Line::from).collect()
 }
 
 pub struct ComposedFrame {
@@ -94,6 +381,16 @@ pub struct HitTarget {
 
 pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     let height = height as usize;
+    if model.screen_reader {
+        return ComposedFrame {
+            targets: Vec::new(),
+            lines: screen_reader_lines(model, height),
+            graph: None,
+            scrollbar: None,
+            suggestion_rows: None,
+            caret: None,
+        };
+    }
     if height == 0 {
         return ComposedFrame {
             lines: Vec::new(),
@@ -107,6 +404,38 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     if let Some(viewer) = &model.viewer {
         return ComposedFrame {
             lines: pad_to(super::views::viewer::render(model, viewer, height), height),
+            graph: None,
+            scrollbar: None,
+            suggestion_rows: None,
+            targets: Vec::new(),
+            caret: None,
+        };
+    }
+    if model.onboarding.is_some() && model.overlay.is_none() {
+        return ComposedFrame {
+            lines: pad_to(super::views::onboarding::lines(model, height), height),
+            graph: None,
+            scrollbar: None,
+            suggestion_rows: None,
+            targets: Vec::new(),
+            caret: None,
+        };
+    }
+    if model.theme_picker.is_some() && model.overlay.is_none() {
+        let picker = super::views::theme_picker::fitted(model, height);
+        let picker_height = picker.len();
+        let mut context = Model {
+            screen: Screen::Agent,
+            theme_picker: None,
+            ..model.clone()
+        };
+        context.graph_run = None;
+        super::views::theme_picker::without_pending_echo(&mut context.transcript);
+        let mut lines = body(&context, height.saturating_sub(picker_height));
+        lines = pad_to(lines, height.saturating_sub(picker_height));
+        lines.extend(picker);
+        return ComposedFrame {
+            lines: pad_to(lines, height),
             graph: None,
             scrollbar: None,
             suggestion_rows: None,
@@ -713,10 +1042,14 @@ fn command_panel_frame(
         rows.push(chrome::effort_rule(model));
     }
     rows.push(Line::from(ui::truncate_run(
-        vec![
-            ui::span("   ", cc.inactive),
-            ui::span_strong(sheet::sheet_title(model), cc.permission, th),
-        ],
+        sheet::help_tabs(model)
+            .or_else(|| sheet::permissions_tabs(model))
+            .unwrap_or_else(|| {
+                vec![
+                    ui::span("   ", cc.inactive),
+                    ui::span_strong(sheet::sheet_title(model), cc.permission, th),
+                ]
+            }),
         model.width,
     )));
     rows.push(blank());
@@ -771,6 +1104,9 @@ fn extension_rows(model: &Model, lines: &[String]) -> Vec<Line<'static>> {
 fn composer_rows(model: &Model) -> (Vec<Line<'static>>, Option<(usize, u16)>) {
     if model.overlay.is_some() {
         return (Vec::new(), None);
+    }
+    if model.reference && model.history_search.is_some() {
+        return chrome::history_box(model);
     }
     // Conversation hints stay close to the prompt and abbreviate on narrow
     // windows. Overlays and the Codex split own their keyboard guidance.
@@ -1192,6 +1528,8 @@ fn handle_history_search_key(model: &mut Model, key: KeyEvent) -> Flow {
         KeyCode::Up => model.history_search_move(1),
         KeyCode::Down => model.history_search_move(-1),
         KeyCode::Char('r') if ctrl => model.history_search_move(1),
+        // The reference's ctrl+s changes whose prompts are searched.
+        KeyCode::Char('s') if ctrl && model.reference => model.history_search_scope(),
         KeyCode::Char('s') if ctrl => model.history_search_move(-1),
         KeyCode::Backspace => {
             if let Some(search) = &mut model.history_search {
@@ -1228,6 +1566,16 @@ pub fn permission_cycle_chord(model: &Model, key: KeyEvent, data: &str) -> bool 
 pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     if key.kind == KeyEventKind::Release {
         return Flow::Continue;
+    }
+    // A question or approval in view is answered before the surface hidden
+    // behind it; the renderer shows it over the steps and the picker too.
+    if model.overlay.is_none() {
+        if model.onboarding.is_some() {
+            return super::views::onboarding::handle_key(model, key);
+        }
+        if model.theme_picker.is_some() {
+            return super::views::theme_picker::handle_key(model, key);
+        }
     }
     // ? in an empty conversation composer opens the shortcuts panel. Any
     // other key closes it and is then handled normally.
@@ -1304,7 +1652,7 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
 
     match input_owner(
         model.overlay.is_some(),
-        model.suggestions.is_some(),
+        model.suggestions.is_some() && model.composer_owns_focus(),
         !model.composer_owns_focus(),
     ) {
         InputOwner::Modal => {
@@ -1324,6 +1672,12 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
             }
         }
         InputOwner::Composer => {}
+    }
+
+    if model.reference && model.vim.is_some() && model.composer_owns_focus() {
+        if let Some(flow) = vim_key(model, key) {
+            return flow;
+        }
     }
 
     if let Some(data) = data.as_deref() {
@@ -1375,7 +1729,7 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
             return Flow::Continue;
         }
         if model.keybindings.matches(data, "tui.input.submit") {
-            let sent = model.composer.editor().get_expanded_text();
+            let sent = model.composer.expanded_text();
             if sent.trim().is_empty() {
                 return Flow::Continue;
             }
@@ -1402,6 +1756,90 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     Flow::Continue
 }
 
+/// Vim editing of the draft. INSERT types as usual and `esc` leaves it; NORMAL takes
+/// `i a I A o` (back to INSERT), `h l 0 ^ $ w b j k`, `x`, `u`, and `d` with `w d $`.
+/// Any other plain key does nothing there. Chords, Enter and the arrows go on to the
+/// composer's own keys; `None` hands the key back.
+fn vim_key(model: &mut Model, key: KeyEvent) -> Option<Flow> {
+    use super::model::VimMode;
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    let vim = model.vim.as_mut()?;
+    if vim.mode == VimMode::Insert {
+        if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+            vim.mode = VimMode::Normal;
+            vim.pending = None;
+            model.mark_caret_moved();
+            return Some(Flow::Continue);
+        }
+        return None;
+    }
+    let KeyCode::Char(ch) = key.code else {
+        vim.pending = None;
+        return None;
+    };
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        vim.pending = None;
+        return None;
+    }
+    let pending = vim.pending.take();
+    let editor = model.composer.editor_mut();
+    let mut insert = false;
+    match (pending, ch) {
+        (Some('d'), 'w') => model.composer.delete_word_vim(),
+        (Some('d'), 'd') => model.composer.delete_line_vim(),
+        (Some('d'), '$') => editor.delete_to_line_end(),
+        (Some(_), _) => {}
+        (None, 'd') => {
+            if let Some(vim) = model.vim.as_mut() {
+                vim.pending = Some('d');
+            }
+        }
+        (None, 'i') => insert = true,
+        (None, 'a') => {
+            editor.move_right();
+            insert = true;
+        }
+        (None, 'I') => {
+            editor.move_line_start();
+            insert = true;
+        }
+        (None, 'A') => {
+            editor.move_line_end();
+            insert = true;
+        }
+        (None, 'o') => {
+            editor.move_line_end();
+            model.composer.push('\n');
+            insert = true;
+        }
+        (None, 'h') => editor.move_left(),
+        (None, 'l') => editor.move_right(),
+        (None, '0' | '^') => editor.move_line_start(),
+        (None, '$') => editor.move_line_end(),
+        (None, 'w') => editor.move_word_forwards(),
+        (None, 'b') => editor.move_word_backwards(),
+        (None, 'j') => editor.cursor_down(),
+        (None, 'k') => editor.cursor_up(),
+        (None, 'x') => editor.delete_forward(),
+        (None, 'u') => editor.undo(),
+        (None, 'D') => editor.delete_to_line_end(),
+        _ => {}
+    }
+    if insert {
+        if let Some(vim) = model.vim.as_mut() {
+            vim.mode = VimMode::Insert;
+        }
+    }
+    model.refresh_suggestions();
+    model.mark_caret_moved();
+    Some(Flow::Continue)
+}
+
 /// `esc` over a draft arms a clear; a second `esc` within
 /// `DOUBLE_ESCAPE_MS` empties the composer, as in Claude Code. The draft goes
 /// to history first, so `↑` brings it back. Only on the conversation, at rest
@@ -1416,13 +1854,13 @@ fn clear_draft_on_double_escape(model: &mut Model) -> bool {
         return false;
     }
     let now = std::time::Instant::now();
-    let window = std::time::Duration::from_millis(crate::DOUBLE_ESCAPE_MS);
+    let window = model.double_escape_window();
     if model
         .clear_armed
         .is_some_and(|armed| now.duration_since(armed) < window)
     {
         model.clear_armed = None;
-        let _ = model.composer.editor_mut().submit();
+        let _ = model.composer.submit();
         model.refresh_suggestions();
     } else {
         model.clear_armed = Some(now);
@@ -1455,12 +1893,7 @@ fn handle_suggestion_key(model: &mut Model, data: Option<&str>) -> Option<Flow> 
         }
         if model.accept_suggestion() || tab {
             if run {
-                let sent = model
-                    .composer
-                    .editor()
-                    .get_expanded_text()
-                    .trim_end()
-                    .to_string();
+                let sent = model.composer.expanded_text().trim_end().to_string();
                 model.dismiss_suggestions();
                 model.submit();
                 return Some(Flow::Submit(sent));
@@ -1511,6 +1944,12 @@ fn handle_global_key(model: &mut Model, data: &str) -> Option<Flow> {
         }
         if model.keybindings.matches(data, "davinci.editor.chordStart") {
             model.chord_x = Some(std::time::Instant::now());
+            return Some(Flow::Continue);
+        }
+        // The reference's ctrl+s sets the draft aside (or brings it back) where
+        // the Sessions overlay would otherwise open.
+        if model.reference && model.keybindings.matches(data, "davinci.sessions.toggle") {
+            model.toggle_stash();
             return Some(Flow::Continue);
         }
     }
@@ -1701,7 +2140,131 @@ fn handle_graph_resume_key(model: &mut Model, key: KeyEvent) -> Flow {
     Flow::Continue
 }
 
+/// The agents dashboard's own keys: rename, pin, find and the two-step delete
+/// on the selected row. `None` leaves ordinary arrows and Enter to the sheet.
+fn handle_agents_control(model: &mut Model, key: KeyEvent) -> Option<Flow> {
+    if model.screen != Screen::Agents {
+        return None;
+    }
+    let reference = model.reference;
+    let sheet = model.agents.as_mut()?;
+    // The selected row, unless the find filter hides it: a hidden row is not acted on.
+    let selected = sheet
+        .agents
+        .get(sheet.selected_index)
+        .filter(|agent| !reference || sheet.matches(agent))
+        .map(|_| sheet.selected_index);
+    if let Some((id, name)) = sheet.renaming.as_mut() {
+        match key.code {
+            KeyCode::Enter => {
+                let name = name.trim().to_string();
+                let id = id.clone();
+                sheet.renaming = None;
+                if !name.is_empty() {
+                    if let Some(agent) = sheet.agents.iter_mut().find(|agent| agent.id == id) {
+                        agent.name = name;
+                    }
+                }
+            }
+            KeyCode::Esc => sheet.renaming = None,
+            KeyCode::Backspace => {
+                name.pop();
+            }
+            KeyCode::Char(ch) if key.modifiers.is_empty() => name.push(ch),
+            _ => {}
+        }
+        return Some(Flow::Continue);
+    }
+    if sheet.finding {
+        match key.code {
+            KeyCode::Esc => {
+                sheet.finding = false;
+                sheet.query.clear();
+            }
+            KeyCode::Enter => sheet.finding = false,
+            KeyCode::Backspace => {
+                sheet.query.pop();
+            }
+            KeyCode::Char(ch) if key.modifiers.is_empty() => sheet.query.push(ch),
+            _ => return None,
+        }
+        model.snap_agents_selection();
+        return Some(Flow::Continue);
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let chord = match key.code {
+        KeyCode::Char('f') if ctrl => Some('f'),
+        KeyCode::Char('r') if ctrl => Some('r'),
+        KeyCode::Char('t') if ctrl => Some('t'),
+        KeyCode::Char('x') if ctrl => Some('x'),
+        // Some terminals deliver a control byte as its C0 character.
+        KeyCode::Char('\u{6}') => Some('f'),
+        KeyCode::Char('\u{12}') => Some('r'),
+        KeyCode::Char('\u{14}') => Some('t'),
+        KeyCode::Char('\u{18}') => Some('x'),
+        _ => None,
+    };
+    if let Some(chord) = chord {
+        let mut deleted = false;
+        match chord {
+            'r' => {
+                if let Some(agent) = selected.and_then(|index| sheet.agents.get(index)) {
+                    sheet.renaming = Some((agent.id.clone(), agent.name.clone()));
+                }
+            }
+            't' => {
+                if let Some(agent) = selected.and_then(|index| sheet.agents.get(index)) {
+                    let id = agent.id.clone();
+                    if let Some(index) = sheet.pinned.iter().position(|pinned| pinned == &id) {
+                        sheet.pinned.remove(index);
+                    } else {
+                        sheet.pinned.push(id);
+                    }
+                }
+            }
+            'f' => {
+                sheet.finding = true;
+                sheet.query.clear();
+            }
+            'x' => {
+                if let Some(agent) = selected.and_then(|index| sheet.agents.get(index)) {
+                    let id = agent.id.clone();
+                    let removable = !matches!(
+                        agent.state,
+                        State::Active | State::Queued | State::Attention
+                    );
+                    if removable && sheet.delete_armed.as_deref() == Some(id.as_str()) {
+                        sheet.delete_armed = None;
+                        if let Some(index) = sheet.agents.iter().position(|row| row.id == id) {
+                            sheet.agents.remove(index);
+                            sheet.selected_index = sheet
+                                .selected_index
+                                .min(sheet.agents.len().saturating_sub(1));
+                            // Enter and `x` act on `agents_index`: keep it on the
+                            // row the view highlights.
+                            model.agents_index = sheet.selected_index;
+                            deleted = true;
+                        }
+                    } else {
+                        sheet.delete_armed = Some(id);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if deleted {
+            // The row that slid into place may be one the find filter hides.
+            model.snap_agents_selection();
+        }
+        return Some(Flow::Continue);
+    }
+    None
+}
+
 fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Flow {
+    if let Some(flow) = handle_agents_control(model, key) {
+        return flow;
+    }
     if model.screen == Screen::GraphResume {
         return handle_graph_resume_key(model, key);
     }
@@ -1741,6 +2304,40 @@ fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Fl
         if key.code == KeyCode::Enter {
             model.catalog_session_only = false;
         }
+    }
+    if model.screen == Screen::Keys && key.kind == KeyEventKind::Press {
+        if let Some(tab) = model.help_tab {
+            if key.code == KeyCode::Tab {
+                model.help_tab = Some((tab + 1) % 3);
+                return Flow::Continue;
+            }
+            if key.code == KeyCode::BackTab {
+                model.help_tab = Some((tab + 2) % 3);
+                return Flow::Continue;
+            }
+        }
+    }
+    if model.screen == Screen::Permissions
+        && model.reference
+        && key.modifiers.is_empty()
+        && matches!(key.code, KeyCode::Left | KeyCode::Right)
+    {
+        let tab = model.permission_tab;
+        model.permission_tab = if key.code == KeyCode::Left {
+            (tab + 6) % 7
+        } else {
+            (tab + 1) % 7
+        };
+        model.permission_index = 0;
+        return Flow::Continue;
+    }
+    if model.screen == Screen::Permissions
+        && model.reference
+        && key.code == KeyCode::Esc
+        && !model.permission_query.is_empty()
+    {
+        model.permission_query.clear();
+        return Flow::Continue;
     }
     if handle_picker_search(model, &key) {
         return Flow::Continue;
@@ -1834,9 +2431,8 @@ fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Fl
 
     if model.screen == Screen::Agents && key.modifiers.is_empty() && key.kind == KeyEventKind::Press
     {
-        let len = model.agents.as_ref().map(|s| s.agents.len()).unwrap_or(0);
-        if len > 0 {
-            let index = model.agents_index % len;
+        // Only a row the find filter shows can be acted on.
+        if let Some(index) = model.selected_agent() {
             match key.code {
                 KeyCode::Char('s') => {
                     return Flow::Choose(Choice::AgentAction {
@@ -2089,8 +2685,11 @@ mod graph_input_tests {
 fn handle_picker_search(model: &mut Model, key: &KeyEvent) -> bool {
     if !matches!(
         model.screen,
-        Screen::Models | Screen::Settings | Screen::Login
+        Screen::Models | Screen::Settings | Screen::Login | Screen::Permissions | Screen::Agents
     ) || key.kind == KeyEventKind::Release
+        || (model.screen == Screen::Permissions && !model.reference)
+        || (model.screen == Screen::Agents
+            && !model.agents.as_ref().is_some_and(|sheet| sheet.finding))
         || key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -2106,6 +2705,11 @@ fn handle_picker_search(model: &mut Model, key: &KeyEvent) -> bool {
     let query = match model.screen {
         Screen::Models => &mut model.catalog_query,
         Screen::Login => &mut model.login_query,
+        Screen::Permissions => &mut model.permission_query,
+        Screen::Agents => match model.agents.as_mut() {
+            Some(sheet) => &mut sheet.query,
+            None => return false,
+        },
         _ => &mut model.settings_query,
     };
     match key.code {
@@ -2124,6 +2728,7 @@ fn handle_picker_search(model: &mut Model, key: &KeyEvent) -> bool {
     let (indices, selected) = match model.screen {
         Screen::Models => (cogitator::visible_indices(model), &mut model.catalog_index),
         Screen::Login => (login::visible_indices(model), &mut model.login_index),
+        Screen::Permissions | Screen::Agents => return true,
         _ => (settings::visible_indices(model), &mut model.settings_index),
     };
     if !indices.contains(selected) {
@@ -2238,8 +2843,15 @@ fn screen_move(model: &mut Model, delta: isize) {
                 wrap_index(model.permission_index, delta, model.permission_rows.len());
         }
         Screen::Agents => {
-            let len = model.agents.as_ref().map(|s| s.agents.len()).unwrap_or(0);
-            model.agents_index = wrap_index(model.agents_index, delta, len);
+            // Move over the rows the find filter shows.
+            let visible = model.visible_agents();
+            if !visible.is_empty() {
+                let at = visible
+                    .iter()
+                    .position(|&index| index == model.agents_index)
+                    .unwrap_or(0);
+                model.agents_index = visible[wrap_index(at, delta, visible.len())];
+            }
             if let Some(s) = model.agents.as_mut() {
                 s.selected_index = model.agents_index;
             }
@@ -2568,16 +3180,14 @@ fn screen_accept(model: &Model) -> Option<Choice> {
             .map(|_| Choice::TreeEntry(model.tree_index)),
         // The sheet is for reading; enter moves on to the decision.
         Screen::Trust => model.project_trust.as_ref().map(|_| Choice::TrustDecide),
-        Screen::Permissions => {
-            pick(model.permission_index, model.permission_rows.len()).map(Choice::Permission)
-        }
-        Screen::Agents => {
-            let len = model.agents.as_ref().map(|s| s.agents.len()).unwrap_or(0);
-            (len > 0).then(|| Choice::AgentAction {
-                action: "inspect",
-                index: model.agents_index % len,
-            })
-        }
+        Screen::Permissions => (model.permission_tab == 0 && model.permission_query.is_empty())
+            .then(|| pick(model.permission_index, model.permission_rows.len()))
+            .flatten()
+            .map(Choice::Permission),
+        Screen::Agents => model.selected_agent().map(|index| Choice::AgentAction {
+            action: "inspect",
+            index,
+        }),
         Screen::ContextInspector => {
             let len = model
                 .context_inspector
@@ -2680,22 +3290,34 @@ fn handle_overlay_key(
         return Flow::Continue;
     }
     if key.modifiers.is_empty() && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
-        let rows = overlay_rows(model, overlay);
-        let anchor = model
-            .overlay_offset
-            .or_else(|| ui::focused_row(&rows))
-            .unwrap_or(0);
+        // A screen reader pages the same physical lines it is shown.
+        let (anchor, last) = if model.screen_reader && is_plain_ask(model, overlay) {
+            let pageable = screen_reader_ask_text(model).pageable().len();
+            // The first press enters paging at the head of the list: before it
+            // the list may have had no row at all, and a step would skip lines.
+            if model.overlay_offset.is_none() {
+                model.overlay_offset = Some(0);
+                return Flow::Continue;
+            }
+            (
+                model.overlay_offset.unwrap_or(0),
+                pageable.saturating_sub(1),
+            )
+        } else {
+            let rows = overlay_rows(model, overlay);
+            let anchor = model
+                .overlay_offset
+                .or_else(|| ui::focused_row(&rows))
+                .unwrap_or(0);
+            (anchor, rows.len().saturating_sub(3))
+        };
         let page = model.height.saturating_sub(6).max(1) as isize;
         let delta = if key.code == KeyCode::PageUp {
             -page
         } else {
             page
         };
-        model.overlay_offset = Some(
-            anchor
-                .saturating_add_signed(delta)
-                .min(rows.len().saturating_sub(3)),
-        );
+        model.overlay_offset = Some(anchor.saturating_add_signed(delta).min(last));
         return Flow::Continue;
     }
     if action_matches(model, data, "tui.select.up") {
@@ -5228,6 +5850,7 @@ mod working_line_spacing_tests {
         model.working = Some(Working::new());
         model.context_bar = ContextBarMode::Full;
         model.context_meter = Some(ContextUsageView {
+            all: false,
             model: "gpt-6-luna".into(),
             window: 200_000,
             free: 150_000,
@@ -5277,6 +5900,7 @@ mod scroll_to_entry_tests {
 
     fn usage(sections: usize) -> ContextUsageView {
         ContextUsageView {
+            all: false,
             model: "gpt-6-luna".into(),
             window: 200_000,
             free: 150_000,

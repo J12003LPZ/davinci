@@ -68,6 +68,8 @@ pub struct Args {
     pub extensions: Vec<String>,
     pub no_extensions: bool,
     pub no_mcp: bool,
+    /// Text-only, line-oriented output for screen readers.
+    pub screen_reader: bool,
     pub print: bool,
     pub export: Option<String>,
     /// Hidden maintainer command: write a live Codex backend capability report.
@@ -417,6 +419,8 @@ pub fn parse_args(args: &[String]) -> Args {
             result.extensions.push(args[i].clone());
         } else if arg == "--no-extensions" || arg == "-ne" {
             result.no_extensions = true;
+        } else if arg == "--screen-reader" {
+            result.screen_reader = true;
         } else if arg == "--no-mcp" {
             result.no_mcp = true;
         } else if arg == "--skill" && i + 1 < args.len() {
@@ -736,10 +740,20 @@ mod tests {
         let help = print_help();
         assert!(help.starts_with("davinci -"));
         assert!(help.contains("--no-mcp"));
+        assert!(help.contains("--screen-reader"));
         assert!(help.contains("Native intelligence"));
         assert!(!help
             .lines()
             .any(|line| line.trim_start().starts_with("pi ")));
+    }
+
+    #[test]
+    fn screen_reader_is_a_boolean_flag() {
+        let parsed = parse_args(&["--screen-reader".into()]);
+        assert!(parsed.screen_reader);
+        assert!(parsed.unknown_flags.is_empty());
+        let plain = parse_args(&[]);
+        assert!(!plain.screen_reader);
     }
 
     #[test]

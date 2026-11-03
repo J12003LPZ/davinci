@@ -9,6 +9,7 @@ use davinci_tui::davinci::{
 
 fn meter() -> ContextUsageView {
     ContextUsageView {
+        all: false,
         model: "gpt-5.6-luna".into(),
         window: 272_000,
         categories: vec![ContextCategory {

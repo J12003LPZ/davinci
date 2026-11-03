@@ -181,7 +181,8 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashAction {
     Quit,
-    Status(String),
+    /// `/help`: the tabbed help sheet in the reference shell, the command list off.
+    Help,
     Prompt(String),
     NewSession,
     Compact(Option<String>),
@@ -317,7 +318,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         "agents" => SlashAction::Agents(args.to_string()),
         "plugins" => SlashAction::Plugins(args.to_string()),
         "tasks" => SlashAction::Tasks,
-        "help" => SlashAction::Status(help_lines().join("\n")),
+        "help" => SlashAction::Help,
         // TS sends unknown slashes (skills, templates, extension commands) to prompt().
         _ => SlashAction::Prompt(trimmed.to_string()),
     }
@@ -326,7 +327,7 @@ pub fn parse_line(line: &str) -> SlashAction {
 /// `/help` rows: built-in commands, then the publicly listed native commands
 /// (`command_specs()`), so every discoverable command typed at the composer
 /// also appears here.
-fn help_lines() -> Vec<String> {
+pub(crate) fn help_lines() -> Vec<String> {
     let builtins = builtin_slash_commands();
     let mut seen: std::collections::HashSet<String> =
         builtins.iter().map(|c| c.name.clone()).collect();
@@ -491,9 +492,7 @@ mod tests {
 
     #[test]
     fn help_lists_builtin_and_public_native_commands_once() {
-        let SlashAction::Status(text) = parse_line("/help") else {
-            panic!("help is not a status");
-        };
+        let text = help_lines().join("\n");
         let names: Vec<&str> = text
             .lines()
             .map(|line| line.split_whitespace().next().unwrap())

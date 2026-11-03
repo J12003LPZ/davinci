@@ -1,11 +1,12 @@
 //! `/permissions`: the active mode and rules grouped by kind.
 //! Enter still applies a mode or removes a rule through the existing policy code.
 
-use ratatui::text::Line;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 
 use super::sheet::{facts, hint, Composer, SheetChrome};
-use crate::davinci::model::Model;
-use crate::davinci::ui::{section_detail, section_row, span};
+use crate::davinci::model::{Model, PermissionRow};
+use crate::davinci::ui::{self, section_detail, section_row, span};
 
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
@@ -13,8 +14,14 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     if model.permission_rows.is_empty() {
         return section_detail(width, th, "No permission policy loaded.");
     }
+    if model.reference && (model.permission_tab != 0 || !model.permission_query.is_empty()) {
+        return filtered_lines(model);
+    }
     let selected = model.permission_index % model.permission_rows.len();
     let mut rows = Vec::new();
+    if model.reference {
+        rows.extend(search_box(model));
+    }
     let mut previous_kind = "";
     for (index, row) in model.permission_rows.iter().enumerate() {
         if row.kind != previous_kind {
@@ -71,6 +78,131 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     rows
 }
 
+const TABS: [&str; 7] = [
+    "Permissions",
+    "Recently blocked",
+    "Allow",
+    "Ask",
+    "Deny",
+    "Auto mode",
+    "Workspace",
+];
+
+pub fn tabs(model: &Model) -> Line<'static> {
+    let th = &model.theme;
+    let accent = ratatui::style::Color::Rgb(0x6A, 0x9B, 0xCC);
+    let mut spans = Vec::new();
+    for (index, label) in TABS.iter().enumerate() {
+        spans.push(span(if index == 0 { "   " } else { "  " }, th.text));
+        let active = index == model.permission_tab;
+        let text = if active {
+            format!(" {label} ")
+        } else {
+            label.to_string()
+        };
+        let style = if active && model.reference {
+            Style::default()
+                .fg(ratatui::style::Color::Black)
+                .bg(accent)
+                .add_modifier(Modifier::BOLD)
+        } else if active {
+            Style::default().fg(th.primary).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.text)
+        };
+        spans.push(Span::styled(text, style));
+    }
+    Line::from(ui::truncate_run(spans, model.width))
+}
+
+fn search_box(model: &Model) -> Vec<Line<'static>> {
+    let inner = model.width.saturating_sub(8);
+    let query = if model.permission_query.is_empty() {
+        "Search…"
+    } else {
+        &model.permission_query
+    };
+    let content = ui::clip_ellipsis(&format!(" ⌕ {query}"), inner);
+    let used = unicode_width::UnicodeWidthStr::width(content.as_str());
+    [
+        format!("   ╭{}╮", "─".repeat(usize::from(inner))),
+        format!(
+            "   │{content}{}│",
+            " ".repeat(usize::from(inner).saturating_sub(used))
+        ),
+        format!("   ╰{}╯", "─".repeat(usize::from(inner))),
+    ]
+    .into_iter()
+    .map(|text| {
+        Line::from(span(
+            ui::clip_ellipsis(&text, model.width),
+            model.theme.border,
+        ))
+    })
+    .collect()
+}
+
+/// A read-only tab: it names the rules the policy holds and never edits them.
+fn filtered_lines(model: &Model) -> Vec<Line<'static>> {
+    let th = &model.theme;
+    let width = model.width;
+    let mut rows = Vec::new();
+    rows.extend(search_box(model));
+    let query = model.permission_query.to_lowercase();
+    if !query.is_empty() {
+        let mut found = false;
+        for row in model
+            .permission_rows
+            .iter()
+            .filter(|row| row.label.to_lowercase().contains(&query))
+        {
+            rows.extend(section_detail(width, th, &row.label));
+            found = true;
+        }
+        if !found {
+            rows.extend(section_detail(width, th, "No rules match."));
+        }
+        return rows;
+    }
+    let (description, empty, keep): (&str, &str, fn(&PermissionRow) -> bool) =
+        match model.permission_tab {
+            1 => (
+                "Recent calls that policy blocked.",
+                "No recently blocked calls.",
+                |_| false,
+            ),
+            2 => ("Tools that run without asking.", "No allow rules.", |row| {
+                row.detail.starts_with("allow")
+            }),
+            3 => ("Prompts shown before a tool runs.", "No ask rules.", |_| {
+                false
+            }),
+            4 => ("Tools that never run.", "No deny rules.", |row| {
+                row.detail.starts_with("deny")
+            }),
+            5 => ("Extra rules for auto mode.", "No auto-mode rules.", |row| {
+                row.source == "auto"
+            }),
+            _ => ("Rules from this workspace.", "No project rules.", |row| {
+                row.source == "project"
+            }),
+        };
+    rows.extend(section_detail(width, th, description));
+    let rules: Vec<&PermissionRow> = model
+        .permission_rows
+        .iter()
+        .filter(|row| row.kind == "rule" && keep(row))
+        .collect();
+    if rules.is_empty() {
+        rows.extend(section_detail(width, th, empty));
+    } else {
+        for row in rules {
+            rows.extend(section_detail(width, th, &row.label));
+        }
+    }
+    rows
+}
+
 pub fn chrome(model: &Model) -> SheetChrome {
     let th = &model.theme;
     let mode = model
@@ -97,8 +229,16 @@ pub fn chrome(model: &Model) -> SheetChrome {
             ],
         ),
         status_third: mode.map(|mode| vec![span(mode, th.muted)]),
-        hints: vec![hint(th, "↑↓ move"), hint(th, "enter apply")],
-        escape: Some("esc close"),
+        hints: if model.reference {
+            vec![hint(th, "←/→ to switch"), hint(th, "↓ to select")]
+        } else {
+            vec![hint(th, "↑↓ move"), hint(th, "enter apply")]
+        },
+        escape: Some(if model.reference {
+            "Esc to cancel"
+        } else {
+            "esc close"
+        }),
         composer: Composer::Hidden,
         ..SheetChrome::default()
     }

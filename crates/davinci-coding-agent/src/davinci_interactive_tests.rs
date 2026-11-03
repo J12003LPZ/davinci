@@ -441,7 +441,87 @@ fn model() -> Model {
 }
 
 #[test]
-fn mid_turn_shift_tab_updates_the_footer_at_once_and_cycles_from_the_displayed_mode() {
+fn the_theme_line_opens_the_picker_only_in_the_reference_shell() {
+    let mut off = model();
+    assert!(!super::theme_line(&mut off, "/theme", || {
+        panic!("settings were read with the setting off")
+    }));
+    assert!(off.theme_picker.is_none());
+
+    let mut on = model();
+    on.reference = true;
+    on.running = true;
+    for other in ["/themes", "/theme dark", "theme", "make a theme"] {
+        assert!(!super::theme_line(&mut on, other, || None), "{other}");
+    }
+    assert!(on.theme_picker.is_none());
+    let before = on.transcript.len();
+    assert!(super::theme_line(&mut on, " /theme ", || Some(
+        "light".into()
+    )));
+    let picker = on.theme_picker.as_ref().expect("opened");
+    assert_eq!(
+        davinci_tui::davinci::views::theme_picker::ENTRIES[picker.index].0,
+        "light"
+    );
+    assert_eq!(picker.applied, "light");
+    // Nothing was added to the conversation, and a queued line that ran it no
+    // longer leaves the shell looking busy.
+    assert_eq!(on.transcript.len(), before);
+    assert!(!on.running);
+    // An unset theme means the default.
+    on.theme_picker = None;
+    assert!(super::theme_line(&mut on, "/theme", || None));
+    assert_eq!(on.theme_picker.as_ref().unwrap().applied, "dark");
+}
+
+#[test]
+fn the_first_run_steps_open_on_the_stored_theme() {
+    let mut off = model();
+    assert!(!super::begin_first_run(&mut off, &Default::default()));
+    for (stored, shown) in [
+        (Some("light"), "light"),
+        (Some("ansi"), "ansi"),
+        (None, "dark"),
+    ] {
+        let mut on = model();
+        on.reference = true;
+        let settings = crate::settings::Settings {
+            theme: stored.map(String::from),
+            ..Default::default()
+        };
+        assert!(super::begin_first_run(&mut on, &settings));
+        let picker = on.theme_picker.as_ref().expect("opened");
+        assert_eq!(
+            davinci_tui::davinci::views::theme_picker::ENTRIES[picker.index].0,
+            shown
+        );
+        assert_eq!(picker.applied, shown);
+    }
+}
+
+#[test]
+fn a_queued_theme_line_waits_behind_the_lines_that_start_a_turn() {
+    let queue = |lines: &[&str]| lines.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let drain =
+        |model: &mut Model| std::iter::from_fn(|| super::next_queued(model)).collect::<Vec<_>>();
+    let mut on = model();
+    on.reference = true;
+    on.queued = queue(&["/theme", "fix it", "/theme", "then test"]);
+    assert_eq!(
+        drain(&mut on),
+        queue(&["fix it", "then test", "/theme", "/theme"])
+    );
+    on.queued = queue(&["/theme"]);
+    assert_eq!(drain(&mut on), queue(&["/theme"]));
+    // Off: first in, first out, as before.
+    let mut off = model();
+    off.queued = queue(&["/theme", "fix it", "/theme"]);
+    assert_eq!(drain(&mut off), queue(&["/theme", "fix it", "/theme"]));
+}
+
+#[test]
+fn mid_turn_shift_tab_queues_the_change_and_the_footer_moves_at_once() {
     let mut agent = Agent::new("base prompt");
     let mut m = model();
     m.screen = davinci_tui::davinci::model::Screen::Agent;
@@ -457,17 +537,20 @@ fn mid_turn_shift_tab_updates_the_footer_at_once_and_cycles_from_the_displayed_m
     };
 
     assert!(!mid_turn_key(&mut m, shift_tab(), &abort, &pending));
-    assert_eq!(m.permission_mode, "edits", "footer changes immediately");
+    assert_eq!(m.permission_mode, "edits", "the footer moves as on main");
     assert_eq!(*pending.lock().unwrap(), Some(PermissionMode::Edits));
     assert_eq!(agent.permission_mode(), PermissionMode::Ask, "agent waits");
 
-    // The second press starts from the displayed mode, not the agent's.
+    // The worker consumes the slot between presses; no sync happens in the
+    // live path, so the second press must start from the footer.
+    assert_eq!(
+        agent.apply_pending_permission_mode(),
+        Some(PermissionMode::Edits)
+    );
+
     assert!(!mid_turn_key(&mut m, shift_tab(), &abort, &pending));
     assert_eq!(m.permission_mode, "read-only");
     assert_eq!(*pending.lock().unwrap(), Some(PermissionMode::ReadOnly));
-    assert!(!abort.load(Ordering::Relaxed));
-
-    // The worker's apply point reaches the agent through set_permission_mode.
     assert_eq!(
         agent.apply_pending_permission_mode(),
         Some(PermissionMode::ReadOnly)
@@ -475,6 +558,40 @@ fn mid_turn_shift_tab_updates_the_footer_at_once_and_cycles_from_the_displayed_m
     assert_eq!(agent.permission_mode(), PermissionMode::ReadOnly);
     assert!(agent.is_plan_mode());
     assert!(pending.lock().unwrap().is_none());
+    assert!(!abort.load(Ordering::Relaxed));
+}
+
+#[test]
+fn the_reference_mid_turn_cycle_skips_always_approve() {
+    let mut agent = Agent::new("base prompt");
+    let mut m = model();
+    m.reference = true;
+    m.screen = davinci_tui::davinci::model::Screen::Agent;
+    m.running = true;
+    change_permission_mode(&mut agent, &mut m, PermissionMode::Ask);
+    let pending = agent.pending_permission_mode.clone();
+    let abort = Arc::new(AtomicBool::new(false));
+    let shift_tab = || {
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::BackTab,
+            crossterm::event::KeyModifiers::SHIFT,
+        )
+    };
+    for expected in ["edits", "read-only", "auto", "ask"] {
+        assert!(!mid_turn_key(&mut m, shift_tab(), &abort, &pending));
+        let applied = agent
+            .apply_pending_permission_mode()
+            .expect("a queued mode");
+        settle_requested_mode(&mut m, &pending, &agent.applied_permission_mode);
+        assert_eq!(m.permission_mode, expected);
+        assert_eq!(applied.as_str(), expected);
+        assert_ne!(m.permission_mode, "always-approve");
+    }
+    assert_eq!(
+        agent.permission_mode(),
+        PermissionMode::Ask,
+        "four stops wrap"
+    );
 }
 
 #[test]
@@ -778,16 +895,12 @@ fn hotkey_rows_name_the_surface_they_toggle() {
 
 #[test]
 fn help_is_one_list_row_per_command_in_the_shell_only() {
-    let Sent::Say(text) = classify("/help") else {
-        panic!("help asked the model");
+    let Sent::Command(crate::slash::SlashAction::Help) = classify("/help") else {
+        panic!("help is not the help sheet");
     };
-    assert!(text.lines().all(|line| line.starts_with("- /")), "{text}");
-    assert!(text.contains("- /effort"), "{text}");
-    // The shared parser stays plain for the legacy chrome's println.
-    let crate::slash::SlashAction::Status(plain) = crate::slash::parse_line("/help") else {
-        panic!("help is not a status");
-    };
-    assert!(plain.lines().all(|line| line.starts_with('/')), "{plain}");
+    let text = crate::slash::help_lines().join("\n");
+    assert!(text.lines().all(|line| line.starts_with('/')), "{text}");
+    assert!(text.contains("/effort"), "{text}");
 }
 
 #[test]
@@ -2411,8 +2524,11 @@ fn commands_with_a_home_reach_perform_which_opens_their_sheet() {
 }
 
 #[test]
-fn help_answers_without_asking_the_model() {
-    assert!(matches!(classify("/help"), Sent::Say(text) if text.contains('/')));
+fn help_is_classified_for_the_shell_not_the_model() {
+    assert!(matches!(
+        classify("/help"),
+        Sent::Command(crate::slash::SlashAction::Help)
+    ));
 }
 
 #[test]
@@ -2583,6 +2699,93 @@ fn first_run_asks_only_what_davinci_cannot_decide_for_itself() {
 }
 
 #[test]
+fn the_first_run_question_waits_for_an_open_approval_and_neither_is_lost() {
+    let agent = davinci_agent::Agent::new("test");
+    let mut model = model();
+    model.reference = true;
+    // An approval is on screen when the welcome ends.
+    model.ask = Question::Trust {
+        path: r"C:\work".into(),
+        options: Vec::new(),
+    }
+    .ask(&agent);
+    model.overlay = Some(Overlay::Ask);
+    let approval = model.ask.title.clone();
+    let mut pending = None;
+
+    super::ask_first_run(&mut model, &agent, &mut pending);
+    assert_eq!(model.ask.title, approval, "the approval was replaced");
+    assert!(pending.is_none() && model.first_run_due);
+    // Still open: nothing is put up over it.
+    super::release_first_run(&mut model, &agent, &mut pending);
+    assert_eq!(model.ask.title, approval);
+
+    // It closes; the question follows, once.
+    model.overlay = None;
+    super::release_first_run(&mut model, &agent, &mut pending);
+    assert_eq!(model.ask.title, "Welcome");
+    assert_eq!(model.overlay, Some(Overlay::Ask));
+    assert!(matches!(pending, Some(Question::FirstRun)) && !model.first_run_due);
+
+    // With nothing open it is put up at once, as before.
+    let mut model = self::model();
+    let mut pending = None;
+    super::ask_first_run(&mut model, &agent, &mut pending);
+    assert_eq!(model.ask.title, "Welcome");
+    assert!(!model.first_run_due);
+}
+
+#[test]
+fn an_editor_that_hands_the_draft_back_leaves_it_alone_whatever_it_holds() {
+    // Line endings, a BOM and the newline an editor adds do not make a change; a
+    // change in a character does, also in text a console could not carry.
+    for draft in [
+        "plain",
+        "crlf\r\nlines\r\nhere",
+        "emoji \u{1f642} and e\u{301} and \u{4f60}\u{597d}",
+        "ends with a newline\n",
+        "[Pasted text #1] and more",
+        "",
+    ] {
+        assert!(super::editor_left_draft_alone(draft, draft), "{draft:?}");
+        assert!(
+            super::editor_left_draft_alone(draft, &format!("{draft}\n")),
+            "{draft:?}"
+        );
+        assert!(
+            super::editor_left_draft_alone(draft, &draft.replace("\r\n", "\n")),
+            "{draft:?}"
+        );
+        assert!(
+            super::editor_left_draft_alone(draft, &format!("\u{feff}{draft}")),
+            "{draft:?}"
+        );
+        assert!(
+            !super::editor_left_draft_alone(draft, &format!("{draft}!")),
+            "{draft:?}"
+        );
+    }
+    assert!(
+        !super::editor_left_draft_alone("e\u{301}", "\u{e9}"),
+        "a different encoding is a change"
+    );
+}
+
+#[test]
+fn the_question_after_the_welcome_steps_is_the_analytics_one_and_grants_no_trust() {
+    // The steps end in this question and nothing else: it offers no trust,
+    // permission or credential choice, and it is unchanged by the steps.
+    let agent = davinci_agent::Agent::new("test");
+    let panel = Question::FirstRun.ask(&agent);
+    for item in &panel.items {
+        let text = format!("{} {}", item.label, item.detail).to_lowercase();
+        assert!(!text.contains("trust") && !text.contains("allow"), "{text}");
+    }
+    assert_eq!(panel.items.len(), 2);
+    assert!(panel.note.contains("usage data"));
+}
+
+#[test]
 fn an_untrusted_project_with_pi_resources_is_warned_about_by_glyph() {
     let dir = tempfile::tempdir().unwrap();
     let _agent_dir = AgentDirEnv::set(dir.path().join("agent"));
@@ -2613,6 +2816,80 @@ fn a_trusted_project_opens_without_a_warning() {
     assert!(!block.iter().any(|entry| {
         matches!(entry, Entry::Tool { target, .. } if target.contains("not trusted"))
     }));
+}
+
+#[test]
+fn the_trust_question_stores_nothing_until_a_row_is_answered_and_each_row_means_what_it_says() {
+    use crate::trust::{get_project_trust_options, ProjectTrustStore};
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let _env = AgentDirEnv::set(agent_dir.clone());
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(project.join(".pi").join("skills")).unwrap();
+
+    let options = get_project_trust_options(&project, false);
+    let question = Question::Trust {
+        path: project.display().to_string(),
+        options: options.clone(),
+    };
+    let panel = question.ask(&davinci_agent::Agent::new("test"));
+    // Building and showing the question grants nothing and stores nothing.
+    let store = ProjectTrustStore::open(&agent_dir);
+    assert_eq!(store.get(&project), None);
+    assert!(!agent_dir.join("trust.json").exists());
+
+    // Every row says what it does to the project's `.pi` resources, and the
+    // row's own meaning is the stored decision it carries.
+    assert_eq!(panel.items.len(), options.len());
+    let accept = options.iter().position(|o| o.label == "Trust").unwrap();
+    let decline = options
+        .iter()
+        .position(|o| o.label == "Do not trust")
+        .unwrap();
+    assert_eq!(panel.items[accept].detail, "project .pi resources are used");
+    assert_eq!(
+        panel.items[decline].detail,
+        "project .pi resources are ignored"
+    );
+    assert!(options[accept].trusted && !options[decline].trusted);
+    assert_eq!(options[accept].updates.len(), 1);
+    assert_eq!(options[accept].updates[0].decision, Some(true));
+    assert_eq!(options[decline].updates.len(), 1);
+    assert_eq!(options[decline].updates[0].decision, Some(false));
+
+    // Declining denies; accepting grants that folder; neither touches another.
+    store.set_many(&options[decline].updates).unwrap();
+    assert_eq!(store.get(&project), Some(false));
+    store.set_many(&options[accept].updates).unwrap();
+    assert_eq!(store.get(&project), Some(true));
+    store.set_many(&options[decline].updates).unwrap();
+    assert_eq!(store.get(&project), Some(false));
+    let parent = project.parent().unwrap();
+    assert_eq!(store.get(&parent.join("unrelated")), None);
+}
+
+#[test]
+fn a_this_session_only_trust_row_stores_nothing() {
+    use crate::trust::{get_project_trust_options, ProjectTrustStore};
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let _env = AgentDirEnv::set(agent_dir.clone());
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let options = get_project_trust_options(&project, true);
+    for label in [
+        "Trust (this session only)",
+        "Do not trust (this session only)",
+    ] {
+        let option = options.iter().find(|o| o.label == label).unwrap();
+        assert!(option.updates.is_empty(), "{label}");
+        ProjectTrustStore::open(&agent_dir)
+            .set_many(&option.updates)
+            .unwrap();
+    }
+    assert_eq!(ProjectTrustStore::open(&agent_dir).get(&project), None);
 }
 
 #[test]
@@ -3412,17 +3689,17 @@ fn a_model_switch_is_confirmed_as_the_elbow_row_under_its_command() {
     let mut m = model();
     m.model_title = "Opus 5.5".into();
     assert_eq!(
-        model_set(&m, Some(Ok(()))),
+        model_set(&m, Some(Ok(())), None),
         Done::Set {
             text: "Set model to Opus 5.5 and saved as your default for new sessions".into(),
             accent: Some("Opus 5.5".into()),
         }
     );
-    let Done::Set { text, .. } = model_set(&m, None) else {
+    let Done::Set { text, .. } = model_set(&m, None, None) else {
         panic!("a session-only switch is still a confirmation");
     };
     assert_eq!(text, "Set model to Opus 5.5 for this session only");
-    let Done::Set { text, .. } = model_set(&m, Some(Err("read-only".into()))) else {
+    let Done::Set { text, .. } = model_set(&m, Some(Err("read-only".into())), None) else {
         panic!("a switch that could not be saved is still a confirmation");
     };
     assert_eq!(text, "Set model to Opus 5.5 for this run only (read-only)");
@@ -3449,7 +3726,7 @@ fn a_confirmed_change_lands_under_the_slash_command_that_asked_for_it() {
     m.model_title = "Opus 5.5".into();
     m.composer.push_str("/model opus-5-5");
     m.submit();
-    let Done::Set { text, accent } = model_set(&m, Some(Ok(()))) else {
+    let Done::Set { text, accent } = model_set(&m, Some(Ok(())), None) else {
         panic!("a confirmation");
     };
     m.confirm(&text, accent.as_deref());
@@ -4981,4 +5258,715 @@ fn audit_wp06_b062_malformed_marketplace_registry_is_visible() {
     assert!(super::marketplace_rows(&agent_dir)
         .iter()
         .all(|row| row.state != davinci_tui::davinci::theme::State::Failed));
+}
+
+#[test]
+fn an_esc_the_theme_picker_consumed_never_counts_toward_a_double_escape() {
+    // Closing the picker does not arm the timer, so the next Esc is a first.
+    let mut model = self::model();
+    model.reference = true;
+    let mut last = None;
+    assert!(davinci_tui::davinci::views::theme_picker::open(
+        &mut model, "dark"
+    ));
+    assert!(!idle_esc(&mut model, &mut last));
+    assert!(model.theme_picker.is_none(), "Esc closes the picker");
+    assert!(last.is_none(), "the closing Esc armed the timer");
+    assert!(!idle_esc(&mut model, &mut last));
+
+    // An Esc from before the picker opened does not pair with one inside it.
+    let mut second = self::model();
+    second.reference = true;
+    let mut last = None;
+    assert!(!idle_esc(&mut second, &mut last));
+    assert!(last.is_some());
+    assert!(davinci_tui::davinci::views::theme_picker::open(
+        &mut second,
+        "dark"
+    ));
+    assert!(!idle_esc(&mut second, &mut last));
+    assert!(second.theme_picker.is_none());
+    assert!(!idle_esc(&mut second, &mut last), "pair spanned the picker");
+}
+
+#[test]
+fn ctrl_enter_sends_the_draft_now_ahead_of_queued_lines() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut m = model();
+    m.reference = true;
+    m.running = true;
+    m.queued.push("later".into());
+    m.type_char("now");
+    let abort = std::sync::Arc::new(AtomicBool::new(false));
+    let pending = std::sync::Mutex::new(None);
+    super::mid_turn_key(
+        &mut m,
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::CONTROL,
+        ),
+        &abort,
+        &pending,
+    );
+    assert_eq!(m.queued, vec!["now".to_string(), "later".to_string()]);
+    assert_eq!(m.composer.to_string(), "", "the draft stayed behind");
+    assert!(
+        abort.load(Ordering::Relaxed),
+        "the running turn was not aborted"
+    );
+    assert!(!m.running, "the turn still reads as running");
+}
+
+#[test]
+fn ctrl_enter_on_an_empty_draft_leaves_the_turn_alone() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut m = model();
+    m.reference = true;
+    m.running = true;
+    let abort = std::sync::Arc::new(AtomicBool::new(false));
+    let pending = std::sync::Mutex::new(None);
+    super::mid_turn_key(
+        &mut m,
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::CONTROL,
+        ),
+        &abort,
+        &pending,
+    );
+    assert!(m.queued.is_empty());
+    assert!(!abort.load(Ordering::Relaxed));
+    assert!(m.running);
+}
+
+#[test]
+fn the_permission_panel_enter_and_a_digit_choose_an_option() {
+    use davinci_tui::davinci::app::{self, Flow};
+    use davinci_tui::davinci::model::Overlay;
+    let enter = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let mut m = model();
+    m.ask = permission_ask(&approval("bash", "git status --short", false), true);
+    m.overlay = Some(Overlay::Ask);
+    m.ask_index = 0;
+    assert!(
+        matches!(
+            app::handle_key(&mut m, enter),
+            Flow::Choose(davinci_tui::davinci::model::Choice::Ask(0))
+        ),
+        "Enter did not choose the first option"
+    );
+
+    let mut m = model();
+    m.ask = permission_ask(&approval("bash", "git status --short", false), true);
+    m.overlay = Some(Overlay::Ask);
+    m.ask_index = 0;
+    let two = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('2'),
+        crossterm::event::KeyModifiers::NONE,
+    );
+    assert!(matches!(app::handle_key(&mut m, two), Flow::Continue));
+    assert_eq!(m.ask_index, 1, "the digit did not move the choice");
+    assert!(
+        matches!(
+            app::handle_key(&mut m, enter),
+            Flow::Choose(davinci_tui::davinci::model::Choice::Ask(1))
+        ),
+        "Enter did not take the digit's option"
+    );
+}
+
+#[test]
+fn the_approval_answer_path_turns_enter_into_an_allow_once_decision() {
+    use std::sync::atomic::AtomicBool;
+    let request = approval("write", "..\\outside.txt", true);
+    let choices = request.host_choices(true);
+    let mut m = model();
+    m.ask = permission_ask(&request, true);
+    m.overlay = Some(davinci_tui::davinci::model::Overlay::Ask);
+    m.ask_index = 0;
+    let abort = std::sync::Arc::new(AtomicBool::new(false));
+    let answer = super::approval_answer_key(
+        &mut m,
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ),
+        &choices,
+        &request,
+        &abort,
+    );
+    assert_eq!(
+        answer.map(|answer| answer.decision),
+        Some(ToolApprovalDecision::AllowOnce),
+        "Enter did not become AllowOnce"
+    );
+}
+
+fn write_approval(
+    legal: Vec<ToolApprovalDecision>,
+    outside: bool,
+    cwd: &str,
+) -> ToolApprovalRequest {
+    ToolApprovalRequest {
+        legal_choices: davinci_agent::approval::offer_scopes(true, false, false)
+            .into_iter()
+            .filter(|choice| {
+                legal.iter().any(|decision| {
+                    *decision
+                        == match choice.scope {
+                            davinci_agent::approval::GrantScope::Once => {
+                                ToolApprovalDecision::AllowOnce
+                            }
+                            davinci_agent::approval::GrantScope::Session => {
+                                ToolApprovalDecision::AllowForSession
+                            }
+                            davinci_agent::approval::GrantScope::Project => {
+                                ToolApprovalDecision::AllowAlways
+                            }
+                            _ => ToolApprovalDecision::Deny,
+                        }
+                })
+            })
+            .collect(),
+        tool_call_id: "call_perm".into(),
+        tool: "write".into(),
+        args: json!({"path": cwd, "content": "permission probe"}),
+        subject: cwd.into(),
+        summary: format!("write · {cwd}"),
+        session_rule: format!("write:{cwd}"),
+        outside_project: outside,
+        mode: PermissionMode::Ask,
+    }
+}
+
+#[test]
+fn the_write_dialog_maps_each_row_to_a_policy_decision() {
+    use davinci_tui::davinci::app::{self, Flow};
+    use davinci_tui::davinci::model::{Choice, Overlay};
+    let request = write_approval(
+        vec![
+            ToolApprovalDecision::AllowOnce,
+            ToolApprovalDecision::AllowForSession,
+            ToolApprovalDecision::AllowAlways,
+            ToolApprovalDecision::Deny,
+        ],
+        false,
+        "inside.txt",
+    );
+    let choices = request.host_choices(true);
+    let mut m = model();
+    m.ask = permission_ask(&request, true);
+    m.overlay = Some(Overlay::Ask);
+    for (index, decision) in choices.iter().enumerate() {
+        m.ask_index = index;
+        let enter = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        match app::handle_key(&mut m, enter) {
+            Flow::Choose(Choice::Ask(chosen)) => {
+                assert_eq!(
+                    super::permission_choice(chosen, &choices),
+                    Some(*decision),
+                    "row {index} maps to {decision:?}"
+                );
+            }
+            other => panic!("row {index} produced {other:?}"),
+        }
+        m.overlay = Some(Overlay::Ask);
+    }
+    // The dialog itself never moves the mode; only the policy can.
+    assert_eq!(m.permission_mode, "ask");
+}
+
+#[test]
+fn an_outside_project_write_offers_only_the_denials() {
+    // The live policy refuses session and project grants for a path outside the
+    // workspace; the dialog must show exactly the choices the policy issued.
+    let request = write_approval(
+        vec![ToolApprovalDecision::AllowOnce, ToolApprovalDecision::Deny],
+        true,
+        "..\\outside.txt",
+    );
+    let ask = permission_ask(&request, false);
+    let labels: Vec<&str> = ask.items.iter().map(|item| item.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        ["Yes", "No", "No, and tell the model what to do differently"]
+    );
+    assert!(request
+        .host_choices(false)
+        .contains(&ToolApprovalDecision::AllowOnce));
+    assert!(!request
+        .host_choices(false)
+        .contains(&ToolApprovalDecision::AllowForSession));
+}
+
+#[test]
+fn escape_and_the_deny_row_are_the_same_decision() {
+    use std::sync::atomic::AtomicBool;
+    let request = write_approval(
+        vec![ToolApprovalDecision::AllowOnce, ToolApprovalDecision::Deny],
+        true,
+        "..\\outside.txt",
+    );
+    let choices = request.host_choices(false);
+    let mut m = model();
+    m.ask = permission_ask(&request, false);
+    m.overlay = Some(davinci_tui::davinci::model::Overlay::Ask);
+    m.ask_index = 1;
+    let abort = std::sync::Arc::new(AtomicBool::new(false));
+    let denied = super::approval_answer_key(
+        &mut m,
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ),
+        &choices,
+        &request,
+        &abort,
+    );
+    assert_eq!(
+        denied.map(|answer| answer.decision),
+        Some(ToolApprovalDecision::Deny)
+    );
+    let mut m = model();
+    m.ask = permission_ask(&request, false);
+    m.overlay = Some(davinci_tui::davinci::model::Overlay::Ask);
+    let escaped = super::approval_answer_key(
+        &mut m,
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ),
+        &choices,
+        &request,
+        &abort,
+    );
+    assert_eq!(
+        escaped.map(|answer| answer.decision),
+        Some(ToolApprovalDecision::Deny),
+        "Escape must deny, never approve or cancel silently"
+    );
+    assert!(!abort.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+fn ctrl_c_key() -> crossterm::event::KeyEvent {
+    crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('c'),
+        crossterm::event::KeyModifiers::CONTROL,
+    )
+}
+
+/// Drain `model`'s queue the way `run_turns` does. Each started line is a turn
+/// that reaches a nested drain, as `on_line` reaches `run_turns`; the lines in
+/// `cancel` are interrupted with a real Ctrl+C key while they run.
+fn drain_with_ctrl_c_on(model: &mut Model, cancel: &[&str]) -> Vec<String> {
+    use std::cell::RefCell;
+    let started = RefCell::new(Vec::new());
+    fn level(model: &mut Model, cancel: &[&str], started: &RefCell<Vec<String>>) -> Next {
+        drain_queue(
+            model,
+            |model| model,
+            |model, line| {
+                started.borrow_mut().push(line.to_string());
+                if cancel.contains(&line) {
+                    let abort = Arc::new(AtomicBool::new(false));
+                    mid_turn_key(model, ctrl_c_key(), &abort, &Mutex::new(None));
+                }
+                level(model, cancel, started)
+            },
+        )
+    }
+    level(model, cancel, &started);
+    started.into_inner()
+}
+
+#[test]
+fn ctrl_c_holds_the_queue_at_every_draining_level_until_a_submission() {
+    let queue = |lines: &[&str]| lines.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+    let mut m = model();
+    m.reference = true;
+    m.running = true;
+
+    // During a queued turn: B starts, Ctrl+C stops it, the outer level must not start C.
+    m.queued = queue(&["B", "C"]);
+    assert_eq!(drain_with_ctrl_c_on(&mut m, &["B"]), queue(&["B"]));
+    assert_eq!(m.queued, queue(&["C"]));
+
+    // During the initial turn: the hold is set before the queue is looked at.
+    let mut initial = model();
+    initial.reference = true;
+    initial.queued = queue(&["B", "C"]);
+    mid_turn_key(
+        &mut initial,
+        ctrl_c_key(),
+        &Arc::new(AtomicBool::new(false)),
+        &Mutex::new(None),
+    );
+    assert!(drain_with_ctrl_c_on(&mut initial, &[]).is_empty());
+    assert_eq!(initial.queued, queue(&["B", "C"]));
+
+    // A deliberate submission clears the hold; the held lines drain after its turn.
+    release_queue_hold(&mut m);
+    assert_eq!(drain_with_ctrl_c_on(&mut m, &[]), queue(&["C"]));
+    assert!(m.queued.is_empty());
+}
+
+#[test]
+fn the_ctrl_c_hold_and_the_reference_chords_do_nothing_with_the_setting_off() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut m = model();
+    m.running = true;
+    m.queued = vec!["B".into(), "C".into()];
+    let abort = Arc::new(AtomicBool::new(false));
+    let pending = Mutex::new(None);
+    mid_turn_key(&mut m, ctrl_c_key(), &abort, &pending);
+    assert!(m.ctrl_c_armed.is_none() && !m.exit_armed, "no hold on main");
+    assert_eq!(drain_with_ctrl_c_on(&mut m, &["B"]), ["B", "C"]);
+
+    // Up leaves the queue alone, ctrl+x ctrl+s sends nothing, ctrl+enter queues.
+    let mut m = model();
+    m.running = true;
+    m.queued = vec!["B".into()];
+    let abort = Arc::new(AtomicBool::new(false));
+    let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+    mid_turn_key(&mut m, up, &abort, &pending);
+    assert_eq!(m.queued, ["B"]);
+    m.type_char("now");
+    for key in [KeyCode::Char('x'), KeyCode::Char('s')] {
+        mid_turn_key(
+            &mut m,
+            KeyEvent::new(key, KeyModifiers::CONTROL),
+            &abort,
+            &pending,
+        );
+    }
+    assert_eq!(m.queued, ["B"]);
+    assert!(m.chord_x.is_none());
+    let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+    mid_turn_key(&mut m, ctrl_enter, &abort, &pending);
+    assert_eq!(m.queued, ["B", "now"], "queued last, no send-now");
+    assert!(!abort.load(Ordering::Relaxed));
+}
+
+fn shift_tab_key() -> crossterm::event::KeyEvent {
+    crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::BackTab,
+        crossterm::event::KeyModifiers::SHIFT,
+    )
+}
+
+#[test]
+fn the_reference_footer_shows_a_requested_mode_only_once_the_worker_applied_it() {
+    let mut agent = Agent::new("base prompt");
+    let mut m = model();
+    m.reference = true;
+    m.screen = davinci_tui::davinci::model::Screen::Agent;
+    m.running = true;
+    change_permission_mode(&mut agent, &mut m, PermissionMode::Edits);
+    let pending = agent.pending_permission_mode.clone();
+    let abort = Arc::new(AtomicBool::new(false));
+
+    // Edits -> Plan: the batch that started under Edits can still write, so the
+    // footer must keep saying edits while the request waits in the slot.
+    mid_turn_key(&mut m, shift_tab_key(), &abort, &pending);
+    assert_eq!(*pending.lock().unwrap(), Some(PermissionMode::ReadOnly));
+    settle_requested_mode(&mut m, &pending, &agent.applied_permission_mode);
+    assert_eq!(m.permission_mode, "edits", "not applied yet");
+
+    // The worker takes the slot at its next batch; the next UI tick shows it.
+    assert_eq!(
+        agent.apply_pending_permission_mode(),
+        Some(PermissionMode::ReadOnly)
+    );
+    settle_requested_mode(&mut m, &pending, &agent.applied_permission_mode);
+    assert_eq!(m.permission_mode, "read-only");
+    assert!(m.requested_permission_mode.is_none());
+}
+
+#[test]
+fn the_footer_does_not_move_when_the_slot_is_only_taken_before_the_install_is_reported() {
+    let mut agent = Agent::new("base prompt");
+    let mut m = model();
+    m.reference = true;
+    m.screen = davinci_tui::davinci::model::Screen::Agent;
+    m.running = true;
+    change_permission_mode(&mut agent, &mut m, PermissionMode::Edits);
+    let pending = agent.pending_permission_mode.clone();
+    let applied = agent.applied_permission_mode.clone();
+    mid_turn_key(
+        &mut m,
+        shift_tab_key(),
+        &Arc::new(AtomicBool::new(false)),
+        &pending,
+    );
+    // The worker has taken the slot and is still installing (a first Auto
+    // activation can probe the sandbox for seconds): nothing is reported yet.
+    pending.lock().unwrap().take();
+    settle_requested_mode(&mut m, &pending, &applied);
+    assert_eq!(m.permission_mode, "edits");
+    assert_eq!(m.requested_permission_mode.as_deref(), Some("read-only"));
+}
+
+#[test]
+fn two_presses_around_one_application_show_the_first_applied_mode_then_the_second() {
+    let mut agent = Agent::new("base prompt");
+    let mut m = model();
+    m.reference = true;
+    m.screen = davinci_tui::davinci::model::Screen::Agent;
+    m.running = true;
+    change_permission_mode(&mut agent, &mut m, PermissionMode::Ask);
+    let pending = agent.pending_permission_mode.clone();
+    let applied = agent.applied_permission_mode.clone();
+    let abort = Arc::new(AtomicBool::new(false));
+
+    mid_turn_key(&mut m, shift_tab_key(), &abort, &pending); // Ask -> Edits
+    assert_eq!(
+        agent.apply_pending_permission_mode(),
+        Some(PermissionMode::Edits)
+    );
+    // Second press before the tick: it overwrites nothing the footer needs.
+    mid_turn_key(&mut m, shift_tab_key(), &abort, &pending); // Edits -> Plan
+    settle_requested_mode(&mut m, &pending, &applied);
+    assert_eq!(m.permission_mode, "edits", "the first applied mode shows");
+    assert_eq!(m.requested_permission_mode.as_deref(), Some("read-only"));
+
+    assert_eq!(
+        agent.apply_pending_permission_mode(),
+        Some(PermissionMode::ReadOnly)
+    );
+    settle_requested_mode(&mut m, &pending, &applied);
+    assert_eq!(m.permission_mode, "read-only");
+    assert!(m.requested_permission_mode.is_none());
+}
+
+#[test]
+fn the_footer_never_shows_a_mode_the_agent_did_not_install() {
+    let mut agent = Agent::new("base prompt");
+    let mut m = model();
+    m.reference = true;
+    m.running = true;
+    change_permission_mode(&mut agent, &mut m, PermissionMode::Ask);
+    let pending = agent.pending_permission_mode.clone();
+    let applied = agent.applied_permission_mode.clone();
+    // A request that is queued, or taken but not installed, is never shown.
+    m.requested_permission_mode = Some("auto".into());
+    *pending.lock().unwrap() = Some(PermissionMode::Auto);
+    settle_requested_mode(&mut m, &pending, &applied);
+    assert_eq!(m.permission_mode, "ask");
+    pending.lock().unwrap().take();
+    settle_requested_mode(&mut m, &pending, &applied);
+    assert_eq!(m.permission_mode, "ask");
+    assert_eq!(m.requested_permission_mode.as_deref(), Some("auto"));
+    // Off: the footer is not driven by the report at all.
+    m.reference = false;
+    *applied.lock().unwrap() = Some(PermissionMode::Edits);
+    settle_requested_mode(&mut m, &pending, &applied);
+    assert_eq!(m.permission_mode, "ask");
+}
+
+#[test]
+fn two_reference_presses_around_the_worker_taking_the_slot_advance_two_steps() {
+    let mut agent = Agent::new("base prompt");
+    let mut m = model();
+    m.reference = true;
+    m.screen = davinci_tui::davinci::model::Screen::Agent;
+    m.running = true;
+    change_permission_mode(&mut agent, &mut m, PermissionMode::Ask);
+    let pending = agent.pending_permission_mode.clone();
+    let abort = Arc::new(AtomicBool::new(false));
+
+    mid_turn_key(&mut m, shift_tab_key(), &abort, &pending);
+    // Consumed, and the footer has not caught up yet: the second press must
+    // start from the request, not from the stale footer.
+    assert_eq!(
+        agent.apply_pending_permission_mode(),
+        Some(PermissionMode::Edits)
+    );
+    mid_turn_key(&mut m, shift_tab_key(), &abort, &pending);
+    assert_eq!(*pending.lock().unwrap(), Some(PermissionMode::ReadOnly));
+    assert_eq!(m.permission_mode, "ask", "still the mode the agent holds");
+    agent.apply_pending_permission_mode();
+    settle_requested_mode(&mut m, &pending, &agent.applied_permission_mode);
+    assert_eq!(m.permission_mode, "read-only");
+    assert_eq!(agent.permission_mode(), PermissionMode::ReadOnly);
+}
+
+#[test]
+fn ctrl_c_in_an_approval_dialog_holds_the_queue_in_the_reference_shell_only() {
+    let request = write_approval(
+        vec![ToolApprovalDecision::AllowOnce, ToolApprovalDecision::Deny],
+        true,
+        "a.txt",
+    );
+    let choices = request.host_choices(false);
+    for reference in [true, false] {
+        let mut m = model();
+        m.reference = reference;
+        m.running = true;
+        m.ask = permission_ask(&request, false);
+        m.overlay = Some(davinci_tui::davinci::model::Overlay::Ask);
+        m.queued = vec!["B".into()];
+        let abort = Arc::new(AtomicBool::new(false));
+        let answer = approval_answer_key(&mut m, ctrl_c_key(), &choices, &request, &abort);
+        assert_eq!(answer.map(|a| a.decision), Some(ToolApprovalDecision::Deny));
+        assert!(abort.load(Ordering::Relaxed));
+        assert_eq!(m.queue_hold, reference);
+        let started = drain_with_ctrl_c_on(&mut m, &[]);
+        if reference {
+            assert!(started.is_empty(), "B must not start behind a cancelled A");
+        } else {
+            assert_eq!(started, ["B"]);
+        }
+    }
+}
+
+#[test]
+fn ctrl_c_cancelling_an_approval_arms_the_exit_press_but_esc_and_off_mode_do_not() {
+    let request = write_approval(
+        vec![ToolApprovalDecision::AllowOnce, ToolApprovalDecision::Deny],
+        true,
+        "a.txt",
+    );
+    let choices = request.host_choices(false);
+    let esc = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    for (reference, key, armed) in [
+        (true, ctrl_c_key(), true),
+        (true, esc, false),
+        (false, ctrl_c_key(), false),
+    ] {
+        let mut m = model();
+        m.reference = reference;
+        m.running = true;
+        m.ask = permission_ask(&request, false);
+        m.overlay = Some(davinci_tui::davinci::model::Overlay::Ask);
+        let abort = Arc::new(AtomicBool::new(false));
+        approval_answer_key(&mut m, key, &choices, &request, &abort);
+        assert_eq!(m.ctrl_c_armed.is_some(), armed, "reference={reference}");
+    }
+}
+
+#[test]
+fn a_ctrl_c_hold_tells_the_user_about_held_lines_only_when_some_are_queued() {
+    let request = write_approval(
+        vec![ToolApprovalDecision::AllowOnce, ToolApprovalDecision::Deny],
+        true,
+        "a.txt",
+    );
+    let choices = request.host_choices(false);
+    for (queued, told) in [(vec!["B".to_string()], true), (Vec::new(), false)] {
+        let mut m = model();
+        m.reference = true;
+        m.running = true;
+        m.ask = permission_ask(&request, false);
+        m.overlay = Some(davinci_tui::davinci::model::Overlay::Ask);
+        m.queued = queued;
+        let abort = Arc::new(AtomicBool::new(false));
+        approval_answer_key(&mut m, ctrl_c_key(), &choices, &request, &abort);
+        let note = m.toast.as_ref().map(|(text, _)| text.clone());
+        if told {
+            assert_eq!(
+                note.as_deref(),
+                Some("Queued lines are held; sending a new prompt resumes them.")
+            );
+        } else {
+            assert!(note.is_none(), "{note:?}");
+        }
+    }
+}
+
+#[test]
+fn the_queue_hold_outlives_the_double_press_timestamp() {
+    let mut m = model();
+    m.reference = true;
+    m.running = true;
+    mid_turn_key(
+        &mut m,
+        ctrl_c_key(),
+        &Arc::new(AtomicBool::new(false)),
+        &Mutex::new(None),
+    );
+    assert!(m.queue_hold && m.ctrl_c_armed.is_some());
+    // The idle Ctrl+C takes the timestamp (`ctrl_c_armed.take()`); the hold is
+    // not the timestamp, so it stays until a deliberate submission.
+    m.ctrl_c_armed = None;
+    assert!(queue_held(&m));
+    release_queue_hold(&mut m);
+    assert!(!queue_held(&m));
+}
+
+#[test]
+fn only_a_picked_command_releases_the_hold_and_send_now_starts_its_own_line() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let command = Choice::Command {
+        name: "/theme".into(),
+        kind: "command".into(),
+    };
+    let tool = Choice::Command {
+        name: "bash".into(),
+        kind: "tool".into(),
+    };
+    for (choice, released) in [
+        (command, true),
+        (tool, false),
+        (Choice::Ask(0), false),
+        (Choice::Session(0), false),
+    ] {
+        let mut m = model();
+        m.reference = true;
+        m.queue_hold = true;
+        release_hold_for_choice(&mut m, &choice);
+        assert_eq!(!m.queue_hold, released, "{choice:?}");
+    }
+
+    // A line queued mid-turn after Ctrl+C waits; send-now starts it.
+    let abort = Arc::new(AtomicBool::new(false));
+    let pending = Mutex::new(None);
+    let mut m = model();
+    m.reference = true;
+    m.running = true;
+    mid_turn_key(&mut m, ctrl_c_key(), &abort, &pending);
+    m.type_char("later");
+    mid_turn_key(
+        &mut m,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        &abort,
+        &pending,
+    );
+    assert_eq!(m.queued, ["later"]);
+    assert!(
+        drain_with_ctrl_c_on(&mut m, &[]).is_empty(),
+        "Enter only queues"
+    );
+    m.type_char("now");
+    mid_turn_key(
+        &mut m,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        &abort,
+        &pending,
+    );
+    assert_eq!(drain_with_ctrl_c_on(&mut m, &[]), ["now", "later"]);
+
+    // The reference's ctrl+x ctrl+s chord is the same send-now.
+    let mut m = model();
+    m.reference = true;
+    m.running = true;
+    m.queue_hold = true;
+    m.type_char("chord");
+    for key in ['x', 's'] {
+        mid_turn_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL),
+            &abort,
+            &pending,
+        );
+    }
+    assert_eq!(drain_with_ctrl_c_on(&mut m, &[]), ["chord"]);
 }

@@ -7757,12 +7757,10 @@ fn handle_user_line(
         SlashAction::Prompt(prompt) => {
             submit_user_message(parsed, agent, session, &prompt, &[], tui)
         }
-        SlashAction::Status(message) => {
-            if let Some(name) = message.strip_prefix("Unknown command /") {
-                if try_extension_slash(parsed, agent, session, name, "")? {
-                    return Ok(true);
-                }
-            }
+        SlashAction::Help => {
+            // The legacy shell keeps the plain command list `/help` printed
+            // before the tabbed sheet existed.
+            let message = slash::help_lines().join("\n");
             session.chrome.status = message.clone();
             println!("{message}");
             Ok(true)
@@ -8604,10 +8602,12 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
             stored.default_project_trust = Some(default_project_trust_value(value).into());
         }
         "tui-mode" => stored.tui_mode = Some(value.to_string()),
+        "tui.reference" => stored.tui.reference = Some(value == "true"),
         "fullscreen-exit-output" => stored.fullscreen_exit_output = Some(value.to_string()),
         "fullscreen-scrollbar" => stored.fullscreen_scrollbar = Some(value.to_string()),
         "fullscreen-copy-on-select" => stored.fullscreen_copy_on_select = Some(value == "true"),
         "show-images" => stored.show_images = Some(value == "true"),
+        "reduce-motion" => stored.reduce_motion = Some(value == "true"),
         "image-width-cells" => stored.image_width_cells = value.parse().ok(),
         "auto-resize-images" => stored.auto_resize_images = Some(value == "true"),
         "block-images" => stored.block_images = Some(value == "true"),
@@ -9257,6 +9257,24 @@ fn interactive_login_providers_from(host: &ExtensionHost) -> Vec<String> {
 
 fn interactive_slash_commands(agent: &Agent, parsed: &Args) -> Vec<SlashCommandSpec> {
     interactive_slash_commands_from(agent, &loaded_extension_host(parsed))
+}
+
+/// The command list the shell completes. The reference lists `/theme`, which this
+/// shell opens as a picker and keeps out of the built-ins, so every rebuild of the
+/// list in the reference shell adds it back.
+fn with_reference_commands(
+    mut commands: Vec<SlashCommandSpec>,
+    reference: bool,
+) -> Vec<SlashCommandSpec> {
+    if reference && !commands.iter().any(|command| command.name == "theme") {
+        commands.push(SlashCommandSpec {
+            name: "theme".into(),
+            description: "Change the theme".into(),
+            argument_hint: None,
+            argument_items: Vec::new(),
+        });
+    }
+    commands
 }
 
 /// [`interactive_slash_commands`] from a host already loaded with the same

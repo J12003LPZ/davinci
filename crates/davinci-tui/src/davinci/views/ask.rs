@@ -174,6 +174,32 @@ fn approval_lines(model: &Model) -> Vec<Line<'static>> {
                 rows.push(dashes);
             }
         }
+        AskKind::Create => {
+            // The reference's create preview is the file as it will read: the line
+            // number and the text, with no diff sign and no tint.
+            rows.push(Line::from(span(format!(" {}", ask.subject), cc.inactive)));
+            if !ask.preview.is_empty() {
+                let dashes = Line::from(span("╌".repeat(width as usize), cc.subtle));
+                rows.push(dashes.clone());
+                let digits = ask
+                    .preview
+                    .iter()
+                    .filter_map(|hunk| hunk.line)
+                    .max()
+                    .map_or(1, |line| line.to_string().len());
+                for hunk in &ask.preview {
+                    let number = hunk.line.map_or(String::new(), |line| line.to_string());
+                    rows.push(Line::from(truncate_run(
+                        vec![
+                            span(format!("  {number:>digits$} "), cc.inactive),
+                            span(hunk.text.clone(), th.text),
+                        ],
+                        width,
+                    )));
+                }
+                rows.push(dashes);
+            }
+        }
         AskKind::List => {
             if !ask.note.is_empty() {
                 rows.push(Line::from(span(format!(" {}", ask.note), cc.inactive)));

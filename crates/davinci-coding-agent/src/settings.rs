@@ -418,6 +418,9 @@ pub struct Settings {
     pub fullscreen_copy_on_select: Option<bool>,
     #[serde(default, rename = "showImages")]
     pub show_images: Option<bool>,
+    /// `reduceMotion`: static frames instead of the animated spinner.
+    #[serde(default, rename = "reduceMotion")]
+    pub reduce_motion: Option<bool>,
     #[serde(default, rename = "imageWidthCells")]
     pub image_width_cells: Option<u32>,
     #[serde(default, rename = "autoResizeImages")]
@@ -483,8 +486,13 @@ pub struct Settings {
     pub auto_scroll: Option<bool>,
     #[serde(default)]
     pub warnings: WarningSettings,
+    #[serde(default, skip_serializing_if = "TuiSettings::is_default")]
+    pub tui: TuiSettings,
     #[serde(default, rename = "externalEditor")]
     pub external_editor: Option<String>,
+    /// `"vim"` gives the reference shell's draft vim INSERT and NORMAL modes.
+    #[serde(default, rename = "editorMode")]
+    pub editor_mode: Option<String>,
     #[serde(default, rename = "modelThinkingLevels")]
     pub model_thinking_levels: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default, rename = "npmCommand")]
@@ -597,6 +605,20 @@ pub struct PermissionSettings {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub additional_directories: Vec<String>,
+}
+
+/// `tui`: the dotted setting `tui.reference` is stored as `{"tui": {"reference": true}}`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TuiSettings {
+    /// Reference-style terminal modes, read once when the session opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<bool>,
+}
+
+impl TuiSettings {
+    fn is_default(&self) -> bool {
+        self.reference.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1934,6 +1956,7 @@ pub fn to_interactive_config(
             .clone()
             .unwrap_or_else(|| "auto".into()),
         fullscreen_copy_on_select: settings.fullscreen_copy_on_select.unwrap_or(true),
+        reduce_motion: settings.reduce_motion.unwrap_or(false),
         show_images: settings.show_images(),
         image_width_cells: settings.image_width_cells(),
         auto_resize_images: settings.image_auto_resize(),
@@ -1957,6 +1980,7 @@ pub fn to_interactive_config(
         output_padding: settings.output_pad.unwrap_or(1),
         clear_on_shrink: settings.clear_on_shrink(),
         terminal_progress: settings.show_terminal_progress(),
+        tui_reference: settings.tui.reference.unwrap_or(false),
         warnings_anthropic_extra_usage: settings.warnings.anthropic_extra_usage.unwrap_or(true),
         model_thinking_summary: match &settings.model_thinking_levels {
             Some(levels) if !levels.is_empty() => format!("{} overrides", levels.len()),
