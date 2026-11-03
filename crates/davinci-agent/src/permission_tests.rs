@@ -2499,3 +2499,22 @@ fn validate_extra_root_accepts_project_directories_and_rejects_the_rest() {
             .contains("filesystem root")
     );
 }
+
+#[test]
+fn the_reference_cycle_is_four_modes_and_wraps() {
+    let mut mode = PermissionMode::Ask;
+    let mut seen = Vec::new();
+    for _ in 0..5 {
+        seen.push(mode.label());
+        mode = mode.next_reference();
+    }
+    assert_eq!(
+        seen,
+        ["Manual", "Accept Edits", "Plan Mode", "Auto Mode", "Manual"]
+    );
+    // Always-approve is a launch flag in the reference, never a cycle stop.
+    assert!(!seen.contains(&"Always Approve"));
+    // Off the reference the five-mode cycle is unchanged.
+    assert_eq!(PermissionMode::Auto.next(), PermissionMode::AlwaysApprove);
+    assert_eq!(PermissionMode::AlwaysApprove.next(), PermissionMode::Ask);
+}

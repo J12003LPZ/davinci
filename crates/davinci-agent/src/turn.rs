@@ -1551,7 +1551,7 @@ Issue the call again if it is still needed.";
     }
 
     /// Background jobs that finished since the last step are told to the
-    /// model here, between one completion and the next — never inside a
+    /// model here, between one completion and the next Ã¢â‚¬â€ never inside a
     /// tool call, and never twice.
     fn inject_job_notices(
         &mut self,
@@ -5037,6 +5037,17 @@ Issue the call again if it is still needed.";
         }
     }
 
+    /// The revision the call was authorized under, from the one evaluation that
+    /// asked the host.
+    ///
+    /// `permission_authorization_inner` holds the policy lock across its
+    /// decision and reports the revision *after* the decision, so a session or
+    /// project grant's own bump is included. Re-reading the revision here and
+    /// demanding it equal the value from before the question treated the
+    /// authorization's bookkeeping write Ã¢â‚¬â€ the session model it records on the
+    /// first call Ã¢â‚¬â€ as a policy change. That discarded a valid one-shot permit
+    /// (whose revision matched the decision) and asked the user the same
+    /// question twice for the same call.
     fn stable_permission_revision(
         &self,
         cwd: &Path,
@@ -5044,34 +5055,7 @@ Issue the call again if it is still needed.";
         name: &str,
         args: &Value,
     ) -> Result<u64, String> {
-        for _ in 0..3 {
-            let before = self
-                .permissions
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .revision()
-                .ok_or_else(|| "Permission denied: policy revision is exhausted.".to_owned())?;
-            if let Some(reason) = self.permission_denial(cwd, id, name, args) {
-                return Err(reason);
-            }
-            let after = self
-                .permissions
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .revision()
-                .ok_or_else(|| "Permission denied: policy revision is exhausted.".to_owned())?;
-            if before == after {
-                return Ok(after);
-            }
-            // A session/project grant can legitimately advance the policy
-            // revision. Any one-shot permit from the prior revision is stale;
-            // discard it and evaluate once more under the new policy.
-            self.approval_registry.take_dispatch(id);
-        }
-        Err(
-            "Permission denied: policy changed repeatedly while authorization was being evaluated."
-                .into(),
-        )
+        self.permission_authorization(cwd, id, name, args)
     }
 
     fn capability_effect_denial(&self, cwd: &Path, name: &str, args: &Value) -> Option<String> {
@@ -7513,6 +7497,42 @@ mod tests {
             agent.permission_mode(),
             crate::PermissionMode::AlwaysApprove
         );
+    }
+
+    #[test]
+    fn one_evaluation_asks_once_when_its_own_bookkeeping_moves_the_revision() {
+        let dir = tempdir().unwrap();
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent = mid_turn_mode_fixture(crate::PermissionMode::Ask, asked.clone(), || {});
+        let args = json!({"path":"once.txt", "content":"fixture"});
+        // A fresh policy has no session model. Recording it is a mutable policy
+        // access, so it moves the revision; that must not discard the approval
+        // the same evaluation just obtained.
+        assert_eq!(agent.permissions.lock().unwrap().session_model, None);
+        let revision = agent
+            .stable_permission_revision(dir.path(), "once", "write", &args)
+            .expect("the user's one-shot approval was refused");
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the same call asked the user twice"
+        );
+        assert_eq!(agent.permissions.lock().unwrap().revision(), Some(revision));
+        // The retained one-shot permit is bound to the revision the approval
+        // reported, so the compatibility dispatch can consume it.
+        let permit = agent
+            .approval_registry
+            .take_dispatch("once")
+            .expect("the approved call has no dispatch permit");
+        permit
+            .consume(
+                &agent.permissions,
+                Some(revision),
+                dir.path(),
+                "write",
+                &args,
+            )
+            .expect("the permit is not bound to the authorized revision");
     }
 
     #[test]

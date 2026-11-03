@@ -62,6 +62,18 @@ impl PermissionMode {
         }
     }
 
+    /// The reference shell's cycle: manual, accept edits, plan, auto. Its
+    /// always-approve is `--dangerously-skip-permissions` at launch, not a
+    /// shift+tab stop, so the reference mode skips it.
+    pub fn next_reference(self) -> Self {
+        match self {
+            Self::Ask => Self::Edits,
+            Self::Edits => Self::ReadOnly,
+            Self::ReadOnly => Self::Auto,
+            Self::Auto | Self::AlwaysApprove => Self::Ask,
+        }
+    }
+
     /// User-facing names and legacy aliases. These select approval policy,
     /// not an operating-system sandbox.
     pub fn parse(text: &str) -> Option<Self> {

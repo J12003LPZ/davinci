@@ -521,7 +521,7 @@ fn a_queued_theme_line_waits_behind_the_lines_that_start_a_turn() {
 }
 
 #[test]
-fn mid_turn_shift_tab_updates_the_footer_at_once_and_cycles_from_the_displayed_mode() {
+fn mid_turn_shift_tab_queues_the_change_and_the_footer_waits_for_the_runtime() {
     let mut agent = Agent::new("base prompt");
     let mut m = model();
     m.screen = davinci_tui::davinci::model::Screen::Agent;
@@ -537,17 +537,25 @@ fn mid_turn_shift_tab_updates_the_footer_at_once_and_cycles_from_the_displayed_m
     };
 
     assert!(!mid_turn_key(&mut m, shift_tab(), &abort, &pending));
-    assert_eq!(m.permission_mode, "edits", "footer changes immediately");
+    assert_eq!(
+        m.permission_mode, "ask",
+        "the footer names the runtime's mode, not the request"
+    );
     assert_eq!(*pending.lock().unwrap(), Some(PermissionMode::Edits));
     assert_eq!(agent.permission_mode(), PermissionMode::Ask, "agent waits");
 
-    // The second press starts from the displayed mode, not the agent's.
-    assert!(!mid_turn_key(&mut m, shift_tab(), &abort, &pending));
-    assert_eq!(m.permission_mode, "read-only");
-    assert_eq!(*pending.lock().unwrap(), Some(PermissionMode::ReadOnly));
-    assert!(!abort.load(Ordering::Relaxed));
+    // The worker's apply point reaches the agent through set_permission_mode;
+    // until then the second press starts from the queued mode.
+    assert_eq!(
+        agent.apply_pending_permission_mode(),
+        Some(PermissionMode::Edits)
+    );
+    sync_permission_state(&agent, &mut m);
+    assert_eq!(m.permission_mode, "edits");
 
-    // The worker's apply point reaches the agent through set_permission_mode.
+    assert!(!mid_turn_key(&mut m, shift_tab(), &abort, &pending));
+    assert_eq!(m.permission_mode, "edits", "the footer waits again");
+    assert_eq!(*pending.lock().unwrap(), Some(PermissionMode::ReadOnly));
     assert_eq!(
         agent.apply_pending_permission_mode(),
         Some(PermissionMode::ReadOnly)
@@ -555,6 +563,40 @@ fn mid_turn_shift_tab_updates_the_footer_at_once_and_cycles_from_the_displayed_m
     assert_eq!(agent.permission_mode(), PermissionMode::ReadOnly);
     assert!(agent.is_plan_mode());
     assert!(pending.lock().unwrap().is_none());
+    assert!(!abort.load(Ordering::Relaxed));
+}
+
+#[test]
+fn the_reference_mid_turn_cycle_skips_always_approve() {
+    let mut agent = Agent::new("base prompt");
+    let mut m = model();
+    m.reference = true;
+    m.screen = davinci_tui::davinci::model::Screen::Agent;
+    m.running = true;
+    change_permission_mode(&mut agent, &mut m, PermissionMode::Ask);
+    let pending = agent.pending_permission_mode.clone();
+    let abort = Arc::new(AtomicBool::new(false));
+    let shift_tab = || {
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::BackTab,
+            crossterm::event::KeyModifiers::SHIFT,
+        )
+    };
+    for expected in ["edits", "read-only", "auto", "ask"] {
+        assert!(!mid_turn_key(&mut m, shift_tab(), &abort, &pending));
+        let applied = agent
+            .apply_pending_permission_mode()
+            .expect("a queued mode");
+        sync_permission_state(&agent, &mut m);
+        assert_eq!(m.permission_mode, expected);
+        assert_eq!(applied.as_str(), expected);
+        assert_ne!(m.permission_mode, "always-approve");
+    }
+    assert_eq!(
+        agent.permission_mode(),
+        PermissionMode::Ask,
+        "four stops wrap"
+    );
 }
 
 #[test]
@@ -5365,4 +5407,153 @@ fn the_approval_answer_path_turns_enter_into_an_allow_once_decision() {
         Some(ToolApprovalDecision::AllowOnce),
         "Enter did not become AllowOnce"
     );
+}
+
+fn write_approval(
+    legal: Vec<ToolApprovalDecision>,
+    outside: bool,
+    cwd: &str,
+) -> ToolApprovalRequest {
+    ToolApprovalRequest {
+        legal_choices: davinci_agent::approval::offer_scopes(true, false, false)
+            .into_iter()
+            .filter(|choice| {
+                legal.iter().any(|decision| {
+                    *decision
+                        == match choice.scope {
+                            davinci_agent::approval::GrantScope::Once => {
+                                ToolApprovalDecision::AllowOnce
+                            }
+                            davinci_agent::approval::GrantScope::Session => {
+                                ToolApprovalDecision::AllowForSession
+                            }
+                            davinci_agent::approval::GrantScope::Project => {
+                                ToolApprovalDecision::AllowAlways
+                            }
+                            _ => ToolApprovalDecision::Deny,
+                        }
+                })
+            })
+            .collect(),
+        tool_call_id: "call_perm".into(),
+        tool: "write".into(),
+        args: json!({"path": cwd, "content": "permission probe"}),
+        subject: cwd.into(),
+        summary: format!("write · {cwd}"),
+        session_rule: format!("write:{cwd}"),
+        outside_project: outside,
+        mode: PermissionMode::Ask,
+    }
+}
+
+#[test]
+fn the_write_dialog_maps_each_row_to_a_policy_decision() {
+    use davinci_tui::davinci::app::{self, Flow};
+    use davinci_tui::davinci::model::{Choice, Overlay};
+    let request = write_approval(
+        vec![
+            ToolApprovalDecision::AllowOnce,
+            ToolApprovalDecision::AllowForSession,
+            ToolApprovalDecision::AllowAlways,
+            ToolApprovalDecision::Deny,
+        ],
+        false,
+        "inside.txt",
+    );
+    let choices = request.host_choices(true);
+    let mut m = model();
+    m.ask = permission_ask(&request, true);
+    m.overlay = Some(Overlay::Ask);
+    for (index, decision) in choices.iter().enumerate() {
+        m.ask_index = index;
+        let enter = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        match app::handle_key(&mut m, enter) {
+            Flow::Choose(Choice::Ask(chosen)) => {
+                assert_eq!(
+                    super::permission_choice(chosen, &choices),
+                    Some(*decision),
+                    "row {index} maps to {decision:?}"
+                );
+            }
+            other => panic!("row {index} produced {other:?}"),
+        }
+        m.overlay = Some(Overlay::Ask);
+    }
+    // The dialog itself never moves the mode; only the policy can.
+    assert_eq!(m.permission_mode, "ask");
+}
+
+#[test]
+fn an_outside_project_write_offers_only_the_denials() {
+    // The live policy refuses session and project grants for a path outside the
+    // workspace; the dialog must show exactly the choices the policy issued.
+    let request = write_approval(
+        vec![ToolApprovalDecision::AllowOnce, ToolApprovalDecision::Deny],
+        true,
+        "..\\outside.txt",
+    );
+    let ask = permission_ask(&request, false);
+    let labels: Vec<&str> = ask.items.iter().map(|item| item.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        ["Yes", "No", "No, and tell the model what to do differently"]
+    );
+    assert!(request
+        .host_choices(false)
+        .contains(&ToolApprovalDecision::AllowOnce));
+    assert!(!request
+        .host_choices(false)
+        .contains(&ToolApprovalDecision::AllowForSession));
+}
+
+#[test]
+fn escape_and_the_deny_row_are_the_same_decision() {
+    use std::sync::atomic::AtomicBool;
+    let request = write_approval(
+        vec![ToolApprovalDecision::AllowOnce, ToolApprovalDecision::Deny],
+        true,
+        "..\\outside.txt",
+    );
+    let choices = request.host_choices(false);
+    let mut m = model();
+    m.ask = permission_ask(&request, false);
+    m.overlay = Some(davinci_tui::davinci::model::Overlay::Ask);
+    m.ask_index = 1;
+    let abort = std::sync::Arc::new(AtomicBool::new(false));
+    let denied = super::approval_answer_key(
+        &mut m,
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ),
+        &choices,
+        &request,
+        &abort,
+    );
+    assert_eq!(
+        denied.map(|answer| answer.decision),
+        Some(ToolApprovalDecision::Deny)
+    );
+    let mut m = model();
+    m.ask = permission_ask(&request, false);
+    m.overlay = Some(davinci_tui::davinci::model::Overlay::Ask);
+    let escaped = super::approval_answer_key(
+        &mut m,
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ),
+        &choices,
+        &request,
+        &abort,
+    );
+    assert_eq!(
+        escaped.map(|answer| answer.decision),
+        Some(ToolApprovalDecision::Deny),
+        "Escape must deny, never approve or cancel silently"
+    );
+    assert!(!abort.load(std::sync::atomic::Ordering::Relaxed));
 }

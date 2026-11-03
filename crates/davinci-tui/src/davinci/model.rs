@@ -520,6 +520,9 @@ pub enum AskKind {
     List,
     Shell,
     File,
+    /// A new file: the preview is the whole content, line numbers and text with
+    /// no diff signs, as the reference's permission frame draws it.
+    Create,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

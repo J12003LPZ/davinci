@@ -1567,9 +1567,15 @@ fn cycle_permission_mode_mid_turn(model: &mut Model, pending: &Mutex<Option<Perm
     let shown = (*slot)
         .or_else(|| PermissionMode::parse(&model.permission_mode))
         .unwrap_or_default();
-    let next = shown.next();
+    let next = if model.reference {
+        shown.next_reference()
+    } else {
+        shown.next()
+    };
     *slot = Some(next);
-    model.permission_mode = next.as_str().to_string();
+    // The indicator names the mode the policy holds. The queued mode is applied
+    // by the agent before its next batch and synced then; it does not get ahead
+    // of that confirmation.
 }
 
 fn mid_turn_key(
@@ -3374,6 +3380,8 @@ fn permission_ask_at(request: &ToolApprovalRequest, trusted: bool, cwd: &std::pa
         preview,
         kind: if shell_tool {
             AskKind::Shell
+        } else if request.tool == "write" && !exists {
+            AskKind::Create
         } else if file_tool {
             AskKind::File
         } else {
@@ -11577,7 +11585,12 @@ fn change_permission_mode(agent: &mut Agent, model: &mut Model, mode: Permission
 }
 
 fn cycle_permission_mode(agent: &mut Agent, model: &mut Model) {
-    let next = agent.permission_mode().next();
+    let current = agent.permission_mode();
+    let next = if model.reference {
+        current.next_reference()
+    } else {
+        current.next()
+    };
     change_permission_mode(agent, model, next);
 }
 

@@ -182,8 +182,12 @@ fn conversation_status(model: &Model) -> Line<'static> {
     ) {
         left.push(span(" · ? for shortcuts", cc.inactive));
     }
+    if model.reference {
+        // The reference always names the agents entry, even with none yet.
+        left.push(span(" · ← for agents", cc.inactive));
+    }
     let agents = model.agents.as_ref().map_or(0, |sheet| sheet.agents.len());
-    if agents > 0 {
+    if !model.reference && agents > 0 {
         let noun = if agents == 1 { "agent" } else { "agents" };
         left.push(span(format!(" · ← {agents} {noun}"), cc.inactive));
     }
@@ -207,8 +211,13 @@ fn conversation_status(model: &Model) -> Line<'static> {
         left.push(pr);
     }
     // Notes show on the row above the composer (`effort_line`), so the
-    // footer's right end keeps the context readout.
-    let right = context_fold(model, usize::from(run_width(&left)));
+    // footer's right end keeps the context readout. The reference's footer has
+    // no right-hand readout at all: its context lives in the viewer and panels.
+    let right = if model.reference {
+        Vec::new()
+    } else {
+        context_fold(model, usize::from(run_width(&left)))
+    };
     spread(model.width, left, right)
 }
 

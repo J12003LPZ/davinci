@@ -1112,6 +1112,73 @@
   ],
   "keys_panels__01_mode1": [
    {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
     "kind": "compact",
     "rows": [
      5,
@@ -1125,6 +1192,73 @@
    }
   ],
   "keys_panels__02_mode2": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
    {
     "kind": "compact",
     "rows": [
@@ -1140,6 +1274,73 @@
   ],
   "keys_panels__03_mode3": [
    {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
+   {
     "kind": "compact",
     "rows": [
      5,
@@ -1153,6 +1354,73 @@
    }
   ],
   "keys_panels__04_mode4": [
+   {
+    "region": {
+     "rows": [
+      1,
+      3
+     ],
+     "cols": [
+      0,
+      9
+     ]
+    },
+    "kind": "mark",
+    "reason": "DaVinci draws its own static three-row mark; its cells are not compared, but it must stay inside the header box."
+   },
+   {
+    "region": {
+     "rows": [
+      1,
+      1
+     ],
+     "cols": [
+      11,
+      30
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Claude Code": "DaVinci",
+     "v2.1.316": "v1.1.7"
+    },
+    "reason": "The product name and version are DaVinci's. The version is the build's: the Rust test the_rules_file_names_the_version_the_binary_reports fails when this value is stale."
+   },
+   {
+    "region": {
+     "rows": [
+      2,
+      2
+     ],
+     "cols": [
+      11,
+      31
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "Opus 5.5": "Demo",
+     "Claude Pro": "local"
+    },
+    "reason": "The model and provider are run-specific: the replay fixture serves model 'demo' from provider 'local'."
+   },
+   {
+    "region": {
+     "rows": [
+      3,
+      3
+     ],
+     "cols": [
+      11,
+      53
+     ]
+    },
+    "kind": "identity",
+    "substitutions": {
+     "~\\AppData\\Local\\Temp\\claude-tui-parity\\proj": "~\\work"
+    },
+    "reason": "The working folder is run-specific: the replay's disposable folder under its isolated home, shown relative to it."
+   },
    {
     "kind": "compact",
     "rows": [
