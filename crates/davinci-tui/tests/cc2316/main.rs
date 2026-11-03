@@ -6,3 +6,4 @@ mod keys;
 mod review;
 mod terminal;
 mod theme;
+mod transcript;
