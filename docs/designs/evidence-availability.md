@@ -251,7 +251,7 @@ The evidence directory is a narrow read-boundary exception, like git metadata. T
 
 ### 5. Evidence store facts
 
-`EvidenceStore` is one flat directory per agent: `~/.davinci/agent/evidence`, constructed at `crates/davinci-coding-agent/src/main.rs:1275-1277`. Files are named `<tag>-<uuid>.txt`; a Script body uses `store_in_session`, which prefixes the name with `s<sha256(session)[..12]>-`. The directory is not session-scoped. A path is protected by the normal permission check on `read`, not by session identity. On Unix, the store creates the directory with mode `0700` and each file with mode `0600`; on other platforms it relies on the agent directory's ACLs.
+`EvidenceStore` is one flat directory per agent: `~/.davinci/agent/evidence`, constructed at `crates/davinci-coding-agent/src/main.rs:1275-1277`. Files are named `<tag>-<uuid>.txt`; a Script body uses `store_in_session`, which prefixes the name with `s<sha256(session)[..12]>-`. The directory is not session-scoped. The directory itself is not session-isolated: access goes through the normal permission check on `read`, and the only session-aware part is the narrower read-boundary exception described next. On Unix, the store creates the directory with mode `0700` and each file with mode `0600`; on other platforms it relies on the agent directory's ACLs.
 
 The read-boundary exception is narrower than the store. It applies only to the `read` tool, only to a canonical path under the evidence root, and only to a filename carrying the active session's token. A symlink that resolves outside the root, or to another session's file, does not qualify. Other read-class tools such as `ls` and `find` do not get the exception, so they cannot enumerate the shared directory under `ReadOutsideRootPolicy::Deny`. Explicit deny rules still override the exception.
 
@@ -442,7 +442,7 @@ This file is `#[path]`-included into the lib's `#[cfg(test)]` module, already ha
 
 Phase A already names the quantity and the recovery reference. Phase B makes the class and error flag explicit and surfaces the Context VM fold count:
 
-* The pruning placeholder says `class: tool_output`; it already names the byte and line counts, the call id, the outcome, and the evidence path.
+* The pruning placeholder (`pruning::placeholder`) says `class: tool_output` and the tool name and character count. The agent appends the evidence path, the call id, the outcome (`error`, `completed` or `unknown`), and the byte and line counts (`crates/davinci-agent/src/lib.rs`, where the hint is built).
 * The Governor trailer says `class: diagnostic` and reports diagnostics kept and omitted; it already names the output id.
 * The Codemode marker says `class: script_output; error: <bool>`; it already names the omitted bytes, the first omitted line, and the evidence path. The error flag is true for a failed, cancelled, or recovery-required run, or when a child failed.
 * The Context VM fold notice reports how many events the fold could not represent and names them as retrievable by source reference. The count also stays in the summarizer prompt.
