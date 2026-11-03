@@ -409,6 +409,10 @@ fn the_agents_dashboard_pins_finds_renames_and_deletes_in_two_steps() {
         Screen::Agents,
         "the first Esc cleared find, not the sheet"
     );
+    // Find moved the selection onto its one result; pick the completed row again.
+    assert_eq!(model.agents_index, 1);
+    model.agents_index = 2;
+    model.agents.as_mut().unwrap().selected_index = 2;
     // Rename the selected row.
     assert_eq!(app::handle_key(&mut model, ctrl('r')), app::Flow::Continue);
     for ch in "-renamed".chars() {
@@ -525,4 +529,431 @@ fn every_screen_renders_on_the_shared_frame() {
         assert_eq!(rows.len(), 20, "{screen:?} did not compose a full frame");
         let _ = sheet::chrome(&model);
     }
+}
+
+#[test]
+fn the_agents_find_filter_governs_selection_navigation_and_actions() {
+    use davinci_tui::davinci::model::Choice;
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    let find = |model: &mut Model, text: &str| {
+        app::handle_key(
+            model,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        );
+        for ch in text.chars() {
+            app::handle_key(model, key(KeyCode::Char(ch)));
+        }
+        app::handle_key(model, key(KeyCode::Enter));
+    };
+
+    // The selection moves to the visible result, and Enter and x act on it.
+    let mut model = agents_model();
+    model.agents_index = 0;
+    find(&mut model, "working");
+    assert_eq!(model.agents_index, 1, "selection left on a hidden agent");
+    assert_eq!(model.agents.as_ref().unwrap().selected_index, 1);
+    assert!(matches!(
+        app::handle_key(&mut model, key(KeyCode::Enter)),
+        app::Flow::Choose(Choice::AgentAction {
+            action: "inspect",
+            index: 1
+        })
+    ));
+    assert!(matches!(
+        app::handle_key(&mut model, key(KeyCode::Char('x'))),
+        app::Flow::Choose(Choice::AgentAction {
+            action: "stop",
+            index: 1
+        })
+    ));
+
+    // Navigation stays inside the visible rows.
+    let mut model = agents_model();
+    model.agents_index = 0;
+    find(&mut model, "stopped");
+    assert_eq!(model.agents_index, 2);
+    app::handle_key(&mut model, key(KeyCode::Down));
+    assert_eq!(model.agents_index, 3);
+    app::handle_key(&mut model, key(KeyCode::Down));
+    assert_eq!(model.agents_index, 2, "wraps over the two visible rows");
+
+    // With no match, no key acts on any agent.
+    let mut model = agents_model();
+    find(&mut model, "zzz");
+    for code in [
+        KeyCode::Enter,
+        KeyCode::Char('s'),
+        KeyCode::Char('x'),
+        KeyCode::Char('r'),
+        KeyCode::Char('d'),
+    ] {
+        let flow = app::handle_key(&mut model, key(code));
+        assert!(
+            !matches!(flow, app::Flow::Choose(_)),
+            "{code:?} acted on a hidden agent"
+        );
+    }
+}
+
+#[test]
+fn screen_reader_mode_draws_the_open_question_and_its_choices_at_any_height() {
+    use davinci_tui::davinci::model::{Ask, Overlay, PickerItem};
+    let mut model = shell(true);
+    model.screen_reader = true;
+    model.ask = Ask {
+        title: "Permission".into(),
+        question: "Run git status?".into(),
+        items: vec![
+            PickerItem::new("Yes", ""),
+            PickerItem::new("Yes, always", "this project"),
+            PickerItem::new("No", ""),
+        ],
+        ..Ask::default()
+    };
+    model.overlay = Some(Overlay::Ask);
+    model.ask_index = 1;
+    for height in [4u16, 5, 6, 8, 24] {
+        let rows: Vec<String> = app::compose(&model, height).iter().map(text).collect();
+        assert_eq!(rows.len(), height as usize);
+        for needle in ["1. Yes", "> 2. Yes, always - this project", "3. No"] {
+            assert!(
+                rows.iter().any(|row| row.contains(needle)),
+                "height {height} lost {needle:?}: {rows:?}"
+            );
+        }
+    }
+    let rows: Vec<String> = app::compose(&model, 24).iter().map(text).collect();
+    assert!(rows.iter().any(|row| row == "Run git status?"), "{rows:?}");
+}
+
+#[test]
+fn screen_reader_mode_windows_a_long_list_around_its_first_row_and_marks_it() {
+    use davinci_tui::davinci::model::{Overlay, SessionItem};
+    let mut model = shell(true);
+    model.screen_reader = true;
+    model.sessions = (0..40)
+        .map(|n| SessionItem::new(&format!("session {n:02}"), "1d"))
+        .collect();
+    model.overlay = Some(Overlay::Sessions);
+    for height in [4u16, 8, 24] {
+        let rows: Vec<String> = app::compose(&model, height).iter().map(text).collect();
+        assert_eq!(rows.len(), height as usize);
+        assert!(
+            rows.iter()
+                .any(|row| row.trim_start().starts_with("> ") && row.contains("session 00")),
+            "height {height}: the selected first row must show with a plain marker: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("session 39")),
+            "height {height} showed the tail while the first row is selected: {rows:?}"
+        );
+    }
+    // Moving the selection moves the window with it.
+    for _ in 0..30 {
+        model.move_selection(1);
+    }
+    let rows: Vec<String> = app::compose(&model, 8).iter().map(text).collect();
+    assert!(
+        rows.iter()
+            .any(|row| row.trim_start().starts_with("> ") && row.contains("session 30")),
+        "{rows:?}"
+    );
+}
+
+fn approval_with_preview() -> Model {
+    use davinci_tui::davinci::model::{Ask, AskKind, Hunk, HunkKind, Overlay, PickerItem};
+    let mut model = shell(true);
+    model.screen_reader = true;
+    let mut preview: Vec<Hunk> = (0..30)
+        .map(|n| Hunk::new(HunkKind::Context, &format!("context line {n}")))
+        .collect();
+    preview[10] = Hunk::new(HunkKind::Del, "old value");
+    preview[11] = Hunk::new(HunkKind::Add, "new value");
+    model.ask = Ask {
+        title: "Edit file".into(),
+        key: "/permissions".into(),
+        question: "Do you want to make this edit?".into(),
+        subject: "src/lib.rs".into(),
+        kind: AskKind::File,
+        preview,
+        items: vec![
+            PickerItem::new("Yes", ""),
+            PickerItem::new("Yes, always", ""),
+            PickerItem::new("No", ""),
+        ],
+        ..Ask::default()
+    };
+    model.overlay = Some(Overlay::Ask);
+    model.ask_index = 1;
+    model
+}
+
+#[test]
+fn screen_reader_approval_keeps_what_it_approves_and_prints_the_preview() {
+    let mut model = approval_with_preview();
+    for height in [4u16, 8, 24] {
+        let rows: Vec<String> = app::compose(&model, height).iter().map(text).collect();
+        assert_eq!(rows.len(), height as usize);
+        for needle in ["src/lib.rs", "> 2. Yes, always"] {
+            assert!(
+                rows.iter().any(|row| row.contains(needle)),
+                "height {height} lost {needle:?}: {rows:?}"
+            );
+        }
+        assert!(
+            rows.iter().any(|row| row.contains("rows hidden")),
+            "height {height} must say that rows are hidden: {rows:?}"
+        );
+        if height >= 8 {
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("Do you want to make this edit?")),
+                "height {height}: {rows:?}"
+            );
+            assert!(
+                rows.iter().any(|row| row.contains("context line 0")),
+                "height {height} must print the preview: {rows:?}"
+            );
+        }
+    }
+    // The preview is reachable: paging moves it while the decision stays put.
+    model.overlay_offset = Some(10);
+    let rows: Vec<String> = app::compose(&model, 8).iter().map(text).collect();
+    assert!(rows.iter().any(|row| row == "- old value"), "{rows:?}");
+    assert!(rows.iter().any(|row| row.contains("src/lib.rs")));
+    assert!(rows.iter().any(|row| row.contains("> 2. Yes, always")));
+}
+
+#[test]
+fn deleting_the_last_selected_agent_keeps_enter_and_x_on_the_highlighted_row() {
+    use davinci_tui::davinci::model::{AgentsSheet, Choice};
+    use davinci_tui::davinci::theme::State;
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    let ctrl = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
+    let mut model = shell(true);
+    model.screen = Screen::Agents;
+    model.agents = Some(AgentsSheet {
+        agents: vec![
+            agent("a0", "zero", State::Done),
+            agent("a1", "one", State::Done),
+            agent("a2", "two", State::Done),
+        ],
+        selected_index: 2,
+        ..AgentsSheet::default()
+    });
+    model.agents_index = 2;
+
+    // Ctrl+X arms, the second Ctrl+X deletes agent 2 of 3.
+    app::handle_key(&mut model, ctrl('x'));
+    app::handle_key(&mut model, ctrl('x'));
+    let sheet = model.agents.as_ref().unwrap();
+    assert_eq!(sheet.agents.len(), 2);
+    assert_eq!(sheet.selected_index, 1, "the view highlights agent 1");
+    assert_eq!(model.agents_index, 1, "the action target follows it");
+    assert_eq!(model.selected_agent(), Some(1));
+    assert!(matches!(
+        app::handle_key(&mut model, key(KeyCode::Enter)),
+        app::Flow::Choose(Choice::AgentAction {
+            action: "inspect",
+            index: 1
+        })
+    ));
+    assert!(matches!(
+        app::handle_key(&mut model, key(KeyCode::Char('x'))),
+        app::Flow::Choose(Choice::AgentAction {
+            action: "stop",
+            index: 1
+        })
+    ));
+}
+
+#[test]
+fn screen_reader_approval_keeps_every_line_of_a_multi_line_command() {
+    use davinci_tui::davinci::model::{Ask, AskKind, Hunk, HunkKind, Overlay, PickerItem};
+    let mut model = shell(true);
+    model.screen_reader = true;
+    model.ask = Ask {
+        title: "Bash".into(),
+        key: "/permissions".into(),
+        question: "Run this command?".into(),
+        subject: "echo safe # comment\r\nrm important.txt".into(),
+        kind: AskKind::File,
+        preview: (0..10)
+            .map(|n| Hunk::new(HunkKind::Context, &format!("detail {n}")))
+            .collect(),
+        items: vec![
+            PickerItem::new("Yes", ""),
+            PickerItem::new("Yes, always", ""),
+            PickerItem::new("No", ""),
+        ],
+        ..Ask::default()
+    };
+    model.overlay = Some(Overlay::Ask);
+    model.ask_index = 1;
+    let rows_at = |model: &Model, height: u16| -> Vec<String> {
+        app::compose(model, height).iter().map(text).collect()
+    };
+
+    let rows = rows_at(&model, 24);
+    assert!(
+        rows.iter().any(|row| row == "echo safe # comment"),
+        "{rows:?}"
+    );
+    assert!(rows.iter().any(|row| row == "rm important.txt"), "{rows:?}");
+
+    for height in [4u16, 8] {
+        let rows = rows_at(&model, height);
+        assert!(
+            rows.iter().any(|row| row == "echo safe # comment"),
+            "height {height}: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("rows hidden")),
+            "height {height}: {rows:?}"
+        );
+        // Paging reaches the hidden subject line, not only the preview.
+        model.overlay_offset = Some(0);
+        let paged = rows_at(&model, height);
+        assert!(
+            paged.iter().any(|row| row == "rm important.txt"),
+            "height {height} paged: {paged:?}"
+        );
+        assert!(
+            paged.iter().any(|row| row == "echo safe # comment"),
+            "height {height} paged: {paged:?}"
+        );
+        assert!(
+            paged.iter().any(|row| row.contains("> 2. Yes, always")),
+            "height {height} paged: {paged:?}"
+        );
+        model.overlay_offset = None;
+    }
+    // A bare `\r` is a break too, and the question and note keep theirs.
+    model.ask.subject = "a\rb".into();
+    model.ask.question = "first\nsecond".into();
+    model.ask.note = "n1\nn2".into();
+    let rows = rows_at(&model, 24);
+    for row in ["a", "b", "first", "second", "n1", "n2"] {
+        assert!(rows.iter().any(|r| r == row), "{row}: {rows:?}");
+    }
+}
+
+fn screen_reader_ask(subject: &str, note: &str, choices: usize, height: u16) -> Model {
+    use davinci_tui::davinci::model::{Ask, AskKind, Overlay, PickerItem};
+    let mut model = shell(true);
+    model.screen_reader = true;
+    model.height = height;
+    model.ask = Ask {
+        title: "Bash".into(),
+        key: "/permissions".into(),
+        question: "Run this command?".into(),
+        subject: subject.into(),
+        note: note.into(),
+        kind: AskKind::File,
+        items: (0..choices)
+            .map(|n| PickerItem::new(&format!("Choice {n}"), ""))
+            .collect(),
+        ..Ask::default()
+    };
+    model.overlay = Some(Overlay::Ask);
+    model.ask_index = 1;
+    model
+}
+
+fn page_down(model: &mut Model) {
+    app::handle_key(model, KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+}
+
+#[test]
+fn screen_reader_approval_pages_to_every_note_line_and_keeps_the_choice_at_height_one() {
+    let note = (0..6)
+        .map(|n| format!("note {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut model = screen_reader_ask("cmd", &note, 2, 4);
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..12 {
+        let rows: Vec<String> = app::compose(&model, 4).iter().map(text).collect();
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().any(|row| row == "cmd"), "{rows:?}");
+        assert!(rows.iter().any(|row| row == "> 2. Choice 1"), "{rows:?}");
+        for n in 0..6 {
+            if rows.contains(&format!("note {n}")) {
+                seen.insert(n);
+            }
+        }
+        page_down(&mut model);
+    }
+    assert_eq!(seen.len(), 6, "every note line is reachable: {seen:?}");
+
+    // One row: Enter acts on the selected choice, so it is the row shown.
+    let model = screen_reader_ask("cmd", &note, 2, 1);
+    let rows: Vec<String> = app::compose(&model, 1).iter().map(text).collect();
+    assert_eq!(rows, vec!["> 2. Choice 1".to_string()]);
+}
+
+#[test]
+fn screen_reader_approval_pages_to_the_tail_of_a_bare_cr_subject() {
+    let subject = (0..40)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\r");
+    let mut model = screen_reader_ask(&subject, "", 3, 8);
+    let mut reached = false;
+    for _ in 0..60 {
+        let rows: Vec<String> = app::compose(&model, 8).iter().map(text).collect();
+        if rows.iter().any(|row| row == "line 39") {
+            reached = true;
+            break;
+        }
+        page_down(&mut model);
+    }
+    assert!(reached, "the subject's last line is unreachable by paging");
+    for _ in 0..80 {
+        page_down(&mut model);
+    }
+    // 39 subject lines past the first are pageable: the offset stops inside them.
+    assert!(
+        model.overlay_offset.unwrap() <= 38,
+        "{:?}",
+        model.overlay_offset
+    );
+    let rows: Vec<String> = app::compose(&model, 8).iter().map(text).collect();
+    assert!(rows.iter().any(|row| row == "line 39"), "{rows:?}");
+    assert!(rows.iter().any(|row| row == "line 0"), "{rows:?}");
+}
+
+#[test]
+fn deleting_an_agent_under_a_filter_moves_the_selection_to_a_visible_row() {
+    use davinci_tui::davinci::model::{AgentsSheet, Choice};
+    use davinci_tui::davinci::theme::State;
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    let ctrl = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
+    let mut model = shell(true);
+    model.screen = Screen::Agents;
+    model.agents = Some(AgentsSheet {
+        agents: vec![
+            agent("a0", "foo-first", State::Done),
+            agent("a1", "bar", State::Done),
+            agent("a2", "foo-last", State::Done),
+        ],
+        selected_index: 2,
+        query: "foo".into(),
+        ..AgentsSheet::default()
+    });
+    model.agents_index = 2;
+    app::handle_key(&mut model, ctrl('x'));
+    app::handle_key(&mut model, ctrl('x'));
+    let sheet = model.agents.as_ref().unwrap();
+    assert_eq!(sheet.agents.len(), 2);
+    assert_eq!(sheet.selected_index, 0, "the hidden `bar` row is skipped");
+    assert_eq!(model.agents_index, 0);
+    assert_eq!(model.selected_agent(), Some(0));
+    assert!(matches!(
+        app::handle_key(&mut model, key(KeyCode::Enter)),
+        app::Flow::Choose(Choice::AgentAction {
+            action: "inspect",
+            index: 0
+        })
+    ));
 }

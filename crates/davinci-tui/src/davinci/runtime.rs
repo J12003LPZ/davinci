@@ -122,6 +122,9 @@ static MOUSE: AtomicBool = AtomicBool::new(false);
 /// Restore reads this, never the setting, so a session that started with the
 /// reference on gives it back whatever the setting says by then.
 static REFERENCE: AtomicBool = AtomicBool::new(false);
+/// Whether the reference's mouse modes were actually written: with
+/// `DAVINCI_DISABLE_MOUSE` they never are, and restore must not turn them off.
+static REFERENCE_MOUSE: AtomicBool = AtomicBool::new(false);
 
 /// Mouse click, drag, move and SGR coordinates, as the reference asks for at
 /// fullscreen. Written as text on every platform: crossterm's Windows mouse
@@ -130,6 +133,17 @@ pub const REFERENCE_MODES_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?100
 /// The matching offs, plus synchronized output so a frame cut short by a
 /// panic cannot leave the terminal holding its display.
 pub const REFERENCE_MODES_OFF: &str = "\x1b[?2026l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+/// What is left of [`REFERENCE_MODES_OFF`] when the mouse modes were never enabled.
+pub const REFERENCE_SYNC_OFF: &str = "\x1b[?2026l";
+
+/// What restore writes for the reference: the mouse offs only if the mouse was turned on.
+pub fn reference_modes_off(mouse_enabled: bool) -> &'static str {
+    if mouse_enabled {
+        REFERENCE_MODES_OFF
+    } else {
+        REFERENCE_SYNC_OFF
+    }
+}
 
 /// Whether the reference shell is on: `PI_DAVINCI_REFERENCE` decides when it
 /// says yes (`1`, `true`, `yes`, `on`) or no (`0`, `false`, `no`, `off`); an
@@ -186,6 +200,7 @@ pub fn reference_mouse_on(reference: bool, mouse: bool) -> &'static str {
 
 fn write_reference_modes(out: &mut impl Write) {
     let on = reference_mouse_on(true, !env_flag("DAVINCI_DISABLE_MOUSE"));
+    REFERENCE_MOUSE.store(!on.is_empty(), Ordering::SeqCst);
     let _ = out.write_all(on.as_bytes());
     let _ = out.flush();
 }
@@ -197,6 +212,16 @@ const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
 fn event_marks_dirty(event: &Event) -> bool {
     !matches!(event, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved)
+}
+
+/// The reference's part of [`restore`]: its terminal modes off, the mouse ones
+/// only if they were turned on.
+fn write_reference_restore(out: &mut impl Write) {
+    if REFERENCE.swap(false, Ordering::SeqCst) {
+        let mouse = REFERENCE_MOUSE.swap(false, Ordering::SeqCst);
+        let _ = out.write_all(reference_modes_off(mouse).as_bytes());
+        let _ = out.flush();
+    }
 }
 
 /// Undo everything [`Session::open`] did, from anywhere, at most once.
@@ -221,11 +246,7 @@ pub fn restore() -> io::Result<()> {
             let _ = execute!(io::stdout(), event::DisableMouseCapture);
         }
     }
-    if REFERENCE.swap(false, Ordering::SeqCst) {
-        let mut out = io::stdout();
-        let _ = out.write_all(REFERENCE_MODES_OFF.as_bytes());
-        let _ = out.flush();
-    }
+    write_reference_restore(&mut io::stdout());
     let _ = execute!(io::stdout(), DisableFocusChange, DisableBracketedPaste);
     match screen_exit(
         ALTERNATE.swap(false, Ordering::SeqCst),
@@ -1180,10 +1201,7 @@ impl Session {
             }
             return false;
         }
-        if model.screen == Screen::Agent
-            && !model.show_tool_output
-            && (row.contains("to expand)") || Self::is_collapsed_tool_summary(row))
-        {
+        if click_expands_tool_output(model, row) {
             model.show_tool_output = true;
             model.dirty = true;
             return true;
@@ -1346,6 +1364,15 @@ impl Session {
             Ok(())
         }
     }
+}
+
+/// Whether a click on `row` opens the collapsed tool output. A `to expand)` row
+/// does everywhere; the one-row group summary only in the reference shell.
+fn click_expands_tool_output(model: &Model, row: &str) -> bool {
+    model.screen == super::model::Screen::Agent
+        && !model.show_tool_output
+        && (row.contains("to expand)")
+            || (model.reference && Session::is_collapsed_tool_summary(row)))
 }
 
 impl Drop for Session {
@@ -1931,7 +1958,52 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
 
 #[cfg(test)]
 mod tests {
+    use super::super::model::Model;
+    use super::super::theme::{ColorDepth, Theme};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn a_collapsed_tool_summary_click_expands_only_in_the_reference_shell() {
+        let mut model = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 80, 24, true);
+        model.screen = super::super::model::Screen::Agent;
+        assert!(super::click_expands_tool_output(
+            &model,
+            "Read 2 files (ctrl+o to expand)"
+        ));
+        assert!(!super::click_expands_tool_output(&model, "  Read 2 files"));
+        model.reference = true;
+        assert!(super::click_expands_tool_output(&model, "  Read 2 files"));
+    }
+
+    #[test]
+    fn restore_leaves_mouse_modes_alone_when_they_were_never_enabled() {
+        // The function `restore` calls, with a buffer for the terminal.
+        super::REFERENCE.store(true, Ordering::SeqCst);
+        super::REFERENCE_MOUSE.store(false, Ordering::SeqCst);
+        let mut off = Vec::new();
+        super::write_reference_restore(&mut off);
+        assert_eq!(off, b"\x1b[?2026l");
+        for mode in ["1000", "1002", "1003", "1006"] {
+            assert!(
+                !String::from_utf8_lossy(&off).contains(mode),
+                "{mode} written for a mouse never on"
+            );
+        }
+        assert!(!super::REFERENCE.load(Ordering::SeqCst));
+
+        super::REFERENCE.store(true, Ordering::SeqCst);
+        super::REFERENCE_MOUSE.store(true, Ordering::SeqCst);
+        let mut on = Vec::new();
+        super::write_reference_restore(&mut on);
+        assert_eq!(on, super::REFERENCE_MODES_OFF.as_bytes());
+        assert!(!super::REFERENCE_MOUSE.load(Ordering::SeqCst));
+
+        // Not a reference session: nothing is written.
+        let mut none = Vec::new();
+        super::write_reference_restore(&mut none);
+        assert!(none.is_empty());
+    }
+
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 

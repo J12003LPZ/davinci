@@ -10,7 +10,8 @@ Usage:
         [--pattern test_cc2316_*.py] [--start-dir scripts/tests]
 
 Exit code is 0 only when every selected test passed (skips and expected
-failures do not fail the run, as in unittest).
+failures do not fail the run, as in unittest). `--ids` that select nothing, or
+name an ID that does not exist, exit 2 and list the unknown IDs.
 """
 from __future__ import annotations
 
@@ -71,7 +72,7 @@ class RecordingResult(unittest.TextTestResult):
         self._finish(test, "unexpected_success")
 
 
-def selected(loader, pattern, start_dir, ids):
+def selected(loader, pattern, start_dir, ids, found=None):
     suite = loader.discover(str(start_dir), pattern=pattern, top_level_dir=str(start_dir))
     chosen = unittest.TestSuite()
 
@@ -80,6 +81,8 @@ def selected(loader, pattern, start_dir, ids):
             for child in item:
                 walk(child)
             return
+        if found is not None:
+            found.add(item.id())
         if not ids or item.id() in ids:
             chosen.addTest(item)
 
@@ -97,7 +100,13 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     loader = unittest.TestLoader()
-    suite = selected(loader, args.pattern, args.start_dir, set(args.ids))
+    found = set()
+    suite = selected(loader, args.pattern, args.start_dir, set(args.ids), found)
+    unknown = sorted(set(args.ids) - found)
+    if unknown or (args.ids and not suite.countTestCases()):
+        print("unknown test IDs: " + (", ".join(unknown) or "(none selected)"),
+              file=sys.stderr)
+        return 2
     runner = unittest.TextTestRunner(verbosity=2, resultclass=RecordingResult)
     result = runner.run(suite)
 

@@ -248,5 +248,63 @@ class RealLedgerTest(unittest.TestCase):
             self.assertTrue((Path(out) / "coverage.md").is_file())
 
 
+class SuiteRunnerTest(unittest.TestCase):
+    def test_report_passes_an_absolute_out_path_to_the_subprocess(self):
+        import types
+        import unittest.mock
+        import cc2316_report as report
+
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            seen["cwd"] = kwargs.get("cwd")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with unittest.mock.patch.object(report.subprocess, "run", fake_run):
+            report.run_suite(Path("relative-evidence"))
+        out = Path(seen["cmd"][seen["cmd"].index("--out") + 1])
+        self.assertTrue(out.is_absolute(), out)
+        self.assertEqual(out, Path("relative-evidence").resolve() / "suite.json")
+        self.assertEqual(seen["cwd"], report.REPO)
+
+    def test_run_suite_exits_2_for_unknown_ids_and_runs_known_ones(self):
+        import contextlib
+        import io
+        import run_suite
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "test_demo.py").write_text(
+                "import unittest\n"
+                "class Demo(unittest.TestCase):\n"
+                "    def test_ok(self):\n"
+                "        pass\n", encoding="utf-8")
+            out = tmp / "out.json"
+
+            def run(*ids):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    code = run_suite.main(
+                        ["--ids", *ids, "--out", str(out), "--pattern", "test_demo.py",
+                         "--start-dir", str(tmp)])
+                return code, err.getvalue()
+
+            try:
+                code, err = run("test_demo.Demo.test_nope")
+                self.assertEqual(code, 2)
+                self.assertIn("test_demo.Demo.test_nope", err)
+                self.assertFalse(out.exists(), "nothing ran, nothing is written")
+                code, err = run("test_demo.Demo.test_ok", "test_demo.Demo.test_typo")
+                self.assertEqual(code, 2)
+                self.assertIn("test_demo.Demo.test_typo", err)
+                self.assertNotIn("test_demo.Demo.test_ok", err)
+                code, _ = run("test_demo.Demo.test_ok")
+                self.assertEqual(code, 0)
+                self.assertTrue(out.is_file())
+            finally:
+                sys.modules.pop("test_demo", None)
+
+
 if __name__ == "__main__":
     unittest.main()

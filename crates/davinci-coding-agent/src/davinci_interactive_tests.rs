@@ -521,7 +521,7 @@ fn a_queued_theme_line_waits_behind_the_lines_that_start_a_turn() {
 }
 
 #[test]
-fn mid_turn_shift_tab_queues_the_change_and_the_footer_waits_for_the_runtime() {
+fn mid_turn_shift_tab_queues_the_change_and_the_footer_moves_at_once() {
     let mut agent = Agent::new("base prompt");
     let mut m = model();
     m.screen = davinci_tui::davinci::model::Screen::Agent;
@@ -537,24 +537,19 @@ fn mid_turn_shift_tab_queues_the_change_and_the_footer_waits_for_the_runtime() {
     };
 
     assert!(!mid_turn_key(&mut m, shift_tab(), &abort, &pending));
-    assert_eq!(
-        m.permission_mode, "ask",
-        "the footer names the runtime's mode, not the request"
-    );
+    assert_eq!(m.permission_mode, "edits", "the footer moves as on main");
     assert_eq!(*pending.lock().unwrap(), Some(PermissionMode::Edits));
     assert_eq!(agent.permission_mode(), PermissionMode::Ask, "agent waits");
 
-    // The worker's apply point reaches the agent through set_permission_mode;
-    // until then the second press starts from the queued mode.
+    // The worker consumes the slot between presses; no sync happens in the
+    // live path, so the second press must start from the footer.
     assert_eq!(
         agent.apply_pending_permission_mode(),
         Some(PermissionMode::Edits)
     );
-    sync_permission_state(&agent, &mut m);
-    assert_eq!(m.permission_mode, "edits");
 
     assert!(!mid_turn_key(&mut m, shift_tab(), &abort, &pending));
-    assert_eq!(m.permission_mode, "edits", "the footer waits again");
+    assert_eq!(m.permission_mode, "read-only");
     assert_eq!(*pending.lock().unwrap(), Some(PermissionMode::ReadOnly));
     assert_eq!(
         agent.apply_pending_permission_mode(),
@@ -587,7 +582,7 @@ fn the_reference_mid_turn_cycle_skips_always_approve() {
         let applied = agent
             .apply_pending_permission_mode()
             .expect("a queued mode");
-        sync_permission_state(&agent, &mut m);
+        settle_requested_mode(&mut m, &pending, &agent.applied_permission_mode);
         assert_eq!(m.permission_mode, expected);
         assert_eq!(applied.as_str(), expected);
         assert_ne!(m.permission_mode, "always-approve");
@@ -5298,6 +5293,7 @@ fn an_esc_the_theme_picker_consumed_never_counts_toward_a_double_escape() {
 fn ctrl_enter_sends_the_draft_now_ahead_of_queued_lines() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let mut m = model();
+    m.reference = true;
     m.running = true;
     m.queued.push("later".into());
     m.type_char("now");
@@ -5325,6 +5321,7 @@ fn ctrl_enter_sends_the_draft_now_ahead_of_queued_lines() {
 fn ctrl_enter_on_an_empty_draft_leaves_the_turn_alone() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let mut m = model();
+    m.reference = true;
     m.running = true;
     let abort = std::sync::Arc::new(AtomicBool::new(false));
     let pending = std::sync::Mutex::new(None);
@@ -5555,4 +5552,421 @@ fn escape_and_the_deny_row_are_the_same_decision() {
         "Escape must deny, never approve or cancel silently"
     );
     assert!(!abort.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+fn ctrl_c_key() -> crossterm::event::KeyEvent {
+    crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('c'),
+        crossterm::event::KeyModifiers::CONTROL,
+    )
+}
+
+/// Drain `model`'s queue the way `run_turns` does. Each started line is a turn
+/// that reaches a nested drain, as `on_line` reaches `run_turns`; the lines in
+/// `cancel` are interrupted with a real Ctrl+C key while they run.
+fn drain_with_ctrl_c_on(model: &mut Model, cancel: &[&str]) -> Vec<String> {
+    use std::cell::RefCell;
+    let started = RefCell::new(Vec::new());
+    fn level(model: &mut Model, cancel: &[&str], started: &RefCell<Vec<String>>) -> Next {
+        drain_queue(
+            model,
+            |model| model,
+            |model, line| {
+                started.borrow_mut().push(line.to_string());
+                if cancel.contains(&line) {
+                    let abort = Arc::new(AtomicBool::new(false));
+                    mid_turn_key(model, ctrl_c_key(), &abort, &Mutex::new(None));
+                }
+                level(model, cancel, started)
+            },
+        )
+    }
+    level(model, cancel, &started);
+    started.into_inner()
+}
+
+#[test]
+fn ctrl_c_holds_the_queue_at_every_draining_level_until_a_submission() {
+    let queue = |lines: &[&str]| lines.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+    let mut m = model();
+    m.reference = true;
+    m.running = true;
+
+    // During a queued turn: B starts, Ctrl+C stops it, the outer level must not start C.
+    m.queued = queue(&["B", "C"]);
+    assert_eq!(drain_with_ctrl_c_on(&mut m, &["B"]), queue(&["B"]));
+    assert_eq!(m.queued, queue(&["C"]));
+
+    // During the initial turn: the hold is set before the queue is looked at.
+    let mut initial = model();
+    initial.reference = true;
+    initial.queued = queue(&["B", "C"]);
+    mid_turn_key(
+        &mut initial,
+        ctrl_c_key(),
+        &Arc::new(AtomicBool::new(false)),
+        &Mutex::new(None),
+    );
+    assert!(drain_with_ctrl_c_on(&mut initial, &[]).is_empty());
+    assert_eq!(initial.queued, queue(&["B", "C"]));
+
+    // A deliberate submission clears the hold; the held lines drain after its turn.
+    release_queue_hold(&mut m);
+    assert_eq!(drain_with_ctrl_c_on(&mut m, &[]), queue(&["C"]));
+    assert!(m.queued.is_empty());
+}
+
+#[test]
+fn the_ctrl_c_hold_and_the_reference_chords_do_nothing_with_the_setting_off() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut m = model();
+    m.running = true;
+    m.queued = vec!["B".into(), "C".into()];
+    let abort = Arc::new(AtomicBool::new(false));
+    let pending = Mutex::new(None);
+    mid_turn_key(&mut m, ctrl_c_key(), &abort, &pending);
+    assert!(m.ctrl_c_armed.is_none() && !m.exit_armed, "no hold on main");
+    assert_eq!(drain_with_ctrl_c_on(&mut m, &["B"]), ["B", "C"]);
+
+    // Up leaves the queue alone, ctrl+x ctrl+s sends nothing, ctrl+enter queues.
+    let mut m = model();
+    m.running = true;
+    m.queued = vec!["B".into()];
+    let abort = Arc::new(AtomicBool::new(false));
+    let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+    mid_turn_key(&mut m, up, &abort, &pending);
+    assert_eq!(m.queued, ["B"]);
+    m.type_char("now");
+    for key in [KeyCode::Char('x'), KeyCode::Char('s')] {
+        mid_turn_key(
+            &mut m,
+            KeyEvent::new(key, KeyModifiers::CONTROL),
+            &abort,
+            &pending,
+        );
+    }
+    assert_eq!(m.queued, ["B"]);
+    assert!(m.chord_x.is_none());
+    let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+    mid_turn_key(&mut m, ctrl_enter, &abort, &pending);
+    assert_eq!(m.queued, ["B", "now"], "queued last, no send-now");
+    assert!(!abort.load(Ordering::Relaxed));
+}
+
+fn shift_tab_key() -> crossterm::event::KeyEvent {
+    crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::BackTab,
+        crossterm::event::KeyModifiers::SHIFT,
+    )
+}
+
+#[test]
+fn the_reference_footer_shows_a_requested_mode_only_once_the_worker_applied_it() {
+    let mut agent = Agent::new("base prompt");
+    let mut m = model();
+    m.reference = true;
+    m.screen = davinci_tui::davinci::model::Screen::Agent;
+    m.running = true;
+    change_permission_mode(&mut agent, &mut m, PermissionMode::Edits);
+    let pending = agent.pending_permission_mode.clone();
+    let abort = Arc::new(AtomicBool::new(false));
+
+    // Edits -> Plan: the batch that started under Edits can still write, so the
+    // footer must keep saying edits while the request waits in the slot.
+    mid_turn_key(&mut m, shift_tab_key(), &abort, &pending);
+    assert_eq!(*pending.lock().unwrap(), Some(PermissionMode::ReadOnly));
+    settle_requested_mode(&mut m, &pending, &agent.applied_permission_mode);
+    assert_eq!(m.permission_mode, "edits", "not applied yet");
+
+    // The worker takes the slot at its next batch; the next UI tick shows it.
+    assert_eq!(
+        agent.apply_pending_permission_mode(),
+        Some(PermissionMode::ReadOnly)
+    );
+    settle_requested_mode(&mut m, &pending, &agent.applied_permission_mode);
+    assert_eq!(m.permission_mode, "read-only");
+    assert!(m.requested_permission_mode.is_none());
+}
+
+#[test]
+fn the_footer_does_not_move_when_the_slot_is_only_taken_before_the_install_is_reported() {
+    let mut agent = Agent::new("base prompt");
+    let mut m = model();
+    m.reference = true;
+    m.screen = davinci_tui::davinci::model::Screen::Agent;
+    m.running = true;
+    change_permission_mode(&mut agent, &mut m, PermissionMode::Edits);
+    let pending = agent.pending_permission_mode.clone();
+    let applied = agent.applied_permission_mode.clone();
+    mid_turn_key(
+        &mut m,
+        shift_tab_key(),
+        &Arc::new(AtomicBool::new(false)),
+        &pending,
+    );
+    // The worker has taken the slot and is still installing (a first Auto
+    // activation can probe the sandbox for seconds): nothing is reported yet.
+    pending.lock().unwrap().take();
+    settle_requested_mode(&mut m, &pending, &applied);
+    assert_eq!(m.permission_mode, "edits");
+    assert_eq!(m.requested_permission_mode.as_deref(), Some("read-only"));
+}
+
+#[test]
+fn two_presses_around_one_application_show_the_first_applied_mode_then_the_second() {
+    let mut agent = Agent::new("base prompt");
+    let mut m = model();
+    m.reference = true;
+    m.screen = davinci_tui::davinci::model::Screen::Agent;
+    m.running = true;
+    change_permission_mode(&mut agent, &mut m, PermissionMode::Ask);
+    let pending = agent.pending_permission_mode.clone();
+    let applied = agent.applied_permission_mode.clone();
+    let abort = Arc::new(AtomicBool::new(false));
+
+    mid_turn_key(&mut m, shift_tab_key(), &abort, &pending); // Ask -> Edits
+    assert_eq!(
+        agent.apply_pending_permission_mode(),
+        Some(PermissionMode::Edits)
+    );
+    // Second press before the tick: it overwrites nothing the footer needs.
+    mid_turn_key(&mut m, shift_tab_key(), &abort, &pending); // Edits -> Plan
+    settle_requested_mode(&mut m, &pending, &applied);
+    assert_eq!(m.permission_mode, "edits", "the first applied mode shows");
+    assert_eq!(m.requested_permission_mode.as_deref(), Some("read-only"));
+
+    assert_eq!(
+        agent.apply_pending_permission_mode(),
+        Some(PermissionMode::ReadOnly)
+    );
+    settle_requested_mode(&mut m, &pending, &applied);
+    assert_eq!(m.permission_mode, "read-only");
+    assert!(m.requested_permission_mode.is_none());
+}
+
+#[test]
+fn the_footer_never_shows_a_mode_the_agent_did_not_install() {
+    let mut agent = Agent::new("base prompt");
+    let mut m = model();
+    m.reference = true;
+    m.running = true;
+    change_permission_mode(&mut agent, &mut m, PermissionMode::Ask);
+    let pending = agent.pending_permission_mode.clone();
+    let applied = agent.applied_permission_mode.clone();
+    // A request that is queued, or taken but not installed, is never shown.
+    m.requested_permission_mode = Some("auto".into());
+    *pending.lock().unwrap() = Some(PermissionMode::Auto);
+    settle_requested_mode(&mut m, &pending, &applied);
+    assert_eq!(m.permission_mode, "ask");
+    pending.lock().unwrap().take();
+    settle_requested_mode(&mut m, &pending, &applied);
+    assert_eq!(m.permission_mode, "ask");
+    assert_eq!(m.requested_permission_mode.as_deref(), Some("auto"));
+    // Off: the footer is not driven by the report at all.
+    m.reference = false;
+    *applied.lock().unwrap() = Some(PermissionMode::Edits);
+    settle_requested_mode(&mut m, &pending, &applied);
+    assert_eq!(m.permission_mode, "ask");
+}
+
+#[test]
+fn two_reference_presses_around_the_worker_taking_the_slot_advance_two_steps() {
+    let mut agent = Agent::new("base prompt");
+    let mut m = model();
+    m.reference = true;
+    m.screen = davinci_tui::davinci::model::Screen::Agent;
+    m.running = true;
+    change_permission_mode(&mut agent, &mut m, PermissionMode::Ask);
+    let pending = agent.pending_permission_mode.clone();
+    let abort = Arc::new(AtomicBool::new(false));
+
+    mid_turn_key(&mut m, shift_tab_key(), &abort, &pending);
+    // Consumed, and the footer has not caught up yet: the second press must
+    // start from the request, not from the stale footer.
+    assert_eq!(
+        agent.apply_pending_permission_mode(),
+        Some(PermissionMode::Edits)
+    );
+    mid_turn_key(&mut m, shift_tab_key(), &abort, &pending);
+    assert_eq!(*pending.lock().unwrap(), Some(PermissionMode::ReadOnly));
+    assert_eq!(m.permission_mode, "ask", "still the mode the agent holds");
+    agent.apply_pending_permission_mode();
+    settle_requested_mode(&mut m, &pending, &agent.applied_permission_mode);
+    assert_eq!(m.permission_mode, "read-only");
+    assert_eq!(agent.permission_mode(), PermissionMode::ReadOnly);
+}
+
+#[test]
+fn ctrl_c_in_an_approval_dialog_holds_the_queue_in_the_reference_shell_only() {
+    let request = write_approval(
+        vec![ToolApprovalDecision::AllowOnce, ToolApprovalDecision::Deny],
+        true,
+        "a.txt",
+    );
+    let choices = request.host_choices(false);
+    for reference in [true, false] {
+        let mut m = model();
+        m.reference = reference;
+        m.running = true;
+        m.ask = permission_ask(&request, false);
+        m.overlay = Some(davinci_tui::davinci::model::Overlay::Ask);
+        m.queued = vec!["B".into()];
+        let abort = Arc::new(AtomicBool::new(false));
+        let answer = approval_answer_key(&mut m, ctrl_c_key(), &choices, &request, &abort);
+        assert_eq!(answer.map(|a| a.decision), Some(ToolApprovalDecision::Deny));
+        assert!(abort.load(Ordering::Relaxed));
+        assert_eq!(m.queue_hold, reference);
+        let started = drain_with_ctrl_c_on(&mut m, &[]);
+        if reference {
+            assert!(started.is_empty(), "B must not start behind a cancelled A");
+        } else {
+            assert_eq!(started, ["B"]);
+        }
+    }
+}
+
+#[test]
+fn ctrl_c_cancelling_an_approval_arms_the_exit_press_but_esc_and_off_mode_do_not() {
+    let request = write_approval(
+        vec![ToolApprovalDecision::AllowOnce, ToolApprovalDecision::Deny],
+        true,
+        "a.txt",
+    );
+    let choices = request.host_choices(false);
+    let esc = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    for (reference, key, armed) in [
+        (true, ctrl_c_key(), true),
+        (true, esc, false),
+        (false, ctrl_c_key(), false),
+    ] {
+        let mut m = model();
+        m.reference = reference;
+        m.running = true;
+        m.ask = permission_ask(&request, false);
+        m.overlay = Some(davinci_tui::davinci::model::Overlay::Ask);
+        let abort = Arc::new(AtomicBool::new(false));
+        approval_answer_key(&mut m, key, &choices, &request, &abort);
+        assert_eq!(m.ctrl_c_armed.is_some(), armed, "reference={reference}");
+    }
+}
+
+#[test]
+fn a_ctrl_c_hold_tells_the_user_about_held_lines_only_when_some_are_queued() {
+    let request = write_approval(
+        vec![ToolApprovalDecision::AllowOnce, ToolApprovalDecision::Deny],
+        true,
+        "a.txt",
+    );
+    let choices = request.host_choices(false);
+    for (queued, told) in [(vec!["B".to_string()], true), (Vec::new(), false)] {
+        let mut m = model();
+        m.reference = true;
+        m.running = true;
+        m.ask = permission_ask(&request, false);
+        m.overlay = Some(davinci_tui::davinci::model::Overlay::Ask);
+        m.queued = queued;
+        let abort = Arc::new(AtomicBool::new(false));
+        approval_answer_key(&mut m, ctrl_c_key(), &choices, &request, &abort);
+        let note = m.toast.as_ref().map(|(text, _)| text.clone());
+        if told {
+            assert_eq!(
+                note.as_deref(),
+                Some("Queued lines are held; sending a new prompt resumes them.")
+            );
+        } else {
+            assert!(note.is_none(), "{note:?}");
+        }
+    }
+}
+
+#[test]
+fn the_queue_hold_outlives_the_double_press_timestamp() {
+    let mut m = model();
+    m.reference = true;
+    m.running = true;
+    mid_turn_key(
+        &mut m,
+        ctrl_c_key(),
+        &Arc::new(AtomicBool::new(false)),
+        &Mutex::new(None),
+    );
+    assert!(m.queue_hold && m.ctrl_c_armed.is_some());
+    // The idle Ctrl+C takes the timestamp (`ctrl_c_armed.take()`); the hold is
+    // not the timestamp, so it stays until a deliberate submission.
+    m.ctrl_c_armed = None;
+    assert!(queue_held(&m));
+    release_queue_hold(&mut m);
+    assert!(!queue_held(&m));
+}
+
+#[test]
+fn only_a_picked_command_releases_the_hold_and_send_now_starts_its_own_line() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let command = Choice::Command {
+        name: "/theme".into(),
+        kind: "command".into(),
+    };
+    let tool = Choice::Command {
+        name: "bash".into(),
+        kind: "tool".into(),
+    };
+    for (choice, released) in [
+        (command, true),
+        (tool, false),
+        (Choice::Ask(0), false),
+        (Choice::Session(0), false),
+    ] {
+        let mut m = model();
+        m.reference = true;
+        m.queue_hold = true;
+        release_hold_for_choice(&mut m, &choice);
+        assert_eq!(!m.queue_hold, released, "{choice:?}");
+    }
+
+    // A line queued mid-turn after Ctrl+C waits; send-now starts it.
+    let abort = Arc::new(AtomicBool::new(false));
+    let pending = Mutex::new(None);
+    let mut m = model();
+    m.reference = true;
+    m.running = true;
+    mid_turn_key(&mut m, ctrl_c_key(), &abort, &pending);
+    m.type_char("later");
+    mid_turn_key(
+        &mut m,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        &abort,
+        &pending,
+    );
+    assert_eq!(m.queued, ["later"]);
+    assert!(
+        drain_with_ctrl_c_on(&mut m, &[]).is_empty(),
+        "Enter only queues"
+    );
+    m.type_char("now");
+    mid_turn_key(
+        &mut m,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        &abort,
+        &pending,
+    );
+    assert_eq!(drain_with_ctrl_c_on(&mut m, &[]), ["now", "later"]);
+
+    // The reference's ctrl+x ctrl+s chord is the same send-now.
+    let mut m = model();
+    m.reference = true;
+    m.running = true;
+    m.queue_hold = true;
+    m.type_char("chord");
+    for key in ['x', 's'] {
+        mid_turn_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL),
+            &abort,
+            &pending,
+        );
+    }
+    assert_eq!(drain_with_ctrl_c_on(&mut m, &[]), ["chord"]);
 }

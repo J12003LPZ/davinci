@@ -189,13 +189,7 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let Some(sheet) = model.agents.as_ref() else {
         return empty_state(width, th);
     };
-    let query = sheet.query.to_lowercase();
-    let matches = |agent: &crate::davinci::model::AgentRow| {
-        query.is_empty()
-            || agent.name.to_lowercase().contains(&query)
-            || agent.activity.to_lowercase().contains(&query)
-            || agent.status.to_lowercase().contains(&query)
-    };
+    let matches = |agent: &crate::davinci::model::AgentRow| sheet.matches(agent);
     if sheet.agents.is_empty() && sheet.profiles.is_empty() {
         let mut rows = counter_rows(model, sheet, width, th);
         if sheet.query.is_empty() {

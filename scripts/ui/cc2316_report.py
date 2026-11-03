@@ -24,9 +24,10 @@ REPO = Path(__file__).resolve().parents[2]
 DEFAULT_EVIDENCE = Path("C:/Users/sergi/Desktop/davinci-cc2316-evidence")
 
 
-def run_suite() -> tuple[int, dict | None, str]:
+def run_suite(evidence: Path = DEFAULT_EVIDENCE) -> tuple[int, dict | None, str]:
     """Run the coverage test IDs against DaVinci through the P19 adapter."""
-    suite_path = DEFAULT_EVIDENCE / "suite.json"
+    # The subprocess runs with cwd=REPO, so a relative path would land there.
+    suite_path = evidence.resolve() / "suite.json"
     completed = subprocess.run(
         [sys.executable, str(REPO / "scripts" / "ui" / "run_suite.py"),
          "--out", str(suite_path)],
@@ -48,7 +49,7 @@ def main(argv=None) -> int:
     suite = ""
     suite_data = None
     if args.run:
-        code, suite_data, tail = run_suite()
+        code, suite_data, tail = run_suite(args.evidence)
         suite = f"Suite exit {code}. Last lines:\n\n```\n{tail}\n```\n\n"
     elif (args.evidence / "suite.json").is_file():
         suite_data = json.loads((args.evidence / "suite.json").read_text(encoding="utf-8"))

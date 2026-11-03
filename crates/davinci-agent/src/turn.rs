@@ -1551,7 +1551,7 @@ Issue the call again if it is still needed.";
     }
 
     /// Background jobs that finished since the last step are told to the
-    /// model here, between one completion and the next Ã¢â‚¬â€ never inside a
+    /// model here, between one completion and the next — never inside a
     /// tool call, and never twice.
     fn inject_job_notices(
         &mut self,
@@ -5044,8 +5044,8 @@ Issue the call again if it is still needed.";
     /// decision and reports the revision *after* the decision, so a session or
     /// project grant's own bump is included. Re-reading the revision here and
     /// demanding it equal the value from before the question treated the
-    /// authorization's bookkeeping write Ã¢â‚¬â€ the session model it records on the
-    /// first call Ã¢â‚¬â€ as a policy change. That discarded a valid one-shot permit
+    /// authorization's bookkeeping write — the session model it records on the
+    /// first call — as a policy change. That discarded a valid one-shot permit
     /// (whose revision matched the decision) and asked the user the same
     /// question twice for the same call.
     fn stable_permission_revision(

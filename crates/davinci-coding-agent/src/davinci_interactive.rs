@@ -1469,15 +1469,19 @@ fn apply(model: &mut Model, turn: &mut Turn, event: &AgentEvent) {
                 // Delta events in this stream carry no whole message, so the counter
                 // also reads the block being streamed: the reference shows its token
                 // count from the first delta, not only when the message ends.
-                let live = model
-                    .transcript
-                    .iter()
-                    .rev()
-                    .find_map(|entry| match entry {
-                        Entry::Prose(text) => Some(estimate_tokens(text)),
-                        _ => None,
-                    })
-                    .unwrap_or(0);
+                let live = if model.reference {
+                    model
+                        .transcript
+                        .iter()
+                        .rev()
+                        .find_map(|entry| match entry {
+                            Entry::Prose(text) => Some(estimate_tokens(text)),
+                            _ => None,
+                        })
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
                 working.tokens = turn.streamed + reported.max(estimated).max(live);
             }
         }
@@ -1558,13 +1562,23 @@ fn double_escape(
     doubled
 }
 
-/// Cycle the permission mode while a turn owns the agent. The next mode comes
-/// from what the footer shows (a queued one, else the model's), the footer
-/// changes at once, and the worker applies the queued mode before its next
-/// batch of tool calls.
+/// Cycle the permission mode while a turn owns the agent. The worker applies
+/// the queued mode before its next batch of tool calls.
+///
+/// With the reference shell on, the footer keeps showing the mode the agent
+/// holds until the worker has applied the request (`settle_requested_mode`), so
+/// a batch that started under Edits is never labelled Plan. The next mode comes
+/// from the queued slot, else the last request the worker already took, else the
+/// footer. With it off, the footer moves at once, as on main.
 fn cycle_permission_mode_mid_turn(model: &mut Model, pending: &Mutex<Option<PermissionMode>>) {
     let mut slot = pending.lock().unwrap_or_else(|err| err.into_inner());
     let shown = (*slot)
+        .or_else(|| {
+            model
+                .requested_permission_mode
+                .as_deref()
+                .and_then(PermissionMode::parse)
+        })
         .or_else(|| PermissionMode::parse(&model.permission_mode))
         .unwrap_or_default();
     let next = if model.reference {
@@ -1573,9 +1587,39 @@ fn cycle_permission_mode_mid_turn(model: &mut Model, pending: &Mutex<Option<Perm
         shown.next()
     };
     *slot = Some(next);
-    // The indicator names the mode the policy holds. The queued mode is applied
-    // by the agent before its next batch and synced then; it does not get ahead
-    // of that confirmation.
+    if model.reference {
+        model.requested_permission_mode = Some(next.as_str().to_string());
+    } else {
+        model.permission_mode = next.as_str().to_string();
+    }
+}
+
+/// On a UI tick of a running turn (reference shell only): the footer takes the
+/// mode the agent reported installing (`applied`, published after
+/// `set_permission_mode` returned), never a queued request or an emptied slot.
+/// `requested_permission_mode` is only the cycle position for the next press;
+/// it clears once nothing is outstanding: the slot is empty and the agent
+/// reported the requested mode.
+fn settle_requested_mode(
+    model: &mut Model,
+    pending: &Mutex<Option<PermissionMode>>,
+    applied: &Mutex<Option<PermissionMode>>,
+) {
+    if !model.reference {
+        return;
+    }
+    let installed = *applied.lock().unwrap_or_else(|err| err.into_inner());
+    let Some(installed) = installed else {
+        return;
+    };
+    model.permission_mode = installed.as_str().to_string();
+    let slot_empty = pending
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .is_none();
+    if slot_empty && model.requested_permission_mode.as_deref() == Some(installed.as_str()) {
+        model.requested_permission_mode = None;
+    }
 }
 
 fn mid_turn_key(
@@ -1594,23 +1638,29 @@ fn mid_turn_key(
     // The reference's send-now chord is `ctrl+x ctrl+s`; ctrl+enter is the same action
     // where the terminal can deliver a modified Enter (CSI-u), which the byte harness
     // and this console path cannot.
-    if ctrl && key.code == KeyCode::Char('x') {
+    if model.reference && ctrl && key.code == KeyCode::Char('x') {
         model.chord_x = Some(std::time::Instant::now());
         return false;
     }
-    if ctrl && key.code == KeyCode::Char('s') {
+    if model.reference && ctrl && key.code == KeyCode::Char('s') {
         let chord = model
             .chord_x
             .take()
             .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(1500));
         if chord && model.send_now() {
+            // The user sent this line on purpose: it starts even after a Ctrl+C hold.
+            release_queue_hold(model);
             abort.store(true, Ordering::Relaxed);
             model.interrupt();
         }
         return false;
     }
     // Up restores the newest queued line for editing, taking it out of the queue.
-    if key.code == KeyCode::Up && model.composer.is_empty() && !model.queued.is_empty() {
+    if model.reference
+        && key.code == KeyCode::Up
+        && model.composer.is_empty()
+        && !model.queued.is_empty()
+    {
         if let Some(line) = model.queued.pop() {
             model.composer.set_text(line);
         }
@@ -1648,8 +1698,11 @@ fn mid_turn_key(
             }
             // A second Ctrl+C within the window leaves; the first one also holds
             // the queued line, so an exit never starts a request.
-            model.ctrl_c_armed = Some(std::time::Instant::now());
-            model.exit_armed = true;
+            if model.reference {
+                model.ctrl_c_armed = Some(std::time::Instant::now());
+                hold_queue_on_cancel(model);
+                model.exit_armed = true;
+            }
             let again = abort.swap(true, Ordering::Relaxed);
             model.interrupt();
             return again;
@@ -1660,8 +1713,9 @@ fn mid_turn_key(
         KeyCode::Char(_) if ctrl => {}
         // Ctrl+Enter sends now: the draft preempts the running turn, whose partial
         // text stays, and becomes the next request.
-        KeyCode::Enter if ctrl => {
+        KeyCode::Enter if ctrl && model.reference => {
             if model.send_now() {
+                release_queue_hold(model);
                 abort.store(true, Ordering::Relaxed);
                 model.interrupt();
             }
@@ -1725,20 +1779,80 @@ fn run_turns(shell: &mut Shell<'_>) -> Next {
     if let Err(err) = run_turn(shell.parsed, shell.agent, shell.model, shell.terminal, host) {
         return Next::Fail(err.to_string());
     }
-    // Ctrl+C is the exit gesture: the line queued behind the turn waits for the
-    // user's next action instead of starting a request they may be leaving from.
-    // Esc is the soft interrupt, and the reference sends the queue after it.
-    if shell.model.ctrl_c_armed.is_some() {
-        return Next::Go;
+    drain_queue(
+        shell,
+        |shell| &mut *shell.model,
+        |shell, line| on_line(shell, line),
+    )
+}
+
+/// A Ctrl+C that cancels a turn holds the queue (reference shell only), so a
+/// line queued behind it does not start by itself.
+fn hold_queue_on_cancel(model: &mut Model) {
+    if model.reference {
+        model.queue_hold = true;
+        if !model.queued.is_empty() {
+            model.push_toast("Queued lines are held; sending a new prompt resumes them.".into());
+        }
     }
-    while let Some(line) = next_queued(shell.model) {
+}
+
+/// A Ctrl+C that cancels from an approval also arms the exit window, as the
+/// mid-turn Ctrl+C does, so the next press leaves even if the worker returned
+/// first. Esc cancels the question without arming it.
+fn arm_exit_on_ctrl_c(model: &mut Model, key: &crossterm::event::KeyEvent) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    if model.reference
+        && key.code == KeyCode::Char('c')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        model.ctrl_c_armed = Some(std::time::Instant::now());
+        model.exit_armed = true;
+    }
+}
+
+/// Whether the Ctrl+C hold keeps the queue from starting more requests.
+fn queue_held(model: &Model) -> bool {
+    model.reference && model.queue_hold
+}
+
+/// A deliberate submission ends the Ctrl+C hold, so held lines drain after it.
+fn release_queue_hold(model: &mut Model) {
+    model.queue_hold = false;
+}
+
+/// Release the hold when a palette pick will run a command line (`on_choice`
+/// sends it through `on_line`).
+fn release_hold_for_choice(model: &mut Model, choice: &Choice) {
+    if matches!(choice, Choice::Command { kind, .. } if kind == "command") {
+        release_queue_hold(model);
+    }
+}
+
+/// Start the queued lines one by one through `start`.
+///
+/// Ctrl+C is the exit gesture: the line queued behind the turn waits for the
+/// user's next action instead of starting a request they may be leaving from.
+/// Esc is the soft interrupt, and the reference sends the queue after it.
+/// `start` reaches a nested `run_turns`, which returns with the hold still set,
+/// so the check runs before every line and every draining level stops.
+fn drain_queue<S>(
+    state: &mut S,
+    model: impl Fn(&mut S) -> &mut Model,
+    mut start: impl FnMut(&mut S, &str) -> Next,
+) -> Next {
+    while !queue_held(model(state)) {
+        let Some(line) = next_queued(model(state)) else {
+            break;
+        };
         // What the composer's own submit pushes before a line is routed.
-        shell.model.transcript.push(Entry::Gap);
-        shell.model.transcript.push(Entry::user(&line));
-        shell.model.transcript.push(Entry::Gap);
-        shell.model.transcript.push(Entry::agent("davinci"));
-        shell.model.running = true;
-        match on_line(shell, &line) {
+        let m = model(state);
+        m.transcript.push(Entry::Gap);
+        m.transcript.push(Entry::user(&line));
+        m.transcript.push(Entry::Gap);
+        m.transcript.push(Entry::agent("davinci"));
+        m.running = true;
+        match start(state, &line) {
             Next::Go => {}
             other => return other,
         }
@@ -1839,6 +1953,9 @@ fn run_turn(
     // left from an earlier turn was already applied at that turn's end.
     let pending_mode = agent.pending_permission_mode.clone();
     *pending_mode.lock().unwrap_or_else(|err| err.into_inner()) = None;
+    let applied_mode = agent.applied_permission_mode.clone();
+    *applied_mode.lock().unwrap_or_else(|err| err.into_inner()) = None;
+    model.requested_permission_mode = None;
     agent.event_sink = Some(EventSink(Arc::new(move |event: &AgentEvent| {
         let _ = event_tx.send(event.clone());
     })));
@@ -1938,6 +2055,7 @@ fn run_turn(
                 model.dirty = true;
                 last_tick = Instant::now();
                 poll_jobs(&jobs, model);
+                settle_requested_mode(model, &pending_mode, &applied_mode);
                 if let Some(runtime) = &roster_runtime {
                     roster_host.tick(runtime, model);
                 }
@@ -4028,6 +4146,8 @@ fn approval_answer_key(
         model.approval_instructions = None;
         model.overlay = None;
         if key.code == KeyCode::Char('c') {
+            hold_queue_on_cancel(model);
+            arm_exit_on_ctrl_c(model, &key);
             abort.store(true, Ordering::Relaxed);
             model.interrupt();
         }
@@ -4099,6 +4219,8 @@ fn approval_key(
             Some(permission_choice(index, choices).unwrap_or(ToolApprovalDecision::Deny))
         }
         Flow::Interrupt | Flow::Quit => {
+            hold_queue_on_cancel(model);
+            arm_exit_on_ctrl_c(model, &key);
             abort.store(true, Ordering::Relaxed);
             model.interrupt();
             model.overlay = None;
@@ -5912,34 +6034,45 @@ pub fn run(
                                 });
                                 Next::Leave
                             }
-                            Flow::Submit(line) => on_line(
-                                &mut Shell {
-                                    parsed,
-                                    agent,
-                                    model: &mut model,
-                                    terminal: &mut terminal,
-                                    host: &host,
-                                    pending: &mut pending,
-                                    cwd: &cwd,
-                                    dresser: &dresser,
-                                    images: &mut attached_images,
-                                },
-                                &line,
-                            ),
-                            Flow::Choose(choice) => on_choice(
-                                &mut Shell {
-                                    parsed,
-                                    agent,
-                                    model: &mut model,
-                                    terminal: &mut terminal,
-                                    host: &host,
-                                    pending: &mut pending,
-                                    cwd: &cwd,
-                                    dresser: &dresser,
-                                    images: &mut attached_images,
-                                },
-                                choice,
-                            ),
+                            Flow::Submit(line) => {
+                                // A deliberate submission ends the Ctrl+C hold on the queue.
+                                release_queue_hold(&mut model);
+                                on_line(
+                                    &mut Shell {
+                                        parsed,
+                                        agent,
+                                        model: &mut model,
+                                        terminal: &mut terminal,
+                                        host: &host,
+                                        pending: &mut pending,
+                                        cwd: &cwd,
+                                        dresser: &dresser,
+                                        images: &mut attached_images,
+                                    },
+                                    &line,
+                                )
+                            }
+                            Flow::Choose(choice) => {
+                                // A command picked from the palette runs through
+                                // `on_line` like a typed one, so it is as deliberate
+                                // as a submission; an Ask answer or a picker row
+                                // starts no turn and leaves the hold alone.
+                                release_hold_for_choice(&mut model, &choice);
+                                on_choice(
+                                    &mut Shell {
+                                        parsed,
+                                        agent,
+                                        model: &mut model,
+                                        terminal: &mut terminal,
+                                        host: &host,
+                                        pending: &mut pending,
+                                        cwd: &cwd,
+                                        dresser: &dresser,
+                                        images: &mut attached_images,
+                                    },
+                                    choice,
+                                )
+                            }
                             Flow::CyclePermissionMode => {
                                 cycle_permission_mode(agent, &mut model);
                                 Next::Go
@@ -11136,6 +11269,10 @@ fn apply_agent_action(shell: &mut Shell<'_>, action: &str, index: usize) -> Next
     let Some(sheet) = shell.model.agents.as_ref() else {
         return Next::Go;
     };
+    // A row the find filter hides is never acted on.
+    if !shell.model.visible_agents().contains(&index) {
+        return Next::Go;
+    }
     let Some(agent_row) = sheet.agents.get(index).cloned() else {
         return Next::Go;
     };
@@ -11612,6 +11749,7 @@ fn run_stop_hooks(shell: &mut Shell<'_>) {
 /// tool rows rather than prose: `bash(git *)` is not markdown emphasis.
 fn sync_permission_state(agent: &Agent, model: &mut Model) {
     model.permission_mode = agent.permission_mode().as_str().to_string();
+    model.requested_permission_mode = None;
 }
 
 fn change_permission_mode(agent: &mut Agent, model: &mut Model, mode: PermissionMode) {

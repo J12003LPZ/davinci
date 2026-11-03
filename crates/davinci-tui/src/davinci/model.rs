@@ -2827,6 +2827,60 @@ pub struct AgentsSheet {
     pub delete_armed: Option<String>,
 }
 
+impl AgentsSheet {
+    /// Whether the find filter shows `agent`: an empty query shows every row.
+    pub fn matches(&self, agent: &AgentRow) -> bool {
+        let query = self.query.to_lowercase();
+        query.is_empty()
+            || agent.name.to_lowercase().contains(&query)
+            || agent.activity.to_lowercase().contains(&query)
+            || agent.status.to_lowercase().contains(&query)
+    }
+
+    /// Indices into `agents` of the rows the find filter shows.
+    pub fn visible(&self) -> Vec<usize> {
+        (0..self.agents.len())
+            .filter(|&index| self.matches(&self.agents[index]))
+            .collect()
+    }
+}
+
+impl Model {
+    /// The `agents` indices that render, navigate and take actions. Off the
+    /// reference shell the dashboard is unfiltered, so every row is visible.
+    pub fn visible_agents(&self) -> Vec<usize> {
+        match self.agents.as_ref() {
+            Some(sheet) if self.reference => sheet.visible(),
+            Some(sheet) => (0..sheet.agents.len()).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// The selected agent's index in `agents`, `None` when the selection is
+    /// hidden by the find filter (or there is no agent).
+    pub fn selected_agent(&self) -> Option<usize> {
+        let len = self.agents.as_ref().map_or(0, |sheet| sheet.agents.len());
+        if len == 0 {
+            return None;
+        }
+        let index = self.agents_index % len;
+        self.visible_agents().contains(&index).then_some(index)
+    }
+
+    /// Move the selection to a visible row when the filter hid it.
+    pub fn snap_agents_selection(&mut self) {
+        if self.selected_agent().is_some() {
+            return;
+        }
+        if let Some(&first) = self.visible_agents().first() {
+            self.agents_index = first;
+            if let Some(sheet) = self.agents.as_mut() {
+                sheet.selected_index = first;
+            }
+        }
+    }
+}
+
 /// One launchable agent profile on the `/agents` sheet.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentProfileRow {
@@ -3214,6 +3268,13 @@ pub struct Model {
     /// double-press window leaves, and the queued line is held rather than sent
     /// into an exit.
     pub ctrl_c_armed: Option<std::time::Instant>,
+    /// The reference holds the queue after a turn-cancelling Ctrl+C until the
+    /// user submits something deliberately; only that, not the double-press
+    /// window above, releases it.
+    pub queue_hold: bool,
+    /// The permission mode a mid-turn cycle asked for that the worker has not
+    /// applied yet (reference mode), so consecutive presses advance from it.
+    pub requested_permission_mode: Option<String>,
     /// When `esc` was pressed once over a draft; a second `esc` within
     /// `DOUBLE_ESCAPE_MS` clears the composer. The hint row says so while it
     /// is up.
@@ -3893,6 +3954,8 @@ impl Model {
             running: false,
             exit_armed: false,
             ctrl_c_armed: None,
+            queue_hold: false,
+            requested_permission_mode: None,
             clear_armed: None,
             working: None,
             shell_runs: Vec::new(),
