@@ -77,7 +77,7 @@ def main(argv=None) -> int:
         "|---|---:|",
         *[f"| {state} | {count} |" for state, count in sorted(by_state.items())],
         "",
-        f"VERIFIED at zero differences: {len(verified)}. "
+        f"VERIFIED rows: {len(verified)} (zero-difference goldens and verified behaviours). "
         f"IN_PROGRESS with a recorded limitation: {len(partial)}. "
         f"Not started, unclassified, failed or blocked: {len(weak)}.",
         "",
