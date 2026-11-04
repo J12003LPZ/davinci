@@ -807,6 +807,7 @@ mod tests {
             program: r#"C:\Program Files\semantic server.exe"#.into(),
             args: vec!["--stdio".into(), "quoted value".into()],
             language: "rust".into(),
+            executable_hash: None,
         };
 
         assert_eq!(

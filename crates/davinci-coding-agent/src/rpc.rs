@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use davinci_agent::{Agent, QueueMode};
@@ -169,6 +170,7 @@ pub struct RpcRuntime {
     pub pending_events: Vec<RpcSessionEvent>,
     pub prompt_needs_turn: bool,
     pub control_operations: std::collections::HashMap<String, Value>,
+    control_operation_order: VecDeque<String>,
     /// Whether this launch loaded the project's own resources.
     pub project_trusted: bool,
     /// Set when project resources were left unloaded for want of trust.
@@ -202,6 +204,7 @@ impl RpcRuntime {
             pending_events: Vec::new(),
             prompt_needs_turn: false,
             control_operations: std::collections::HashMap::new(),
+            control_operation_order: VecDeque::new(),
             project_trusted: true,
             project_trust_diagnostic: None,
         }
@@ -280,6 +283,10 @@ pub fn resolve_scoped_models(models: &[Model], patterns: &[String]) -> Vec<Model
         .collect()
 }
 
+fn valid_rpc_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_RPC_ID_BYTES && !id.chars().any(char::is_control)
+}
+
 /// Record one pending UI answer. Ids are client-supplied, so they are bounded
 /// and the map refuses new entries once full; a repeat for a live id replaces
 /// its value instead of growing the map.
@@ -291,7 +298,7 @@ fn record_ui_response(
     let Some(id) = id else {
         return Err("UI response requires an id".into());
     };
-    if id.is_empty() || id.len() > MAX_RPC_ID_BYTES || id.chars().any(char::is_control) {
+    if !valid_rpc_id(id) {
         return Err("invalid UI response id".into());
     }
     if !runtime.pending_ui.contains_key(id) && runtime.pending_ui.len() >= MAX_PENDING_UI {
@@ -299,6 +306,24 @@ fn record_ui_response(
     }
     runtime.pending_ui.insert(id.to_string(), command);
     Ok(())
+}
+
+/// Keep the operation cache bounded by evicting the oldest completed record.
+/// A full cache must not block new control operations.
+fn remember_control_operation(runtime: &mut RpcRuntime, id: String, value: Value) {
+    if runtime
+        .control_operations
+        .insert(id.clone(), value)
+        .is_none()
+    {
+        runtime.control_operation_order.push_back(id);
+    }
+    while runtime.control_operations.len() > MAX_CONTROL_OPERATIONS {
+        let Some(oldest) = runtime.control_operation_order.pop_front() else {
+            break;
+        };
+        runtime.control_operations.remove(&oldest);
+    }
 }
 
 pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse {
@@ -834,10 +859,8 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 .operation_id
                 .clone()
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            if !runtime.control_operations.contains_key(&op_id)
-                && runtime.control_operations.len() >= MAX_CONTROL_OPERATIONS
-            {
-                return fail(id, &kind, "too many recorded control operations".into());
+            if !valid_rpc_id(&op_id) {
+                return fail(id, &kind, "invalid operationId".into());
             }
             let Some(runtime_handle) = &runtime.agent.runtime else {
                 return fail(id, &kind, "No active runtime handle available".into());
@@ -945,7 +968,7 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                             "reason": receipt.reason,
                         })
                     };
-                    runtime.control_operations.insert(op_id, result_val.clone());
+                    remember_control_operation(runtime, op_id, result_val.clone());
                     ok(id, &kind, Some(result_val))
                 }
                 other => fail(id, &kind, format!("Unknown control action: {other}")),
@@ -1846,28 +1869,70 @@ mod tests {
         assert!(record_ui_response(&mut runtime, Some(&oversized), RpcCommand::default()).is_err());
         assert!(record_ui_response(&mut runtime, None, RpcCommand::default()).is_err());
         assert!(record_ui_response(&mut runtime, Some("bad\nid"), RpcCommand::default()).is_err());
+    }
 
-        runtime.control_operations.clear();
+    #[test]
+    fn control_operations_are_bounded_by_eviction_not_rejection() {
+        let mut runtime = RpcRuntime::new(
+            davinci_agent::Agent::new_builtin(PromptProfile::Stable),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp"),
+        );
         for index in 0..MAX_CONTROL_OPERATIONS {
-            runtime
-                .control_operations
-                .insert(format!("op-{index}"), Value::Null);
+            remember_control_operation(
+                &mut runtime,
+                format!("op-{index}"),
+                serde_json::json!({ "index": index }),
+            );
         }
-        let response = handle_rpc(
+        remember_control_operation(
+            &mut runtime,
+            "new-operation".into(),
+            serde_json::json!({ "ok": true }),
+        );
+        assert_eq!(runtime.control_operations.len(), MAX_CONTROL_OPERATIONS);
+        assert!(runtime.control_operations.contains_key("new-operation"));
+        assert!(!runtime.control_operations.contains_key("op-0"));
+        assert_eq!(
+            runtime.control_operation_order.len(),
+            MAX_CONTROL_OPERATIONS
+        );
+
+        // A full cache must not block actions that do not record anything.
+        let inspect = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                id: Some("inspect".into()),
+                kind: "agent_control".into(),
+                agent_id: Some("00000000-0000-0000-0000-000000000000".into()),
+                action: Some("inspect".into()),
+                operation_id: Some("inspect-only".into()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(!inspect
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("too many")));
+        assert_eq!(runtime.control_operations.len(), MAX_CONTROL_OPERATIONS);
+
+        let oversized = "x".repeat(MAX_RPC_ID_BYTES + 1);
+        let invalid = handle_rpc(
             &mut runtime,
             RpcCommand {
                 id: Some("control".into()),
                 kind: "agent_control".into(),
                 agent_id: Some("00000000-0000-0000-0000-000000000000".into()),
-                operation_id: Some("new-operation".into()),
+                action: Some("stop".into()),
+                operation_id: Some(oversized),
                 ..RpcCommand::default()
             },
         );
-        assert!(!response.success);
-        assert!(response
+        assert!(!invalid.success);
+        assert!(invalid
             .error
             .as_deref()
-            .is_some_and(|message| message.contains("too many")));
+            .is_some_and(|message| message.contains("invalid operationId")));
     }
 
     #[test]

@@ -399,6 +399,7 @@ impl LanguageIntelligence {
                         program: command.program.to_string_lossy().into_owned(),
                         args: command.args.clone(),
                         language: family.as_str().into(),
+                        executable_hash: None,
                     },
                 );
                 let policy = permissions.lock().map_err(|_| launch_denied())?;

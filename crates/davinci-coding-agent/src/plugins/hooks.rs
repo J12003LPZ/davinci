@@ -11,10 +11,8 @@
 //! warning, as in Claude Code. Hooks only run for approved plugins; the
 //! approval is tied to [`digest`].
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use regex::Regex;
@@ -127,10 +125,11 @@ pub fn parse_hook_document(doc: &Value, out: &mut Vec<PluginHook>, unsupported: 
 }
 
 /// Fingerprint of everything a plugin can execute: the hook definitions plus
-/// the whole plugin tree except `.git`. A hook runs through a shell and may
-/// reach any plugin file (an unbraced `$CLAUDE_PLUGIN_ROOT`, a script that
-/// imports a library), so no subset of files is safe to leave out and no file
-/// is large enough to trust by size and mtime alone.
+/// the whole plugin tree, including `.git`, which a hook or MCP command can
+/// reference. A hook runs through a shell and may reach any plugin file (an
+/// unbraced `$CLAUDE_PLUGIN_ROOT`, a script that imports a library), so no
+/// subset of files is safe to leave out and no file is large enough to trust
+/// by size and mtime alone.
 ///
 /// The same digest gates a plugin's MCP servers, so it is computed even when
 /// `hooks` is empty. A symlink that cannot be resolved inside the plugin, or
@@ -146,24 +145,11 @@ pub fn digest(root: &Path, hooks: &[PluginHook]) -> Option<String> {
     Some(hex(&hasher.finalize()))
 }
 
-/// [`digest`], computed once per process for each plugin root and hook set.
-/// Walking a large plugin on every prompt would cost more than the prompt.
-/// A change made while a process runs is seen by the next process, and
-/// `plugin approve` always hashes afresh.
+/// [`digest`] for plugin loading. A loaded plugin must not keep a digest from
+/// before a same-process edit and re-approval, so this shares the
+/// change-detecting cache used by execution-time approval checks.
 pub fn digest_cached(root: &Path, hooks: &[PluginHook]) -> Option<String> {
-    type Cache = Mutex<BTreeMap<(PathBuf, String), Option<String>>>;
-    static CACHE: OnceLock<Cache> = OnceLock::new();
-    let key = (root.to_path_buf(), definitions_json(hooks));
-    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
-    if let Some(found) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
-        return found.clone();
-    }
-    let value = digest(root, hooks);
-    cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(key, value.clone());
-    value
+    digest_unless_unchanged(root, hooks)
 }
 
 /// [`digest`] for execution-time approval checks, which run on every tool
@@ -208,8 +194,7 @@ fn tree_fingerprint(root: &Path) -> String {
     let walker = walkdir::WalkDir::new(root)
         .follow_links(false)
         .sort_by_file_name()
-        .into_iter()
-        .filter_entry(|entry| entry.file_name() != ".git");
+        .into_iter();
     for entry in walker {
         let Ok(entry) = entry else {
             hasher.update(b"<unreadable>");
@@ -280,8 +265,7 @@ fn hash_tree(root: &Path, canonical_root: &Path, hasher: &mut Sha256) -> bool {
     let walker = walkdir::WalkDir::new(root)
         .follow_links(false)
         .sort_by_file_name()
-        .into_iter()
-        .filter_entry(|entry| entry.file_name() != ".git");
+        .into_iter();
     let mut clean = true;
     for entry in walker {
         let Ok(entry) = entry else {
@@ -851,7 +835,11 @@ mod tests {
         assert_ne!(third, second, "a new file appeared");
 
         std::fs::write(root.join(".git/HEAD"), "ref").unwrap();
-        assert_eq!(digest(root, &hooks).unwrap(), third, ".git is not hashed");
+        assert_ne!(
+            digest(root, &hooks).unwrap(),
+            third,
+            "a script inside .git is executable and must change the digest"
+        );
         // Plugins with only MCP servers still need a tree digest for approval.
         assert!(digest(root, &[]).is_some());
     }

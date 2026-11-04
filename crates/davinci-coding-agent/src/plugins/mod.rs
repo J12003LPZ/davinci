@@ -1178,6 +1178,42 @@ mod tests {
     }
 
     #[test]
+    fn reapproval_after_a_same_process_edit_is_visible_to_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let _homes = FakeHomes::new(dir.path());
+        let agent_dir = dir.path().join("agent");
+        let root = dir.path().join("reapproval-demo");
+        write(
+            &root.join(".claude-plugin/plugin.json"),
+            r#"{"name":"demo"}"#,
+        );
+        write(&root.join(".mcp.json"), r#"{"srv":{"command":"tool"}}"#);
+        install_fixture(&agent_dir, &root, false);
+        let first = manifest::load_plugin(&root).unwrap().hooks_digest.unwrap();
+
+        write(
+            &root.join(".mcp.json"),
+            r#"{"srv":{"command":"tool","args":["changed"]}}"#,
+        );
+        let fresh = hooks::digest(&root, &[]).unwrap();
+        assert_ne!(fresh, first, "the edit must change the digest");
+        store::update(&agent_dir, |file| {
+            file.plugins
+                .get_mut("demo@local")
+                .ok_or("plugin disappeared")?
+                .hooks_approved = Some(fresh.clone());
+            Ok(())
+        })
+        .unwrap();
+
+        let reloaded = manifest::load_plugin(&root).unwrap();
+        assert_eq!(reloaded.hooks_digest.as_deref(), Some(fresh.as_str()));
+        let active = active(&agent_dir);
+        assert!(active.plugins[0].hooks_approved());
+        assert!(active.mcp_servers().contains_key("plugin_demo_srv"));
+    }
+
+    #[test]
     fn loaded_hooks_recheck_revoked_approval() {
         loaded_hook_revocation("revoke");
     }

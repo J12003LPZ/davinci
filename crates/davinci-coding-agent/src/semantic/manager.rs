@@ -165,6 +165,21 @@ pub fn server_launch_allowed(
     project_trusted && execution_allowed && effects_contained
 }
 
+/// Resolves a configured executable and enforces its optional digest. Every
+/// launch path must use the returned path so the digest covers the executable
+/// that is actually started, even when the configuration is relative.
+pub fn verify_configured_executable(config: &LspServerConfig) -> Result<PathBuf, String> {
+    let executable = if config.executable.is_absolute() {
+        config.executable.clone()
+    } else {
+        config.root_dir.join(&config.executable)
+    };
+    if let Some(expected) = config.executable_hash.as_deref() {
+        verify_executable(&executable, Some(expected))?;
+    }
+    Ok(executable)
+}
+
 /// Verifies that the executable exists and, if an expected hash is provided, matches it.
 pub fn verify_executable(path: &Path, expected_hash: Option<&str>) -> Result<(), String> {
     if !path.exists() {
@@ -327,14 +342,7 @@ impl LspServerManager {
     /// Registers or updates server configuration for a workspace root.
     pub fn register_server(&self, config: LspServerConfig) -> Result<(), String> {
         // A configured digest is an integrity control, not documentation.
-        if config.executable_hash.is_some() {
-            let executable = if config.executable.is_absolute() {
-                config.executable.clone()
-            } else {
-                config.root_dir.join(&config.executable)
-            };
-            verify_executable(&executable, config.executable_hash.as_deref())?;
-        }
+        let _ = verify_configured_executable(&config)?;
         let mut sessions = self.sessions.lock().unwrap();
         let root = config.root_dir.clone();
         let session = LspServerSession {
