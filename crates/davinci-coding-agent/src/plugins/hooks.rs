@@ -11,8 +11,12 @@
 //! warning, as in Claude Code. Hooks only run for approved plugins; the
 //! approval is tied to [`digest`].
 
+#[cfg(unix)]
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(unix)]
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use regex::Regex;
