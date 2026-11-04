@@ -895,6 +895,40 @@ fn a_late_worker_summary_is_kept_without_changing_the_state() {
     }
 }
 
+#[test]
+fn a_repeated_foreground_finish_marks_the_run_delivered() {
+    use davinci_agent::codemode::{ScriptRunRecord, ScriptRunRegistry, ScriptRunState};
+    use std::collections::HashSet;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = ScriptRunRegistry::open(dir.path()).unwrap();
+    registry
+        .create(&ScriptRunRecord::new(
+            "foreground",
+            "call",
+            Some("s"),
+            "w",
+            "rev",
+        ))
+        .unwrap();
+    registry
+        .transition("foreground", ScriptRunState::Running)
+        .unwrap();
+    registry
+        .transition("foreground", ScriptRunState::Completed)
+        .unwrap();
+    // The foreground result was already reported in its tool result, so the
+    // duplicate terminal state must still be marked delivered.
+    assert!(!registry
+        .finish("foreground", ScriptRunState::Completed, None)
+        .unwrap());
+    assert!(registry.get("foreground").unwrap().notified);
+    let branch = HashSet::new();
+    assert!(registry
+        .pending_notifications(Some("s"), "w", &branch)
+        .unwrap()
+        .is_empty());
+}
+
 fn owner_locks_dir() -> std::path::PathBuf {
     let owners = davinci_session::default_agent_dir().join("script-owners");
     std::fs::create_dir_all(&owners).unwrap();

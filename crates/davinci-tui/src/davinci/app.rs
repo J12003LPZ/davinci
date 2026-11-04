@@ -2324,9 +2324,9 @@ fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Fl
     {
         let tab = model.permission_tab;
         model.permission_tab = if key.code == KeyCode::Left {
-            (tab + 6) % 7
+            (tab + 3) % 4
         } else {
-            (tab + 1) % 7
+            (tab + 1) % 4
         };
         model.permission_index = 0;
         return Flow::Continue;

@@ -762,17 +762,39 @@ fn validate_request(spec: &SandboxSpec, request: &ExecutionRequest) -> Result<()
         ));
     }
     let executable = Path::new(&request.executable);
-    let cwd = Path::new(&request.cwd);
+    let requested_cwd = Path::new(&request.cwd);
     let workspace = Path::new(&spec.workspace);
     if !executable.is_absolute() {
         return Err(SandboxFailure::policy_denied(
             "executor requires a host-resolved absolute executable",
         ));
     }
-    if !cwd.is_absolute() || !cwd.starts_with(workspace) {
+    if !requested_cwd.is_absolute() || !workspace.is_absolute() {
         return Err(SandboxFailure::new(
             SandboxErrorCode::FilesystemDenied,
             "execution cwd is outside the sandbox workspace",
+        ));
+    }
+    // Resolve the path the backend will actually use. A lexical `..` removal
+    // is not enough: in `/workspace/link/../escape` the link is followed
+    // before `..`, which can land outside while the simplified path stays in.
+    // A cwd that cannot be resolved cannot be checked, so reject it.
+    let cwd_real = requested_cwd.canonicalize().map_err(|error| {
+        SandboxFailure::new(
+            SandboxErrorCode::FilesystemDenied,
+            format!("execution cwd is unavailable: {error}"),
+        )
+    })?;
+    let workspace_real = workspace.canonicalize().map_err(|error| {
+        SandboxFailure::new(
+            SandboxErrorCode::FilesystemDenied,
+            format!("sandbox workspace is unavailable: {error}"),
+        )
+    })?;
+    if !cwd_real.starts_with(&workspace_real) {
+        return Err(SandboxFailure::new(
+            SandboxErrorCode::FilesystemDenied,
+            "execution cwd resolves outside the sandbox workspace",
         ));
     }
     if request.argv.len() > 256
@@ -788,10 +810,16 @@ fn validate_request(spec: &SandboxSpec, request: &ExecutionRequest) -> Result<()
 
 fn find_host_executable(name: &str, workspace: &Path) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
+    // Compare canonical forms on both sides: Windows canonicalizes to a
+    // `\\?\` path and macOS resolves `/tmp` to `/private/tmp`, so a plain
+    // `starts_with` on the workspace would never reject a workspace binary.
+    let workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
     for directory in std::env::split_paths(&path).filter(|path| path.is_absolute()) {
         let candidate = directory.join(name);
         if let Ok(canonical) = candidate.canonicalize() {
-            if canonical.is_file() && !canonical.starts_with(workspace) {
+            if canonical.is_file() && !canonical.starts_with(&workspace) {
                 return Some(canonical);
             }
         }
@@ -1430,7 +1458,8 @@ mod tests {
     #[test]
     fn host_backend_is_only_for_full_access() {
         let backend = HostBackend;
-        let spec = spec(SandboxMode::WorkspaceWrite, NetworkPolicy::Denied);
+        let mut spec = spec(SandboxMode::WorkspaceWrite, NetworkPolicy::Denied);
+        let _root = use_real_workspace(&mut spec);
         let request = request(&spec);
         let error = backend
             .prepare(&spec, &request, &BTreeMap::new())
@@ -1442,6 +1471,7 @@ mod tests {
     fn auto_full_access_uses_explicit_host_even_with_native_backend_installed() {
         let mut spec = spec(SandboxMode::FullAccess, NetworkPolicy::Unrestricted);
         spec.required_capabilities = lifecycle_capabilities();
+        let _root = use_real_workspace(&mut spec);
         let prepared = SandboxBroker
             .prepare(&spec, &request(&spec), &BTreeMap::new())
             .unwrap();
@@ -1960,10 +1990,102 @@ mod tests {
             },
         );
         spec.required_capabilities.network_allowlist = true;
+        let _root = use_real_workspace(&mut spec);
         let error = backend
             .prepare(&spec, &request(&spec), &BTreeMap::new())
             .unwrap_err();
         assert_eq!(error.code, SandboxErrorCode::CapabilityUnavailable);
+    }
+
+    #[test]
+    fn request_cwd_cannot_traverse_out_of_the_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let escape = root.path().join("escape");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&escape).unwrap();
+        let mut spec = spec(SandboxMode::FullAccess, NetworkPolicy::Unrestricted);
+        spec.workspace = workspace.to_string_lossy().into_owned();
+        spec.filesystem.mounts[0].source = Some(spec.workspace.clone());
+        spec.filesystem.mounts[0].target = spec.workspace.clone();
+        let mut request = request(&spec);
+        request.cwd = workspace
+            .join("..")
+            .join("escape")
+            .to_string_lossy()
+            .into_owned();
+        let error = HostBackend
+            .prepare(&spec, &request, &BTreeMap::new())
+            .unwrap_err();
+        assert_eq!(error.code, SandboxErrorCode::FilesystemDenied);
+        assert!(error.message.contains("resolves outside"), "{error:?}");
+    }
+
+    #[test]
+    fn request_cwd_must_resolve_to_check_containment() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut spec = spec(SandboxMode::FullAccess, NetworkPolicy::Unrestricted);
+        spec.workspace = workspace.to_string_lossy().into_owned();
+        spec.filesystem.mounts[0].source = Some(spec.workspace.clone());
+        spec.filesystem.mounts[0].target = spec.workspace.clone();
+        let mut request = request(&spec);
+        request.cwd = workspace.join("missing").to_string_lossy().into_owned();
+        let error = HostBackend
+            .prepare(&spec, &request, &BTreeMap::new())
+            .unwrap_err();
+        assert_eq!(error.code, SandboxErrorCode::FilesystemDenied);
+        assert!(error.message.contains("unavailable"), "{error:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_cwd_symlink_outside_the_workspace_is_denied() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("escape")).unwrap();
+        let mut spec = spec(SandboxMode::FullAccess, NetworkPolicy::Unrestricted);
+        spec.workspace = workspace.to_string_lossy().into_owned();
+        let mut request = request(&spec);
+        request.cwd = workspace.join("escape").to_string_lossy().into_owned();
+        let error = HostBackend
+            .prepare(&spec, &request, &BTreeMap::new())
+            .unwrap_err();
+        assert_eq!(error.code, SandboxErrorCode::FilesystemDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_cwd_symlink_then_parent_traversal_is_denied() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(outside.join("child")).unwrap();
+        std::fs::create_dir_all(outside.join("escape")).unwrap();
+        // `/workspace/link/../escape` simplifies to `/workspace/escape`
+        // lexically, but resolves through the link to `/outside/escape`.
+        std::os::unix::fs::symlink(outside.join("child"), workspace.join("link")).unwrap();
+        let mut spec = spec(SandboxMode::FullAccess, NetworkPolicy::Unrestricted);
+        spec.workspace = workspace.to_string_lossy().into_owned();
+        spec.filesystem.mounts[0].source = Some(spec.workspace.clone());
+        spec.filesystem.mounts[0].target = spec.workspace.clone();
+        let mut request = request(&spec);
+        request.cwd = workspace
+            .join("link")
+            .join("..")
+            .join("escape")
+            .to_string_lossy()
+            .into_owned();
+        let error = HostBackend
+            .prepare(&spec, &request, &BTreeMap::new())
+            .unwrap_err();
+        assert_eq!(error.code, SandboxErrorCode::FilesystemDenied);
+        assert!(error.message.contains("resolves outside"), "{error:?}");
     }
 
     #[test]

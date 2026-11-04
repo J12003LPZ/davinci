@@ -353,7 +353,10 @@ fn normalize_path(path: &str) -> Result<String, String> {
     if path.is_empty() || path.len() > 4096 || path.contains('\0') {
         return Err("verification path is empty, oversized, or contains NUL".into());
     }
-    let candidate = Path::new(path);
+    // Normalize first: on Unix a backslash is an ordinary character, so
+    // `..\..\etc` would otherwise look like one safe component.
+    let normalized = path.replace('\\', "/");
+    let candidate = Path::new(&normalized);
     if candidate.is_absolute() {
         return Err(format!("verification path is absolute: {path}"));
     }
@@ -365,7 +368,7 @@ fn normalize_path(path: &str) -> Result<String, String> {
     }) {
         return Err(format!("verification path escapes the workspace: {path}"));
     }
-    Ok(path.replace('\\', "/"))
+    Ok(normalized)
 }
 
 fn source_identity(root: &Path, paths: &[String], transaction_identity: Option<&str>) -> String {
@@ -1076,6 +1079,11 @@ mod tests {
     fn traversal_is_rejected() {
         let error = normalize_path("../secret.txt").unwrap_err();
         assert!(error.contains("escapes"));
+        let error = normalize_path(r"..\..\secret.txt").unwrap_err();
+        assert!(error.contains("escapes"));
+        let error = normalize_path(r"..\..\..\etc\passwd").unwrap_err();
+        assert!(error.contains("escapes"));
+        assert_eq!(normalize_path(r"src\lib.rs").unwrap(), "src/lib.rs");
     }
 
     #[test]

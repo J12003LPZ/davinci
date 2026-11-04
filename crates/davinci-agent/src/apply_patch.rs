@@ -370,7 +370,10 @@ pub fn apply_hunks_to_content(original: &str, hunks: &[Hunk]) -> Result<String, 
         }
 
         if match_pattern.is_empty() {
-            // Addition only hunk
+            // Addition-only hunk: it has no context lines to locate. A
+            // non-empty `@@` header names an anchor line; a bare `@@` (the
+            // form the advertised grammar admits) appends, as does an
+            // explicit `*** End of File`.
             let mut additions: Vec<&str> = hunk
                 .lines
                 .iter()
@@ -379,8 +382,48 @@ pub fn apply_hunks_to_content(original: &str, hunks: &[Hunk]) -> Result<String, 
                     _ => None,
                 })
                 .collect();
-            file_lines.append(&mut additions);
-            search_from = file_lines.len();
+            if hunk.end_of_file {
+                file_lines.append(&mut additions);
+                search_from = file_lines.len();
+                continue;
+            }
+            let anchor = hunk.header.strip_prefix("@@").unwrap_or("").trim();
+            if anchor.is_empty() {
+                file_lines.append(&mut additions);
+                search_from = file_lines.len();
+                continue;
+            }
+            let matches_from = |from: usize| {
+                file_lines
+                    .iter()
+                    .enumerate()
+                    .skip(from)
+                    .filter(|(_, line)| line.trim_end() == anchor)
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>()
+            };
+            let mut matches = matches_from(search_from);
+            if matches.is_empty() && search_from > 0 {
+                matches = matches_from(0);
+            }
+            let insert_after = match matches.as_slice() {
+                [index] => *index + 1,
+                [] => {
+                    return Err(format!(
+                        "Context mismatch for hunk `{}`: anchor `{anchor}` not found in file",
+                        hunk.header
+                    ))
+                }
+                _ => {
+                    return Err(format!(
+                        "Context mismatch for hunk `{}`: anchor `{anchor}` is not unique",
+                        hunk.header
+                    ))
+                }
+            };
+            let added = additions.len();
+            file_lines.splice(insert_after..insert_after, additions);
+            search_from = insert_after + added;
             continue;
         }
 
@@ -813,6 +856,57 @@ mod tests {
 
         let created = fs::read_to_string(dir.path().join("created.txt")).unwrap();
         assert_eq!(created, "First created line\n");
+    }
+
+    #[test]
+    fn add_only_hunk_inserts_after_its_anchor() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("anchored.txt");
+        fs::write(&target, "alpha\nbeta\ngamma\n").unwrap();
+        let patch =
+            "*** Begin Patch\n*** Update File: anchored.txt\n@@ beta\n+INSERTED\n*** End Patch";
+        execute_apply_patch(dir.path(), patch).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "alpha\nbeta\nINSERTED\ngamma\n"
+        );
+    }
+
+    #[test]
+    fn add_only_hunk_requires_a_unique_anchor() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("duplicate.txt");
+        fs::write(&target, "alpha\nbeta\nbeta\n").unwrap();
+        let patch =
+            "*** Begin Patch\n*** Update File: duplicate.txt\n@@ beta\n+INSERTED\n*** End Patch";
+        let error = execute_apply_patch(dir.path(), patch).unwrap_err();
+        assert!(error.contains("not unique"), "{error}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "alpha\nbeta\nbeta\n");
+
+        let patch =
+            "*** Begin Patch\n*** Update File: duplicate.txt\n@@ missing\n+INSERTED\n*** End Patch";
+        let error = execute_apply_patch(dir.path(), patch).unwrap_err();
+        assert!(error.contains("not found"), "{error}");
+    }
+
+    #[test]
+    fn add_only_hunk_without_an_anchor_appends() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("bare.txt");
+        fs::write(&target, "alpha\n").unwrap();
+        let patch = "*** Begin Patch\n*** Update File: bare.txt\n@@\n+INSERTED\n*** End Patch";
+        execute_apply_patch(dir.path(), patch).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "alpha\nINSERTED\n");
+    }
+
+    #[test]
+    fn add_only_hunk_with_end_of_file_appends() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("append.txt");
+        fs::write(&target, "alpha\nbeta\n").unwrap();
+        let patch = "*** Begin Patch\n*** Update File: append.txt\n@@\n+tail\n*** End of File\n*** End Patch";
+        execute_apply_patch(dir.path(), patch).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "alpha\nbeta\ntail\n");
     }
 
     #[test]

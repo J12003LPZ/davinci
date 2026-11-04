@@ -6,6 +6,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine;
+use davinci_sys::process::ProcessTree;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -429,7 +430,7 @@ pub fn tool_specs() -> Vec<AgentTool> {
         AgentTool {
             name: "read".into(),
             description: "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files.".into(),
-            parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"number"},"limit":{"type":"number"}},"required":["path"]}),
+            parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"number"},"limit":{"type":"number","minimum":1}},"required":["path"]}),
         },
         AgentTool {
             name: "retrieve_context".into(),
@@ -1663,11 +1664,11 @@ fn read_tool_cached(
         .and_then(Value::as_u64)
         .unwrap_or(1)
         .max(1) as usize;
-    let limit = input
-        .get("limit")
-        .and_then(Value::as_u64)
-        .map(|v| v as usize)
-        .unwrap_or(DEFAULT_MAX_LINES);
+    let limit = match input.get("limit").and_then(Value::as_u64) {
+        Some(0) => return Err(ToolError::Failed("`limit` must be at least 1".into())),
+        Some(value) => value as usize,
+        None => DEFAULT_MAX_LINES,
+    };
     let key = CacheKey::new(
         CacheNamespace::File,
         format!("text-window:{offset}:{limit}"),
@@ -1852,11 +1853,11 @@ fn read_tool(
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(1)
         .max(1) as usize;
-    let limit = input
-        .get("limit")
-        .and_then(serde_json::Value::as_u64)
-        .map(|value| value as usize);
-    let limit = limit.unwrap_or(DEFAULT_MAX_LINES);
+    let limit = match input.get("limit").and_then(serde_json::Value::as_u64) {
+        Some(0) => return Err(ToolError::Failed("`limit` must be at least 1".into())),
+        Some(value) => value as usize,
+        None => DEFAULT_MAX_LINES,
+    };
     if is_notebook {
         let (content, truncation) = truncate_read(&content, offset, Some(limit));
         let mut details = serde_json::json!({"path": path, "truncation": truncation});
@@ -2472,7 +2473,7 @@ fn spawn_shell(
     cwd: &Path,
     command: &str,
     background: bool,
-) -> Result<std::process::Child, ToolError> {
+) -> Result<(std::process::Child, ProcessTree), ToolError> {
     let custom = std::env::var("PI_SHELL")
         .ok()
         .filter(|value| !value.is_empty());
@@ -2495,15 +2496,8 @@ fn spawn_shell(
             process.stdin(std::process::Stdio::piped());
         }
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // Its own group, so `job_kill` can take the whole tree down.
-        process.process_group(0);
-    }
-    let mut child = process
-        .spawn()
-        .map_err(|err| ToolError::Failed(err.to_string()))?;
+    let (mut child, tree) =
+        ProcessTree::spawn(&mut process).map_err(|err| ToolError::Failed(err.to_string()))?;
     if matches!(
         config.command_transport,
         davinci_ai::CommandTransport::Stdin
@@ -2515,7 +2509,7 @@ fn spawn_shell(
                 .map_err(|err| ToolError::Failed(err.to_string()))?;
         }
     }
-    Ok(child)
+    Ok((child, tree))
 }
 
 /// Resolves the shell for a sandboxed background command; see
@@ -2635,11 +2629,15 @@ fn shell_tool(
         }
         let child = match operation.as_ref() {
             Some(operation) => operation
-                .begin(false, || Ok(()), || spawn_shell(cwd, &command, true))
+                .begin(
+                    false,
+                    || Ok(()),
+                    || spawn_shell(cwd, &command, true).map(|(child, _)| child),
+                )
                 .map_err(|error| {
                     ToolError::Failed(format!("background job dispatch failed: {error}"))
                 })??,
-            None => spawn_shell(cwd, &command, true)?,
+            None => spawn_shell(cwd, &command, true)?.0,
         };
         let shown = required_str(input, "command")?;
         let pid = child.id();
@@ -2691,12 +2689,8 @@ fn shell_tool(
         }
         (output, false)
     } else {
-        wait_shell_output(
-            spawn_shell(cwd, &command, false)?,
-            timeout_ms,
-            timeout_label.as_deref(),
-            context,
-        )?
+        let (child, tree) = spawn_shell(cwd, &command, false)?;
+        wait_shell_output(child, tree, timeout_ms, timeout_label.as_deref(), context)?
     };
     let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
     if !output.stderr.is_empty() {
@@ -2828,7 +2822,8 @@ fn join_finished_shell_stream(
 }
 
 fn finish_shell_capture(
-    child_pid: u32,
+    child: &std::process::Child,
+    tree: &ProcessTree,
     stdout_handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
     stderr_handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
     stdout_capture: &Arc<Mutex<ShellStreamCapture>>,
@@ -2843,7 +2838,16 @@ fn finish_shell_capture(
     }
     let pending = !shell_readers_finished(&stdout_handle, &stderr_handle);
     if pending {
-        crate::jobs::kill_tree(child_pid);
+        // The direct child has already been reaped, so its PID may be gone.
+        // The tree owner is retained from spawn (a Windows job, or the Unix
+        // process group) and still reaches a descendant holding the pipe.
+        tree.kill(child);
+        let killed = std::time::Instant::now();
+        while !shell_readers_finished(&stdout_handle, &stderr_handle)
+            && killed.elapsed() < READER_GRACE
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     let stdout_done = join_finished_shell_stream(stdout_handle)?;
@@ -2874,6 +2878,7 @@ fn append_pipe_truncated_note(stderr: &mut Vec<u8>, truncated: bool) {
 
 fn wait_shell_output(
     mut child: std::process::Child,
+    tree: ProcessTree,
     timeout_ms: Option<u64>,
     timeout_label: Option<&str>,
     context: &ToolContext,
@@ -2904,11 +2909,12 @@ fn wait_shell_output(
                     std::thread::sleep(std::time::Duration::from_millis(10));
                     continue;
                 }
-                crate::jobs::kill_tree(child.id());
+                tree.kill(&child);
                 let _ = child.kill();
                 let _ = child.wait();
                 let (stdout, mut stderr, truncated) = finish_shell_capture(
-                    child.id(),
+                    &child,
+                    &tree,
                     stdout_handle,
                     stderr_handle,
                     &stdout_capture,
@@ -2935,11 +2941,12 @@ fn wait_shell_output(
                 }));
             }
             Err(err) => {
-                crate::jobs::kill_tree(child.id());
+                tree.kill(&child);
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = finish_shell_capture(
-                    child.id(),
+                    &child,
+                    &tree,
                     stdout_handle,
                     stderr_handle,
                     &stdout_capture,
@@ -2950,7 +2957,8 @@ fn wait_shell_output(
         }
     };
     let (stdout, mut stderr, truncated) = finish_shell_capture(
-        child.id(),
+        &child,
+        &tree,
         stdout_handle,
         stderr_handle,
         &stdout_capture,
@@ -3092,22 +3100,18 @@ fn powershell_tool(
                 .stdin(stdin)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                process.process_group(0);
-            }
-            process
-                .spawn()
-                .map_err(|error| ToolError::Failed(error.to_string()))
+            ProcessTree::spawn(&mut process).map_err(|error| ToolError::Failed(error.to_string()))
         };
-        let child = if let Some(operation) = operation.as_ref() {
-            operation.begin(false, || Ok(()), spawn).map_err(|error| {
-                ToolError::Failed(format!("background job dispatch failed: {error}"))
-            })??
+        let (child, tree) = if let Some(operation) = operation.as_ref() {
+            let child = operation
+                .begin(false, || Ok(()), || spawn().map(|(child, _)| child))
+                .map_err(|error| {
+                    ToolError::Failed(format!("background job dispatch failed: {error}"))
+                })??;
+            (child, None)
         } else {
             match spawn() {
-                Ok(child) => child,
+                Ok((child, tree)) => (child, Some(tree)),
                 Err(_) => continue,
             }
         };
@@ -3127,8 +3131,9 @@ fn powershell_tool(
                 );
             return Ok(crate::jobs::started_result(id, pid, command));
         }
+        let tree = tree.expect("foreground PowerShell spawn owns its process tree");
         let (output, pipe_truncated) =
-            wait_shell_output(child, timeout_ms, timeout_label.as_deref(), context)?;
+            wait_shell_output(child, tree, timeout_ms, timeout_label.as_deref(), context)?;
         let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
         if !output.stderr.is_empty() {
             if !content.is_empty() {
@@ -5452,7 +5457,8 @@ mod tests {
     #[test]
     fn shell_capture_real_child_overflow_is_an_error() {
         for stream in ["stdout", "stderr"] {
-            let child = Command::new(std::env::current_exe().unwrap())
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
                 .args([
                     "--exact",
                     "tools::tests::shell_capture_output_fixture",
@@ -5461,11 +5467,16 @@ mod tests {
                 .env("DAVINCI_TEST_SHELL_CAPTURE_STREAM", stream)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            let error = wait_shell_output(child, Some(10_000), Some("10"), &ToolContext::default())
-                .unwrap_err();
+                .stderr(std::process::Stdio::piped());
+            let (child, tree) = ProcessTree::spawn(&mut command).unwrap();
+            let error = wait_shell_output(
+                child,
+                tree,
+                Some(10_000),
+                Some("10"),
+                &ToolContext::default(),
+            )
+            .unwrap_err();
             assert!(
                 error.to_string().contains("stream byte limit"),
                 "{stream}: {error}"
@@ -5490,6 +5501,107 @@ mod tests {
         assert!(result.content.contains("started"));
         assert!(result.content.contains("output truncated"));
         assert!(result.is_error, "partial output cannot verify success");
+    }
+
+    #[test]
+    // The fixture must exit while its descendant keeps the inherited pipe.
+    #[allow(clippy::zombie_processes)]
+    fn shell_pipe_holding_descendant_fixture() {
+        let Ok(pid_file) = std::env::var("DAVINCI_TEST_SHELL_DESCENDANT_PID_FILE") else {
+            return;
+        };
+        let child = Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+        std::fs::write(pid_file, child.id().to_string()).unwrap();
+        // Do not wait: the descendant must outlive this fixture process and
+        // keep the inherited pipe open for the parent test to clean up.
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn foreground_shell_terminates_a_pipe_holding_descendant_on_windows() {
+        fn alive(pid: u32) -> bool {
+            let filter = format!("PID eq {pid}");
+            Command::new("tasklist")
+                .args(["/NH", "/FI", &filter])
+                .output()
+                .is_ok_and(|output| {
+                    String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+                })
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("descendant.pid");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "tools::tests::shell_pipe_holding_descendant_fixture",
+                "--nocapture",
+            ])
+            .env("DAVINCI_TEST_SHELL_DESCENDANT_PID_FILE", &pid_file)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let (child, tree) = ProcessTree::spawn(&mut command).unwrap();
+        let (_output, truncated) = wait_shell_output(
+            child,
+            tree,
+            Some(10_000),
+            Some("10"),
+            &ToolContext::default(),
+        )
+        .unwrap();
+        assert!(
+            truncated,
+            "the descendant held the pipe past the grace period"
+        );
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while alive(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pipe-holding descendant {pid} survived the foreground command"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foreground_shell_terminates_a_pipe_holding_descendant() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = execute_tool_with(
+            dir.path(),
+            "bash",
+            &serde_json::json!({"command": "sleep 30 & echo $!", "timeout": 5}),
+            &ToolContext::default(),
+        )
+        .unwrap();
+        assert!(result.content.contains("output truncated"));
+        let pid: i32 = result
+            .content
+            .lines()
+            .next()
+            .and_then(|line| line.trim().parse().ok())
+            .expect("the shell printed the descendant pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pipe-holding descendant {pid} survived the foreground command"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -6192,6 +6304,13 @@ mod tests {
             sliced.details.as_ref().unwrap()["truncation"]["totalLines"],
             3
         );
+        let error = execute_tool(
+            dir.path(),
+            "read",
+            &serde_json::json!({"path":"b.txt","limit":0}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("at least 1"), "{error}");
         execute_tool(
             dir.path(),
             "write",

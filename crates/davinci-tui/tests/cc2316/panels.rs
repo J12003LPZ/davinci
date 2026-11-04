@@ -241,8 +241,13 @@ fn the_permissions_tabs_filter_and_never_apply_from_a_read_only_tab() {
     let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
     assert_eq!(app::handle_key(&mut model, right), app::Flow::Continue);
     assert_eq!(model.permission_tab, 1);
-    assert_eq!(app::handle_key(&mut model, right), app::Flow::Continue);
-    assert_eq!(model.permission_tab, 2);
+    let tab_labels: Vec<String> = tabs.iter().map(|span| span.content.to_string()).collect();
+    assert!(
+        tab_labels.iter().all(|tab| !tab.contains("Ask")
+            && !tab.contains("Auto mode")
+            && !tab.contains("Recently")),
+        "tabs without a row source must not be shown: {tab_labels:?}"
+    );
     let rows: Vec<String> = davinci_tui::davinci::views::permissions::lines(&model)
         .iter()
         .map(text)
@@ -253,6 +258,21 @@ fn the_permissions_tabs_filter_and_never_apply_from_a_read_only_tab() {
     );
     assert!(
         !rows.iter().any(|row| row.contains("bash(rm *)")),
+        "{rows:?}"
+    );
+    // Deny is one step past Allow and shows only deny rules.
+    assert_eq!(app::handle_key(&mut model, right), app::Flow::Continue);
+    assert_eq!(model.permission_tab, 2);
+    let rows: Vec<String> = davinci_tui::davinci::views::permissions::lines(&model)
+        .iter()
+        .map(text)
+        .collect();
+    assert!(
+        rows.iter().any(|row| row.contains("bash(rm *)")),
+        "{rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("bash(git *)")),
         "{rows:?}"
     );
     // Enter on a filtered tab is read-only: no Choice reaches the host.

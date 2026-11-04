@@ -96,6 +96,129 @@ fn session_persistence_failure_blocks_provider_and_mutation_boundaries() {
     }
 }
 
+#[derive(Default)]
+struct TurnEndRecorder {
+    outcomes: std::sync::Mutex<Vec<bool>>,
+}
+
+impl crate::RuntimeSubscriber for TurnEndRecorder {
+    fn on_event(&self, event: &crate::RuntimeEventEnvelope) -> crate::RuntimeDecision {
+        if let crate::RuntimeEvent::TurnEnded { success } = &event.payload {
+            self.outcomes.lock().unwrap().push(*success);
+        }
+        crate::RuntimeDecision::Continue
+    }
+}
+
+#[test]
+fn a_persistence_failure_keeps_every_completed_tool_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = JsonlSession::create(dir.path(), dir.path().to_str().unwrap(), None).unwrap();
+    let path = session.path.clone();
+    let mut agent = Agent::new("batch fixture");
+    agent.cwd = dir.path().to_path_buf();
+    agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+    agent.session = Some(session);
+    let recorder = Arc::new(TurnEndRecorder::default());
+    let bus = crate::RuntimeBus::new();
+    bus.subscribe(recorder.clone());
+    agent.runtime = Some(crate::RuntimeHandle::new(
+        crate::RunId::new(),
+        crate::AgentId::new(),
+        bus,
+    ));
+    let broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_path = path.clone();
+    agent.post_tool = Some(crate::PostToolHook(Arc::new(move |_, _, _, _, result| {
+        if !broken.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            break_storage(&hook_path);
+        }
+        result
+    })));
+    agent.prompt("write twice");
+    let result = agent.run_loop(|_| {
+        Ok(AssistantMessage {
+            extra: Default::default(),
+            id: "batch".into(),
+            role: "assistant".into(),
+            content: vec![
+                ContentBlock::ToolCall {
+                    id: "first".into(),
+                    name: "write".into(),
+                    arguments: serde_json::json!({"path":"one.txt", "content":"one"}),
+                },
+                ContentBlock::ToolCall {
+                    id: "second".into(),
+                    name: "write".into(),
+                    arguments: serde_json::json!({"path":"two.txt", "content":"two"}),
+                },
+            ],
+            model: "fixture".into(),
+            usage: None,
+            stop_reason: Some(StopReason::ToolUse),
+            error_message: None,
+        })
+    });
+    assert!(result.is_err());
+    assert_eq!(
+        *recorder.outcomes.lock().unwrap(),
+        vec![false],
+        "a failed persistence boundary must report exactly one failed turn end"
+    );
+    for id in ["first", "second"] {
+        assert!(
+            agent.messages.iter().any(|message| {
+                message.role == "toolResult" && message.tool_call_id.as_deref() == Some(id)
+            }),
+            "completed tool result {id} was dropped after a persistence error"
+        );
+    }
+    assert!(dir.path().join("one.txt").exists());
+    assert!(dir.path().join("two.txt").exists());
+}
+
+#[test]
+fn an_empty_failed_assistant_message_is_not_persisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = JsonlSession::create(dir.path(), dir.path().to_str().unwrap(), None).unwrap();
+    let path = session.path.clone();
+    let mut agent = Agent::new("empty fixture");
+    agent.session = Some(session);
+    agent.prompt("call the tool");
+    let events = agent
+        .run_loop(|_| {
+            Ok(AssistantMessage {
+                extra: Default::default(),
+                id: "empty".into(),
+                role: "assistant".into(),
+                content: Vec::new(),
+                model: "fixture".into(),
+                usage: None,
+                stop_reason: Some(StopReason::Aborted),
+                error_message: None,
+            })
+        })
+        .unwrap();
+    // The empty message is not provider history, but its terminal status is
+    // still reported to the caller.
+    assert!(events.iter().any(|event| matches!(
+        event,
+        crate::AgentEvent::MessageUpdate {
+            assistant_message_event,
+            ..
+        } if assistant_message_event.message().stop_reason == Some(StopReason::Aborted)
+    )));
+    assert!(!agent
+        .messages
+        .iter()
+        .any(|message| { message.role == "assistant" && message.content.is_empty() }));
+    let reopened = JsonlSession::open(&path).unwrap();
+    let messages = crate::messages_from_session(&reopened);
+    assert!(!messages
+        .iter()
+        .any(|message| { message.role == "assistant" && message.content.is_empty() }));
+}
+
 #[test]
 fn session_persistence_preserves_tool_result_identity() {
     let dir = tempfile::tempdir().unwrap();

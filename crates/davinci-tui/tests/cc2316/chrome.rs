@@ -159,6 +159,16 @@ fn the_home_folder_reads_as_a_tilde() {
     assert_eq!(home("/home/ana", Some("/home/ana")), "~");
     assert_eq!(home("/home/ana/", Some("/home/ana/")), "~");
     assert_eq!(home(r"c:\users\ANA\proj", Some(r"C:\Users\ana")), r"~\proj");
+    // A multibyte home makes the byte split a non-char boundary.
+    assert_eq!(
+        home(r"C:\Users\José\proj", Some(r"C:\Users\José")),
+        r"~\proj"
+    );
+    assert_eq!(home("/home/José/proj", Some("/home/José")), "~/proj");
+    assert_eq!(
+        home("/home/Joséphine/proj", Some("/home/José")),
+        "/home/Joséphine/proj"
+    );
     // A sibling that merely starts with the home path is not under it.
     assert_eq!(
         home("/home/anaconda/proj", Some("/home/ana")),

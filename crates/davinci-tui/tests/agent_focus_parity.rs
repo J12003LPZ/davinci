@@ -402,6 +402,26 @@ fn terminal_resize_click_targets_not_stale() {
 }
 
 #[test]
+fn refocusing_the_view_clears_the_pointer_and_marks_the_frame_dirty() {
+    let mut m = agent_parity().model(110, 36);
+    m.focus_agent("w-map-auth");
+    m.roster_focus_enter();
+    assert!(m.roster.focus.is_some());
+    m.dirty = false;
+    m.focus_agent("w-map-auth");
+    assert!(m.roster.focus.is_none());
+    assert!(m.dirty, "clearing focus must repaint");
+
+    m.focus_main();
+    m.roster_focus_enter();
+    assert!(m.roster.focus.is_some());
+    m.dirty = false;
+    m.focus_main();
+    assert!(m.roster.focus.is_none());
+    assert!(m.dirty, "clearing focus while already on main must repaint");
+}
+
+#[test]
 fn the_setting_off_draws_no_roster_and_takes_no_keys() {
     let mut m = agent_parity().model(110, 36);
     m.roster.enabled = false;

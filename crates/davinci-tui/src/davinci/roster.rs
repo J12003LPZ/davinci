@@ -187,6 +187,7 @@ impl Model {
         }
         if self.viewing_worker() == Some(agent_id) {
             self.roster.focus = None;
+            self.dirty = true;
             return;
         }
         self.park_composer();
@@ -211,6 +212,7 @@ impl Model {
     pub fn focus_main(&mut self) {
         self.roster.focus = None;
         if self.roster.scope == ViewScope::Main {
+            self.dirty = true;
             return;
         }
         self.park_composer();

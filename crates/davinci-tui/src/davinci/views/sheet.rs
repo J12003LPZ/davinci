@@ -327,9 +327,7 @@ pub fn title(screen: Screen) -> &'static str {
         Screen::Recovery => "Recovery",
         Screen::Diff => "Review changes",
         Screen::Mcp => "MCP servers",
-        Screen::Permissions => {
-            "Permissions  Recently denied   Allow   Ask   Deny   Auto mode   Workspace"
-        }
+        Screen::Permissions => "Permissions   Allow   Deny   Workspace",
         Screen::Workflows => "Workflows",
         Screen::TaskBoard => "Background",
         Screen::Agents => "Agents",
