@@ -3535,22 +3535,49 @@ fn folds(agent: &Agent) -> u64 {
     agent.runtime.as_ref().unwrap().context_vm.metrics().folds
 }
 
-/// Plain turns until an automatic Hybrid fold has run and been applied.
-fn fold_until_applied(agent: &mut Agent) {
+fn filler_turn(agent: &mut Agent, turn: usize) {
+    agent.prompt(&format!(
+        "Continue with step {turn}. {}",
+        "notes ".repeat(300)
+    ));
+    agent
+        .run_loop(|agent: &Agent| Ok::<_, String>(done_reply(agent)))
+        .expect("filler turn runs");
+}
+
+/// Plain turns until an automatic Hybrid fold has run and been applied;
+/// returns how many it took.
+fn fold_until_applied(agent: &mut Agent) -> usize {
     let (folds_before, applied_before) = (folds(agent), agent.hybrid_compaction_stats.applied);
     for turn in 0..200 {
-        agent.prompt(&format!(
-            "Continue with step {turn}. {}",
-            "notes ".repeat(300)
-        ));
-        agent
-            .run_loop(|agent: &Agent| Ok::<_, String>(done_reply(agent)))
-            .expect("filler turn runs");
+        filler_turn(agent, turn);
         if folds(agent) > folds_before && agent.hybrid_compaction_stats.applied > applied_before {
-            return;
+            return turn + 1;
         }
     }
     panic!("no automatic Hybrid fold was applied");
+}
+
+/// Operations that are children of another operation, i.e. script children.
+fn all_child_operations(journal: &OperationJournal) -> usize {
+    let snapshot = journal.snapshot().unwrap();
+    snapshot
+        .operations
+        .iter()
+        .filter(|op| op.context().parent_operation_id.is_some())
+        .count()
+}
+
+/// One A/B row, readable with `--nocapture`.
+fn log_ab(label: &str, agent: &Agent, runs: usize, journal: &OperationJournal, recovered: usize) {
+    eprintln!(
+        "AB {label}: executions={runs} edit_children={} folds={} applied={} compactions={} recovered={recovered} marker_in_provider={}",
+        all_child_operations(journal),
+        folds(agent),
+        agent.hybrid_compaction_stats.applied,
+        agent.run_stats().compactions,
+        provider_transcript(agent).contains(SCRIPT_MARK),
+    );
 }
 
 fn provider_transcript(agent: &Agent) -> String {
@@ -3724,7 +3751,7 @@ fn hybrid_fold_preserves_script_evidence_without_rerunning_the_script() {
         fixture.agent.hybrid_compaction_stats.applied,
     );
 
-    fold_until_applied(&mut fixture.agent);
+    let filler_turns = fold_until_applied(&mut fixture.agent);
     assert!(folds(&fixture.agent) > folds_before);
     assert!(fixture.agent.hybrid_compaction_stats.applied > applied_before);
     // The fold replaced the transcript that held the script result.
@@ -3772,6 +3799,14 @@ fn hybrid_fold_preserves_script_evidence_without_rerunning_the_script() {
     assert_eq!(input(), "edited by script");
     assert!(fixture.host.child_errors.lock().unwrap().is_empty());
     assert_tool_pairs(&fixture.agent.messages_for_provider());
+    log_ab(
+        "hybrid+codemode",
+        &fixture.agent,
+        executions(),
+        &fixture.journal,
+        recovered_script_results(&fixture.agent).len(),
+    );
+    eprintln!("AB hybrid+codemode: filler_turns_to_fold={filler_turns}");
 }
 
 #[test]
@@ -3870,4 +3905,64 @@ fn hybrid_fold_keeps_a_denied_script_child_denied_and_recoverable() {
         crate::PermissionMode::ReadOnly
     );
     assert_tool_pairs(&fixture.agent.messages_for_provider());
+}
+
+/// Control for the Hybrid test: the same fixture, provider script and context
+/// growth with Context VM off and CodeMode off. The script cannot run, so there
+/// is no script output to recover; the contrast asserted is that nothing ran,
+/// no Hybrid fold happened, and the transcript kept every turn.
+#[test]
+fn context_vm_and_codemode_off_control_runs_no_script_and_folds_nothing() {
+    use crate::runtime::ContextVmMode;
+    let mut fixture = hybrid_codemode_fixture(vec![edit_input(
+        "codemode baseline sentinel",
+        "edited by script",
+    )]);
+    fixture.agent.clear_codemode();
+    fixture.agent.set_context_vm_mode(ContextVmMode::Off);
+    assert!(!fixture
+        .agent
+        .provider_tool_specs()
+        .iter()
+        .any(|tool| tool.name == "codemode"));
+    let (folds_before, applied_before) = (
+        folds(&fixture.agent),
+        fixture.agent.hybrid_compaction_stats.applied,
+    );
+    let compactions_before = fixture.agent.run_stats().compactions;
+
+    // The same provider script: a codemode call, then the same context growth.
+    run_script_turn(&mut fixture.agent, "script-call-1");
+    let refused = fixture
+        .agent
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some("script-call-1"))
+        .expect("the call still gets a result");
+    assert_eq!(refused.is_error, Some(true), "{refused:?}");
+    for turn in 0..60 {
+        filler_turn(&mut fixture.agent, turn);
+    }
+
+    let executions = fixture.host.runs.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(executions, 0);
+    assert_eq!(all_child_operations(&fixture.journal), 0);
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.path().join("input.txt")).unwrap(),
+        "codemode baseline sentinel"
+    );
+    assert_eq!(folds(&fixture.agent), folds_before);
+    assert_eq!(
+        fixture.agent.hybrid_compaction_stats.applied,
+        applied_before
+    );
+    assert_eq!(fixture.agent.hybrid_compaction_stats.attempts, 0);
+    assert_eq!(fixture.agent.run_stats().compactions, compactions_before);
+    // Not folded: the first prompt and the last filler turn are both still there.
+    let transcript = provider_transcript(&fixture.agent);
+    assert!(transcript.contains("Run the script."));
+    assert!(transcript.contains("Continue with step 59."));
+    assert!(!transcript.contains(SCRIPT_MARK));
+    assert_tool_pairs(&fixture.agent.messages_for_provider());
+    log_ab("all-off", &fixture.agent, executions, &fixture.journal, 0);
 }
