@@ -811,6 +811,41 @@ fn full_success_and_failure_tool_results_are_durably_bound_to_outbox_digests() {
 }
 
 #[test]
+fn result_with_a_float_that_does_not_roundtrip_reads_back() {
+    // 20.958299999999998 is the latency a real batch child (verification_plan) journaled. Without
+    // serde_json's float_roundtrip a reparse prints 20.9583, so a hash of the reparsed value no
+    // longer matched the digest written for the stored text.
+    let latency = 20.958299999999998_f64;
+    let fixture = Fixture::new();
+    let result = ToolResult {
+        content: "plan ready".into(),
+        is_error: false,
+        details: Some(json!({"telemetry": {"latencyMs": latency, "lastLatencyMs": latency}})),
+    };
+    let attempt_id = fixture.complete_provider_call(
+        "float-call",
+        "read",
+        &json!({"path": "output.txt"}),
+        &result,
+    );
+    let stored = fixture
+        .journal
+        .load_result_for_attempt(attempt_id)
+        .unwrap()
+        .expect("result with a non-roundtripping float is readable");
+    for key in ["latencyMs", "lastLatencyMs"] {
+        let read = stored.payload["details"]["telemetry"][key]
+            .as_f64()
+            .unwrap();
+        assert_eq!(
+            read.to_bits(),
+            latency.to_bits(),
+            "{key} must be bit-identical"
+        );
+    }
+}
+
+#[test]
 fn result_transition_and_session_outbox_are_atomic() {
     let fixture = Fixture::new();
     let plan = fixture.provider_plan("atomic-call", "write", &json!({"path": "x"}));

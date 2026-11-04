@@ -190,3 +190,44 @@ impl<'de> Deserialize<'de> for ScopedIdempotencyKey {
         Self::new(wire.scope, wire.key).map_err(D::Error::custom)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::PayloadDigest;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn parse_then_serialize_reproduces_the_original_serialization() {
+        // Digests hash serialized bytes, so a reparse must print what was written. Without serde_json's
+        // float_roundtrip about 9% of arbitrary doubles (e.g. 20.958299999999998) print one ulp off.
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut values = vec![
+            json!(20.958299999999998_f64),
+            json!(-0.0_f64),
+            json!(f64::MIN_POSITIVE),
+            json!(5e-324_f64),
+            json!(f64::MAX),
+            json!(i64::MIN),
+            json!(i64::MAX),
+            json!(u64::MAX),
+            json!((1_u64 << 53) + 1),
+        ];
+        for _ in 0..20_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            values.push(json!(
+                1.0 + (state >> 11) as f64 / (1_u64 << 53) as f64 * 99.0
+            ));
+        }
+        for value in values {
+            let text = serde_json::to_string(&value).unwrap();
+            let reparsed: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(serde_json::to_string(&reparsed).unwrap(), text);
+            assert_eq!(
+                PayloadDigest::of_json(&reparsed).unwrap(),
+                PayloadDigest::of_bytes(text.as_bytes())
+            );
+        }
+    }
+}

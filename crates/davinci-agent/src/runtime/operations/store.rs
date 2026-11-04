@@ -441,12 +441,7 @@ impl OperationJournal {
                 .map_err(sqlite_error)?;
             row.map(|(stored_digest, reference, payload, created_at_ms)| {
                 let reference: super::ResultRef = decode_json(&reference)?;
-                let payload: Value = decode_json(&payload)?;
-                let digest = PayloadDigest::of_json(&payload)
-                    .map_err(|error| JournalError::Serialization(error.to_string()))?;
-                if digest != reference.payload_digest || digest.to_string() != stored_digest {
-                    return Err(JournalError::ResultDigestMismatch);
-                }
+                let payload = verified_result_payload(&reference, &payload, &stored_digest)?;
                 Ok(StoredResult {
                     reference,
                     payload,
@@ -916,6 +911,26 @@ impl OperationJournal {
     }
 }
 
+/// The digest of a stored result payload is the hash of its exact stored text, which is also what the writer
+/// digested (`encode_bounded` and `PayloadDigest::of_json` both emit compact `serde_json` bytes). Hashing the
+/// text, not a reparsed `Value`, keeps verification independent of how a number reparses. Any mismatch with
+/// the reference or the stored digest column fails closed.
+pub(super) fn stored_payload_digest(payload_json: &str) -> PayloadDigest {
+    PayloadDigest::of_bytes(payload_json.as_bytes())
+}
+
+fn verified_result_payload(
+    reference: &super::ResultRef,
+    payload_json: &str,
+    stored_digest: &str,
+) -> Result<Value, JournalError> {
+    let digest = stored_payload_digest(payload_json);
+    if digest != reference.payload_digest || digest.to_string() != stored_digest {
+        return Err(JournalError::ResultDigestMismatch);
+    }
+    decode_json(payload_json)
+}
+
 #[cfg(test)]
 mod writer_wait_tests {
     use super::*;
@@ -989,5 +1004,39 @@ mod writer_wait_tests {
         ));
         drop(guard);
         assert!(journal.try_state_with_wait(Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn a_row_written_the_old_way_with_a_nonroundtripping_float_verifies() {
+        // Legacy text and its digest as the previous writer stored them: the digest is the SHA-256 of these
+        // exact bytes, and 20.958299999999998 reparses one ulp off without float_roundtrip.
+        let text =
+            r#"{"content":"plan","details":{"latencyMs":20.958299999999998},"isError":false}"#;
+        let digest = PayloadDigest::of_bytes(text.as_bytes());
+        assert_eq!(
+            digest.to_string(),
+            "52a0f822c03fbf73ccd2fceeed4769eca3fa1756d0e3085f181cbd94a7aee081"
+        );
+        let reference = crate::runtime::operations::ResultRef::new(digest);
+        let value = verified_result_payload(&reference, text, &digest.to_string()).unwrap();
+        let read = value["details"]["latencyMs"].as_f64().unwrap();
+        assert_eq!(read.to_bits(), 20.958299999999998_f64.to_bits());
+    }
+
+    #[test]
+    fn a_tampered_payload_text_still_fails_closed() {
+        let text = r#"{"details":{"latencyMs":20.958299999999998}}"#;
+        let digest = PayloadDigest::of_bytes(text.as_bytes());
+        let reference = crate::runtime::operations::ResultRef::new(digest);
+        let tampered = text.replace("20.958299999999998", "20.9583");
+        assert!(matches!(
+            verified_result_payload(&reference, &tampered, &digest.to_string()),
+            Err(JournalError::ResultDigestMismatch)
+        ));
+        let other = PayloadDigest::of_bytes(b"other").to_string();
+        assert!(matches!(
+            verified_result_payload(&reference, text, &other),
+            Err(JournalError::ResultDigestMismatch)
+        ));
     }
 }

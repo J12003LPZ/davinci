@@ -8,7 +8,6 @@
 
 use super::model::{OperationAttempt, OperationSpec};
 use super::store_api::JOURNAL_DATABASE_FILE_NAME;
-use super::PayloadDigest;
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -633,13 +632,9 @@ fn read_results(
             }
         };
         let payload = serde_json::from_str::<Value>(&payload_json);
-        let payload_valid = match &payload {
-            Ok(value) => match PayloadDigest::of_json(value) {
-                Ok(digest) => digest.to_string() == payload_digest,
-                Err(_) => false,
-            },
-            Err(_) => false,
-        };
+        // Hash the stored text, as the writer did, not a reparsed value.
+        let payload_valid = payload.is_ok()
+            && super::store::stored_payload_digest(&payload_json).to_string() == payload_digest;
         let result_error = if reference == Value::Null || payload.is_err() || !payload_valid {
             let issue = if !payload_valid {
                 "result payload digest does not match"
@@ -1156,7 +1151,7 @@ mod tests {
     use crate::runtime::operations::{
         CallerType, EffectClass, EffectProfile, ExecutionOwner, ExecutionOwnerId, IdempotencyScope,
         JournalId, JournalIdentity, OperationContext, OperationJournal, OperationKind,
-        RootNamespaceId, ScopedIdempotencyKey, WorkspaceId, WorkspaceIdentity,
+        PayloadDigest, RootNamespaceId, ScopedIdempotencyKey, WorkspaceId, WorkspaceIdentity,
     };
     use crate::runtime::{AgentId, RunId};
     use serde_json::json;
@@ -1253,6 +1248,50 @@ mod tests {
             output.status,
             InspectorStatus::Healthy | InspectorStatus::Findings
         ));
+    }
+
+    /// Insert a result row for the fixture's one attempt, written the way the journal writes it:
+    /// the digest column is the hash of the stored payload text.
+    fn insert_result(temp: &tempfile::TempDir, payload_json: &str, digest: &str) {
+        let connection = rusqlite::Connection::open(
+            temp.path()
+                .join(".davinci")
+                .join("operations")
+                .join("operations.sqlite3"),
+        )
+        .unwrap();
+        let (operation_id, attempt_id): (String, String) = connection
+            .query_row("SELECT operation_id, attempt_id FROM attempts", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO operation_results
+                 (result_id, operation_id, attempt_id, payload_digest, result_ref_json, payload_json, created_at_ms)
+                 VALUES ('00000000-0000-0000-0000-000000000001', ?1, ?2, ?3, '{}', ?4, 1)",
+                rusqlite::params![operation_id, attempt_id, digest, payload_json],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_result_with_a_nonroundtripping_float_is_valid_and_a_tampered_one_is_not() {
+        let text = r#"{"details":{"latencyMs":20.958299999999998}}"#;
+        let digest = PayloadDigest::of_bytes(text.as_bytes()).to_string();
+        for (stored, expected) in [
+            (text.to_owned(), true),
+            (text.replace("958299999999998", "9583"), false),
+        ] {
+            let (temp, operation_id, _) = fixture();
+            insert_result(&temp, &stored, &digest);
+            let output = inspect(temp.path(), InspectionTarget::Operation(operation_id));
+            let report = serde_json::to_string(&output.report).unwrap();
+            assert!(
+                report.contains(&format!("\"payload_valid\":{expected}")),
+                "payload_valid must be {expected}: {report}"
+            );
+        }
     }
 
     #[test]

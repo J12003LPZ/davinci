@@ -39,7 +39,7 @@ image = { version = "=0.25.10", default-features = false, features = ["jpeg", "g
 libc = "=0.2.191"
 rusqlite = { version = "=0.41.1", features = ["backup", "bundled"] }
 serde = { version = "=1.0.229", features = ["derive", "rc"] }
-serde_json = "=1.0.154"
+serde_json = { version = "=1.0.154", features = ["float_roundtrip"] }
 icu_segmenter = { version = "=2.4.0", default-features = false, features = ["compiled_data"] }
 unicode-segmentation = "=1.13.3"
 unicode-width = "=0.2.2"
