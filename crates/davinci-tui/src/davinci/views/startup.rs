@@ -344,18 +344,24 @@ pub fn home_relative(path: &str, home: Option<&str>) -> String {
         return path.to_string();
     };
     let split = home.len();
-    match path.get(..split) {
-        Some(head) if head.eq_ignore_ascii_case(home) => {
-            let rest = &path[split..];
-            if rest.is_empty() || rest.chars().all(|c| c == '/' || c == '\\') {
-                "~".to_string()
-            } else if rest.starts_with(['/', '\\']) {
-                format!("~{rest}")
-            } else {
-                path.to_string()
-            }
-        }
-        _ => path.to_string(),
+    // Compare bytes, not `str::get(..split)`: `split` is a byte length and a
+    // multibyte home makes it a non-char boundary in `path`.
+    let head_matches = path
+        .as_bytes()
+        .get(..split)
+        .is_some_and(|head| head.eq_ignore_ascii_case(home.as_bytes()));
+    if !head_matches {
+        return path.to_string();
+    }
+    let Some(rest) = path.get(split..) else {
+        return path.to_string();
+    };
+    if rest.is_empty() || rest.chars().all(|c| c == '/' || c == '\\') {
+        "~".to_string()
+    } else if rest.starts_with(['/', '\\']) {
+        format!("~{rest}")
+    } else {
+        path.to_string()
     }
 }
 

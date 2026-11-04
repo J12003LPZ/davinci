@@ -753,6 +753,24 @@ fn require_capabilities(
     }
 }
 
+/// Resolve `.` and `..` without touching the filesystem, so containment is
+/// checked against the path the backend will actually use.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 fn validate_request(spec: &SandboxSpec, request: &ExecutionRequest) -> Result<(), SandboxFailure> {
     spec.validate()?;
     if request.sandbox_id != spec.id {
@@ -762,18 +780,28 @@ fn validate_request(spec: &SandboxSpec, request: &ExecutionRequest) -> Result<()
         ));
     }
     let executable = Path::new(&request.executable);
-    let cwd = Path::new(&request.cwd);
-    let workspace = Path::new(&spec.workspace);
+    let cwd = normalize_lexically(Path::new(&request.cwd));
+    let workspace = normalize_lexically(Path::new(&spec.workspace));
     if !executable.is_absolute() {
         return Err(SandboxFailure::policy_denied(
             "executor requires a host-resolved absolute executable",
         ));
     }
-    if !cwd.is_absolute() || !cwd.starts_with(workspace) {
+    if !cwd.is_absolute() || !cwd.starts_with(&workspace) {
         return Err(SandboxFailure::new(
             SandboxErrorCode::FilesystemDenied,
             "execution cwd is outside the sandbox workspace",
         ));
+    }
+    // When both paths exist, a symlink inside the workspace must not point
+    // outside it. Non-existent paths fall back to the lexical check above.
+    if let (Ok(cwd_real), Ok(workspace_real)) = (cwd.canonicalize(), workspace.canonicalize()) {
+        if !cwd_real.starts_with(&workspace_real) {
+            return Err(SandboxFailure::new(
+                SandboxErrorCode::FilesystemDenied,
+                "execution cwd resolves outside the sandbox workspace",
+            ));
+        }
     }
     if request.argv.len() > 256
         || request.argv.iter().any(|arg| arg.contains('\0'))
@@ -788,10 +816,16 @@ fn validate_request(spec: &SandboxSpec, request: &ExecutionRequest) -> Result<()
 
 fn find_host_executable(name: &str, workspace: &Path) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
+    // Compare canonical forms on both sides: Windows canonicalizes to a
+    // `\\?\` path and macOS resolves `/tmp` to `/private/tmp`, so a plain
+    // `starts_with` on the workspace would never reject a workspace binary.
+    let workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
     for directory in std::env::split_paths(&path).filter(|path| path.is_absolute()) {
         let candidate = directory.join(name);
         if let Ok(canonical) = candidate.canonicalize() {
-            if canonical.is_file() && !canonical.starts_with(workspace) {
+            if canonical.is_file() && !canonical.starts_with(&workspace) {
                 return Some(canonical);
             }
         }
@@ -1964,6 +1998,41 @@ mod tests {
             .prepare(&spec, &request(&spec), &BTreeMap::new())
             .unwrap_err();
         assert_eq!(error.code, SandboxErrorCode::CapabilityUnavailable);
+    }
+
+    #[test]
+    fn request_cwd_cannot_traverse_out_of_the_workspace() {
+        let spec = spec(SandboxMode::FullAccess, NetworkPolicy::Unrestricted);
+        let mut request = request(&spec);
+        request.cwd = format!(
+            "{}{}..{}escape",
+            spec.workspace,
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR
+        );
+        let error = HostBackend
+            .prepare(&spec, &request, &BTreeMap::new())
+            .unwrap_err();
+        assert_eq!(error.code, SandboxErrorCode::FilesystemDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_cwd_symlink_outside_the_workspace_is_denied() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("escape")).unwrap();
+        let mut spec = spec(SandboxMode::FullAccess, NetworkPolicy::Unrestricted);
+        spec.workspace = workspace.to_string_lossy().into_owned();
+        let mut request = request(&spec);
+        request.cwd = workspace.join("escape").to_string_lossy().into_owned();
+        let error = HostBackend
+            .prepare(&spec, &request, &BTreeMap::new())
+            .unwrap_err();
+        assert_eq!(error.code, SandboxErrorCode::FilesystemDenied);
     }
 
     #[test]

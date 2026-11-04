@@ -78,15 +78,7 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     rows
 }
 
-const TABS: [&str; 7] = [
-    "Permissions",
-    "Recently blocked",
-    "Allow",
-    "Ask",
-    "Deny",
-    "Auto mode",
-    "Workspace",
-];
+const TABS: [&str; 4] = ["Permissions", "Allow", "Deny", "Workspace"];
 
 pub fn tabs(model: &Model) -> Line<'static> {
     let th = &model.theme;
@@ -164,24 +156,15 @@ fn filtered_lines(model: &Model) -> Vec<Line<'static>> {
         }
         return rows;
     }
+    // Only rule kinds the policy can actually hold get a tab; there is no
+    // blocked-call log, ask list or auto-mode list to show.
     let (description, empty, keep): (&str, &str, fn(&PermissionRow) -> bool) =
         match model.permission_tab {
-            1 => (
-                "Recent calls that policy blocked.",
-                "No recently blocked calls.",
-                |_| false,
-            ),
-            2 => ("Tools that run without asking.", "No allow rules.", |row| {
+            1 => ("Tools that run without asking.", "No allow rules.", |row| {
                 row.detail.starts_with("allow")
             }),
-            3 => ("Prompts shown before a tool runs.", "No ask rules.", |_| {
-                false
-            }),
-            4 => ("Tools that never run.", "No deny rules.", |row| {
+            2 => ("Tools that never run.", "No deny rules.", |row| {
                 row.detail.starts_with("deny")
-            }),
-            5 => ("Extra rules for auto mode.", "No auto-mode rules.", |row| {
-                row.source == "auto"
             }),
             _ => ("Rules from this workspace.", "No project rules.", |row| {
                 row.source == "project"

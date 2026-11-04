@@ -429,7 +429,7 @@ pub fn tool_specs() -> Vec<AgentTool> {
         AgentTool {
             name: "read".into(),
             description: "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files.".into(),
-            parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"number"},"limit":{"type":"number"}},"required":["path"]}),
+            parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"number"},"limit":{"type":"number","minimum":1}},"required":["path"]}),
         },
         AgentTool {
             name: "retrieve_context".into(),
@@ -1663,11 +1663,11 @@ fn read_tool_cached(
         .and_then(Value::as_u64)
         .unwrap_or(1)
         .max(1) as usize;
-    let limit = input
-        .get("limit")
-        .and_then(Value::as_u64)
-        .map(|v| v as usize)
-        .unwrap_or(DEFAULT_MAX_LINES);
+    let limit = match input.get("limit").and_then(Value::as_u64) {
+        Some(0) => return Err(ToolError::Failed("`limit` must be at least 1".into())),
+        Some(value) => value as usize,
+        None => DEFAULT_MAX_LINES,
+    };
     let key = CacheKey::new(
         CacheNamespace::File,
         format!("text-window:{offset}:{limit}"),
@@ -1852,11 +1852,11 @@ fn read_tool(
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(1)
         .max(1) as usize;
-    let limit = input
-        .get("limit")
-        .and_then(serde_json::Value::as_u64)
-        .map(|value| value as usize);
-    let limit = limit.unwrap_or(DEFAULT_MAX_LINES);
+    let limit = match input.get("limit").and_then(serde_json::Value::as_u64) {
+        Some(0) => return Err(ToolError::Failed("`limit` must be at least 1".into())),
+        Some(value) => value as usize,
+        None => DEFAULT_MAX_LINES,
+    };
     if is_notebook {
         let (content, truncation) = truncate_read(&content, offset, Some(limit));
         let mut details = serde_json::json!({"path": path, "truncation": truncation});
@@ -2828,7 +2828,6 @@ fn join_finished_shell_stream(
 }
 
 fn finish_shell_capture(
-    child_pid: u32,
     stdout_handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
     stderr_handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
     stdout_capture: &Arc<Mutex<ShellStreamCapture>>,
@@ -2842,9 +2841,10 @@ fn finish_shell_capture(
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let pending = !shell_readers_finished(&stdout_handle, &stderr_handle);
-    if pending {
-        crate::jobs::kill_tree(child_pid);
-    }
+    // The child has already been waited on by the caller, so its PID (and on
+    // Unix its process-group ID) may have been recycled. Never signal it
+    // after that point: leave the pipe-holding descendant alone and report a
+    // partial capture instead.
 
     let stdout_done = join_finished_shell_stream(stdout_handle)?;
     let stderr_done = join_finished_shell_stream(stderr_handle)?;
@@ -2908,7 +2908,6 @@ fn wait_shell_output(
                 let _ = child.kill();
                 let _ = child.wait();
                 let (stdout, mut stderr, truncated) = finish_shell_capture(
-                    child.id(),
                     stdout_handle,
                     stderr_handle,
                     &stdout_capture,
@@ -2939,7 +2938,6 @@ fn wait_shell_output(
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = finish_shell_capture(
-                    child.id(),
                     stdout_handle,
                     stderr_handle,
                     &stdout_capture,
@@ -2950,7 +2948,6 @@ fn wait_shell_output(
         }
     };
     let (stdout, mut stderr, truncated) = finish_shell_capture(
-        child.id(),
         stdout_handle,
         stderr_handle,
         &stdout_capture,
@@ -6192,6 +6189,13 @@ mod tests {
             sliced.details.as_ref().unwrap()["truncation"]["totalLines"],
             3
         );
+        let error = execute_tool(
+            dir.path(),
+            "read",
+            &serde_json::json!({"path":"b.txt","limit":0}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("at least 1"), "{error}");
         execute_tool(
             dir.path(),
             "write",

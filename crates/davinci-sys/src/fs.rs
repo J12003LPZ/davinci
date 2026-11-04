@@ -62,11 +62,21 @@ pub fn open_append_private(path: &Path) -> io::Result<fs::File> {
 /// The caller positions the cursor; this is for private append logs that must
 /// inspect and repair their own admitted handle.
 pub fn open_read_write_private(path: &Path) -> io::Result<fs::File> {
-    private_options()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(path)
+    let mut options = private_options();
+    // Refuse to follow a symlink: the caller repairs this handle in place and
+    // must not truncate or append through a link planted in the workspace.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.create(true).read(true).write(true).open(path)
 }
 
 /// Restrict an existing file to its owner (0600 on Unix). No-op elsewhere.

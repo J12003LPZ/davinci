@@ -592,10 +592,12 @@ pub fn run_bounded(
 
     let grace_started = Instant::now();
     let mut closed = 0;
+    let mut cut_short = false;
     while closed < 2 {
         let left = READER_GRACE.saturating_sub(grace_started.elapsed());
         if left.is_zero() {
             tree.kill(&child);
+            cut_short = true;
             break;
         }
         match done_rx.recv_timeout(left) {
@@ -604,12 +606,19 @@ pub fn run_bounded(
                 // A descendant still holds a pipe. Kill the whole tree and
                 // return instead of joining a reader thread without a bound.
                 tree.kill(&child);
+                cut_short = true;
                 break;
             }
         }
     }
     (result.stdout, result.stdout_truncated) = take(&out);
     (result.stderr, result.stderr_truncated) = take(&err);
+    if cut_short {
+        // A capture stopped before both readers reported EOF may be missing
+        // bytes; do not present it as complete.
+        result.stdout_truncated = true;
+        result.stderr_truncated = true;
+    }
     Ok(result)
 }
 
@@ -823,6 +832,10 @@ mod tests {
         })
         .unwrap();
         assert!(String::from_utf8_lossy(&out.stdout).contains("done"));
+        assert!(
+            out.stdout_truncated,
+            "a capture cut short by a pipe-holding descendant is not complete"
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 

@@ -260,6 +260,7 @@ impl Agent {
         );
         let mut output_tail = String::new();
         let mut rerun_denied = false;
+        let mut persistence_error = None;
         for mut result in results {
             let name = result.tool_name.clone().unwrap_or_default();
             self.after_tool(&name, &mut result);
@@ -274,7 +275,9 @@ impl Agent {
             let lines: Vec<&str> = text.lines().collect();
             output_tail = lines[lines.len().saturating_sub(30)..].join("\n");
             self.messages.push(result.clone());
-            self.persist_chat(&result)?;
+            if let Err(error) = self.persist_chat(&result) {
+                persistence_error.get_or_insert(error);
+            }
             new_messages.push(result.clone());
             self.push_event(
                 events,
@@ -283,6 +286,9 @@ impl Agent {
                 },
             );
             self.push_event(events, AgentEvent::MessageEnd { message: result });
+        }
+        if let Some(error) = persistence_error {
+            return Err(error);
         }
         // The rerun's own exit status decides failure. Evidence alone cannot:
         // a passing run whose command does not cover the changed files is
@@ -1202,46 +1208,54 @@ Issue the call again if it is still needed.";
                     &format!("{}/{}", self.provider, self.model_id),
                 );
             }
-            self.messages.push(chat.clone());
+            // A failed or length-stopped turn can lose its only tool-call
+            // block, leaving no content. Do not persist an empty assistant
+            // message mid-history: several providers reject it.
+            let has_assistant_content = !chat.content.is_empty();
+            if has_assistant_content {
+                self.messages.push(chat.clone());
+            }
             if !matches!(
                 assistant.stop_reason,
                 Some(StopReason::Error | StopReason::Aborted)
             ) {
                 self.note_provider_context(assistant.usage.as_ref(), &chat);
             }
-            self.persist_assistant(&assistant, &chat, native_responses_resume.as_ref());
-            self.ensure_session_persistence()?;
-            new_messages.push(chat.clone());
-            // A closure that streamed live has already shown the sink the
-            // start and every update; they are recorded here, not resent.
-            let start = AgentEvent::MessageStart {
-                message: chat.clone(),
-            };
-            if streamed_live {
-                events.push(start);
-            } else {
-                self.push_event(&mut events, start);
-            }
-            let updates =
-                stream_events.unwrap_or_else(|| davinci_ai::events_from_complete(&assistant));
-            let shared_chat = std::sync::Arc::new(chat.clone());
-            for assistant_message_event in updates {
-                let update = AgentEvent::MessageUpdate {
-                    message: std::sync::Arc::clone(&shared_chat),
-                    assistant_message_event,
+            if has_assistant_content {
+                self.persist_assistant(&assistant, &chat, native_responses_resume.as_ref());
+                self.ensure_session_persistence()?;
+                new_messages.push(chat.clone());
+                // A closure that streamed live has already shown the sink the
+                // start and every update; they are recorded here, not resent.
+                let start = AgentEvent::MessageStart {
+                    message: chat.clone(),
                 };
                 if streamed_live {
-                    events.push(update);
+                    events.push(start);
                 } else {
-                    self.push_event(&mut events, update);
+                    self.push_event(&mut events, start);
                 }
+                let updates =
+                    stream_events.unwrap_or_else(|| davinci_ai::events_from_complete(&assistant));
+                let shared_chat = std::sync::Arc::new(chat.clone());
+                for assistant_message_event in updates {
+                    let update = AgentEvent::MessageUpdate {
+                        message: std::sync::Arc::clone(&shared_chat),
+                        assistant_message_event,
+                    };
+                    if streamed_live {
+                        events.push(update);
+                    } else {
+                        self.push_event(&mut events, update);
+                    }
+                }
+                self.push_event(
+                    &mut events,
+                    AgentEvent::MessageEnd {
+                        message: chat.clone(),
+                    },
+                );
             }
-            self.push_event(
-                &mut events,
-                AgentEvent::MessageEnd {
-                    message: chat.clone(),
-                },
-            );
 
             // A tool call cut off by the output limit executes nothing, but the
             // model can recover with a smaller call. Bound the retries so a
@@ -1431,6 +1445,7 @@ Issue the call again if it is still needed.";
 
             let had_tools = !tool_calls.is_empty();
             let mut tool_results = Vec::new();
+            let mut persistence_error = None;
             if had_tools {
                 let cwd = self.cwd.clone();
                 let messages = self.execute_tool_batch(&cwd, tool_calls, &mut events);
@@ -1438,7 +1453,13 @@ Issue the call again if it is still needed.";
                     let name = result.tool_name.clone().unwrap_or_default();
                     self.after_tool(&name, &mut result);
                     self.messages.push(result.clone());
-                    self.persist_chat(&result)?;
+                    // Every tool in the batch has already run. Record all of
+                    // its results before reporting the first persistence
+                    // error, or a later result is lost while its side effect
+                    // stands.
+                    if let Err(error) = self.persist_chat(&result) {
+                        persistence_error.get_or_insert(error);
+                    }
                     new_messages.push(result.clone());
                     self.push_event(
                         &mut events,
@@ -1465,6 +1486,9 @@ Issue the call again if it is still needed.";
             );
             if let Some(runtime) = &self.runtime {
                 runtime.emit_turn_end(!self.abort_requested());
+            }
+            if let Some(error) = persistence_error {
+                return Err(error);
             }
 
             // Inputs can arrive while the provider or a completion hook runs.

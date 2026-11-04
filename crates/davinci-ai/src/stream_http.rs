@@ -268,7 +268,9 @@ pub(crate) fn send(
         response,
         cancellation,
     };
-    if response.status() >= 400 {
+    if response.status() >= 300 {
+        // Redirects are disabled under the process budget, so a 3xx body is
+        // not a provider reply. Treat every non-success status alike.
         let mut error = ProviderError::new(
             Some(response.status()),
             format!("Provider error: {}", response.status()),
@@ -308,6 +310,27 @@ mod tests {
             }
         }
         reader.read_exact(&mut vec![0; length]).unwrap();
+    }
+
+    #[test]
+    fn a_3xx_response_is_a_provider_error_not_a_reply() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            consume_request(&mut socket);
+            socket
+                .write_all(
+                    b"HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let error = match send(&url, &[], &serde_json::json!({}), Some(10_000), false, None) {
+            Ok(_) => panic!("a 3xx response was parsed as a provider reply"),
+            Err(error) => error,
+        };
+        server.join().unwrap();
+        assert_eq!(error.status, Some(304));
     }
 
     #[test]

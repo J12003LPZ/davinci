@@ -476,6 +476,7 @@ impl ScriptRunRegistry {
         detached: Option<(ScriptRunSummary, Option<String>)>,
     ) -> Result<bool, ScriptRunError> {
         let _guard = self.guard();
+        let foreground = detached.is_none();
         let late = detached.clone();
         let result = self.advance_locked(run_id, next, |record| match detached {
             Some((summary, log_ref)) => {
@@ -487,15 +488,28 @@ impl ScriptRunRegistry {
         // A worker may report after the controller already settled the run
         // (for example `RecoveryRequired` once Kill outlasted its grace). The
         // state stays as recorded, but a summary that was never stored is kept.
+        // A repeated foreground finish still marks the run delivered, because
+        // its result was already reported even though the duplicate state was
+        // suppressed before `apply` ran.
         let unchanged = match &result {
             Ok(changed) => !changed,
             Err(error) => error.code == "DENIED",
         };
-        if let (true, Some((summary, log_ref))) = (unchanged, late) {
+        if unchanged {
             let mut record = self.get(run_id)?;
-            if record.state.terminal() && record.summary.is_none() {
-                record.summary = Some(summary);
-                record.log_ref = log_ref;
+            let mut changed = false;
+            if foreground && record.state.terminal() && !record.notified {
+                record.notified = true;
+                changed = true;
+            }
+            if let Some((summary, log_ref)) = late {
+                if record.state.terminal() && record.summary.is_none() {
+                    record.summary = Some(summary);
+                    record.log_ref = log_ref;
+                    changed = true;
+                }
+            }
+            if changed {
                 self.write(&self.path(run_id)?, &record)?;
             }
         }

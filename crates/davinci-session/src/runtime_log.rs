@@ -60,10 +60,26 @@ impl RuntimeLogWriter {
         if let Some(parent) = path.parent() {
             davinci_sys::fs::create_private_dir_all(parent)?;
         }
+        // Reject a planted link before opening, then verify the admitted
+        // handle too: `O_NOFOLLOW`/`FILE_FLAG_OPEN_REPARSE_POINT` close the
+        // race between the two checks.
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("runtime log {} is a symbolic link", path.display()),
+                )
+                .into());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         // Admit the opened handle itself: repair and append must act on the
         // file that passed the checks, not on whatever the path names later.
         let mut file = davinci_sys::fs::open_read_write_private(&path)?;
-        if !file.metadata()?.is_file() {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("runtime log {} is not a regular file", path.display()),
@@ -340,6 +356,20 @@ mod tests {
         fs::write(&path, bytes).unwrap();
         let rows: Vec<DummyEnvelope> = read_runtime_log(&path).unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_runtime_log_is_refused_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        fs::write(&target, b"do not touch").unwrap();
+        let link = dir.path().join("session.runtime.jsonl");
+        symlink(&target, &link).unwrap();
+        let error = RuntimeLogWriter::open(&link).unwrap_err();
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        assert_eq!(fs::read(&target).unwrap(), b"do not touch");
     }
 
     #[test]

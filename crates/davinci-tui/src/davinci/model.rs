@@ -3486,8 +3486,7 @@ pub struct Model {
     /// `/permissions` — mode and rules.
     pub permission_rows: Vec<PermissionRow>,
     pub permission_index: usize,
-    /// The permissions sheet's tab: 0 Permissions, 1 Recently blocked, 2 Allow,
-    /// 3 Ask, 4 Deny, 5 Auto mode, 6 Workspace.
+    /// The permissions sheet's tab: 0 Permissions, 1 Allow, 2 Deny, 3 Workspace.
     pub permission_tab: usize,
     pub permission_query: String,
     /// `5e` — deterministic agent workflows (`/workflows`).

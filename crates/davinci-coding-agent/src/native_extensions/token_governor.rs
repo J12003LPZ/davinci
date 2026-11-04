@@ -828,9 +828,13 @@ pub fn compress_with_reference(
                 .map(|line| (*line).to_string()),
         );
     }
-    // Lines folded by the repeat collapse were shown once, not omitted.
-    let omitted = lines.saturating_sub(selected.len());
-    let selected = collapse_repeated_lines(selected);
+    // Lines dropped by the repeat collapse are omitted from the digest too;
+    // the marker shows one line in their place, so count the dropped lines.
+    let selected_before_collapse = selected.len();
+    let (selected, folded) = collapse_repeated_lines(selected);
+    let omitted = lines
+        .saturating_sub(selected_before_collapse)
+        .saturating_add(folded);
     let mut digest = selected.join("\n");
     if omitted > 0 || stored.is_some() {
         digest.push_str("\n\n");
@@ -874,13 +878,17 @@ fn clears_specialized_threshold(specialized: usize, generic: usize, pct: u8) -> 
             <= generic.saturating_mul(100usize.saturating_sub(pct as usize))
 }
 
-fn collapse_repeated_lines(lines: Vec<String>) -> Vec<String> {
+/// Collapse runs of identical lines to the first line plus one marker, and
+/// return how many source lines were dropped (markers are not source lines).
+fn collapse_repeated_lines(lines: Vec<String>) -> (Vec<String>, usize) {
     let mut output = Vec::new();
     let mut previous: Option<String> = None;
     let mut repeats = 0usize;
+    let mut folded = 0usize;
     for line in lines {
         if previous.as_deref() == Some(line.as_str()) {
             repeats += 1;
+            folded += 1;
             if repeats == 3 {
                 output.push(format!("[… repeated line omitted: {line}]"));
             }
@@ -890,7 +898,7 @@ fn collapse_repeated_lines(lines: Vec<String>) -> Vec<String> {
         previous = Some(line.clone());
         output.push(line);
     }
-    output
+    (output, folded)
 }
 
 /// A one-line account of a call for the stored manifest: the command for a
@@ -2180,7 +2188,7 @@ mod tests {
     }
 
     #[test]
-    fn omitted_count_ignores_lines_folded_by_the_repeat_collapse() {
+    fn omitted_count_includes_lines_folded_by_the_repeat_collapse() {
         let config = TokenGovernorConfig {
             compress_threshold_bytes: 1,
             compress_threshold_lines: 1,
@@ -2189,10 +2197,11 @@ mod tests {
             max_important_lines: 1,
             ..Default::default()
         };
-        // Ten identical head lines all "kept": nothing omitted, some folded.
+        // Ten identical head lines: one is shown and a marker replaces the
+        // rest, so nine source lines are missing from the digest.
         let compressed = compress_output(&["same"; 10].join("\n"), &config);
         assert!(
-            !compressed.content.contains("omitted;"),
+            compressed.content.contains("9 of 10 lines omitted"),
             "{}",
             compressed.content
         );

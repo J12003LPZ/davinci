@@ -82,13 +82,25 @@ pub fn process_codex_websocket(
     let (_, continuation) =
         acquire_cached_continuation(cache_session_id, account_id, Instant::now());
     let (request_body, _) = build_cached_websocket_request_body(body, continuation.as_ref());
-    let acquired = acquire_live_socket(
+    let mut acquired = acquire_live_socket(
         url,
         headers,
         connect_timeout_ms,
         cache_session_id,
         account_id,
     )?;
+    if acquired.reused && !socket_is_quiet_and_open(&mut acquired.stream) {
+        // A cached backend socket may carry frames left after the previous
+        // terminal event, or be closed by the peer. Replace it before writing.
+        release_live_socket(acquired.key, acquired.stream, false);
+        acquired = acquire_live_socket(
+            url,
+            headers,
+            connect_timeout_ms,
+            cache_session_id,
+            account_id,
+        )?;
+    }
     let mut stream = acquired.stream;
     let socket_reused = acquired.reused;
     record_websocket_request_stats(
@@ -100,15 +112,26 @@ pub fn process_codex_websocket(
     let idle_timeout_ms = idle_timeout_ms
         .filter(|ms| *ms > 0)
         .unwrap_or(DEFAULT_WEBSOCKET_IDLE_TIMEOUT_MS);
-    stream
-        .set_read_timeout(Some(Duration::from_millis(idle_timeout_ms)))
-        .map_err(|err| format!("WebSocket timeout: {err}"))?;
+    if let Err(err) = stream.set_read_timeout(Some(Duration::from_millis(idle_timeout_ms))) {
+        // The cache entry was marked busy by acquisition; release it or the
+        // session loses socket reuse permanently.
+        release_live_socket(acquired.key, stream, false);
+        return Err(format!("WebSocket timeout: {err}"));
+    }
     let mut outgoing = request_body.clone();
     if let Value::Object(map) = &mut outgoing {
         map.insert("type".into(), Value::String("response.create".into()));
     }
     crate::wire_dump::write_current("wire", &outgoing);
-    let observation = crate::provider_observation::Attempt::try_start("websocket")?;
+    let observation = match crate::provider_observation::Attempt::try_start("websocket") {
+        Ok(observation) => observation,
+        Err(err) => {
+            // The cache entry was marked busy by acquisition; an early return
+            // must release it or the session loses socket reuse permanently.
+            release_live_socket(acquired.key, stream, false);
+            return Err(err);
+        }
+    };
     let send = write_text_frame(&mut stream, &outgoing.to_string());
     if let Err(err) = send {
         observation.finish("failed", None, None);
@@ -1513,8 +1536,14 @@ fn public_websocket_attempt(
         map.insert("type".into(), Value::String("response.create".into()));
     }
     crate::wire_dump::write_current("wire", &outgoing);
-    let observation = crate::provider_observation::Attempt::try_start(PUBLIC_WS_ATTEMPT)
-        .map_err(PublicWsFailure::unsafe_to_replay)?;
+    let observation = match crate::provider_observation::Attempt::try_start(PUBLIC_WS_ATTEMPT) {
+        Ok(observation) => observation,
+        Err(err) => {
+            // Release the busy cache entry before an early return.
+            release_live_socket(acquired.key, stream, false);
+            return Err(PublicWsFailure::unsafe_to_replay(err));
+        }
+    };
     if let Err(err) = write_text_frame(&mut stream, &outgoing.to_string()) {
         observation.finish("failed", None, None);
         release_live_socket(acquired.key, stream, false);
