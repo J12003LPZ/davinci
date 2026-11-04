@@ -421,11 +421,18 @@ struct Captured {
     truncated: bool,
 }
 
+#[derive(Clone, Copy)]
+enum Reader {
+    Stdout,
+    Stderr,
+}
+
 fn drain<R: Read + Send + 'static>(
     mut pipe: R,
     cap: usize,
-    done: mpsc::Sender<()>,
+    done: mpsc::Sender<Reader>,
     thread_name: &'static str,
+    reader: Reader,
 ) -> io::Result<Arc<Mutex<Captured>>> {
     let shared = Arc::new(Mutex::new(Captured::default()));
     let sink = Arc::clone(&shared);
@@ -447,7 +454,7 @@ fn drain<R: Read + Send + 'static>(
                     }
                 }
             }
-            let _ = done.send(());
+            let _ = done.send(reader);
         })?;
     Ok(shared)
 }
@@ -457,20 +464,28 @@ fn take(shared: &Arc<Mutex<Captured>>) -> (Vec<u8>, bool) {
     (std::mem::take(&mut captured.bytes), captured.truncated)
 }
 
-/// What `run_bounded` owns of the child's process tree.
+/// Ownership of a child's process tree.
 ///
 /// On Windows the child starts suspended and joins a fresh job before its
 /// first instruction, so every descendant is a member. Terminating the job
 /// still reaches them after the direct child has exited, which
 /// `taskkill /PID <root> /T` cannot: it walks the tree from a root that no
 /// longer exists. Without a job (assignment refused), it falls back to that.
-struct Tree {
+///
+/// On Unix the child is put in its own process group by `spawn`, so a group
+/// signal still reaches descendants after the leader is reaped. Keep this
+/// value alive for as long as cleanup may be needed.
+pub struct ProcessTree {
     #[cfg(windows)]
     job: Option<windows_job::Job>,
 }
 
-impl Tree {
-    fn spawn(command: &mut Command) -> io::Result<(Child, Self)> {
+impl ProcessTree {
+    /// Spawn `command` with tree ownership. On Unix the command is placed in
+    /// its own process group; on Windows it starts suspended and joins a job.
+    pub fn spawn(command: &mut Command) -> io::Result<(Child, Self)> {
+        #[cfg(unix)]
+        set_own_process_group(command);
         #[cfg(windows)]
         {
             windows_job::spawn(command).map(|(child, job)| (child, Self { job }))
@@ -483,7 +498,7 @@ impl Tree {
 
     /// Kill every remaining process of the tree, including after the direct
     /// child has been reaped.
-    fn kill(&self, child: &Child) {
+    pub fn kill(&self, child: &Child) {
         #[cfg(windows)]
         if let Some(job) = &self.job {
             job.terminate();
@@ -493,10 +508,23 @@ impl Tree {
     }
 }
 
-fn stop_child(child: &mut Child, tree: &Tree) {
+fn stop_child(child: &mut Child, tree: &ProcessTree) {
     tree.kill(child);
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// A cut capture is incomplete only on the stream whose reader had not
+/// reached EOF. A stream that already closed is complete even when the other
+/// one is still held by a descendant.
+fn mark_cut_short(
+    stdout_truncated: &mut bool,
+    stderr_truncated: &mut bool,
+    stdout_closed: bool,
+    stderr_closed: bool,
+) {
+    *stdout_truncated |= !stdout_closed;
+    *stderr_truncated |= !stderr_closed;
 }
 
 /// Run a child while draining its pipes, bounding each captured stream, and
@@ -515,8 +543,7 @@ pub fn run_bounded(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    set_own_process_group(&mut command);
-    let (mut child, tree) = Tree::spawn(&mut command)?;
+    let (mut child, tree) = ProcessTree::spawn(&mut command)?;
 
     if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
         // A child that exits without reading gives the writer BrokenPipe.
@@ -551,6 +578,7 @@ pub fn run_bounded(
         limits.output_cap,
         done_tx.clone(),
         "davinci-child-stdout",
+        Reader::Stdout,
     ) {
         Ok(out) => out,
         Err(err) => {
@@ -558,7 +586,13 @@ pub fn run_bounded(
             return Err(err);
         }
     };
-    let err = match drain(stderr, limits.output_cap, done_tx, "davinci-child-stderr") {
+    let err = match drain(
+        stderr,
+        limits.output_cap,
+        done_tx,
+        "davinci-child-stderr",
+        Reader::Stderr,
+    ) {
         Ok(err) => err,
         Err(err) => {
             stop_child(&mut child, &tree);
@@ -591,9 +625,10 @@ pub fn run_bounded(
     }
 
     let grace_started = Instant::now();
-    let mut closed = 0;
+    let mut stdout_closed = false;
+    let mut stderr_closed = false;
     let mut cut_short = false;
-    while closed < 2 {
+    while !(stdout_closed && stderr_closed) {
         let left = READER_GRACE.saturating_sub(grace_started.elapsed());
         if left.is_zero() {
             tree.kill(&child);
@@ -601,7 +636,8 @@ pub fn run_bounded(
             break;
         }
         match done_rx.recv_timeout(left) {
-            Ok(()) => closed += 1,
+            Ok(Reader::Stdout) => stdout_closed = true,
+            Ok(Reader::Stderr) => stderr_closed = true,
             Err(_) => {
                 // A descendant still holds a pipe. Kill the whole tree and
                 // return instead of joining a reader thread without a bound.
@@ -614,10 +650,12 @@ pub fn run_bounded(
     (result.stdout, result.stdout_truncated) = take(&out);
     (result.stderr, result.stderr_truncated) = take(&err);
     if cut_short {
-        // A capture stopped before both readers reported EOF may be missing
-        // bytes; do not present it as complete.
-        result.stdout_truncated = true;
-        result.stderr_truncated = true;
+        mark_cut_short(
+            &mut result.stdout_truncated,
+            &mut result.stderr_truncated,
+            stdout_closed,
+            stderr_closed,
+        );
     }
     Ok(result)
 }
@@ -837,6 +875,114 @@ mod tests {
             "a capture cut short by a pipe-holding descendant is not complete"
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_descendant_holding_only_stderr_does_not_mark_stdout_truncated() {
+        // `sleep` inherits stderr but its stdout is /dev/null, so the shell's
+        // stdout reaches EOF while stderr stays open.
+        let out = run_bounded(
+            shell("echo done; sleep 30 1>/dev/null &"),
+            None,
+            limits(10_000),
+            &|| false,
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("done"));
+        assert!(
+            !out.stdout_truncated,
+            "a stream that reached EOF must not be marked truncated"
+        );
+        assert!(
+            out.stderr_truncated,
+            "the stream still held by the descendant is incomplete"
+        );
+    }
+
+    #[test]
+    fn cut_short_marks_only_the_stream_that_did_not_close() {
+        let mut stdout = false;
+        let mut stderr = false;
+        mark_cut_short(&mut stdout, &mut stderr, true, false);
+        assert!(!stdout);
+        assert!(stderr);
+
+        let mut stdout = false;
+        let mut stderr = false;
+        mark_cut_short(&mut stdout, &mut stderr, false, true);
+        assert!(stdout);
+        assert!(!stderr);
+
+        // A cap overflow already marked one stream; a cut elsewhere must not
+        // clear it.
+        let mut stdout = true;
+        let mut stderr = false;
+        mark_cut_short(&mut stdout, &mut stderr, true, false);
+        assert!(stdout);
+        assert!(stderr);
+    }
+
+    fn process_is_alive(pid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            unsafe { libc::kill(pid as i32, 0) == 0 }
+        }
+        #[cfg(windows)]
+        {
+            let filter = format!("PID eq {pid}");
+            Command::new("tasklist")
+                .args(["/NH", "/FI", &filter])
+                .output()
+                .is_ok_and(|output| {
+                    String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+                })
+        }
+    }
+
+    #[test]
+    fn process_tree_kills_a_descendant_after_the_root_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("descendant.pid");
+        let path = pid_file.to_string_lossy();
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("powershell");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "$p = Start-Process -FilePath ping -ArgumentList '-n','30','127.0.0.1' -NoNewWindow -RedirectStandardOutput NUL -PassThru; [IO.File]::WriteAllText('{path}', [string]$p.Id)"
+                ),
+            ]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 30 & echo $! > \"$1\"", "sh", path.as_ref()]);
+            command
+        };
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        let (mut child, tree) = ProcessTree::spawn(&mut command).unwrap();
+        assert!(child.wait().unwrap().success());
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("the root wrote the descendant pid");
+        assert!(
+            process_is_alive(pid),
+            "the descendant should outlive the root"
+        );
+
+        tree.kill(&child);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while process_is_alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "the process tree did not kill descendant {pid}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]

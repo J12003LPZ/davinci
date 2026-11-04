@@ -96,6 +96,20 @@ fn session_persistence_failure_blocks_provider_and_mutation_boundaries() {
     }
 }
 
+#[derive(Default)]
+struct TurnEndRecorder {
+    outcomes: std::sync::Mutex<Vec<bool>>,
+}
+
+impl crate::RuntimeSubscriber for TurnEndRecorder {
+    fn on_event(&self, event: &crate::RuntimeEventEnvelope) -> crate::RuntimeDecision {
+        if let crate::RuntimeEvent::TurnEnded { success } = &event.payload {
+            self.outcomes.lock().unwrap().push(*success);
+        }
+        crate::RuntimeDecision::Continue
+    }
+}
+
 #[test]
 fn a_persistence_failure_keeps_every_completed_tool_result() {
     let dir = tempfile::tempdir().unwrap();
@@ -105,6 +119,14 @@ fn a_persistence_failure_keeps_every_completed_tool_result() {
     agent.cwd = dir.path().to_path_buf();
     agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
     agent.session = Some(session);
+    let recorder = Arc::new(TurnEndRecorder::default());
+    let bus = crate::RuntimeBus::new();
+    bus.subscribe(recorder.clone());
+    agent.runtime = Some(crate::RuntimeHandle::new(
+        crate::RunId::new(),
+        crate::AgentId::new(),
+        bus,
+    ));
     let broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let hook_path = path.clone();
     agent.post_tool = Some(crate::PostToolHook(Arc::new(move |_, _, _, _, result| {
@@ -138,6 +160,11 @@ fn a_persistence_failure_keeps_every_completed_tool_result() {
         })
     });
     assert!(result.is_err());
+    assert_eq!(
+        *recorder.outcomes.lock().unwrap(),
+        vec![false],
+        "a failed persistence boundary must report exactly one failed turn end"
+    );
     for id in ["first", "second"] {
         assert!(
             agent.messages.iter().any(|message| {
@@ -158,19 +185,29 @@ fn an_empty_failed_assistant_message_is_not_persisted() {
     let mut agent = Agent::new("empty fixture");
     agent.session = Some(session);
     agent.prompt("call the tool");
-    let result = agent.run_loop(|_| {
-        Ok(AssistantMessage {
-            extra: Default::default(),
-            id: "empty".into(),
-            role: "assistant".into(),
-            content: Vec::new(),
-            model: "fixture".into(),
-            usage: None,
-            stop_reason: Some(StopReason::Aborted),
-            error_message: None,
+    let events = agent
+        .run_loop(|_| {
+            Ok(AssistantMessage {
+                extra: Default::default(),
+                id: "empty".into(),
+                role: "assistant".into(),
+                content: Vec::new(),
+                model: "fixture".into(),
+                usage: None,
+                stop_reason: Some(StopReason::Aborted),
+                error_message: None,
+            })
         })
-    });
-    assert!(result.is_ok());
+        .unwrap();
+    // The empty message is not provider history, but its terminal status is
+    // still reported to the caller.
+    assert!(events.iter().any(|event| matches!(
+        event,
+        crate::AgentEvent::MessageUpdate {
+            assistant_message_event,
+            ..
+        } if assistant_message_event.message().stop_reason == Some(StopReason::Aborted)
+    )));
     assert!(!agent
         .messages
         .iter()

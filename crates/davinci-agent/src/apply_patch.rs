@@ -370,8 +370,10 @@ pub fn apply_hunks_to_content(original: &str, hunks: &[Hunk]) -> Result<String, 
         }
 
         if match_pattern.is_empty() {
-            // Addition-only hunk: it has no context lines to locate, so the
-            // `@@` header names an anchor line (or `*** End of File` appends).
+            // Addition-only hunk: it has no context lines to locate. A
+            // non-empty `@@` header names an anchor line; a bare `@@` (the
+            // form the advertised grammar admits) appends, as does an
+            // explicit `*** End of File`.
             let mut additions: Vec<&str> = hunk
                 .lines
                 .iter()
@@ -387,10 +389,9 @@ pub fn apply_hunks_to_content(original: &str, hunks: &[Hunk]) -> Result<String, 
             }
             let anchor = hunk.header.strip_prefix("@@").unwrap_or("").trim();
             if anchor.is_empty() {
-                return Err(format!(
-                    "Add-only hunk `{}` needs an `@@` anchor line or `*** End of File`",
-                    hunk.header
-                ));
+                file_lines.append(&mut additions);
+                search_from = file_lines.len();
+                continue;
             }
             let matches_from = |from: usize| {
                 file_lines
@@ -889,14 +890,13 @@ mod tests {
     }
 
     #[test]
-    fn add_only_hunk_without_an_anchor_or_eof_is_rejected() {
+    fn add_only_hunk_without_an_anchor_appends() {
         let dir = tempdir().unwrap();
         let target = dir.path().join("bare.txt");
         fs::write(&target, "alpha\n").unwrap();
         let patch = "*** Begin Patch\n*** Update File: bare.txt\n@@\n+INSERTED\n*** End Patch";
-        let error = execute_apply_patch(dir.path(), patch).unwrap_err();
-        assert!(error.contains("anchor line"), "{error}");
-        assert_eq!(fs::read_to_string(&target).unwrap(), "alpha\n");
+        execute_apply_patch(dir.path(), patch).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "alpha\nINSERTED\n");
     }
 
     #[test]

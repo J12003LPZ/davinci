@@ -1210,8 +1210,16 @@ Issue the call again if it is still needed.";
             }
             // A failed or length-stopped turn can lose its only tool-call
             // block, leaving no content. Do not persist an empty assistant
-            // message mid-history: several providers reject it.
+            // message mid-history: several providers reject it. Its error
+            // status still belongs in the event stream, which is what
+            // callers and print mode inspect for the terminal result.
             let has_assistant_content = !chat.content.is_empty();
+            let has_terminal_status = matches!(
+                assistant.stop_reason,
+                Some(StopReason::Error | StopReason::Aborted)
+            ) || assistant.error_message.is_some()
+                || (assistant.stop_reason == Some(StopReason::Length) && length_stop_dropped_calls);
+            let record_assistant = has_assistant_content || has_terminal_status;
             if has_assistant_content {
                 self.messages.push(chat.clone());
             }
@@ -1221,10 +1229,12 @@ Issue the call again if it is still needed.";
             ) {
                 self.note_provider_context(assistant.usage.as_ref(), &chat);
             }
-            if has_assistant_content {
-                self.persist_assistant(&assistant, &chat, native_responses_resume.as_ref());
-                self.ensure_session_persistence()?;
-                new_messages.push(chat.clone());
+            if record_assistant {
+                if has_assistant_content {
+                    self.persist_assistant(&assistant, &chat, native_responses_resume.as_ref());
+                    self.ensure_session_persistence()?;
+                    new_messages.push(chat.clone());
+                }
                 // A closure that streamed live has already shown the sink the
                 // start and every update; they are recorded here, not resent.
                 let start = AgentEvent::MessageStart {
@@ -1477,6 +1487,11 @@ Issue the call again if it is still needed.";
                 }
             }
 
+            // A persistence error fails the turn. Return before announcing a
+            // successful end; the outer boundary records the failure once.
+            if let Some(error) = persistence_error {
+                return Err(error);
+            }
             self.push_event(
                 &mut events,
                 AgentEvent::TurnEnd {
@@ -1486,9 +1501,6 @@ Issue the call again if it is still needed.";
             );
             if let Some(runtime) = &self.runtime {
                 runtime.emit_turn_end(!self.abort_requested());
-            }
-            if let Some(error) = persistence_error {
-                return Err(error);
             }
 
             // Inputs can arrive while the provider or a completion hook runs.
