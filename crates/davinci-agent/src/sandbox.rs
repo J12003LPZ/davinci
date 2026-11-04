@@ -253,6 +253,21 @@ pub struct ContainerBackend {
     executable: PathBuf,
 }
 
+/// The uid:gid the container runs as. On Unix this is the owner of the
+/// workspace so a writable bind mount stays writable; elsewhere the image's
+/// unprivileged `nobody` account is used instead of the image default (root).
+fn container_user(spec: &SandboxSpec) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(metadata) = std::fs::metadata(&spec.workspace) {
+            return format!("{}:{}", metadata.uid(), metadata.gid());
+        }
+    }
+    let _ = spec;
+    "65534:65534".to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerCleanupPlan {
     pub executable: PathBuf,
@@ -342,6 +357,15 @@ impl SandboxBackend for ContainerBackend {
             "--rm".into(),
             "--init".into(),
             "--read-only".into(),
+            // Run as the workspace owner (or nobody) and drop every capability
+            // the image would otherwise grant root. Without these, root in the
+            // container can chown/chmod the bind-mounted workspace and use
+            // NET_RAW whenever the network policy is not `Denied`.
+            "--user".into(),
+            container_user(spec),
+            "--cap-drop=ALL".into(),
+            "--security-opt".into(),
+            "no-new-privileges".into(),
         ];
         if matches!(spec.network, NetworkPolicy::Denied) {
             argv.extend(["--network".into(), "none".into()]);
@@ -365,6 +389,12 @@ impl SandboxBackend for ContainerBackend {
                     argv.extend(["--mount".into(), value]);
                 }
                 MountAccess::Temporary => {
+                    if mount.target.contains(':') || mount.target.contains(',') {
+                        return Err(SandboxFailure::new(
+                            SandboxErrorCode::FilesystemDenied,
+                            "container temporary mount targets cannot contain ':' or ','",
+                        ));
+                    }
                     let mut value = format!("{}:rw,nosuid,nodev", mount.target);
                     if let Some(bytes) = spec.resources.max_temp_bytes {
                         value.push_str(&format!(",size={bytes}"));
@@ -637,14 +667,22 @@ pub fn attenuate_child_spec(
         ));
     }
     for mount in &requested.filesystem.mounts {
-        if matches!(mount.access, MountAccess::Temporary | MountAccess::Hidden) {
-            continue;
-        }
-        let allowed = parent.filesystem.mounts.iter().any(|candidate| {
-            candidate.source == mount.source
-                && candidate.target == mount.target
-                && mount_access_is_no_more_permissive(mount.access, candidate.access)
-        });
+        let allowed = match mount.access {
+            // A temporary mount has no host source to compare. It is allowed
+            // only when the parent already declares the same target, so a
+            // child cannot add a tmpfs over an image directory (or reuse the
+            // target to smuggle container options).
+            MountAccess::Temporary => parent.filesystem.mounts.iter().any(|candidate| {
+                candidate.access == MountAccess::Temporary && candidate.target == mount.target
+            }),
+            // Hidden entries materialize nothing; they cannot widen access.
+            MountAccess::Hidden => continue,
+            _ => parent.filesystem.mounts.iter().any(|candidate| {
+                candidate.source == mount.source
+                    && candidate.target == mount.target
+                    && mount_access_is_no_more_permissive(mount.access, candidate.access)
+            }),
+        };
         if !allowed {
             return Err(SandboxFailure::policy_denied(
                 "child filesystem mount exceeds parent authority",
@@ -753,6 +791,24 @@ fn require_capabilities(
     }
 }
 
+/// Resolve `.` and `..` without touching the filesystem, so containment is
+/// checked against the path the backend will actually use.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 fn validate_request(spec: &SandboxSpec, request: &ExecutionRequest) -> Result<(), SandboxFailure> {
     spec.validate()?;
     if request.sandbox_id != spec.id {
@@ -762,18 +818,28 @@ fn validate_request(spec: &SandboxSpec, request: &ExecutionRequest) -> Result<()
         ));
     }
     let executable = Path::new(&request.executable);
-    let cwd = Path::new(&request.cwd);
-    let workspace = Path::new(&spec.workspace);
+    let cwd = normalize_lexically(Path::new(&request.cwd));
+    let workspace = normalize_lexically(Path::new(&spec.workspace));
     if !executable.is_absolute() {
         return Err(SandboxFailure::policy_denied(
             "executor requires a host-resolved absolute executable",
         ));
     }
-    if !cwd.is_absolute() || !cwd.starts_with(workspace) {
+    if !cwd.is_absolute() || !cwd.starts_with(&workspace) {
         return Err(SandboxFailure::new(
             SandboxErrorCode::FilesystemDenied,
             "execution cwd is outside the sandbox workspace",
         ));
+    }
+    // When both paths exist, a symlink inside the workspace must not point
+    // outside it. Non-existent paths fall back to the lexical check above.
+    if let (Ok(cwd_real), Ok(workspace_real)) = (cwd.canonicalize(), workspace.canonicalize()) {
+        if !cwd_real.starts_with(&workspace_real) {
+            return Err(SandboxFailure::new(
+                SandboxErrorCode::FilesystemDenied,
+                "execution cwd resolves outside the sandbox workspace",
+            ));
+        }
     }
     if request.argv.len() > 256
         || request.argv.iter().any(|arg| arg.contains('\0'))
@@ -788,10 +854,16 @@ fn validate_request(spec: &SandboxSpec, request: &ExecutionRequest) -> Result<()
 
 fn find_host_executable(name: &str, workspace: &Path) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
+    // Compare canonical forms on both sides: Windows canonicalizes to a
+    // `\\?\` path and macOS resolves `/tmp` to `/private/tmp`, so a plain
+    // `starts_with` on the workspace would never reject a workspace binary.
+    let workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
     for directory in std::env::split_paths(&path).filter(|path| path.is_absolute()) {
         let candidate = directory.join(name);
         if let Ok(canonical) = candidate.canonicalize() {
-            if canonical.is_file() && !canonical.starts_with(workspace) {
+            if canonical.is_file() && !canonical.starts_with(&workspace) {
                 return Some(canonical);
             }
         }
@@ -1408,6 +1480,29 @@ mod tests {
     }
 
     #[test]
+    fn child_cannot_add_a_temporary_mount_the_parent_does_not_declare() {
+        let parent = spec(SandboxMode::WorkspaceWrite, NetworkPolicy::Denied);
+        let mut child = parent.clone();
+        child.filesystem.mounts.push(davinci_protocol::MountRule {
+            source: None,
+            target: "/usr".into(),
+            access: MountAccess::Temporary,
+        });
+        let error = attenuate_child_spec(&parent, &child).unwrap_err();
+        assert_eq!(error.code, SandboxErrorCode::PolicyDenied);
+
+        // The parent's own temporary home may be delegated unchanged.
+        let mut parent = parent;
+        parent.filesystem.mounts.push(davinci_protocol::MountRule {
+            source: None,
+            target: "/tmp/davinci-home".into(),
+            access: MountAccess::Temporary,
+        });
+        let child = parent.clone();
+        assert!(attenuate_child_spec(&parent, &child).is_ok());
+    }
+
+    #[test]
     fn child_resource_limits_only_tighten() {
         let mut parent = spec(SandboxMode::WorkspaceWrite, NetworkPolicy::Denied);
         parent.resources.max_memory_bytes = Some(1024);
@@ -1920,6 +2015,15 @@ mod tests {
         assert!(argv
             .iter()
             .any(|arg| *arg == format!("type=bind,src={git},dst={git},readonly")));
+        assert!(argv.iter().any(|arg| arg == "--cap-drop=ALL"));
+        assert!(argv.iter().any(|arg| arg == "--security-opt"));
+        assert!(argv.iter().any(|arg| arg == "no-new-privileges"));
+        let user = argv
+            .iter()
+            .position(|arg| arg == "--user")
+            .map(|at| argv[at + 1].as_str())
+            .expect("container user");
+        assert!(!user.is_empty() && user.contains(':'), "{user}");
     }
 
     #[test]
@@ -1964,6 +2068,41 @@ mod tests {
             .prepare(&spec, &request(&spec), &BTreeMap::new())
             .unwrap_err();
         assert_eq!(error.code, SandboxErrorCode::CapabilityUnavailable);
+    }
+
+    #[test]
+    fn request_cwd_cannot_traverse_out_of_the_workspace() {
+        let spec = spec(SandboxMode::FullAccess, NetworkPolicy::Unrestricted);
+        let mut request = request(&spec);
+        request.cwd = format!(
+            "{}{}..{}escape",
+            spec.workspace,
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR
+        );
+        let error = HostBackend
+            .prepare(&spec, &request, &BTreeMap::new())
+            .unwrap_err();
+        assert_eq!(error.code, SandboxErrorCode::FilesystemDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_cwd_symlink_outside_the_workspace_is_denied() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("escape")).unwrap();
+        let mut spec = spec(SandboxMode::FullAccess, NetworkPolicy::Unrestricted);
+        spec.workspace = workspace.to_string_lossy().into_owned();
+        let mut request = request(&spec);
+        request.cwd = workspace.join("escape").to_string_lossy().into_owned();
+        let error = HostBackend
+            .prepare(&spec, &request, &BTreeMap::new())
+            .unwrap_err();
+        assert_eq!(error.code, SandboxErrorCode::FilesystemDenied);
     }
 
     #[test]

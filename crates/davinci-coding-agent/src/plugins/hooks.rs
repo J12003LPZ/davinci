@@ -126,19 +126,23 @@ pub fn parse_hook_document(doc: &Value, out: &mut Vec<PluginHook>, unsupported: 
     out.sort_by(|a, b| a.event.cmp(&b.event));
 }
 
-/// Fingerprint of everything a hook can execute: the hook definitions plus
+/// Fingerprint of everything a plugin can execute: the hook definitions plus
 /// the whole plugin tree except `.git`. A hook runs through a shell and may
 /// reach any plugin file (an unbraced `$CLAUDE_PLUGIN_ROOT`, a script that
 /// imports a library), so no subset of files is safe to leave out and no file
 /// is large enough to trust by size and mtime alone.
+///
+/// The same digest gates a plugin's MCP servers, so it is computed even when
+/// `hooks` is empty. A symlink that cannot be resolved inside the plugin, or
+/// an unreadable entry, makes the tree unapprovable and returns `None`.
 pub fn digest(root: &Path, hooks: &[PluginHook]) -> Option<String> {
-    if hooks.is_empty() {
-        return None;
-    }
+    let canonical_root = std::fs::canonicalize(root).ok()?;
     let mut hasher = Sha256::new();
     hasher.update(definitions_json(hooks));
     hasher.update([0]);
-    hash_tree(root, &mut hasher);
+    if !hash_tree(root, &canonical_root, &mut hasher) {
+        return None;
+    }
     Some(hex(&hasher.finalize()))
 }
 
@@ -149,9 +153,6 @@ pub fn digest(root: &Path, hooks: &[PluginHook]) -> Option<String> {
 pub fn digest_cached(root: &Path, hooks: &[PluginHook]) -> Option<String> {
     type Cache = Mutex<BTreeMap<(PathBuf, String), Option<String>>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
-    if hooks.is_empty() {
-        return None;
-    }
     let key = (root.to_path_buf(), definitions_json(hooks));
     let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
     if let Some(found) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
@@ -185,9 +186,6 @@ pub fn digest_unless_unchanged(root: &Path, hooks: &[PluginHook]) -> Option<Stri
 fn digest_with_metadata_cache(root: &Path, hooks: &[PluginHook]) -> Option<String> {
     type Cache = Mutex<BTreeMap<(PathBuf, String), (String, Option<String>)>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
-    if hooks.is_empty() {
-        return None;
-    }
     let key = (root.to_path_buf(), definitions_json(hooks));
     let fingerprint = tree_fingerprint(root);
     let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
@@ -221,23 +219,16 @@ fn tree_fingerprint(root: &Path) -> String {
         hasher.update([0]);
         match std::fs::symlink_metadata(entry.path()) {
             Ok(meta) => {
-                let modified = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                hasher.update(format!("{:?}:{}:{modified}", meta.file_type(), meta.len()));
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    hasher.update(format!(
-                        ":{}.{}:{}:{}",
-                        meta.ctime(),
-                        meta.ctime_nsec(),
-                        meta.ino(),
-                        meta.dev()
-                    ));
+                fingerprint_metadata(&mut hasher, &meta);
+                // A link's own metadata never changes when its target does;
+                // include the resolved target so a cached digest is not stale.
+                if meta.file_type().is_symlink() {
+                    if let Ok(target) = std::fs::canonicalize(entry.path()) {
+                        hasher.update(target.to_string_lossy().as_bytes());
+                        if let Ok(target_meta) = std::fs::metadata(&target) {
+                            fingerprint_metadata(&mut hasher, &target_meta);
+                        }
+                    }
                 }
             }
             Err(_) => hasher.update(b"<unreadable>"),
@@ -245,6 +236,25 @@ fn tree_fingerprint(root: &Path) -> String {
         hasher.update([0]);
     }
     hex(&hasher.finalize())
+}
+
+#[cfg(unix)]
+fn fingerprint_metadata(hasher: &mut Sha256, meta: &std::fs::Metadata) {
+    use std::os::unix::fs::MetadataExt;
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    hasher.update(format!("{:?}:{}:{modified}", meta.file_type(), meta.len()));
+    hasher.update(format!(
+        ":{}.{}:{}:{}",
+        meta.ctime(),
+        meta.ctime_nsec(),
+        meta.ino(),
+        meta.dev()
+    ));
 }
 
 fn definitions_json(hooks: &[PluginHook]) -> String {
@@ -266,15 +276,17 @@ fn definitions_json(hooks: &[PluginHook]) -> String {
     .to_string()
 }
 
-fn hash_tree(root: &Path, hasher: &mut Sha256) {
+fn hash_tree(root: &Path, canonical_root: &Path, hasher: &mut Sha256) -> bool {
     let walker = walkdir::WalkDir::new(root)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
         .filter_entry(|entry| entry.file_name() != ".git");
+    let mut clean = true;
     for entry in walker {
         let Ok(entry) = entry else {
             hasher.update(b"<unreadable>");
+            clean = false;
             continue;
         };
         if entry.file_type().is_dir() {
@@ -284,30 +296,62 @@ fn hash_tree(root: &Path, hasher: &mut Sha256) {
         hasher.update(rel_path.to_string_lossy().replace('\\', "/").as_bytes());
         hasher.update([0]);
         if entry.file_type().is_symlink() {
-            let target = std::fs::read_link(entry.path()).unwrap_or_default();
-            hasher.update(b"L");
-            hasher.update(target.to_string_lossy().as_bytes());
-        } else {
-            match std::fs::File::open(entry.path()) {
-                Ok(mut file) => {
-                    use std::io::Read as _;
-                    hasher.update(b"C");
-                    let mut buffer = [0u8; 64 * 1024];
-                    loop {
-                        match file.read(&mut buffer) {
-                            Ok(0) => break,
-                            Ok(read) => hasher.update(&buffer[..read]),
-                            Err(_) => {
-                                hasher.update(b"<unreadable>");
-                                break;
-                            }
-                        }
-                    }
+            let Ok(target) = std::fs::canonicalize(entry.path()) else {
+                hasher.update(b"L<unresolved>");
+                hasher.update([0]);
+                clean = false;
+                continue;
+            };
+            if !target.starts_with(canonical_root) {
+                // A link outside the approved tree would let its target change
+                // without invalidating the approval, so fail closed.
+                hasher.update(b"L<outside>");
+                clean = false;
+            } else if target.is_file() {
+                hasher.update(b"C");
+                if !hash_file(&target, hasher) {
+                    clean = false;
                 }
-                Err(_) => hasher.update(b"<unreadable>"),
+            } else {
+                // WalkDir does not descend a link. Approving it would cover
+                // only the link text, so refuse rather than under-hash.
+                hasher.update(b"L<directory>");
+                clean = false;
             }
+        } else if entry.file_type().is_file() {
+            hasher.update(b"C");
+            if !hash_file(entry.path(), hasher) {
+                clean = false;
+            }
+        } else {
+            hasher.update(b"U");
+            clean = false;
         }
         hasher.update([0]);
+    }
+    clean
+}
+
+fn hash_file(path: &Path, hasher: &mut Sha256) -> bool {
+    use std::io::Read as _;
+    match std::fs::File::open(path) {
+        Ok(mut file) => {
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                match file.read(&mut buffer) {
+                    Ok(0) => return true,
+                    Ok(read) => hasher.update(&buffer[..read]),
+                    Err(_) => {
+                        hasher.update(b"<unreadable>");
+                        return false;
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            hasher.update(b"<unreadable>");
+            false
+        }
     }
 }
 
@@ -808,7 +852,34 @@ mod tests {
 
         std::fs::write(root.join(".git/HEAD"), "ref").unwrap();
         assert_eq!(digest(root, &hooks).unwrap(), third, ".git is not hashed");
-        assert_eq!(digest(root, &[]), None);
+        // Plugins with only MCP servers still need a tree digest for approval.
+        assert!(digest(root, &[]).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_outside_the_plugin_makes_the_tree_unapprovable() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("plugin");
+        let outside = dir.path().join("outside.sh");
+        std::fs::create_dir(root.as_path()).unwrap();
+        std::fs::write(&outside, "echo outside").unwrap();
+        symlink(&outside, root.join("run.sh")).unwrap();
+        assert!(digest(&root, &[]).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_the_plugin_is_hashed_through_its_target() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("real.sh"), "echo one").unwrap();
+        symlink(root.join("real.sh"), root.join("run.sh")).unwrap();
+        let first = digest(root, &[]).unwrap();
+        std::fs::write(root.join("real.sh"), "echo two").unwrap();
+        assert_ne!(digest(root, &[]).unwrap(), first);
     }
 
     #[test]

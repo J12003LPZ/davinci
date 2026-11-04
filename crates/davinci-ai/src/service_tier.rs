@@ -33,9 +33,10 @@ impl CodexServiceTier {
         if self != Self::Fast || model.api != "openai-codex-responses" {
             return Ok(());
         }
-        let auth_path = crate::default_auth_path();
+        let auth_path = crate::default_auth_path().ok();
         let capability = auth_path
-            .parent()
+            .as_deref()
+            .and_then(|path| path.parent())
             .map(|directory| crate::fast_capability_for_model(directory, &model.id))
             .unwrap_or(crate::FastCapability::Unknown);
         self.validate_capability(capability, &model.id)

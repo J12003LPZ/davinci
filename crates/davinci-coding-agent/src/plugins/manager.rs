@@ -101,15 +101,20 @@ pub fn plugin_rows(agent_dir: &Path) -> Vec<ManagedRow> {
             }
             match super::locate(key, record).and_then(|path| manifest::load_plugin(&path)) {
                 Ok(plugin) => {
+                    let subject = if plugin.hooks.is_empty() && !plugin.mcp_servers.is_empty() {
+                        "MCP servers"
+                    } else {
+                        "hooks"
+                    };
                     let hooks = match &plugin.hooks_digest {
-                        None => "no hooks",
+                        None => format!("no {subject}"),
                         Some(digest) if record.hooks_approved.as_ref() == Some(digest) => {
-                            "hooks approved"
+                            format!("{subject} approved")
                         }
                         Some(_) if record.hooks_approved.is_some() => {
-                            "hooks changed, approval needed"
+                            format!("{subject} changed, approval needed")
                         }
-                        Some(_) => "hooks need approval",
+                        Some(_) => format!("{subject} need approval"),
                     };
                     let needs_approval = plugin.hooks_digest.is_some()
                         && record.hooks_approved != plugin.hooks_digest;
@@ -126,7 +131,7 @@ pub fn plugin_rows(agent_dir: &Path) -> Vec<ManagedRow> {
                             .map(|v| format!("v{v}"))
                             .unwrap_or_default(),
                         plugin.component_summary(),
-                        hooks.to_string(),
+                        hooks,
                     ]
                     .into_iter()
                     .filter(|part| !part.is_empty())
@@ -394,6 +399,10 @@ fn mcp_sources(agent_dir: &Path, files: &McpFiles) -> BTreeMap<String, (McpSourc
         Vec::new()
     };
     for active in plugins {
+        // Approval covers the plugin's MCP servers exactly as it covers hooks.
+        if !active.hooks_approved() {
+            continue;
+        }
         for (server, config) in &active.plugin.mcp_servers {
             // `ActivePlugins::mcp_servers` skips entries that do not parse.
             if serde_json::from_value::<davinci_mcp::ServerConfig>(config.clone()).is_err() {

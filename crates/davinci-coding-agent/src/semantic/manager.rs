@@ -326,6 +326,15 @@ impl LspServerManager {
 
     /// Registers or updates server configuration for a workspace root.
     pub fn register_server(&self, config: LspServerConfig) -> Result<(), String> {
+        // A configured digest is an integrity control, not documentation.
+        if config.executable_hash.is_some() {
+            let executable = if config.executable.is_absolute() {
+                config.executable.clone()
+            } else {
+                config.root_dir.join(&config.executable)
+            };
+            verify_executable(&executable, config.executable_hash.as_deref())?;
+        }
         let mut sessions = self.sessions.lock().unwrap();
         let root = config.root_dir.clone();
         let session = LspServerSession {
@@ -567,6 +576,24 @@ mod tests {
 
         std::fs::write(&bin_path, b"malicious-tampered-binary").unwrap();
         assert!(verify_executable(&bin_path, Some(&hash_v1)).is_err());
+    }
+
+    #[test]
+    fn register_server_refuses_a_mismatched_executable_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let executable = tmp.path().join("server");
+        std::fs::write(&executable, b"replaced-binary").unwrap();
+        let config = LspServerConfig {
+            executable: executable.clone(),
+            args: Vec::new(),
+            languages: vec!["rust".into()],
+            root_dir: tmp.path().to_path_buf(),
+            policy: ServerExecutionPolicy::NavigationOnly,
+            idle_timeout: Duration::from_secs(300),
+            env_allowlist: Vec::new(),
+            executable_hash: Some("00".repeat(32)),
+        };
+        assert!(LspServerManager::new().register_server(config).is_err());
     }
 
     #[test]

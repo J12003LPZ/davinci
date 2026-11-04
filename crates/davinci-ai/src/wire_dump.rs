@@ -61,12 +61,16 @@ pub fn write_current(kind: &str, value: &serde_json::Value) {
 
 /// Dump failures must never prevent a provider request from completing.
 pub fn write_to(dir: &Path, seq: u64, kind: &str, value: &serde_json::Value) {
-    if !matches!(kind, "logical" | "wire" | "usage") || std::fs::create_dir_all(dir).is_err() {
+    if !matches!(kind, "logical" | "wire" | "usage")
+        || davinci_sys::fs::create_private_dir_all(dir).is_err()
+    {
         return;
     }
     let path = dir.join(format!("{seq:04}-{}-{kind}.json", std::process::id()));
     if let Ok(text) = serde_json::to_string_pretty(value) {
-        let _ = std::fs::write(path, text);
+        // Dumps contain conversation content, so the file is owner-only on
+        // Unix even when the user picked a shared directory.
+        let _ = davinci_sys::fs::atomic_write_private(&path, text.as_bytes());
     }
 }
 
@@ -96,6 +100,22 @@ mod tests {
         .unwrap();
         assert_eq!(logical["input"][1], 2);
         assert!(dir.path().join(name("usage")).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_files_and_directory_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("shared");
+        write_to(&dump, 1, "wire", &serde_json::json!({"content": "private"}));
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dump), 0o700);
+        assert_eq!(
+            mode(&dump.join(format!("0001-{}-wire.json", std::process::id()))),
+            0o600
+        );
     }
 
     #[test]

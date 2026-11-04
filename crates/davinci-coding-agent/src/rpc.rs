@@ -19,6 +19,11 @@ pub const COMPACTION_PROMPT_ERROR: &str =
 pub const STREAMING_PROMPT_ERROR: &str =
     "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
 
+/// A local client must not be able to grow these maps without bound.
+const MAX_PENDING_UI: usize = 1024;
+const MAX_CONTROL_OPERATIONS: usize = 1024;
+const MAX_RPC_ID_BYTES: usize = 256;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RpcCommand {
     #[serde(default)]
@@ -273,6 +278,27 @@ pub fn resolve_scoped_models(models: &[Model], patterns: &[String]) -> Vec<Model
         .into_iter()
         .map(|item: ScopedModelRef| item.model)
         .collect()
+}
+
+/// Record one pending UI answer. Ids are client-supplied, so they are bounded
+/// and the map refuses new entries once full; a repeat for a live id replaces
+/// its value instead of growing the map.
+fn record_ui_response(
+    runtime: &mut RpcRuntime,
+    id: Option<&str>,
+    command: RpcCommand,
+) -> Result<(), String> {
+    let Some(id) = id else {
+        return Err("UI response requires an id".into());
+    };
+    if id.is_empty() || id.len() > MAX_RPC_ID_BYTES || id.chars().any(char::is_control) {
+        return Err("invalid UI response id".into());
+    }
+    if !runtime.pending_ui.contains_key(id) && runtime.pending_ui.len() >= MAX_PENDING_UI {
+        return Err("too many pending UI responses".into());
+    }
+    runtime.pending_ui.insert(id.to_string(), command);
+    Ok(())
 }
 
 pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse {
@@ -788,18 +814,14 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
             runtime.bash_aborted = true;
             ok(id, &kind, None)
         }
-        "extension_ui_response" => {
-            if let Some(response_id) = id.clone() {
-                runtime.pending_ui.insert(response_id, command);
-            }
-            ok(id, &kind, None)
-        }
-        "decision_response" => {
-            if let Some(response_id) = id.clone() {
-                runtime.pending_ui.insert(response_id, command);
-            }
-            ok(id, &kind, None)
-        }
+        "extension_ui_response" => match record_ui_response(runtime, id.as_deref(), command) {
+            Ok(()) => ok(id, &kind, None),
+            Err(message) => fail(id, &kind, message),
+        },
+        "decision_response" => match record_ui_response(runtime, id.as_deref(), command) {
+            Ok(()) => ok(id, &kind, None),
+            Err(message) => fail(id, &kind, message),
+        },
         "agent_control" => {
             let Some(agent_id_str) = command.agent_id.as_deref() else {
                 return fail(id, &kind, "Missing agentId parameter".into());
@@ -808,16 +830,20 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 return fail(id, &kind, format!("Invalid agentId: {agent_id_str}"));
             };
             let action_name = command.action.as_deref().unwrap_or("inspect");
+            let op_id = command
+                .operation_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            if !runtime.control_operations.contains_key(&op_id)
+                && runtime.control_operations.len() >= MAX_CONTROL_OPERATIONS
+            {
+                return fail(id, &kind, "too many recorded control operations".into());
+            }
             let Some(runtime_handle) = &runtime.agent.runtime else {
                 return fail(id, &kind, "No active runtime handle available".into());
             };
             let controller =
                 davinci_agent::runtime::WorkerController::new(runtime_handle.registry.clone());
-
-            let op_id = command
-                .operation_id
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
             match action_name {
                 "inspect" => {
@@ -1795,6 +1821,53 @@ mod tests {
                 .and_then(|item| item.value.clone()),
             Some("a".into())
         );
+    }
+
+    #[test]
+    fn pending_ui_is_bounded_and_ids_are_validated() {
+        let mut runtime = RpcRuntime::new(
+            davinci_agent::Agent::new_builtin(PromptProfile::Stable),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp"),
+        );
+        for index in 0..MAX_PENDING_UI {
+            record_ui_response(
+                &mut runtime,
+                Some(&format!("ui-{index}")),
+                RpcCommand::default(),
+            )
+            .unwrap();
+        }
+        let full = record_ui_response(&mut runtime, Some("one-more"), RpcCommand::default());
+        assert!(full.unwrap_err().contains("too many"));
+        record_ui_response(&mut runtime, Some("ui-0"), RpcCommand::default()).unwrap();
+
+        let oversized = "x".repeat(MAX_RPC_ID_BYTES + 1);
+        assert!(record_ui_response(&mut runtime, Some(&oversized), RpcCommand::default()).is_err());
+        assert!(record_ui_response(&mut runtime, None, RpcCommand::default()).is_err());
+        assert!(record_ui_response(&mut runtime, Some("bad\nid"), RpcCommand::default()).is_err());
+
+        runtime.control_operations.clear();
+        for index in 0..MAX_CONTROL_OPERATIONS {
+            runtime
+                .control_operations
+                .insert(format!("op-{index}"), Value::Null);
+        }
+        let response = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                id: Some("control".into()),
+                kind: "agent_control".into(),
+                agent_id: Some("00000000-0000-0000-0000-000000000000".into()),
+                operation_id: Some("new-operation".into()),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(!response.success);
+        assert!(response
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("too many")));
     }
 
     #[test]

@@ -32,11 +32,7 @@ pub fn log(line: &str) {
         Sink::Off => {}
         Sink::Stderr => eprintln!("[pi-ai] {line}"),
         Sink::File(path) => {
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
+            if let Ok(mut file) = davinci_sys::fs::open_append_private(path) {
                 let _ = writeln!(file, "[pi-ai] {line}");
             }
         }

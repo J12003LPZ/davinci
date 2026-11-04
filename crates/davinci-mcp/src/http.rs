@@ -36,8 +36,34 @@ struct Reply {
     value: Value,
 }
 
+/// Reject cleartext endpoints except loopback, so `${ENV}`-expanded bearer
+/// headers are never sent over a plain-HTTP connection. `fixture:` URLs are
+/// the test-only in-process fixture.
+fn validate_endpoint(url: &str) -> Result<()> {
+    if url.starts_with("fixture:") {
+        return Ok(());
+    }
+    let parsed =
+        url::Url::parse(url).map_err(|err| Error::Protocol(format!("invalid MCP URL: {err}")))?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => match parsed.host() {
+            Some(url::Host::Domain(host)) if host.eq_ignore_ascii_case("localhost") => Ok(()),
+            Some(url::Host::Ipv4(address)) if address.is_loopback() => Ok(()),
+            Some(url::Host::Ipv6(address)) if address.is_loopback() => Ok(()),
+            _ => Err(Error::Protocol(
+                "MCP HTTP endpoints must use https unless they are loopback".into(),
+            )),
+        },
+        other => Err(Error::Protocol(format!(
+            "unsupported MCP URL scheme `{other}`; use https"
+        ))),
+    }
+}
+
 impl HttpTransport {
     pub fn new(url: &str, headers: BTreeMap<String, String>) -> Result<Self> {
+        validate_endpoint(url)?;
         let fixture = load_fixture(url);
         Ok(Self {
             url: url.to_string(),
@@ -552,6 +578,32 @@ fn sse_events(text: &str) -> std::vec::IntoIter<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn clear_text_remote_endpoints_are_rejected_but_loopback_and_fixtures_are_allowed() {
+        for rejected in [
+            "http://example.com/mcp",
+            "http://10.0.0.1/mcp",
+            "ftp://example.com/mcp",
+        ] {
+            assert!(
+                HttpTransport::new(rejected, BTreeMap::new()).is_err(),
+                "{rejected}"
+            );
+        }
+        for allowed in [
+            "https://example.com/mcp",
+            "http://localhost/mcp",
+            "http://127.0.0.1:8080/mcp",
+            "http://[::1]:8080/mcp",
+            "fixture:/nonexistent",
+        ] {
+            assert!(
+                HttpTransport::new(allowed, BTreeMap::new()).is_ok(),
+                "{allowed}"
+            );
+        }
+    }
 
     #[test]
     fn agent_keeps_the_redirect_budget_and_header_override_behavior() {

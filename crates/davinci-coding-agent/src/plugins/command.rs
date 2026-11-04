@@ -20,8 +20,8 @@ plugin install <name>[@marketplace]    install or replace (preserves enabled sta
 plugin import [claude|codex] [<key>|--all]
                                        list or adopt Claude Code / Codex plugins
 plugin info <plugin>                   components, hooks and warnings
-plugin approve <plugin>                allow the plugin's listed hooks to run
-plugin revoke <plugin>                 stop its hooks
+plugin approve <plugin>                allow the plugin's hooks and MCP servers to run
+plugin revoke <plugin>                 stop its hooks and MCP servers
 plugin test <plugin>                   run its approved SessionStart hooks once
 plugin enable|disable <plugin>
 plugin update <plugin>                 reinstall from its marketplace
@@ -225,6 +225,14 @@ fn install(agent_dir: &Path, target: &str) -> Result<String, String> {
 fn append_hook_notice(out: &mut String, key: &str, record: &InstalledPlugin, plugin: &Plugin) {
     match hook_state(record, plugin) {
         "none" | "approved" => {}
+        _ if plugin.hooks.is_empty() => {
+            let _ = write!(
+                out,
+                "\n\nThis plugin starts MCP servers: local commands that run on your machine.\n{}\
+                 They stay off until you approve them: `plugin approve {key}`.",
+                describe_mcp_servers(plugin)
+            );
+        }
         _ => {
             let _ = write!(
                 out,
@@ -234,6 +242,29 @@ fn append_hook_notice(out: &mut String, key: &str, record: &InstalledPlugin, plu
             );
         }
     }
+}
+
+fn describe_mcp_servers(plugin: &Plugin) -> String {
+    let mut out = String::new();
+    for (name, config) in &plugin.mcp_servers {
+        if let Some(url) = config.get("url").and_then(Value::as_str) {
+            let _ = writeln!(out, "  {name}: {url}");
+            continue;
+        }
+        let command = config.get("command").and_then(Value::as_str).unwrap_or("?");
+        let args = config
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|args| {
+                args.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        let _ = writeln!(out, "  {name}: {command} {args}");
+    }
+    out
 }
 
 fn describe_hooks(plugin: &Plugin) -> String {
@@ -435,7 +466,12 @@ fn info(agent_dir: &Path, target: &str) -> Result<String, String> {
             let _ = writeln!(out, "{label}: {value}");
         }
     }
-    let _ = writeln!(out, "hooks: {}", hook_state(&record, &plugin));
+    let approval = if plugin.hooks.is_empty() && !plugin.mcp_servers.is_empty() {
+        "MCP servers"
+    } else {
+        "hooks"
+    };
+    let _ = writeln!(out, "{approval}: {}", hook_state(&record, &plugin));
     out.push_str(&describe_hooks(&plugin));
     for unsupported in &plugin.unsupported_hooks {
         let _ = writeln!(out, "  not supported, never run: {unsupported}");
@@ -448,19 +484,33 @@ fn info(agent_dir: &Path, target: &str) -> Result<String, String> {
 
 fn approve(agent_dir: &Path, target: &str) -> Result<String, String> {
     let (key, _, plugin) = load_installed(agent_dir, target)?;
+    if plugin.hooks.is_empty() && plugin.mcp_servers.is_empty() {
+        return Ok(format!("{key} has no hooks or MCP servers to approve."));
+    }
     // Hash afresh: approval must cover the files as they are now, not as a
     // cached digest from earlier in this process saw them.
     let Some(digest) = super::hooks::digest(&plugin.root, &plugin.hooks) else {
-        return Ok(format!("{key} has no hooks to approve."));
+        return Err(format!(
+            "{key} contains a symlink outside its root or an unreadable file, so it cannot be approved."
+        ));
     };
     store::update(agent_dir, |file| {
         let record = file.plugins.get_mut(&key).ok_or("plugin disappeared")?;
         record.hooks_approved = Some(digest);
         Ok(())
     })?;
+    let what = match (plugin.hooks.is_empty(), plugin.mcp_servers.is_empty()) {
+        (true, false) => "MCP servers",
+        (false, true) => "hooks",
+        (false, false) => "hooks and MCP servers",
+        (true, true) => unreachable!(),
+    };
+    let mut details = describe_hooks(&plugin);
+    if !plugin.mcp_servers.is_empty() {
+        details.push_str(&describe_mcp_servers(&plugin));
+    }
     Ok(format!(
-        "Approved these hooks for {key}:\n{}Any change to them or to the plugin's files turns them off until you approve again.\n{RELOAD_HINT}",
-        describe_hooks(&plugin)
+        "Approved {what} for {key}:\n{details}Any change to them or to the plugin's files turns them off until you approve again.\n{RELOAD_HINT}"
     ))
 }
 

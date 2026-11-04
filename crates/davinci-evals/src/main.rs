@@ -420,10 +420,9 @@ fn resolve_runtime_config(
         permission_mode: permission_mode.to_string(),
         timeout: Duration::from_secs(300),
         clean_agent_dir: artifact_root.join("agent"),
-        auth_source: {
-            let path = davinci_ai::default_auth_path();
-            path.is_file().then_some(path)
-        },
+        auth_source: davinci_ai::default_auth_path()
+            .ok()
+            .filter(|path| path.is_file()),
         allowed_env,
     })
 }

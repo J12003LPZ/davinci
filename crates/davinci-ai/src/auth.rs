@@ -86,7 +86,8 @@ pub struct ResolvedAuth {
 }
 
 pub struct AuthStorage {
-    path: PathBuf,
+    /// `None` for a memory-only store; nothing is read from or written to disk.
+    path: Option<PathBuf>,
     data: HashMap<String, Credential>,
     runtime_overrides: HashMap<String, String>,
 }
@@ -98,7 +99,7 @@ impl AuthStorage {
 
     pub fn in_memory() -> Self {
         Self {
-            path: std::env::temp_dir().join(format!("pi-auth-memory-{}.json", std::process::id())),
+            path: None,
             data: HashMap::new(),
             runtime_overrides: HashMap::new(),
         }
@@ -113,7 +114,7 @@ impl AuthStorage {
             HashMap::new()
         };
         Ok(Self {
-            path: path.to_path_buf(),
+            path: Some(path.to_path_buf()),
             data,
             runtime_overrides: HashMap::new(),
         })
@@ -370,20 +371,29 @@ impl AuthStorage {
         Ok(true)
     }
 
-    fn lock_path(&self) -> PathBuf {
-        let mut name = self.path.as_os_str().to_owned();
+    fn lock_path(&self) -> Option<PathBuf> {
+        let path = self.path.as_ref()?;
+        let mut name = path.as_os_str().to_owned();
         name.push(".lock");
-        PathBuf::from(name)
+        Some(PathBuf::from(name))
     }
 
-    fn lock(&self) -> Result<davinci_sys::lock::ExclusiveFileLock, AuthStorageError> {
+    fn lock(&self) -> Result<Option<davinci_sys::lock::ExclusiveFileLock>, AuthStorageError> {
+        let Some(path) = self.lock_path() else {
+            // A memory-only store has no file to serialize access to.
+            return Ok(None);
+        };
         const AUTH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-        davinci_sys::lock::ExclusiveFileLock::acquire(&self.lock_path(), AUTH_LOCK_WAIT)
+        davinci_sys::lock::ExclusiveFileLock::acquire(&path, AUTH_LOCK_WAIT)
+            .map(Some)
             .map_err(|err| AuthStorageError::Write(format!("auth.json is busy: {err}")))
     }
 
     fn read_disk(&self) -> Result<HashMap<String, Credential>, AuthStorageError> {
-        match fs::read_to_string(&self.path) {
+        let Some(path) = &self.path else {
+            return Ok(self.data.clone());
+        };
+        match fs::read_to_string(path) {
             Ok(raw) => {
                 serde_json::from_str(&raw).map_err(|err| AuthStorageError::Invalid(err.to_string()))
             }
@@ -415,10 +425,12 @@ impl AuthStorage {
                 data.remove(provider);
             }
         }
-        let raw = serde_json::to_string_pretty(&data)
-            .map_err(|err| AuthStorageError::Write(err.to_string()))?;
-        davinci_sys::fs::atomic_write_private(&self.path, raw.as_bytes())
-            .map_err(|err| AuthStorageError::Write(err.to_string()))?;
+        if let Some(path) = &self.path {
+            let raw = serde_json::to_string_pretty(&data)
+                .map_err(|err| AuthStorageError::Write(err.to_string()))?;
+            davinci_sys::fs::atomic_write_private(path, raw.as_bytes())
+                .map_err(|err| AuthStorageError::Write(err.to_string()))?;
+        }
         self.data = data;
         Ok(())
     }
@@ -436,10 +448,12 @@ pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
-/// Display form of the credential path. Code that reads or writes
-/// credentials uses [`try_default_auth_path`].
-pub fn default_auth_path() -> PathBuf {
-    try_default_auth_path().unwrap_or_else(|_| PathBuf::from(".davinci/agent/auth.json"))
+/// Display form of the credential path. Returns the same error as
+/// [`try_default_auth_path`] instead of falling back to a relative path in the
+/// current directory, where a future writer could put `auth.json` inside a
+/// repository.
+pub fn default_auth_path() -> Result<PathBuf, AuthStorageError> {
+    try_default_auth_path()
 }
 
 /// The credential file. Without a home directory this fails instead of
@@ -1138,6 +1152,17 @@ mod tests {
             .login_oauth("github-copilot", "token", None, Some(u64::MAX))
             .unwrap();
         assert_eq!(stored_credential_problem("github-copilot", &storage), None);
+    }
+
+    #[test]
+    fn in_memory_storage_has_no_backing_file() {
+        let mut storage = AuthStorage::in_memory();
+        storage.login_api_key("openai", "sk-memory").unwrap();
+        assert!(storage.path.is_none());
+        assert_eq!(
+            storage.get("openai").and_then(|item| item.key.as_deref()),
+            Some("sk-memory")
+        );
     }
 
     #[test]

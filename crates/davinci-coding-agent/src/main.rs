@@ -2021,7 +2021,7 @@ impl ModelRuntimeKey {
                 davinci_ai::models_store_path(&agent_dir),
                 models_json_path(&agent_dir),
                 crate::settings::settings_path(&agent_dir),
-                davinci_ai::default_auth_path(),
+                davinci_ai::try_default_auth_path().unwrap_or_default(),
                 agent_dir.join("extensions"),
             ]
             .into_iter()

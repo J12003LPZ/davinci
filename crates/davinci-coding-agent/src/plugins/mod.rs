@@ -40,7 +40,8 @@ pub struct ActivePlugin {
 }
 
 impl ActivePlugin {
-    /// Hooks run only when the approved digest matches the hooks on disk.
+    /// Hooks and plugin-declared MCP servers run only when the approved
+    /// digest matches the plugin content on disk.
     pub fn hooks_approved(&self) -> bool {
         #[cfg(test)]
         tests::APPROVAL_CHECKS.with(|count| count.set(count.get() + 1));
@@ -252,8 +253,8 @@ impl ActivePlugins {
     }
 
     /// MCP servers as `plugin_<plugin>_<server>` with plugin variables
-    /// expanded. Entries that do not parse are skipped; [`Self::diagnostics`]
-    /// names them.
+    /// expanded. Only approved plugins contribute servers. Entries that do
+    /// not parse are skipped; [`Self::diagnostics`] names them.
     pub fn mcp_servers(&self) -> BTreeMap<String, davinci_mcp::ServerConfig> {
         self.parsed_mcp_servers().0
     }
@@ -273,6 +274,15 @@ impl ActivePlugins {
         let mut out = BTreeMap::new();
         let mut errors = Vec::new();
         for active in &self.plugins {
+            // A plugin's MCP servers are executable content from the plugin
+            // manifest; like hooks, they start only after explicit approval.
+            if !active.plugin.mcp_servers.is_empty() && !active.hooks_approved() {
+                errors.push(format!(
+                    "plugin {} MCP servers need approval; run `plugin approve {}`",
+                    active.plugin.name, active.key
+                ));
+                continue;
+            }
             let vars = [
                 (
                     "${CLAUDE_PLUGIN_ROOT}",
@@ -1316,19 +1326,21 @@ mod tests {
         assert_eq!(profiles[0].tools, vec!["read", "find", "edit"]);
         assert_eq!(profiles[0].model, "inherit");
         assert_eq!(profiles[0].permission_mode, "edits");
-        let servers = plugins.mcp_servers();
-        let server = &servers["plugin_demo_srv"];
-        assert!(server.args[0].ends_with("server.js"));
-        assert!(!server.args[0].contains("${"));
+        // MCP servers are executable plugin content and stay off until approval.
+        assert!(!plugins.mcp_servers().contains_key("plugin_demo_srv"));
 
         // Unapproved: the hook never runs.
         assert!(!plugins.has_hooks(HookEvent::PreToolUse));
         assert!(!plugins.has_matching_hook(HookEvent::PreToolUse, "Bash"));
 
-        // Approved: it runs; a changed hook file revokes it.
+        // Approved: hooks and MCP servers run; a changed file revokes both.
         install_fixture(&agent_dir, &root, true);
         let plugins = active(&agent_dir);
         assert!(plugins.plugins[0].hooks_approved());
+        let servers = plugins.mcp_servers();
+        let server = &servers["plugin_demo_srv"];
+        assert!(server.args[0].ends_with("server.js"));
+        assert!(!server.args[0].contains("${"));
         assert!(plugins.has_matching_hook(HookEvent::PreToolUse, "Bash"));
         assert!(!plugins.has_matching_hook(HookEvent::PreToolUse, "Read"));
         write(
@@ -1337,6 +1349,32 @@ mod tests {
         );
         let plugins = active(&agent_dir);
         assert!(!plugins.plugins[0].hooks_approved());
+    }
+
+    #[test]
+    fn mcp_only_plugins_require_approval_before_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let _homes = FakeHomes::new(dir.path());
+        let agent_dir = dir.path().join("agent");
+        let root = dir.path().join("demo");
+        write(
+            &root.join(".claude-plugin/plugin.json"),
+            r#"{"name":"demo"}"#,
+        );
+        write(&root.join(".mcp.json"), r#"{"srv":{"command":"tool"}}"#);
+        install_fixture(&agent_dir, &root, false);
+
+        let plugins = active(&agent_dir);
+        assert!(plugins.mcp_servers().is_empty());
+        assert!(plugins
+            .diagnostics()
+            .iter()
+            .any(|line| line.contains("MCP servers need approval")));
+
+        install_fixture(&agent_dir, &root, true);
+        assert!(active(&agent_dir)
+            .mcp_servers()
+            .contains_key("plugin_demo_srv"));
     }
 
     #[test]
@@ -1383,7 +1421,7 @@ mod tests {
             &root.join(".mcp.json"),
             r#"{"good":{"command":"node"},"bad":{"command":42}}"#,
         );
-        install_fixture(&agent_dir, &root, false);
+        install_fixture(&agent_dir, &root, true);
         store::update(&agent_dir, |file| {
             file.plugins.insert(
                 "ghost@mk".into(),
