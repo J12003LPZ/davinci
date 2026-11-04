@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -519,8 +518,6 @@ pub struct Settings {
     )]
     pub language_intelligence:
         Option<crate::native_extensions::language_intelligence::LanguageIntelligenceConfig>,
-    #[serde(default, rename = "languageServers")]
-    pub language_servers: Option<HashMap<String, LspServerConfigSetting>>,
     /// Settings keys this struct does not model (for example `subagents`,
     /// written by extensions). Except for retired keys, they are carried through
     /// untouched so `pi install`/`pi remove` cannot drop another tool's config.
@@ -539,6 +536,9 @@ fn parse_extra_settings<'de, D: serde::Deserializer<'de>>(
 ) -> Result<serde_json::Map<String, serde_json::Value>, D::Error> {
     let mut extra = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
     extra.remove("decisionIntelligence");
+    // `languageServers` was parsed but never consumed; it stays retired so
+    // users are not left believing its executableHash pins a binary.
+    extra.remove("languageServers");
     Ok(extra)
 }
 
@@ -550,29 +550,11 @@ fn serialize_extra_settings<S: serde::Serializer>(
 
     let mut map = serializer.serialize_map(None)?;
     for (key, value) in extra {
-        if key != "decisionIntelligence" {
+        if key != "decisionIntelligence" && key != "languageServers" {
             map.serialize_entry(key, value)?;
         }
     }
     map.end()
-}
-
-/// Language server configuration from settings.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct LspServerConfigSetting {
-    pub executable: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub languages: Vec<String>,
-    #[serde(default, rename = "envAllowlist")]
-    pub env_allowlist: Vec<String>,
-    #[serde(default)]
-    pub policy: Option<String>,
-    #[serde(default)]
-    pub trusted: Option<bool>,
-    #[serde(default, rename = "executableHash")]
-    pub executable_hash: Option<String>,
 }
 
 /// `webSearch` in settings: provider keys for the `web_search` tool.
@@ -2048,6 +2030,26 @@ mod tests {
         );
         assert_eq!(output["workerResources"], input["workerResources"]);
     }
+
+    #[test]
+    fn retired_language_server_override_is_dropped() {
+        let input = serde_json::json!({
+            "languageServers": {
+                "typescript": {
+                    "executable": "./node_modules/.bin/typescript-language-server",
+                    "executableHash": "00"
+                }
+            }
+        });
+        let settings: super::Settings = serde_json::from_value(input).unwrap();
+        assert!(
+            !settings.extra.contains_key("languageServers"),
+            "the inert integrity setting must not survive in the passthrough"
+        );
+        let output = serde_json::to_value(settings).unwrap();
+        assert!(output.get("languageServers").is_none());
+    }
+
     #[test]
     fn regression_manifest_globs_obey_package_filters() {
         use super::*;

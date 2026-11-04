@@ -145,7 +145,6 @@ pub fn load_plugin(root: &Path) -> Result<Plugin, String> {
     for doc in &hook_docs {
         hooks::parse_hook_document(doc, &mut plugin.hooks, &mut plugin.unsupported_hooks);
     }
-    plugin.hooks_digest = hooks::digest_cached(&root, &plugin.hooks);
 
     let mut mcp_docs = Vec::new();
     if let Some(value) = manifest.get("mcpServers") {
@@ -170,6 +169,11 @@ pub fn load_plugin(root: &Path) -> Result<Plugin, String> {
                 }
             }
         }
+    }
+    // Plugins with no runnable component need no approval. Hooks and MCP
+    // servers both execute plugin-controlled content and share one digest.
+    if !plugin.hooks.is_empty() || !plugin.mcp_servers.is_empty() {
+        plugin.hooks_digest = hooks::digest_cached(&root, &plugin.hooks);
     }
     Ok(plugin)
 }

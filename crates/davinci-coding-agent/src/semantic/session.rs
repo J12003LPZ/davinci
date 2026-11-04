@@ -31,6 +31,10 @@ pub struct LanguageServerSpec {
     pub program: String,
     pub args: Vec<String>,
     pub language: String,
+    /// Optional SHA-256 the launched executable must match. Projects and
+    /// discovery leave this unset; a caller that pins a binary sets it.
+    #[serde(default)]
+    pub executable_hash: Option<String>,
 }
 
 /// Bounded session registry. It records lifecycle intent but never starts a
@@ -309,6 +313,7 @@ pub fn resolve_language_server(language: &str, root: &Path) -> Option<LanguageSe
         program: program.to_string_lossy().into_owned(),
         args,
         language,
+        executable_hash: None,
     })
 }
 

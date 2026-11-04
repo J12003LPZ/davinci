@@ -53,20 +53,57 @@ pub fn create_new_private(path: &Path) -> io::Result<fs::File> {
     private_options().write(true).create_new(true).open(path)
 }
 
-/// Open `path` for appending, creating it 0600 on Unix when missing.
+/// Open `path` for appending, creating it 0600 on Unix when missing. An
+/// existing file is tightened to 0600 as well, and a symlink is refused so a
+/// planted link cannot redirect private log content somewhere else.
 pub fn open_append_private(path: &Path) -> io::Result<fs::File> {
-    private_options().create(true).append(true).open(path)
+    let mut options = private_options();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.create(true).append(true).open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
 /// Open `path` for reading and writing, creating it 0600 on Unix when missing.
 /// The caller positions the cursor; this is for private append logs that must
 /// inspect and repair their own admitted handle.
 pub fn open_read_write_private(path: &Path) -> io::Result<fs::File> {
-    private_options()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(path)
+    let mut options = private_options();
+    // Refuse to follow a symlink: the caller repairs this handle in place and
+    // must not truncate or append through a link planted in the workspace.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.create(true).read(true).write(true).open(path)
 }
 
 /// Restrict an existing file to its owner (0600 on Unix). No-op elsewhere.
@@ -722,6 +759,28 @@ mod tests {
         create_private_dir_all(&nested).unwrap();
         let mode = std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_open_tightens_existing_files_and_refuses_symlinks() {
+        use std::io::Write as _;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("trace.log");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut file = open_append_private(&path).unwrap();
+        file.write_all(b"new").unwrap();
+        drop(file);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"oldnew");
+
+        let link = dir.path().join("trace-link");
+        symlink(&path, &link).unwrap();
+        assert!(open_append_private(&link).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"oldnew");
     }
 
     #[cfg(unix)]

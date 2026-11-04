@@ -1100,7 +1100,7 @@ pub fn trust_project(agent_dir: &Path, cwd: &Path) -> Step {
 
 pub fn plugins_step(agent_dir: &Path) -> Step {
     const ID: &str = "plugins";
-    const TITLE: &str = "plugin hooks";
+    const TITLE: &str = "plugin execution";
     let active = crate::plugins::active(agent_dir);
     let pending = active
         .plugins
@@ -1112,7 +1112,7 @@ pub fn plugins_step(agent_dir: &Path) -> Step {
         let detail = if active.plugins.is_empty() {
             "no plugins enabled".to_string()
         } else {
-            format!("{} plugin(s), no hooks waiting", active.plugins.len())
+            format!("{} plugin(s), nothing waiting", active.plugins.len())
         };
         return Step::new(ID, TITLE, StepState::Ready, detail);
     }
@@ -1125,7 +1125,10 @@ pub fn plugins_step(agent_dir: &Path) -> Step {
         ID,
         TITLE,
         StepState::Action,
-        format!("hooks of {} wait for approval", pending.join(", ")),
+        format!(
+            "hooks or MCP servers of {} wait for approval",
+            pending.join(", ")
+        ),
     )
     .with_action(format!("read them with /plugins, then {action}"))
 }

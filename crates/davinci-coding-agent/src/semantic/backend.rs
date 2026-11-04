@@ -3,7 +3,8 @@
 use super::documents::DocumentTracker;
 use super::manager::{
     build_client_capabilities, build_initialize_params, build_sanitized_command,
-    parse_server_capabilities, LspServerConfig, ServerExecutionPolicy,
+    parse_server_capabilities, verify_configured_executable, LspServerConfig,
+    ServerExecutionPolicy,
 };
 use super::tools::{is_path_in_root, path_to_uri, uri_to_path};
 use super::transport::{is_unsolicited_effect, lsp_frame, LspFrameParser, RequestTable};
@@ -437,7 +438,7 @@ impl LocalLspSession {
         cache: CacheRuntime,
     ) -> Result<Self, String> {
         let request_timeout = request_timeout.max(Duration::from_millis(1));
-        let config = LspServerConfig {
+        let mut config = LspServerConfig {
             executable: PathBuf::from(&spec.program),
             args: spec.args.clone(),
             languages: vec![spec.language.clone()],
@@ -445,8 +446,9 @@ impl LocalLspSession {
             policy: ServerExecutionPolicy::NavigationOnly,
             idle_timeout: request_timeout,
             env_allowlist: Vec::new(),
-            executable_hash: None,
+            executable_hash: spec.executable_hash.clone(),
         };
+        config.executable = verify_configured_executable(&config)?;
         let mut command = build_sanitized_command(&config);
         command
             .stdin(Stdio::piped())
@@ -1082,6 +1084,28 @@ fn format_server_error(error: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_launch_refuses_a_mismatched_executable_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let spec = super::super::LanguageServerSpec {
+            program: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            args: Vec::new(),
+            language: "rust".into(),
+            executable_hash: Some("00".repeat(32)),
+        };
+        let error = LocalLspSession::launch(
+            &spec,
+            root.path(),
+            Duration::from_secs(5),
+            CacheRuntime::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("hash mismatch"), "{error}");
+    }
     use tempfile::tempdir;
 
     #[test]
@@ -1220,6 +1244,7 @@ mod tests {
                 "--nocapture".into(),
             ],
             language: "rust".into(),
+            executable_hash: None,
         };
         let key = super::super::LazySemanticSessionRegistry::key(root.path(), "rust", "fixture");
         let cache = CacheRuntime::default();

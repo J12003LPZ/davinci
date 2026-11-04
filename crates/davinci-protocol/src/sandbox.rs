@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// A delegated spec cannot grow the backend's argv without bound.
+const MAX_FILESYSTEM_MOUNTS: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxMode {
@@ -239,6 +242,9 @@ impl SandboxSpec {
                 ));
             }
         }
+        if self.filesystem.mounts.len() > MAX_FILESYSTEM_MOUNTS {
+            return Err(SandboxFailure::policy_denied("too many filesystem mounts"));
+        }
         for mount in &self.filesystem.mounts {
             validate_absolute_path(&mount.target, "mount target")?;
             match mount.access {
@@ -249,7 +255,25 @@ impl SandboxSpec {
                         .ok_or_else(|| SandboxFailure::policy_denied("mount source is required"))?;
                     validate_absolute_path(source, "mount source")?;
                 }
-                MountAccess::Temporary | MountAccess::Hidden => {
+                MountAccess::Temporary => {
+                    if mount.source.is_some() {
+                        return Err(SandboxFailure::policy_denied(
+                            "temporary/hidden mounts cannot name a host source",
+                        ));
+                    }
+                    // Docker treats `:` as the start of the tmpfs option list
+                    // and `,` separates options, so neither may appear in a
+                    // target that is interpolated into `--tmpfs`.
+                    if mount.target.contains(':')
+                        || mount.target.contains(',')
+                        || mount.target.chars().any(char::is_control)
+                    {
+                        return Err(SandboxFailure::policy_denied(
+                            "temporary mount target contains unsupported characters",
+                        ));
+                    }
+                }
+                MountAccess::Hidden => {
                     if mount.source.is_some() {
                         return Err(SandboxFailure::policy_denied(
                             "temporary/hidden mounts cannot name a host source",
@@ -506,6 +530,40 @@ mod tests {
         });
         let error = spec.validate().unwrap_err();
         assert_eq!(error.code, SandboxErrorCode::PolicyDenied);
+    }
+
+    #[test]
+    fn temporary_mount_targets_cannot_carry_tmpfs_options() {
+        let mut spec = fixture_spec();
+        spec.filesystem.mounts.push(MountRule {
+            source: None,
+            target: "/tmp:rw,exec".into(),
+            access: MountAccess::Temporary,
+        });
+        assert_eq!(
+            spec.validate().unwrap_err().code,
+            SandboxErrorCode::PolicyDenied
+        );
+        spec.filesystem.mounts.last_mut().unwrap().target = "/tmp/davinci-home".into();
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn mount_count_is_bounded() {
+        let mut spec = fixture_spec();
+        for index in 0..=MAX_FILESYSTEM_MOUNTS {
+            spec.filesystem.mounts.push(MountRule {
+                source: None,
+                target: format!("/tmp/mount-{index}"),
+                access: MountAccess::Temporary,
+            });
+        }
+        assert_eq!(
+            spec.validate().unwrap_err().code,
+            SandboxErrorCode::PolicyDenied
+        );
+        spec.filesystem.mounts.truncate(MAX_FILESYSTEM_MOUNTS);
+        assert!(spec.validate().is_ok());
     }
 
     #[test]
