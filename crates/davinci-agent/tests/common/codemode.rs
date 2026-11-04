@@ -2941,3 +2941,466 @@ fn script_history_is_persisted_with_a_stable_wire_kind() {
     assert_eq!(history["complete"], json!(true), "{facts}");
     assert_eq!(history["callId"], facts["operationRef"], "{facts}");
 }
+
+// Hybrid Context VM with Controlled CodeMode: an actual broker child runs, an
+// automatic Hybrid fold replaces the transcript that held its result, and the
+// result is recovered from the Context VM and the retained script log without
+// running the script again.
+const SCRIPT_MARK: &str = "SCRIPT-SENTINEL";
+
+fn edit_input(old: &str, new: &str) -> Value {
+    json!({"path":"input.txt","edits":[{"oldText":old,"newText":new}]})
+}
+
+/// Runs one scripted `edit` child per execution through the real broker and
+/// returns a large output carrying `SCRIPT_MARK`.
+struct HybridScriptHost {
+    runs: Arc<std::sync::atomic::AtomicUsize>,
+    edits: Mutex<std::collections::VecDeque<Value>>,
+    child_errors: Mutex<Vec<String>>,
+}
+
+fn script_output(run: usize) -> String {
+    (0..150)
+        .map(|line| format!("{SCRIPT_MARK} run {run} line {line} {}\n", "x".repeat(40)))
+        .collect()
+}
+
+impl crate::codemode::CodeModeHost for HybridScriptHost {
+    fn admits_controlled_mode(&self) -> bool {
+        true
+    }
+    fn execute(
+        &self,
+        _: &crate::codemode::CodeModeRequest,
+        _: &crate::codemode::CodeModeRunContext,
+        broker: Arc<dyn crate::codemode::CodeModeBroker>,
+    ) -> crate::codemode::CodeModeOutcome {
+        use crate::codemode::*;
+        let run = self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let args = self
+            .edits
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("scripted edit");
+        let call = CodeModeCall {
+            request_id: 1,
+            tool: "edit".into(),
+            args,
+        };
+        if let Err(error) = broker.call(call) {
+            self.child_errors.lock().unwrap().push(error.code);
+        }
+        CodeModeOutcome {
+            status: CodeModeStatus::Completed,
+            script_completed: true,
+            output_text: script_output(run),
+            output_complete: true,
+            output_artifact: None,
+            children: vec![],
+            host_notes: vec![],
+            operation_ref: "forged".into(),
+            error: None,
+        }
+    }
+}
+
+fn assistant_reply(
+    content: Vec<davinci_ai::ContentBlock>,
+    input: u64,
+) -> davinci_ai::AssistantMessage {
+    davinci_ai::AssistantMessage {
+        extra: Default::default(),
+        id: "hybrid-codemode-fixture".into(),
+        role: "assistant".into(),
+        model: "fixture".into(),
+        usage: Some(davinci_protocol::Usage {
+            input,
+            output: 4,
+            ..Default::default()
+        }),
+        error_message: None,
+        stop_reason: Some(match content.first() {
+            Some(davinci_ai::ContentBlock::ToolCall { .. }) => davinci_ai::StopReason::ToolUse,
+            _ => davinci_ai::StopReason::Stop,
+        }),
+        content,
+    }
+}
+
+/// The request's own size at four bytes a token, as the provider's count.
+fn measured_tokens(agent: &Agent) -> u64 {
+    serde_json::to_vec(&davinci_ai::openai_responses_input(
+        &agent.messages_for_provider(),
+    ))
+    .unwrap()
+    .len() as u64
+        / 4
+}
+
+fn done_reply(agent: &Agent) -> davinci_ai::AssistantMessage {
+    assistant_reply(
+        vec![davinci_ai::ContentBlock::Text {
+            text: "done".into(),
+        }],
+        measured_tokens(agent),
+    )
+}
+
+/// One user turn in which the provider emits a single CodeMode call.
+fn run_script_turn(agent: &mut Agent, call_id: &str) {
+    agent.prompt("Run the script.");
+    let mut sent = false;
+    agent
+        .run_loop(|agent: &Agent| {
+            Ok::<_, String>(if std::mem::replace(&mut sent, true) {
+                done_reply(agent)
+            } else {
+                assistant_reply(
+                    vec![davinci_ai::ContentBlock::ToolCall {
+                        id: call_id.into(),
+                        name: "codemode".into(),
+                        arguments: json!({"code":"return 1"}),
+                    }],
+                    measured_tokens(agent),
+                )
+            })
+        })
+        .expect("script turn runs");
+}
+
+fn folds(agent: &Agent) -> u64 {
+    agent.runtime.as_ref().unwrap().context_vm.metrics().folds
+}
+
+/// Plain turns until an automatic Hybrid fold has run and been applied.
+fn fold_until_applied(agent: &mut Agent) {
+    let (folds_before, applied_before) = (folds(agent), agent.hybrid_compaction_stats.applied);
+    for turn in 0..200 {
+        agent.prompt(&format!(
+            "Continue with step {turn}. {}",
+            "notes ".repeat(300)
+        ));
+        agent
+            .run_loop(|agent: &Agent| Ok::<_, String>(done_reply(agent)))
+            .expect("filler turn runs");
+        if folds(agent) > folds_before && agent.hybrid_compaction_stats.applied > applied_before {
+            return;
+        }
+    }
+    panic!("no automatic Hybrid fold was applied");
+}
+
+fn provider_transcript(agent: &Agent) -> String {
+    agent
+        .messages_for_provider()
+        .iter()
+        .map(|message| davinci_ai::content_text(&message.content))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn tool_result_text(agent: &Agent, call_id: &str) -> String {
+    let message = agent
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some(call_id))
+        .expect("tool result in the transcript");
+    davinci_ai::content_text(&message.content)
+}
+
+/// Every result answers an earlier call and every call has its result.
+fn assert_tool_pairs(messages: &[davinci_ai::ChatMessage]) {
+    let mut open = std::collections::HashSet::new();
+    for message in messages {
+        for block in &message.content {
+            if let davinci_ai::MessageContent::ToolCall { id, .. } = block {
+                assert!(open.insert(id.clone()), "duplicate call {id}");
+            }
+        }
+        if message.role == "toolResult" {
+            let id = message.tool_call_id.as_ref().expect("result carries an id");
+            assert!(open.remove(id), "result {id} without an earlier call");
+        }
+    }
+    assert!(open.is_empty(), "calls without results: {open:?}");
+}
+
+struct HybridCodemodeFixture {
+    agent: Agent,
+    workspace: tempfile::TempDir,
+    evidence: tempfile::TempDir,
+    journal: Arc<OperationJournal>,
+    host: Arc<HybridScriptHost>,
+}
+
+/// Hybrid mode, automatic compaction, an evidence store and a summarizer that
+/// cites every script result it is shown, with Controlled CodeMode.
+fn hybrid_codemode_fixture(edits: Vec<Value>) -> HybridCodemodeFixture {
+    use crate::runtime::ContextVmMode;
+    let (mut agent, workspace, journal) = configured_agent();
+    let evidence = tempfile::tempdir().unwrap();
+    agent.evidence = Some(crate::EvidenceStore::new(evidence.path()));
+    agent.tools = vec!["read".into(), "write".into(), "edit".into(), "batch".into()];
+    agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+    let host = Arc::new(HybridScriptHost {
+        runs: Arc::default(),
+        edits: Mutex::new(edits.into()),
+        child_errors: Mutex::default(),
+    });
+    agent
+        .enable_codemode(host.clone(), crate::codemode::CodeModeMode::Controlled)
+        .unwrap();
+    agent.set_context_vm_mode(ContextVmMode::Hybrid);
+    agent.auto_compaction = true;
+    agent.context_window = 32_000;
+    agent.compaction = crate::CompactionSettings {
+        reserve_tokens: 2_000,
+        keep_recent_tokens: 1_000,
+        ..crate::CompactionSettings::default()
+    };
+    agent.summarizer = Some(crate::Summarizer::new(|request| {
+        let text = if request.label == "context state fold" {
+            let cited = request
+                .prompt
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|event| {
+                    event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(SCRIPT_MARK))
+                })
+                .map(|event| {
+                    json!({"value":"a CodeMode script ran","source_refs":[event["source_ref"]],
+                        "provenance_kind":"tool_evidence"})
+                })
+                .collect::<Vec<_>>();
+            json!({ "completed": cited }).to_string()
+        } else {
+            "## Goal\nContinue.".into()
+        };
+        Ok(crate::SummarizeResponse {
+            text,
+            usage: Some(Default::default()),
+            stop_reason: Some(davinci_ai::StopReason::Stop),
+            error_message: None,
+            has_tool_call: false,
+        })
+    }));
+    HybridCodemodeFixture {
+        agent,
+        workspace,
+        evidence,
+        journal,
+        host,
+    }
+}
+
+/// The text of every script result the surviving ledger cites, retrieved by
+/// source reference the way the model would.
+fn recovered_script_results(agent: &Agent) -> Vec<String> {
+    use crate::runtime::context_vm::{cited_source_refs, RetrieveContextRequest};
+    let vm = &agent.runtime.as_ref().unwrap().context_vm;
+    let state = vm.load_state_from_root().unwrap();
+    cited_source_refs(&state)
+        .into_iter()
+        .filter_map(|source_ref| {
+            vm.retrieve(&RetrieveContextRequest {
+                source_ref: Some(source_ref),
+                ..Default::default()
+            })
+            .ok()
+        })
+        .map(|result| {
+            assert!(!result.truncated, "one page holds the whole result");
+            result.content
+        })
+        .filter(|content| content.contains(SCRIPT_MARK))
+        .collect()
+}
+
+/// Operations whose parent is the tool call `call_id`.
+fn child_operations(journal: &OperationJournal, call_id: &str) -> usize {
+    let snapshot = journal.snapshot().unwrap();
+    let parents = snapshot
+        .operations
+        .iter()
+        .filter(|op| op.context().wire_tool_call_id.as_deref() == Some(call_id))
+        .collect::<Vec<_>>();
+    assert_eq!(parents.len(), 1, "one parent operation for {call_id}");
+    let parent = parents[0].operation_id();
+    snapshot
+        .operations
+        .iter()
+        .filter(|op| op.context().parent_operation_id == Some(parent))
+        .count()
+}
+
+#[test]
+fn hybrid_fold_preserves_script_evidence_without_rerunning_the_script() {
+    let mut fixture = hybrid_codemode_fixture(vec![edit_input(
+        "codemode baseline sentinel",
+        "edited by script",
+    )]);
+    let runs = fixture.host.runs.clone();
+    let executions = || runs.load(std::sync::atomic::Ordering::SeqCst);
+    let input = || std::fs::read_to_string(fixture.workspace.path().join("input.txt")).unwrap();
+    run_script_turn(&mut fixture.agent, "script-call-1");
+    let original = tool_result_text(&fixture.agent, "script-call-1");
+    assert!(original.contains("run 1 line 149"));
+    assert_eq!(executions(), 1);
+    assert_eq!(input(), "edited by script");
+    assert_eq!(child_operations(&fixture.journal, "script-call-1"), 1);
+    let (folds_before, applied_before) = (
+        folds(&fixture.agent),
+        fixture.agent.hybrid_compaction_stats.applied,
+    );
+
+    fold_until_applied(&mut fixture.agent);
+    assert!(folds(&fixture.agent) > folds_before);
+    assert!(fixture.agent.hybrid_compaction_stats.applied > applied_before);
+    // The fold replaced the transcript that held the script result.
+    assert!(
+        !provider_transcript(&fixture.agent).contains(SCRIPT_MARK),
+        "the script result must have left the provider transcript"
+    );
+    assert_tool_pairs(&fixture.agent.messages_for_provider());
+
+    // Discovery: the surviving ledger cites the result; retrieval returns it exactly.
+    assert_eq!(
+        recovered_script_results(&fixture.agent),
+        vec![original.clone()]
+    );
+    // The recovered result names its retained script log; an ordinary `read`
+    // of that file returns the script's exact output.
+    let log_id = original
+        .split("Script log ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("host note names the script log")
+        .to_string();
+    let log_path = fixture.evidence.path().join(format!("{log_id}.jsonl"));
+    let read = fixture.agent.execute_tool_batch(
+        fixture.workspace.path(),
+        vec![(
+            "read-evidence".into(),
+            "read".into(),
+            json!({"path": log_path}),
+        )],
+        &mut Vec::new(),
+    );
+    assert_eq!(read[0].is_error, Some(false), "{read:?}");
+    let log = davinci_ai::content_text(&read[0].content);
+    let output = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|record| record["kind"] == "output")
+        .expect("the log retains the script output");
+    assert_eq!(output["text"].as_str(), Some(script_output(1).as_str()));
+
+    // No re-execution: one host run, one child, the edit applied once.
+    assert_eq!(executions(), 1);
+    assert_eq!(child_operations(&fixture.journal, "script-call-1"), 1);
+    assert_eq!(input(), "edited by script");
+    assert!(fixture.host.child_errors.lock().unwrap().is_empty());
+    assert_tool_pairs(&fixture.agent.messages_for_provider());
+}
+
+#[test]
+fn hybrid_fold_keeps_a_denied_script_child_denied_and_recoverable() {
+    let mut fixture = hybrid_codemode_fixture(vec![
+        edit_input("codemode baseline sentinel", "edited by script"),
+        edit_input("edited by script", "denied edit"),
+    ]);
+    let runs = fixture.host.runs.clone();
+    let executions = || runs.load(std::sync::atomic::Ordering::SeqCst);
+    let input = || std::fs::read_to_string(fixture.workspace.path().join("input.txt")).unwrap();
+
+    // The permitted edit takes effect.
+    run_script_turn(&mut fixture.agent, "script-call-1");
+    assert_eq!(input(), "edited by script");
+    assert!(fixture.host.child_errors.lock().unwrap().is_empty());
+
+    // The mode cycles between turns; the next tool batch sees it.
+    assert_eq!(
+        fixture.agent.permission_mode(),
+        crate::PermissionMode::AlwaysApprove
+    );
+    let mut cycled = 0;
+    while fixture.agent.cycle_permission_mode() != crate::PermissionMode::ReadOnly {
+        cycled += 1;
+        assert!(cycled < 5, "the mode never reached read-only");
+    }
+    run_script_turn(&mut fixture.agent, "script-call-2");
+    let denied = tool_result_text(&fixture.agent, "script-call-2");
+    let parsed: Value = serde_json::from_str(&denied).unwrap();
+    assert_eq!(parsed["status"], json!("partial"));
+    assert_eq!(parsed["children"][0]["status"], json!("notStarted"));
+    assert_eq!(parsed["children"][0]["error"]["code"], json!("DENIED"));
+    assert_eq!(*fixture.host.child_errors.lock().unwrap(), vec!["DENIED"]);
+    assert_eq!(
+        input(),
+        "edited by script",
+        "the denied edit changed nothing"
+    );
+    assert_eq!(executions(), 2);
+    let denied_children = child_operations(&fixture.journal, "script-call-2");
+    let (folds_before, applied_before) = (
+        folds(&fixture.agent),
+        fixture.agent.hybrid_compaction_stats.applied,
+    );
+
+    fold_until_applied(&mut fixture.agent);
+    assert!(folds(&fixture.agent) > folds_before);
+    assert!(fixture.agent.hybrid_compaction_stats.applied > applied_before);
+    assert!(
+        !provider_transcript(&fixture.agent).contains(SCRIPT_MARK),
+        "both script results must have left the provider transcript"
+    );
+    assert_tool_pairs(&fixture.agent.messages_for_provider());
+
+    // The denial is recovered from the surviving ledger exactly as it was
+    // delivered, and the retained script log records the child as NotStarted.
+    let recovered = recovered_script_results(&fixture.agent);
+    assert_eq!(recovered.len(), 2, "both script results stay recoverable");
+    assert_eq!(
+        recovered
+            .iter()
+            .filter(|text| text.contains("run 2 line"))
+            .collect::<Vec<_>>(),
+        vec![&denied]
+    );
+    let log_id = parsed["hostNotes"][0]
+        .as_str()
+        .and_then(|note| note.strip_prefix("Script log "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("host note names the script log");
+    let read = fixture.agent.execute_tool_batch(
+        fixture.workspace.path(),
+        vec![(
+            "read-denied-log".into(),
+            "read".into(),
+            json!({"path": fixture.evidence.path().join(format!("{log_id}.jsonl"))}),
+        )],
+        &mut Vec::new(),
+    );
+    assert_eq!(read[0].is_error, Some(false), "{read:?}");
+    let log = davinci_ai::content_text(&read[0].content);
+    assert!(log.contains("edit request 1 ordinal 1 NotStarted"), "{log}");
+    assert!(log.contains("DENIED"), "{log}");
+
+    // Nothing ran again and nothing changed.
+    assert_eq!(executions(), 2);
+    assert_eq!(*fixture.host.child_errors.lock().unwrap(), vec!["DENIED"]);
+    assert_eq!(
+        child_operations(&fixture.journal, "script-call-2"),
+        denied_children
+    );
+    assert_eq!(input(), "edited by script");
+    assert_eq!(
+        fixture.agent.permission_mode(),
+        crate::PermissionMode::ReadOnly
+    );
+    assert_tool_pairs(&fixture.agent.messages_for_provider());
+}
