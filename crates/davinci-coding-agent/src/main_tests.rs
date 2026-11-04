@@ -6116,4 +6116,23 @@ fn resume_reapplies_feature_settings_and_exposes_open_script_recovery() {
     assert_eq!(wakeups[0].run_id, "run-left-open");
     assert_eq!(wakeups[0].state, ScriptRunState::RecoveryRequired);
     assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // A real turn through the normal run loop must not replay the open run or
+    // start another one.
+    let run_files = || std::fs::read_dir(&runs).unwrap().count();
+    assert_eq!(run_files(), 1);
+    resumed.prompt("Continue.");
+    resumed
+        .run_loop(|_| Ok::<_, String>(print_policy_text_reply("done")))
+        .expect("the resumed turn runs");
+    assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(run_files(), 1, "no new run was created");
+    assert_eq!(
+        ScriptRunRegistry::open(&runs)
+            .unwrap()
+            .get("run-left-open")
+            .unwrap()
+            .state,
+        ScriptRunState::RecoveryRequired
+    );
 }

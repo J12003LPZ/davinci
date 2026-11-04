@@ -3137,6 +3137,12 @@ struct HybridCodemodeFixture {
 
 /// Hybrid mode, automatic compaction, an evidence store and a summarizer that
 /// cites every script result it is shown, with Controlled CodeMode.
+///
+/// Fixture limits: the summarizer always cites script results it sees, so the
+/// Hybrid tests prove survival and recovery of cited evidence, not that a real
+/// summarizer keeps the references. They build the script-log path from the
+/// fixture evidence dir; the model-visible result only names a script id, so
+/// they do not prove model-side discoverability.
 fn hybrid_codemode_fixture(edits: Vec<Value>) -> HybridCodemodeFixture {
     use crate::runtime::ContextVmMode;
     let (mut agent, workspace, journal) = configured_agent();
