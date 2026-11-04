@@ -6027,3 +6027,124 @@ fn audit_review_default_tools_allowlist_survives_reload_and_syncs_authorization(
         vec!["read".to_string()]
     );
 }
+
+/// Admits Controlled mode and counts executions: a resumed run must never reach it.
+struct CountingCodeModeHost(Arc<std::sync::atomic::AtomicUsize>);
+impl davinci_agent::codemode::CodeModeHost for CountingCodeModeHost {
+    fn admits_controlled_mode(&self) -> bool {
+        true
+    }
+    fn execute(
+        &self,
+        _: &davinci_agent::codemode::CodeModeRequest,
+        _: &davinci_agent::codemode::CodeModeRunContext,
+        _: Arc<dyn davinci_agent::codemode::CodeModeBroker>,
+    ) -> davinci_agent::codemode::CodeModeOutcome {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        unreachable!("a resumed run is reconciled, never replayed")
+    }
+}
+
+#[test]
+fn resume_reapplies_feature_settings_and_exposes_open_script_recovery() {
+    use davinci_agent::codemode::{
+        ScriptRunRecord, ScriptRunRegistry, ScriptRunState, WaitAction, WaitForScriptRequest,
+    };
+    use davinci_agent::runtime::ContextVmMode;
+    let _env_lock = PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+    let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+    let _env = EnvRestore::set("DAVINCI_CONTEXT_VM", "");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    crate::TEST_CODEMODE_HOST
+        .with(|host| *host.borrow_mut() = Some(Arc::new(CountingCodeModeHost(executions.clone()))));
+    struct ClearHost;
+    impl Drop for ClearHost {
+        fn drop(&mut self) {
+            crate::TEST_CODEMODE_HOST.with(|host| *host.borrow_mut() = None);
+        }
+    }
+    let _clear = ClearHost;
+
+    // The first process ran with the defaults and left a session behind.
+    let sessions = dir.path().join("sessions");
+    let session = JsonlSession::create(&sessions, &workspace.to_string_lossy(), None).unwrap();
+    let (path, session_id) = (session.path.clone(), session.header.id.clone());
+    let mut first = Agent::new("fixture");
+    first.cwd = workspace.clone();
+    first.load_from_session(session).unwrap();
+    super::apply_session_agent_settings(&mut first, None).unwrap();
+    assert_eq!(first.context_vm_mode(), ContextVmMode::Off);
+    assert!(!first.has_staged_codemode());
+    drop(first);
+
+    // Its script run was open when the process died: a record, owned by
+    // nobody alive, written before any registry opens the directory.
+    let runs = dir.path().join("evidence").join("script-runs");
+    std::fs::create_dir_all(&runs).unwrap();
+    let mut record = ScriptRunRecord::new(
+        "run-left-open",
+        "call-left-open",
+        Some(&session_id),
+        &workspace.canonicalize().unwrap().to_string_lossy(),
+        "revision",
+    );
+    record.state = ScriptRunState::Running;
+    record.owner = Some("dead owner".into());
+    let stored = runs.join("run-left-open.json");
+    std::fs::write(&stored, serde_json::to_vec(&record).unwrap()).unwrap();
+
+    // The settings changed since: resume applies the current merged config.
+    super::settings::save_settings(
+        dir.path(),
+        &super::settings::Settings {
+            context_vm: Some("hybrid".into()),
+            codemode: Some(serde_json::json!({"mode": "controlled"})),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut resumed = Agent::new("fixture");
+    resumed.cwd = workspace;
+    resumed.evidence = Some(davinci_agent::EvidenceStore::new(
+        dir.path().join("evidence"),
+    ));
+    resumed
+        .load_from_session(JsonlSession::open(&path).unwrap())
+        .unwrap();
+    super::apply_session_agent_settings(&mut resumed, None).unwrap();
+    assert_eq!(resumed.context_vm_mode(), ContextVmMode::Hybrid);
+    assert!(resumed.has_staged_codemode());
+    assert_eq!(resumed.feature_use()["codemode"]["mode"], "controlled");
+    assert_eq!(resumed.feature_use()["contextVm"]["mode"], "hybrid");
+
+    // The open run is exposed as recovery work, through the model's own
+    // status handle and the wakeup queue, and is never replayed.
+    let status = resumed.wait_for_script(WaitForScriptRequest {
+        tool_call_id: "run-left-open".into(),
+        action: WaitAction::Status,
+    });
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&status.content).unwrap()["state"],
+        "recoveryRequired",
+        "{status:?}"
+    );
+    assert_eq!(
+        ScriptRunRegistry::open(&runs)
+            .unwrap()
+            .get("run-left-open")
+            .unwrap()
+            .state,
+        ScriptRunState::RecoveryRequired
+    );
+    let wakeups = resumed.pending_script_wakeups();
+    assert_eq!(wakeups.len(), 1);
+    assert_eq!(wakeups[0].run_id, "run-left-open");
+    assert_eq!(wakeups[0].state, ScriptRunState::RecoveryRequired);
+    assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
