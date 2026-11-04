@@ -5503,6 +5503,25 @@ mod tests {
         assert!(result.is_error, "partial output cannot verify success");
     }
 
+    #[test]
+    // The fixture must exit while its descendant keeps the inherited pipe.
+    #[allow(clippy::zombie_processes)]
+    fn shell_pipe_holding_descendant_fixture() {
+        let Ok(pid_file) = std::env::var("DAVINCI_TEST_SHELL_DESCENDANT_PID_FILE") else {
+            return;
+        };
+        let child = Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+        std::fs::write(pid_file, child.id().to_string()).unwrap();
+        // Do not wait: the descendant must outlive this fixture process and
+        // keep the inherited pipe open for the parent test to clean up.
+    }
+
     #[cfg(windows)]
     #[test]
     fn foreground_shell_terminates_a_pipe_holding_descendant_on_windows() {
@@ -5518,13 +5537,15 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("descendant.pid");
-        let script = format!(
-            "$p = Start-Process -FilePath ping -ArgumentList '-n','30','127.0.0.1' -NoNewWindow -PassThru; [IO.File]::WriteAllText('{}', [string]$p.Id)",
-            pid_file.display()
-        );
-        let mut command = Command::new("powershell");
+        let mut command = Command::new(std::env::current_exe().unwrap());
         command
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .args([
+                "--exact",
+                "tools::tests::shell_pipe_holding_descendant_fixture",
+                "--nocapture",
+            ])
+            .env("DAVINCI_TEST_SHELL_DESCENDANT_PID_FILE", &pid_file)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         let (child, tree) = ProcessTree::spawn(&mut command).unwrap();
