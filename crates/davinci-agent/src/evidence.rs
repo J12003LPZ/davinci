@@ -170,6 +170,12 @@ pub fn session_token(session_id: &str) -> String {
     digest[..12].to_string()
 }
 
+/// URI schemes of Script evidence that `retrieve_context` can resolve. A URI
+/// names a host-created file in the evidence store by its file stem; it never
+/// carries a path.
+pub const SCRIPT_LOG_URI: &str = "script-log://";
+pub const SCRIPT_OUTPUT_URI: &str = "script-output://";
+
 /// Cut `text` at a char boundary at or before `cap` bytes.
 pub fn cut_at_char_boundary(text: &str, cap: usize) -> &str {
     if text.len() <= cap {

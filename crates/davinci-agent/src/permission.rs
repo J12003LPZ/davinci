@@ -184,12 +184,14 @@ pub fn tool_class(tool: &str) -> ToolClass {
         // A batch is judged operation by operation; the wrapper itself
         // changes nothing.
         // `memory_search` and `retrieve_output` read the memory index and
-        // governor's store. Artifact submission is a mutation, not a read.
+        // governor's store. `retrieve_context` reads this conversation's own
+        // folded history and the Script evidence it retained; without this a
+        // read-only mode would cut the model off from what a fold removed.
+        // Artifact submission is a mutation, not a read.
         "read" | "grep" | "find" | "ls" | "job_output" | "todo" | "mcp_read" | "batch"
-        | "codemode" | "memory_search" | "retrieve_output" | "update_plan" | "tool_search"
-        | "agent_status" | "task_list" | "task_get" | "workflow_status" | "propose_plan" => {
-            ToolClass::Read
-        }
+        | "codemode" | "memory_search" | "retrieve_output" | "retrieve_context" | "update_plan"
+        | "tool_search" | "agent_status" | "task_list" | "task_get" | "workflow_status"
+        | "propose_plan" => ToolClass::Read,
         // Process control, messages to workers, and task dispatch can cause effects.
         "job_kill" | "agent_message" | "agent_stop" | "task_create" | "task_update"
         | "graph_submit" => ToolClass::Other,

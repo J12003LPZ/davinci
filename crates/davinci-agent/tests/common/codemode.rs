@@ -3620,6 +3620,8 @@ fn assert_tool_pairs(messages: &[davinci_ai::ChatMessage]) {
 
 struct HybridCodemodeFixture {
     agent: Agent,
+    /// Keeps the session file alive.
+    _sessions: tempfile::TempDir,
     workspace: tempfile::TempDir,
     evidence: tempfile::TempDir,
     journal: Arc<OperationJournal>,
@@ -3631,15 +3633,34 @@ struct HybridCodemodeFixture {
 ///
 /// Fixture limits: the summarizer always cites script results it sees, so the
 /// Hybrid tests prove survival and recovery of cited evidence, not that a real
-/// summarizer keeps the references. They build the script-log path from the
-/// fixture evidence dir; the model-visible result only names a script id, so
-/// they do not prove model-side discoverability.
+/// summarizer keeps the references. Script evidence is found the way a model
+/// finds it, by reading the references in the provider view and calling
+/// `retrieve_context`; whether a real model does so is not shown here.
 fn hybrid_codemode_fixture(edits: Vec<Value>) -> HybridCodemodeFixture {
     use crate::runtime::ContextVmMode;
     let (mut agent, workspace, journal) = configured_agent();
     let evidence = tempfile::tempdir().unwrap();
     agent.evidence = Some(crate::EvidenceStore::new(evidence.path()));
-    agent.tools = vec!["read".into(), "write".into(), "edit".into(), "batch".into()];
+    // A real session file, so every tool result is an authoritative entry the
+    // Context VM can anchor evidence references to.
+    let sessions = tempfile::tempdir().unwrap();
+    let session = davinci_session::JsonlSession::create(
+        sessions.path(),
+        workspace.path().to_str().unwrap(),
+        None,
+    )
+    .unwrap();
+    let session_id = session.header.id.clone();
+    agent.session = Some(session);
+    let runtime = agent.runtime.clone().unwrap().with_session(session_id);
+    agent.set_runtime(runtime);
+    agent.tools = vec![
+        "read".into(),
+        "write".into(),
+        "edit".into(),
+        "batch".into(),
+        "retrieve_context".into(),
+    ];
     agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
     let host = Arc::new(HybridScriptHost {
         runs: Arc::default(),
@@ -3687,11 +3708,51 @@ fn hybrid_codemode_fixture(edits: Vec<Value>) -> HybridCodemodeFixture {
     }));
     HybridCodemodeFixture {
         agent,
+        _sessions: sessions,
         workspace,
         evidence,
         journal,
         host,
     }
+}
+
+/// One `retrieve_context` call through the tool surface, as the model makes it.
+fn retrieve_context_call(
+    agent: &mut Agent,
+    cwd: &std::path::Path,
+    call_id: &str,
+    input: Value,
+) -> (bool, String) {
+    let out = agent.execute_tool_batch(
+        cwd,
+        vec![(call_id.into(), "retrieve_context".into(), input)],
+        &mut Vec::new(),
+    );
+    (
+        out[0].is_error == Some(true),
+        davinci_ai::content_text(&out[0].content),
+    )
+}
+
+/// Script evidence references named anywhere in `text`.
+fn evidence_uris(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for scheme in [
+        crate::evidence::SCRIPT_LOG_URI,
+        crate::evidence::SCRIPT_OUTPUT_URI,
+    ] {
+        for (at, _) in text.match_indices(scheme) {
+            let name: String = text[at + scheme.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            let uri = format!("{scheme}{name}");
+            if !found.contains(&uri) {
+                found.push(uri);
+            }
+        }
+    }
+    found
 }
 
 /// The text of every script result the surviving ledger cites, retrieved by
@@ -3769,32 +3830,28 @@ fn hybrid_fold_preserves_script_evidence_without_rerunning_the_script() {
         recovered_script_results(&fixture.agent),
         vec![original.clone()]
     );
-    // The recovered result names its retained script log; an ordinary `read`
-    // of that file returns the script's exact output.
-    let log_id = original
-        .split("Script log ")
-        .nth(1)
-        .and_then(|rest| rest.split_whitespace().next())
-        .expect("host note names the script log")
-        .to_string();
-    let log_path = fixture.evidence.path().join(format!("{log_id}.jsonl"));
-    let read = fixture.agent.execute_tool_batch(
+    // The model's own view names the retained log; `retrieve_context` on that
+    // reference returns the script's exact output.
+    let view = provider_transcript(&fixture.agent);
+    let log_uri = evidence_uris(&view)
+        .into_iter()
+        .find(|uri| uri.starts_with(crate::evidence::SCRIPT_LOG_URI))
+        .expect("the provider view names the script log");
+    let (is_error, text) = retrieve_context_call(
+        &mut fixture.agent,
         fixture.workspace.path(),
-        vec![(
-            "read-evidence".into(),
-            "read".into(),
-            json!({"path": log_path}),
-        )],
-        &mut Vec::new(),
+        "retrieve-log",
+        json!({"sourceRef": log_uri, "query": "run 1 line 149", "offset": 0, "limit": 120}),
     );
-    assert_eq!(read[0].is_error, Some(false), "{read:?}");
-    let log = davinci_ai::content_text(&read[0].content);
-    let output = log
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .find(|record| record["kind"] == "output")
-        .expect("the log retains the script output");
-    assert_eq!(output["text"].as_str(), Some(script_output(1).as_str()));
+    assert!(!is_error, "{text}");
+    let page: Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        page["content"]
+            .as_str()
+            .unwrap()
+            .contains(script_output(1).lines().last().unwrap()),
+        "{text}"
+    );
 
     // No re-execution: one host run, one child, the edit applied once.
     assert_eq!(executions(), 1);
@@ -3813,7 +3870,7 @@ fn hybrid_fold_preserves_script_evidence_without_rerunning_the_script() {
 }
 
 #[test]
-fn hybrid_fold_keeps_a_denied_script_child_denied_and_recoverable() {
+fn hybrid_denied_operation_after_fold_remains_denied() {
     let mut fixture = hybrid_codemode_fixture(vec![
         edit_input("codemode baseline sentinel", "edited by script"),
         edit_input("edited by script", "denied edit"),
@@ -3876,24 +3933,27 @@ fn hybrid_fold_keeps_a_denied_script_child_denied_and_recoverable() {
             .collect::<Vec<_>>(),
         vec![&denied]
     );
-    let log_id = parsed["hostNotes"][0]
-        .as_str()
-        .and_then(|note| note.strip_prefix("Script log "))
-        .and_then(|rest| rest.split_whitespace().next())
-        .expect("host note names the script log");
-    let read = fixture.agent.execute_tool_batch(
-        fixture.workspace.path(),
-        vec![(
-            "read-denied-log".into(),
-            "read".into(),
-            json!({"path": fixture.evidence.path().join(format!("{log_id}.jsonl"))}),
-        )],
-        &mut Vec::new(),
-    );
-    assert_eq!(read[0].is_error, Some(false), "{read:?}");
-    let log = davinci_ai::content_text(&read[0].content);
-    assert!(log.contains("edit request 1 ordinal 1 NotStarted"), "{log}");
-    assert!(log.contains("DENIED"), "{log}");
+    let view = provider_transcript(&fixture.agent);
+    let log_uris = evidence_uris(&view)
+        .into_iter()
+        .filter(|uri| uri.starts_with(crate::evidence::SCRIPT_LOG_URI))
+        .collect::<Vec<_>>();
+    assert_eq!(log_uris.len(), 2, "the view names both script logs: {view}");
+    let mut log = String::new();
+    for (index, uri) in log_uris.iter().enumerate() {
+        for query in ["NotStarted", "DENIED"] {
+            let (is_error, text) = retrieve_context_call(
+                &mut fixture.agent,
+                fixture.workspace.path(),
+                &format!("retrieve-log-{index}-{query}"),
+                json!({"sourceRef": uri, "query": query, "offset": 0, "limit": 120}),
+            );
+            assert!(!is_error);
+            log.push_str(&text);
+        }
+    }
+    assert!(log.contains("edit request 1 ordinal 1 NotStarted"));
+    assert!(log.contains("DENIED"));
 
     // Nothing ran again and nothing changed.
     assert_eq!(executions(), 2);
@@ -3968,4 +4028,235 @@ fn context_vm_and_codemode_off_control_runs_no_script_and_folds_nothing() {
     assert!(!transcript.contains(SCRIPT_MARK));
     assert_tool_pairs(&fixture.agent.messages_for_provider());
     log_ab("all-off", &fixture.agent, executions, &fixture.journal, 0);
+}
+
+/// One script turn, then plain turns until Hybrid has folded it away.
+fn folded_script_fixture() -> HybridCodemodeFixture {
+    let mut fixture = hybrid_codemode_fixture(vec![edit_input(
+        "codemode baseline sentinel",
+        "edited by script",
+    )]);
+    run_script_turn(&mut fixture.agent, "script-call-1");
+    fold_until_applied(&mut fixture.agent);
+    assert!(!provider_transcript(&fixture.agent).contains(SCRIPT_MARK));
+    fixture
+}
+
+fn view_log_uri(agent: &Agent) -> String {
+    evidence_uris(&provider_transcript(agent))
+        .into_iter()
+        .find(|uri| uri.starts_with(crate::evidence::SCRIPT_LOG_URI))
+        .expect("the provider view names the script log")
+}
+
+fn retrieve_uri(
+    fixture: &mut HybridCodemodeFixture,
+    id: &str,
+    uri: &str,
+    extra: Value,
+) -> (bool, String) {
+    let mut input = json!({"sourceRef": uri, "offset": 0, "limit": 120});
+    for (key, value) in extra.as_object().into_iter().flatten() {
+        input[key] = value.clone();
+    }
+    retrieve_context_call(&mut fixture.agent, fixture.workspace.path(), id, input)
+}
+
+fn stored_log_names(fixture: &HybridCodemodeFixture) -> Vec<String> {
+    std::fs::read_dir(fixture.evidence.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.starts_with("script-log-"))
+        .collect()
+}
+
+#[test]
+fn hybrid_model_surface_recovers_script_evidence() {
+    let mut fixture = hybrid_codemode_fixture(vec![edit_input(
+        "codemode baseline sentinel",
+        "edited by script",
+    )]);
+    run_script_turn(&mut fixture.agent, "script-call-1");
+    // The delivered result never carries the reference; only the ledger does.
+    let original = tool_result_text(&fixture.agent, "script-call-1");
+    assert!(!original.contains(crate::evidence::SCRIPT_LOG_URI));
+    assert!(!original.contains("scriptEvidence"));
+    fold_until_applied(&mut fixture.agent);
+    let uri = view_log_uri(&fixture.agent);
+    let before = fixture.agent.runtime.as_ref().unwrap().context_vm.metrics();
+
+    // Paging: the 150-line output spans pages, and the continuation reaches
+    // every line exactly once.
+    let mut collected = String::new();
+    let mut offset = 0;
+    let mut pages = 0;
+    loop {
+        let (is_error, text) = retrieve_uri(
+            &mut fixture,
+            &format!("page-{pages}"),
+            &uri,
+            json!({"offset": offset, "limit": 100}),
+        );
+        assert!(!is_error);
+        let page: Value = serde_json::from_str(&text).unwrap();
+        // Bounded: one page stays well under the per-page byte bound.
+        assert!(text.len() < 40 * 1024);
+        collected.push_str(page["content"].as_str().unwrap());
+        collected.push('\n');
+        pages += 1;
+        match page["next_offset"].as_u64() {
+            Some(next) => offset = next as usize,
+            None => break,
+        }
+        assert!(pages < 10);
+    }
+    assert!(pages >= 2);
+    for line in script_output(1).lines() {
+        assert_eq!(collected.matches(line).count(), 1, "{line}");
+    }
+    // Every page is a page fault in the existing accounting.
+    let after = fixture.agent.runtime.as_ref().unwrap().context_vm.metrics();
+    assert_eq!(after.page_faults, before.page_faults + pages as u64);
+    assert_eq!(after.page_fault_hits, before.page_fault_hits + pages as u64);
+
+    // The ledger section is a handful of short lines.
+    let view = provider_transcript(&fixture.agent);
+    let section = view
+        .split("## Script evidence")
+        .nth(1)
+        .expect("the ledger lists script evidence");
+    let lines = section
+        .lines()
+        .skip(1)
+        .take_while(|line| line.starts_with("- "));
+    assert_eq!(lines.clone().count(), 1);
+    assert!(lines.map(str::len).sum::<usize>() < 256);
+}
+
+#[test]
+fn hybrid_script_evidence_refuses_unknown_and_foreign_references() {
+    let mut fixture = folded_script_fixture();
+    let own = view_log_uri(&fixture.agent);
+    let other = folded_script_fixture();
+    let foreign = view_log_uri(&other.agent);
+    assert_ne!(own, foreign);
+    for (id, uri) in [
+        ("foreign", foreign.as_str()),
+        ("guess", "script-log://script-log-000000000000"),
+        ("traversal", "script-log://../../secret"),
+        ("absolute", "script-log://C:/Windows/win"),
+        (
+            "output",
+            "script-output://s000000000000-script-output-000000000000",
+        ),
+    ] {
+        let (is_error, text) = retrieve_uri(&mut fixture, id, uri, json!({}));
+        assert!(is_error, "{id}");
+        assert!(text.contains("unknown context source_ref"), "{id}: {text}");
+    }
+    // The foreign fixture's own file exists and was not readable here.
+    assert_eq!(stored_log_names(&other).len(), 1);
+}
+
+#[test]
+fn hybrid_script_evidence_stops_when_permission_is_revoked() {
+    let mut fixture = folded_script_fixture();
+    let uri = view_log_uri(&fixture.agent);
+    let (is_error, _) = retrieve_uri(&mut fixture, "allowed", &uri, json!({}));
+    assert!(!is_error);
+    fixture
+        .agent
+        .permissions
+        .lock()
+        .unwrap()
+        .deny
+        .push(crate::PermissionRule::bare("read"));
+    let (is_error, text) = retrieve_uri(&mut fixture, "revoked", &uri, json!({}));
+    assert!(is_error);
+    assert!(text.contains("no longer allow reading"), "{text}");
+    assert!(!text.contains(SCRIPT_MARK));
+}
+
+#[test]
+fn hybrid_script_evidence_missing_file_is_reported_not_empty() {
+    let mut fixture = folded_script_fixture();
+    let uri = view_log_uri(&fixture.agent);
+    for name in stored_log_names(&fixture) {
+        std::fs::remove_file(fixture.evidence.path().join(name)).unwrap();
+    }
+    let (is_error, text) = retrieve_uri(&mut fixture, "missing", &uri, json!({}));
+    assert!(is_error);
+    assert!(text.contains("script evidence unavailable"), "{text}");
+}
+
+#[test]
+fn hybrid_script_evidence_suppressed_by_a_hook_is_not_recoverable() {
+    let mut fixture = hybrid_codemode_fixture(vec![edit_input(
+        "codemode baseline sentinel",
+        "edited by script",
+    )]);
+    fixture.agent.post_tool = Some(crate::PostToolHook(Arc::new(
+        |_, _, name, _, mut result| {
+            if name == "codemode" {
+                result.content = "[withheld by policy]".into();
+            }
+            result
+        },
+    )));
+    run_script_turn(&mut fixture.agent, "script-call-1");
+    fold_until_applied(&mut fixture.agent);
+    // The full log was stored before the hook ran, and is still on disk.
+    let names = stored_log_names(&fixture);
+    assert_eq!(names.len(), 1);
+    assert!(evidence_uris(&provider_transcript(&fixture.agent)).is_empty());
+    let stem = names[0].trim_end_matches(".jsonl");
+    let uri = format!("{}{stem}", crate::evidence::SCRIPT_LOG_URI);
+    let (is_error, text) = retrieve_uri(&mut fixture, "suppressed", &uri, json!({}));
+    assert!(is_error);
+    assert!(text.contains("unknown context source_ref"), "{text}");
+    assert!(!text.contains(SCRIPT_MARK));
+}
+
+#[test]
+fn hybrid_second_fold_and_reload_keep_every_script_reference() {
+    let mut fixture = hybrid_codemode_fixture(vec![
+        edit_input("codemode baseline sentinel", "edited by script"),
+        edit_input("edited by script", "edited again"),
+    ]);
+    run_script_turn(&mut fixture.agent, "script-call-1");
+    fold_until_applied(&mut fixture.agent);
+    run_script_turn(&mut fixture.agent, "script-call-2");
+    fold_until_applied(&mut fixture.agent);
+    let uris = evidence_uris(&provider_transcript(&fixture.agent));
+    assert_eq!(uris.len(), 2, "both references survive two folds");
+    for (index, uri) in uris.iter().enumerate() {
+        let (is_error, text) = retrieve_uri(
+            &mut fixture,
+            &format!("r{index}"),
+            uri,
+            json!({"query": "run"}),
+        );
+        assert!(!is_error);
+        assert!(text.contains(SCRIPT_MARK));
+    }
+    // Reload: the references come from the session file alone.
+    let path = fixture.agent.session.as_ref().unwrap().path.clone();
+    let reopened = davinci_session::JsonlSession::open(&path).unwrap();
+    let events = crate::runtime::context_vm::events_from_session_branch(
+        &reopened.entries,
+        reopened.leaf_id.as_deref(),
+    );
+    let mut reloaded: Vec<String> = events
+        .iter()
+        .flat_map(|event| {
+            event
+                .artifact_refs
+                .iter()
+                .map(|artifact| artifact.uri.clone())
+        })
+        .collect();
+    reloaded.sort();
+    let mut expected = uris.clone();
+    expected.sort();
+    assert_eq!(reloaded, expected);
 }

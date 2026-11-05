@@ -89,6 +89,9 @@ pub use context::{
 };
 pub use events::AgentEvent;
 pub use evidence::{EvidenceStore, EVIDENCE_TTL};
+
+/// Script evidence references a Hybrid ledger lists; see `script_evidence_section`.
+const LEDGER_SCRIPT_REFS: usize = 24;
 pub use file_mutation_queue::{mutation_queue_key, with_file_mutation_queue};
 pub use images::{
     apply_block_images, convert_to_llm_for_provider, normalize_tool_result_images,
@@ -2558,6 +2561,33 @@ impl Agent {
                 .as_ref()
                 .map(|_| crate::evidence::session_token(&session)),
         );
+        // `retrieve_context` resolves Script log and output references from
+        // this store. Each read asks the live policy again, as `read` would,
+        // so a rule added after the Script ran takes effect on its evidence.
+        if let (Some(runtime), Some(store)) = (&self.runtime, &self.evidence) {
+            let permissions = self.permissions.clone();
+            let cwd = self.cwd.clone();
+            runtime
+                .context_vm
+                .bind_script_evidence(runtime::context_vm::ScriptEvidenceBinding {
+                    dir: store.dir().to_path_buf(),
+                    session_id: session,
+                    readable: Arc::new(move |path| {
+                        matches!(
+                            permissions
+                                .lock()
+                                .unwrap_or_else(|err| err.into_inner())
+                                .decide(
+                                    "script-evidence",
+                                    "read",
+                                    &serde_json::json!({"path": path}),
+                                    &cwd,
+                                ),
+                            PermissionVerdict::Allow
+                        )
+                    }),
+                });
+        }
     }
 
     pub fn cycle_permission_mode(&mut self) -> PermissionMode {
@@ -5262,6 +5292,49 @@ impl Agent {
         )
     }
 
+    /// The Script logs and outputs of the active branch, as references the
+    /// model can pass to `retrieve_context`. They are host-created, listed
+    /// whether or not a summarizer cited the result, and read from the whole
+    /// branch, so a second fold or a reload keeps what the first one listed.
+    /// Only the newest [`LEDGER_SCRIPT_REFS`] are listed, with the count of
+    /// the rest. Empty when no Script left evidence, so a run without
+    /// CodeMode renders the ledger it always did.
+    fn script_evidence_section(&self) -> String {
+        let mut refs: Vec<(String, String)> = Vec::new();
+        for event in self.context_vm_events_for_runtime() {
+            for artifact in &event.artifact_refs {
+                if (artifact.uri.starts_with(evidence::SCRIPT_LOG_URI)
+                    || artifact.uri.starts_with(evidence::SCRIPT_OUTPUT_URI))
+                    && !refs.iter().any(|(uri, _)| uri == &artifact.uri)
+                {
+                    refs.push((artifact.uri.clone(), artifact.source_ref.clone()));
+                }
+            }
+        }
+        if refs.is_empty() {
+            return String::new();
+        }
+        let omitted = refs.len().saturating_sub(LEDGER_SCRIPT_REFS);
+        let mut out = String::from(
+            "
+## Script evidence (retained logs and outputs; retrieve_context with sourceRef=<uri>)
+",
+        );
+        if omitted > 0 {
+            out.push_str(&format!(
+                "- {omitted} older reference(s) not listed
+"
+            ));
+        }
+        for (uri, source_ref) in refs.iter().skip(omitted) {
+            out.push_str(&format!(
+                "- {uri} [{source_ref}]
+"
+            ));
+        }
+        out
+    }
+
     /// Build the replacement for `messages` from `state`. One path serves the
     /// free preflight and the real call, so the fit math cannot drift.
     ///
@@ -5286,7 +5359,8 @@ impl Agent {
         state: &runtime::context_vm::CheckpointState,
         recovery: bool,
     ) -> (CompactionResult, bool) {
-        let ledger = runtime::context_vm::render_ledger(state);
+        let mut ledger = runtime::context_vm::render_ledger(state);
+        ledger.push_str(&self.script_evidence_section());
         let threshold_budget = self.hybrid_replacement_budget(false);
         let first = compaction::compact_messages_with_summary_requiring(
             &self.messages,

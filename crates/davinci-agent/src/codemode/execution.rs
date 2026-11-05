@@ -686,7 +686,7 @@ impl Agent {
             .as_ref()
             .map(|runtime| runtime.cancellation_token.child_token())
             .unwrap_or_default();
-        let run = || -> Result<(CodeModeOutcome, String), CodeModeError> {
+        let run = || -> Result<(CodeModeOutcome, String, Vec<String>), CodeModeError> {
             self.run_script(id, &request, parent, cancellation, false)
         };
         self.finish_script_run(run, parent)
@@ -702,7 +702,7 @@ impl Agent {
         parent: Option<OperationId>,
         cancellation: crate::runtime::CancellationToken,
         detached: bool,
-    ) -> Result<(CodeModeOutcome, String), CodeModeError> {
+    ) -> Result<(CodeModeOutcome, String, Vec<String>), CodeModeError> {
         {
             let mut limits = CodeModeLimits::default().for_request(request)?;
             let binding = self
@@ -771,6 +771,7 @@ impl Agent {
                 }
             }
             let mut log_ref = None;
+            let mut evidence_uris: Vec<String> = Vec::new();
             let mut outcome = binding.host.execute(request, &context, broker.clone());
             let drained = broker.close(std::time::Duration::from_millis(
                 context.limits.cleanup_grace_ms,
@@ -805,6 +806,10 @@ impl Agent {
                 if let Some(evidence) = self.evidence.as_ref() {
                     match evidence.store_in_session(session, "script-output", &body) {
                         Ok(path) => {
+                            if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                                evidence_uris
+                                    .push(format!("{}{stem}", crate::evidence::SCRIPT_OUTPUT_URI));
+                            }
                             outcome.output_artifact = Some(super::CodeModeArtifact {
                                 id: path.to_string_lossy().into_owned(),
                                 kind: super::CodeModeArtifactKind::ToolOutput,
@@ -838,6 +843,7 @@ impl Agent {
                     .persist_script_log(&context.identity.invocation_id, &events)
                 {
                     log_ref = Some(log.id.clone());
+                    evidence_uris.push(format!("{}{}", crate::evidence::SCRIPT_LOG_URI, log.id));
                     outcome.host_notes.push(format!(
                         "Script log {} retained {} event(s), {} bytes{}.",
                         log.id,
@@ -939,7 +945,7 @@ impl Agent {
                 });
                 let _ = registry.finish(&context.identity.invocation_id, state, summary);
             }
-            Ok((outcome, authority))
+            Ok((outcome, authority, evidence_uris))
         }
     }
 
@@ -947,7 +953,7 @@ impl Agent {
     /// requests refused before a script ran, so attempts are never undercounted.
     fn finish_script_run(
         &self,
-        run: impl FnOnce() -> Result<(CodeModeOutcome, String), CodeModeError>,
+        run: impl FnOnce() -> Result<(CodeModeOutcome, String, Vec<String>), CodeModeError>,
         parent: Option<OperationId>,
     ) -> ToolResult {
         let finish = |completed: bool| {
@@ -958,13 +964,20 @@ impl Agent {
             }
         };
         match run() {
-            Ok((outcome, authority)) => {
+            Ok((outcome, authority, evidence)) => {
                 finish(matches!(outcome.status, CodeModeStatus::Completed));
+                // Host-created references to the retained log and output. They
+                // ride in `details` only: the model-visible `content` is
+                // unchanged, and only the Context VM surfaces them.
+                let mut details = json!({"codemode":outcome,"_codemode_authority":authority});
+                if !evidence.is_empty() {
+                    details["scriptEvidence"] = json!(evidence);
+                }
                 ToolResult {
                     content: serde_json::to_string(&outcome)
                         .unwrap_or_else(|_| "Codemode outcome serialization failed".into()),
                     is_error: !matches!(outcome.status, CodeModeStatus::Completed),
-                    details: Some(json!({"codemode":outcome,"_codemode_authority":authority})),
+                    details: Some(details),
                 }
             }
             Err(mut error) => {

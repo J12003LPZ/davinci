@@ -29,6 +29,7 @@ pub use reducer::{
 };
 pub use retrieval::{retrieve_context_tool, RetrieveContextRequest, RetrieveContextResult};
 pub use shadow::{compare_shadow_views, ShadowComparison};
+pub use sources::ScriptEvidenceBinding;
 pub use store::{
     ContextObject, ContextObjectStore, CONTEXT_OBJECT_ALGORITHM, CONTEXT_OBJECT_SCHEMA,
 };
@@ -92,6 +93,7 @@ pub struct ContextVmRuntime {
     source_images: Arc<RwLock<sources::SourceImages>>,
     session_source: Arc<RwLock<Option<sources::SessionSource>>>,
     source_index: Arc<std::sync::Mutex<sources::SourceIndex>>,
+    script_evidence: Arc<RwLock<Option<sources::ScriptEvidenceBinding>>>,
     metrics: Arc<RwLock<ContextVmMetrics>>,
     diagnostics: Arc<RwLock<diagnostics::ContextVmDiagnostics>>,
 }
@@ -118,6 +120,7 @@ impl ContextVmRuntime {
             source_images: Arc::default(),
             session_source: Arc::new(RwLock::new(None)),
             source_index: Arc::default(),
+            script_evidence: Arc::default(),
             metrics,
             diagnostics: Arc::default(),
         }

@@ -289,6 +289,38 @@ fn content_hash(visible_text: &str, images: &[EventImage]) -> String {
 }
 
 fn artifact_refs_from_message(message: &ChatMessage, source_ref: &str) -> Vec<ArtifactRef> {
+    let mut refs = script_evidence_refs(message, source_ref);
+    refs.extend(governor_refs(message, source_ref));
+    refs
+}
+
+/// The Script log and output a codemode result retained, as the host named
+/// them in `details.scriptEvidence`. Only a tool result carries them.
+fn script_evidence_refs(message: &ChatMessage, source_ref: &str) -> Vec<ArtifactRef> {
+    if !matches!(message.role.as_str(), "toolResult" | "tool_result") {
+        return Vec::new();
+    }
+    message
+        .extra
+        .get("details")
+        .and_then(|details| details.get("scriptEvidence"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|uri| {
+            uri.starts_with(crate::evidence::SCRIPT_LOG_URI)
+                || uri.starts_with(crate::evidence::SCRIPT_OUTPUT_URI)
+        })
+        .map(|uri| ArtifactRef {
+            uri: uri.to_string(),
+            content_hash: String::new(),
+            source_ref: source_ref.to_string(),
+        })
+        .collect()
+}
+
+fn governor_refs(message: &ChatMessage, source_ref: &str) -> Vec<ArtifactRef> {
     let Some(governor) = message
         .extra
         .get("tokenGovernor")

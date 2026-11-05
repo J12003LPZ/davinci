@@ -1,13 +1,30 @@
 use super::{
     events::{event_from_session_entry, EventImage},
-    ContextVmRuntime,
+    ArtifactRef, ContextVmRuntime,
 };
+use crate::evidence::{session_token, SCRIPT_LOG_URI, SCRIPT_OUTPUT_URI};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::Arc,
 };
+
+/// The most bytes of one Script log or output a `retrieve_context` call can
+/// load. What lies past it is reported as cut, never dropped silently; the
+/// stores themselves retain about 1 MiB.
+pub(crate) const MAX_SCRIPT_EVIDENCE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Where the host keeps this session's Script logs and outputs, and whether
+/// the permission policy would still let the model read a given file. The
+/// host sets it; nothing the model sends reaches it.
+#[derive(Clone)]
+pub struct ScriptEvidenceBinding {
+    pub dir: PathBuf,
+    pub session_id: String,
+    pub readable: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
+}
 
 /// The largest session record a source lookup buffers. `read_until` holds a
 /// newline-free record whole, so a corrupt or enormous line could allocate
@@ -214,6 +231,9 @@ impl ContextVmRuntime {
     }
 
     pub(crate) fn source_material(&self, source_ref: &str) -> Result<SourceMaterial, String> {
+        if source_ref.starts_with(SCRIPT_LOG_URI) || source_ref.starts_with(SCRIPT_OUTPUT_URI) {
+            return self.script_evidence_material(source_ref);
+        }
         let binding = self
             .session_source
             .read()
@@ -228,7 +248,7 @@ impl ContextVmRuntime {
                 .find(|event| event.source_ref == source_ref)
                 .map(|e| e.content_hash.clone())
                 .ok_or("unknown context source_ref")?;
-            let (text, images) = self.session_source_text(&binding, id, &expected)?;
+            let (text, images, _) = self.session_source_text(&binding, id, &expected)?;
             return Ok(SourceMaterial {
                 text,
                 images,
@@ -258,12 +278,102 @@ impl ContextVmRuntime {
         })
     }
 
+    /// Bind where Script evidence is kept. Re-binding replaces the earlier one.
+    pub fn bind_script_evidence(&self, binding: ScriptEvidenceBinding) {
+        *self
+            .script_evidence
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(binding);
+    }
+
+    /// The text behind a `script-log://` or `script-output://` reference.
+    /// The reference must be one a tool result in this conversation carries
+    /// (a foreign branch's is not in `events`), and, with a bound session, the
+    /// authoritative session entry must still name it. The file is then found
+    /// by the host's own naming, inside the evidence directory, for this
+    /// session only, and only while the permission policy still allows it.
+    fn script_evidence_material(&self, uri: &str) -> Result<SourceMaterial, String> {
+        let unavailable = |why: &str| format!("script evidence unavailable: {why}");
+        let (entry_ref, expected) = self
+            .events
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|event| {
+                event
+                    .artifact_refs
+                    .iter()
+                    .any(|artifact| artifact.uri == uri)
+            })
+            .map(|event| (event.source_ref.clone(), event.content_hash.clone()))
+            .ok_or("unknown context source_ref")?;
+        let session = self
+            .session_source
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let (Some(id), Some(session)) = (entry_ref.strip_prefix("session:"), session) {
+            let (_, _, refs) = self.session_source_text(&session, id, &expected)?;
+            if !refs.iter().any(|artifact| artifact.uri == uri) {
+                return Err(unavailable("the session entry does not name it"));
+            }
+        }
+        let binding = self
+            .script_evidence
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(|| unavailable("no evidence store is bound"))?;
+        let (name, is_log) = match uri.strip_prefix(SCRIPT_LOG_URI) {
+            Some(id) => (id, true),
+            None => (
+                uri.strip_prefix(SCRIPT_OUTPUT_URI).unwrap_or_default(),
+                false,
+            ),
+        };
+        if !script_evidence_name_ok(name, is_log, &binding.session_id) {
+            return Err(unavailable("malformed or foreign reference"));
+        }
+        let file_name = format!("{name}.{}", if is_log { "jsonl" } else { "txt" });
+        let real = contained_file(&binding.dir, &file_name).map_err(unavailable)?;
+        if !(binding.readable)(&real) {
+            return Err(unavailable(
+                "the current permissions no longer allow reading it",
+            ));
+        }
+        let (mut text, cut) = if is_log {
+            let size = std::fs::metadata(&real)
+                .map_err(|_| unavailable("file is unreadable"))?
+                .len();
+            if size > MAX_SCRIPT_EVIDENCE_BYTES as u64 {
+                return Err(unavailable("log exceeds the retrieval bound"));
+            }
+            let slice = crate::codemode::ScriptLogStore::new(&binding.dir, &binding.session_id)
+                .read_script_log(name, 0, MAX_SCRIPT_EVIDENCE_BYTES)
+                .map_err(|error| unavailable(&error.message))?;
+            (slice.text, !slice.complete)
+        } else {
+            read_utf8_prefix(&real, MAX_SCRIPT_EVIDENCE_BYTES)
+                .map_err(|_| unavailable("file is unreadable"))?
+        };
+        if cut {
+            text.push_str(&format!(
+                "\n[truncated: only the first {MAX_SCRIPT_EVIDENCE_BYTES} bytes of this script evidence are retrievable]"
+            ));
+        }
+        Ok(SourceMaterial {
+            text,
+            images: Vec::new(),
+            images_not_retained: false,
+        })
+    }
+
     fn session_source_text(
         &self,
         binding: &SessionSource,
         id: &str,
         expected_hash: &str,
-    ) -> Result<(String, Vec<EventImage>), String> {
+    ) -> Result<(String, Vec<EventImage>, Vec<ArtifactRef>), String> {
         let mut index = self.source_index.lock().unwrap_or_else(|e| e.into_inner());
         if index.path.as_ref() != Some(&binding.path) || index.session_id != binding.id {
             index.reset_for(binding);
@@ -302,7 +412,7 @@ impl ContextVmRuntime {
                         if event.content_hash != expected_hash {
                             return Err("context source integrity check failed".into());
                         }
-                        return Ok((event.visible_text, event.images));
+                        return Ok((event.visible_text, event.images, event.artifact_refs));
                     }
                     None if !rebuilt => {
                         // Stale offset (file rewritten in place): rebuild from the header.
@@ -384,6 +494,53 @@ impl ContextVmRuntime {
     }
 }
 
+/// A name the host would have given: `script-log-<12 hex>`, or this session's
+/// `s<token>-script-output-<12 hex>`. Nothing else is ever joined to a path.
+fn script_evidence_name_ok(name: &str, is_log: bool, session_id: &str) -> bool {
+    let tail_ok = |tail: &str| tail.len() == 12 && tail.chars().all(|c| c.is_ascii_hexdigit());
+    if is_log {
+        name.strip_prefix("script-log-").is_some_and(tail_ok)
+    } else {
+        name.strip_prefix(&format!("s{}-script-output-", session_token(session_id)))
+            .is_some_and(tail_ok)
+    }
+}
+
+/// `dir/file_name` when it is the evidence directory's own child after
+/// resolving links. A symlink or junction resolves elsewhere and fails.
+fn contained_file(dir: &Path, file_name: &str) -> Result<PathBuf, &'static str> {
+    let real = std::fs::canonicalize(dir.join(file_name)).map_err(|_| "file is missing")?;
+    let root = std::fs::canonicalize(dir).map_err(|_| "evidence store is missing")?;
+    if real != root.join(file_name) {
+        return Err("file is outside the evidence store");
+    }
+    Ok(real)
+}
+
+/// Up to `cap` bytes of a file as text, cut on a character boundary. The
+/// flag says whether more followed.
+fn read_utf8_prefix(path: &Path, cap: usize) -> std::io::Result<(String, bool)> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(cap as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    let cut = bytes.len() > cap;
+    bytes.truncate(cap);
+    Ok((
+        match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(error) => {
+                let valid = error.utf8_error().valid_up_to();
+                let split_tail = cut && error.utf8_error().error_len().is_none();
+                let bytes = error.into_bytes();
+                let end = if split_tail { valid } else { bytes.len() };
+                String::from_utf8_lossy(&bytes[..end]).into_owned()
+            }
+        },
+        cut,
+    ))
+}
+
 /// The entry at `offset` when it is `id`. `Ok(None)` means the offset is
 /// stale; a record past the ceiling is an error, never buffered.
 fn read_entry_at(
@@ -437,5 +594,86 @@ mod tests {
             read_record(&mut reader, 10, &mut line).unwrap(),
             Record::End
         ));
+    }
+
+    #[test]
+    fn script_evidence_names_are_only_the_hosts_own() {
+        let session = "session-a";
+        let token = session_token(session);
+        assert!(script_evidence_name_ok(
+            "script-log-0123456789ab",
+            true,
+            session
+        ));
+        assert!(!script_evidence_name_ok(
+            "script-log-0123456789a",
+            true,
+            session
+        ));
+        assert!(!script_evidence_name_ok(
+            "script-log-../../x12345",
+            true,
+            session
+        ));
+        assert!(!script_evidence_name_ok(
+            "script-log-0123456789ab.jsonl",
+            true,
+            session
+        ));
+        let own = format!("s{token}-script-output-0123456789ab");
+        assert!(script_evidence_name_ok(&own, false, session));
+        // Another session's output carries another token.
+        assert!(!script_evidence_name_ok(&own, false, "session-b"));
+        assert!(!script_evidence_name_ok(
+            "../s-script-output-0123456789ab",
+            false,
+            session
+        ));
+    }
+
+    #[test]
+    fn a_link_out_of_the_evidence_store_is_not_contained() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("evidence");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("script-log-0123456789ab.jsonl"), "own").unwrap();
+        assert!(contained_file(&dir, "script-log-0123456789ab.jsonl").is_ok());
+        assert!(contained_file(&dir, "script-log-ffffffffffff.jsonl").is_err());
+
+        let outside = root.path().join("outside.jsonl");
+        std::fs::write(&outside, "secret").unwrap();
+        let link = dir.join("script-log-aaaaaaaaaaaa.jsonl");
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&outside, &link);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, &link);
+        // Creating a symlink can need a privilege the runner lacks; the
+        // containment rule is exercised wherever one can be made.
+        if linked.is_ok() {
+            assert_eq!(
+                contained_file(&dir, "script-log-aaaaaaaaaaaa.jsonl"),
+                Err("file is outside the evidence store")
+            );
+        }
+    }
+
+    #[test]
+    fn a_prefix_read_stops_on_a_character_boundary_and_says_it_was_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        // Two-byte characters: a cap of 5 splits the third one.
+        std::fs::write(&path, "éééé").unwrap();
+        assert_eq!(
+            read_utf8_prefix(&path, 5).unwrap(),
+            ("éé".to_string(), true)
+        );
+        assert_eq!(
+            read_utf8_prefix(&path, 8).unwrap(),
+            ("éééé".to_string(), false)
+        );
+        assert_eq!(
+            read_utf8_prefix(&path, 100).unwrap(),
+            ("éééé".to_string(), false)
+        );
     }
 }

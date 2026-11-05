@@ -4073,6 +4073,27 @@ Issue the call again if it is still needed.";
                 result = (hook.0)(id, cwd, name, args, result);
             }
         }
+        // The full Script output and log are stored before post-tool hooks run.
+        // A hook that changed what the model sees may have suppressed some of
+        // it, so the stored copy must not stay reachable: the references to it
+        // survive only when the hook left the result as it was. A hook cannot
+        // add or alter them either; they are host-created.
+        let pre_hook_evidence = pre_hook_result
+            .details
+            .as_ref()
+            .and_then(|details| details.get("scriptEvidence"));
+        let untouched = result.content == pre_hook_result.content
+            && result.is_error == pre_hook_result.is_error
+            && result
+                .details
+                .as_ref()
+                .and_then(|details| details.get("scriptEvidence"))
+                == pre_hook_evidence;
+        if !untouched {
+            if let Some(Value::Object(details)) = result.details.as_mut() {
+                details.remove("scriptEvidence");
+            }
+        }
         if name == "codemode" {
             result.is_error |= pre_hook_error;
             if let Some(authority) = codemode_authority {
