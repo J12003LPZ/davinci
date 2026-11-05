@@ -26,8 +26,8 @@ pub use policy::{
 };
 pub use recovery::{reconcile_script_child_effect, resolve_script_effect, ScriptEffectResolution};
 pub use runs::{
-    reconcile_script_run, ReconciledScriptRun, ScriptRunError, ScriptRunRecord, ScriptRunRegistry,
-    ScriptRunState, ScriptRunSummary, ScriptWakeup,
+    reconcile_script_run, render_open_run, ReconciledScriptRun, ScriptRunError, ScriptRunRecord,
+    ScriptRunRegistry, ScriptRunState, ScriptRunSummary, ScriptWakeup,
 };
 pub use script_log::{
     ScriptLogError, ScriptLogEvent, ScriptLogRef, ScriptLogSlice, ScriptLogStore,

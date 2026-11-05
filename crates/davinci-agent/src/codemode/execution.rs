@@ -390,11 +390,24 @@ impl Agent {
                     }
                 }
             }
-            Ok(serde_json::json!({
+            let mut value = serde_json::json!({
                 "toolCallId": record.run_id,
                 "state": record.state,
                 "terminal": record.state.terminal(),
-            }))
+            });
+            // A finished run names its retained log. The reference rides in
+            // the payload only when there is one, so a running run's result
+            // is what it was; `finalize_tool_result_for_delivery` drops it
+            // from the details if a hook changes the result.
+            if let Some(id) = record
+                .log_ref
+                .as_deref()
+                .filter(|_| record.state.terminal())
+            {
+                value["scriptEvidence"] =
+                    serde_json::json!([format!("{}{id}", crate::evidence::SCRIPT_LOG_URI)]);
+            }
+            Ok(value)
         })();
         match result {
             Ok(value) => ToolResult {
@@ -610,6 +623,31 @@ impl Agent {
     }
 
     /// Entry ids on the path from the session root to the current leaf.
+    /// Runs of this session, workspace and branch that the model may still
+    /// need a handle for, from the durable registry (never from the fold).
+    pub(crate) fn open_script_runs(&self) -> Vec<super::ScriptRunRecord> {
+        self.open_script_runs_probe()
+            .map(|probe| probe())
+            .unwrap_or_default()
+    }
+
+    /// The same lookup frozen to the current scope, so the Context VM can
+    /// page the full inventory without holding the agent.
+    pub(crate) fn open_script_runs_probe(
+        &self,
+    ) -> Option<Arc<dyn Fn() -> Vec<super::ScriptRunRecord> + Send + Sync>> {
+        self.codemode.as_ref()?;
+        let dir = self.evidence.as_ref()?.dir().join("script-runs");
+        let session = self.runtime.as_ref()?.session_id.clone();
+        let workspace = self.cwd.canonicalize().ok()?.to_string_lossy().into_owned();
+        let branch = self.current_branch_ids();
+        Some(Arc::new(move || {
+            super::ScriptRunRegistry::open(&dir)
+                .map(|registry| registry.open_runs(session.as_deref(), &workspace, &branch))
+                .unwrap_or_default()
+        }))
+    }
+
     fn current_branch_ids(&self) -> std::collections::HashSet<String> {
         self.session
             .as_ref()

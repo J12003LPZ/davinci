@@ -3637,6 +3637,14 @@ struct HybridCodemodeFixture {
 /// finds it, by reading the references in the provider view and calling
 /// `retrieve_context`; whether a real model does so is not shown here.
 fn hybrid_codemode_fixture(edits: Vec<Value>) -> HybridCodemodeFixture {
+    hybrid_codemode_fixture_with(edits, None)
+}
+
+/// As [`hybrid_codemode_fixture`], with another CodeMode host when given.
+fn hybrid_codemode_fixture_with(
+    edits: Vec<Value>,
+    custom: Option<Arc<dyn crate::codemode::CodeModeHost>>,
+) -> HybridCodemodeFixture {
     use crate::runtime::ContextVmMode;
     let (mut agent, workspace, journal) = configured_agent();
     let evidence = tempfile::tempdir().unwrap();
@@ -3668,7 +3676,10 @@ fn hybrid_codemode_fixture(edits: Vec<Value>) -> HybridCodemodeFixture {
         child_errors: Mutex::default(),
     });
     agent
-        .enable_codemode(host.clone(), crate::codemode::CodeModeMode::Controlled)
+        .enable_codemode(
+            custom.unwrap_or_else(|| host.clone()),
+            crate::codemode::CodeModeMode::Controlled,
+        )
         .unwrap();
     agent.set_context_vm_mode(ContextVmMode::Hybrid);
     agent.auto_compaction = true;
@@ -4259,4 +4270,219 @@ fn hybrid_second_fold_and_reload_keep_every_script_reference() {
     let mut expected = uris.clone();
     expected.sort();
     assert_eq!(reloaded, expected);
+}
+
+/// A background host that runs only when the test lets it: it announces that
+/// it started, then blocks on a channel until released. No sleeps, so the
+/// ordering is the test's, not the clock's.
+struct GatedScriptHost {
+    started: Mutex<std::sync::mpsc::Sender<()>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    runs: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl crate::codemode::CodeModeHost for GatedScriptHost {
+    fn admits_controlled_mode(&self) -> bool {
+        true
+    }
+    fn admits_background_scripts(&self) -> bool {
+        true
+    }
+    fn execute(
+        &self,
+        _: &crate::codemode::CodeModeRequest,
+        _: &crate::codemode::CodeModeRunContext,
+        _: Arc<dyn crate::codemode::CodeModeBroker>,
+    ) -> crate::codemode::CodeModeOutcome {
+        use crate::codemode::*;
+        self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.started.lock().unwrap().send(());
+        // The bound only stops a broken test from hanging forever.
+        let released = self
+            .release
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(900))
+            .is_ok();
+        assert!(released, "the test never released the script");
+        CodeModeOutcome {
+            status: CodeModeStatus::Completed,
+            script_completed: true,
+            output_text: script_output(1),
+            output_complete: true,
+            output_artifact: None,
+            children: vec![],
+            host_notes: vec![],
+            operation_ref: "fixture".into(),
+            error: None,
+            retained_output: None,
+            omitted_bytes: 0,
+            omitted_start_line: None,
+        }
+    }
+}
+
+/// One user turn in which the provider emits a single call, then finishes.
+fn tool_call_turn(agent: &mut Agent, call_id: &str, name: &str, arguments: Value) {
+    agent.prompt("Continue.");
+    let mut sent = false;
+    agent
+        .run_loop(|agent: &Agent| {
+            Ok::<_, String>(if std::mem::replace(&mut sent, true) {
+                done_reply(agent)
+            } else {
+                assistant_reply(
+                    vec![davinci_ai::ContentBlock::ToolCall {
+                        id: call_id.into(),
+                        name: name.into(),
+                        arguments: arguments.clone(),
+                    }],
+                    measured_tokens(agent),
+                )
+            })
+        })
+        .expect("tool turn runs");
+}
+
+/// A Hybrid fixture whose CodeMode host waits for the test.
+fn gated_fixture() -> (
+    HybridCodemodeFixture,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fixture = hybrid_codemode_fixture_with(
+        Vec::new(),
+        Some(Arc::new(GatedScriptHost {
+            started: Mutex::new(started_tx),
+            release: Mutex::new(release_rx),
+            runs: runs.clone(),
+        })),
+    );
+    (fixture, started_rx, release_tx, runs)
+}
+
+#[test]
+fn hybrid_fold_while_script_running_preserves_handle() {
+    let (mut fixture, started, release, runs) = gated_fixture();
+    tool_call_turn(
+        &mut fixture.agent,
+        "bg-call-1",
+        "codemode",
+        json!({"code": "// @script: {\"startInBackground\": true}\nreturn 1;"}),
+    );
+    started.recv().expect("the background script started");
+    let handle = serde_json::from_str::<Value>(&tool_result_text(&fixture.agent, "bg-call-1"))
+        .unwrap()["toolCallId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Fold while the script is still blocked.
+    fold_until_applied(&mut fixture.agent);
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let view = provider_transcript(&fixture.agent);
+    // The start result and the call that made it left the provider view.
+    assert!(
+        !view.contains("\"toolCallId\":"),
+        "start result still in view"
+    );
+    assert!(!view.contains("tool_call codemode"));
+    // The ledger still names the handle, and the test did not supply it: the
+    // model reads it from the view.
+    let from_view = view
+        .split_whitespace()
+        .find(|word| word.starts_with("bg-bg-call-1-"))
+        .expect("the ledger names the running script's handle")
+        .to_string();
+    assert_eq!(from_view, handle);
+    assert!(view.contains("state=running"));
+    // Still running: status says so and carries no evidence yet.
+    tool_call_turn(
+        &mut fixture.agent,
+        "wait-running",
+        "wait_for_script",
+        json!({"toolCallId": from_view, "action": "status"}),
+    );
+    let running: Value =
+        serde_json::from_str(&tool_result_text(&fixture.agent, "wait-running")).unwrap();
+    assert_eq!(running["state"], json!("running"));
+    assert_eq!(running["terminal"], json!(false));
+    assert!(running.get("scriptEvidence").is_none());
+
+    // Let it finish; wait_for_script returns terminal with the typed reference.
+    release.send(()).unwrap();
+    let mut terminal = Value::Null;
+    for attempt in 0..400 {
+        tool_call_turn(
+            &mut fixture.agent,
+            &format!("wait-{attempt}"),
+            "wait_for_script",
+            json!({"toolCallId": from_view, "action": "wait"}),
+        );
+        let result: Value = serde_json::from_str(&tool_result_text(
+            &fixture.agent,
+            &format!("wait-{attempt}"),
+        ))
+        .unwrap();
+        if result["terminal"] == json!(true) {
+            terminal = result;
+            break;
+        }
+    }
+    assert_eq!(terminal["state"], json!("completed"), "{terminal}");
+    let uri = terminal["scriptEvidence"][0].as_str().unwrap().to_string();
+    assert!(uri.starts_with(crate::evidence::SCRIPT_LOG_URI));
+    // The wait result is now a session entry; the next sync anchors the ref.
+    filler_turn(&mut fixture.agent, 900);
+    let (is_error, text) = retrieve_uri(
+        &mut fixture,
+        "recover-bg",
+        &uri,
+        json!({"query": "line 149"}),
+    );
+    assert!(!is_error, "{text}");
+    assert!(text.contains(script_output(1).lines().last().unwrap()));
+    // One execution, never replayed.
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_tool_pairs(&fixture.agent.messages_for_provider());
+}
+
+#[test]
+fn hybrid_ledger_cites_the_pageable_inventory_past_its_cap() {
+    let (mut fixture, started, release, runs) = gated_fixture();
+    // The gated host runs one script per release; several handles are made by
+    // starting scripts that all block until the test lets them go.
+    let total = 18;
+    for index in 0..total {
+        tool_call_turn(
+            &mut fixture.agent,
+            &format!("bg-call-{index}"),
+            "codemode",
+            json!({"code": "// @script: {\"startInBackground\": true}\nreturn 1;"}),
+        );
+        started.recv().unwrap();
+    }
+    fold_until_applied(&mut fixture.agent);
+    let view = provider_transcript(&fixture.agent);
+    assert_eq!(view.matches("state=running").count(), 16);
+    assert!(view.contains(&format!(
+        "- 2 more: retrieve_context with sourceRef={}",
+        crate::evidence::SCRIPT_INVENTORY_URI
+    )));
+    let (is_error, text) = retrieve_uri(
+        &mut fixture,
+        "inventory",
+        crate::evidence::SCRIPT_INVENTORY_URI,
+        json!({"limit": 100}),
+    );
+    assert!(!is_error, "{text}");
+    assert_eq!(text.matches("state=running").count(), total);
+    for _ in 0..total {
+        release.send(()).unwrap();
+    }
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), total);
 }

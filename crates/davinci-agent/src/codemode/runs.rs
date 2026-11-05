@@ -634,10 +634,39 @@ impl ScriptRunRegistry {
         workspace_binding: &str,
         branch: &HashSet<String>,
     ) -> Result<Vec<ScriptRunRecord>, ScriptRunError> {
+        let mut pending = self.scoped_records(session_id, workspace_binding, branch);
+        pending.retain(|record| record.state.terminal() && !record.notified);
+        Ok(pending)
+    }
+
+    /// Runs the model may still need a handle for, oldest first: not yet
+    /// terminal, awaiting recovery, or finished with no wakeup delivered.
+    pub fn open_runs(
+        &self,
+        session_id: Option<&str>,
+        workspace_binding: &str,
+        branch: &HashSet<String>,
+    ) -> Vec<ScriptRunRecord> {
+        let mut open = self.scoped_records(session_id, workspace_binding, branch);
+        open.retain(|record| {
+            !record.state.terminal()
+                || record.state == ScriptRunState::RecoveryRequired
+                || !record.notified
+        });
+        open
+    }
+
+    /// Every record of this session, workspace and branch, oldest first.
+    fn scoped_records(
+        &self,
+        session_id: Option<&str>,
+        workspace_binding: &str,
+        branch: &HashSet<String>,
+    ) -> Vec<ScriptRunRecord> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
-        let mut pending = Vec::new();
+        let mut records = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
@@ -663,12 +692,12 @@ impl ScriptRunRegistry {
                     Err(_) => continue,
                 }
             }
-            if in_scope && record.state.terminal() && !record.notified {
-                pending.push(record);
+            if in_scope {
+                records.push(record);
             }
         }
-        pending.sort_by_key(|record| record.started_at_ms);
-        Ok(pending)
+        records.sort_by_key(|record| record.started_at_ms);
+        records
     }
 
     /// Mark one finished run as delivered so it can never wake a turn twice.
@@ -690,4 +719,19 @@ impl ScriptRunError {
             message: message.into(),
         }
     }
+}
+
+/// The inventory line for one open run: its handle and what the registry
+/// says about it, plus the typed reference to its log once it has one.
+pub fn render_open_run(record: &ScriptRunRecord) -> String {
+    let state = serde_json::to_value(record.state)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let log = record
+        .log_ref
+        .as_deref()
+        .map(|id| format!(" log={}{id}", crate::evidence::SCRIPT_LOG_URI))
+        .unwrap_or_default();
+    format!("- {} state={state}{log}", record.run_id)
 }

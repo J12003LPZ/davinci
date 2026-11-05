@@ -2,7 +2,7 @@ use super::{
     events::{event_from_session_entry, EventImage},
     ArtifactRef, ContextVmRuntime,
 };
-use crate::evidence::{session_token, SCRIPT_LOG_URI, SCRIPT_OUTPUT_URI};
+use crate::evidence::{session_token, SCRIPT_INVENTORY_URI, SCRIPT_LOG_URI, SCRIPT_OUTPUT_URI};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -24,6 +24,8 @@ pub struct ScriptEvidenceBinding {
     pub dir: PathBuf,
     pub session_id: String,
     pub readable: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
+    /// The open background Scripts, one line each, from the run registry.
+    pub inventory: Arc<dyn Fn() -> String + Send + Sync>,
 }
 
 /// The largest session record a source lookup buffers. `read_until` holds a
@@ -231,6 +233,9 @@ impl ContextVmRuntime {
     }
 
     pub(crate) fn source_material(&self, source_ref: &str) -> Result<SourceMaterial, String> {
+        if source_ref == SCRIPT_INVENTORY_URI {
+            return self.script_inventory_material();
+        }
         if source_ref.starts_with(SCRIPT_LOG_URI) || source_ref.starts_with(SCRIPT_OUTPUT_URI) {
             return self.script_evidence_material(source_ref);
         }
@@ -284,6 +289,35 @@ impl ContextVmRuntime {
             .script_evidence
             .write()
             .unwrap_or_else(|e| e.into_inner()) = Some(binding);
+    }
+
+    /// The full list of open background Scripts. It is built by the host from
+    /// the run registry for this session, workspace and branch, so there is no
+    /// session entry to anchor it to; the ledger cites it when it does not fit.
+    fn script_inventory_material(&self) -> Result<SourceMaterial, String> {
+        let binding = self
+            .script_evidence
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or("script evidence unavailable: no evidence store is bound")?;
+        let mut text = (binding.inventory)();
+        if text.is_empty() {
+            text = "No open background Scripts.".into();
+        }
+        if text.len() > MAX_SCRIPT_EVIDENCE_BYTES {
+            text =
+                crate::evidence::cut_at_char_boundary(&text, MAX_SCRIPT_EVIDENCE_BYTES).to_string();
+            text.push_str(
+                "
+[truncated]",
+            );
+        }
+        Ok(SourceMaterial {
+            text,
+            images: Vec::new(),
+            images_not_retained: false,
+        })
     }
 
     /// The text behind a `script-log://` or `script-output://` reference.

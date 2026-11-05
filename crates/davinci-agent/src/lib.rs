@@ -92,6 +92,10 @@ pub use evidence::{EvidenceStore, EVIDENCE_TTL};
 
 /// Script evidence references a Hybrid ledger lists; see `script_evidence_section`.
 const LEDGER_SCRIPT_REFS: usize = 24;
+
+/// Open background Scripts a Hybrid ledger lists by name; past this it cites
+/// the pageable `script-inventory://active` instead.
+const LEDGER_OPEN_SCRIPTS: usize = 16;
 pub use file_mutation_queue::{mutation_queue_key, with_file_mutation_queue};
 pub use images::{
     apply_block_images, convert_to_llm_for_provider, normalize_tool_result_images,
@@ -2567,11 +2571,27 @@ impl Agent {
         if let (Some(runtime), Some(store)) = (&self.runtime, &self.evidence) {
             let permissions = self.permissions.clone();
             let cwd = self.cwd.clone();
+            let open_runs = self.open_script_runs_probe();
             runtime
                 .context_vm
                 .bind_script_evidence(runtime::context_vm::ScriptEvidenceBinding {
                     dir: store.dir().to_path_buf(),
                     session_id: session,
+                    inventory: Arc::new(move || {
+                        open_runs
+                            .as_ref()
+                            .map(|probe| {
+                                probe()
+                                    .iter()
+                                    .map(codemode::render_open_run)
+                                    .collect::<Vec<_>>()
+                                    .join(
+                                        "
+",
+                                    )
+                            })
+                            .unwrap_or_default()
+                    }),
                     readable: Arc::new(move |path| {
                         matches!(
                             permissions
@@ -5292,14 +5312,43 @@ impl Agent {
         )
     }
 
-    /// The Script logs and outputs of the active branch, as references the
+    /// What a Hybrid ledger adds for CodeMode, built from authoritative data
+    /// and never from the summarizer's proposals.
+    ///
+    /// Open background Scripts come from the durable run registry and are
+    /// always named by handle (running, awaiting recovery, or finished with no
+    /// wakeup delivered yet): a fold cannot drop a handle the model still
+    /// needs. Past [`LEDGER_OPEN_SCRIPTS`] the ledger names the first ones and
+    /// cites the pageable `script-inventory://active` for the rest. These
+    /// lines are part of the ledger text, so the replacement budgets already
+    /// count them.
+    ///
+    /// Script logs and outputs of the active branch follow, as references the
     /// model can pass to `retrieve_context`. They are host-created, listed
     /// whether or not a summarizer cited the result, and read from the whole
     /// branch, so a second fold or a reload keeps what the first one listed.
     /// Only the newest [`LEDGER_SCRIPT_REFS`] are listed, with the count of
-    /// the rest. Empty when no Script left evidence, so a run without
-    /// CodeMode renders the ledger it always did.
+    /// the rest. Empty when no Script ran, so a run without CodeMode renders
+    /// the ledger it always did.
     fn script_evidence_section(&self) -> String {
+        let mut out = String::new();
+        let open = self.open_script_runs();
+        if !open.is_empty() {
+            out.push_str(
+                "\n## Open background Scripts (wait_for_script with toolCallId=<handle>)\n",
+            );
+            for record in open.iter().take(LEDGER_OPEN_SCRIPTS) {
+                out.push_str(&codemode::render_open_run(record));
+                out.push('\n');
+            }
+            if open.len() > LEDGER_OPEN_SCRIPTS {
+                out.push_str(&format!(
+                    "- {} more: retrieve_context with sourceRef={}\n",
+                    open.len() - LEDGER_OPEN_SCRIPTS,
+                    evidence::SCRIPT_INVENTORY_URI
+                ));
+            }
+        }
         let mut refs: Vec<(String, String)> = Vec::new();
         for event in self.context_vm_events_for_runtime() {
             for artifact in &event.artifact_refs {
@@ -5312,25 +5361,17 @@ impl Agent {
             }
         }
         if refs.is_empty() {
-            return String::new();
+            return out;
         }
         let omitted = refs.len().saturating_sub(LEDGER_SCRIPT_REFS);
-        let mut out = String::from(
-            "
-## Script evidence (retained logs and outputs; retrieve_context with sourceRef=<uri>)
-",
+        out.push_str(
+            "\n## Script evidence (retained logs and outputs; retrieve_context with sourceRef=<uri>)\n",
         );
         if omitted > 0 {
-            out.push_str(&format!(
-                "- {omitted} older reference(s) not listed
-"
-            ));
+            out.push_str(&format!("- {omitted} older reference(s) not listed\n"));
         }
         for (uri, source_ref) in refs.iter().skip(omitted) {
-            out.push_str(&format!(
-                "- {uri} [{source_ref}]
-"
-            ));
+            out.push_str(&format!("- {uri} [{source_ref}]\n"));
         }
         out
     }

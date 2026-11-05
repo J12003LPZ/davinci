@@ -175,6 +175,8 @@ pub fn session_token(session_id: &str) -> String {
 /// carries a path.
 pub const SCRIPT_LOG_URI: &str = "script-log://";
 pub const SCRIPT_OUTPUT_URI: &str = "script-output://";
+/// The host-built, pageable list of background Scripts still open.
+pub const SCRIPT_INVENTORY_URI: &str = "script-inventory://active";
 
 /// Cut `text` at a char boundary at or before `cap` bytes.
 pub fn cut_at_char_boundary(text: &str, cap: usize) -> &str {
