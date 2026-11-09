@@ -64,7 +64,7 @@ webpki-roots = "=1.0.10"
 zeroize = { version = "=1.9.1", features = ["serde"] }
 signal-hook = "=0.4.5"
 zstd = "=0.14.3"
-toml_edit = { version = "=0.25.17", default-features = false, features = ["parse"] }
+toml_edit = { version = "=0.25.19", default-features = false, features = ["parse"] }
 
 [profile.release]
 lto = "thin"
