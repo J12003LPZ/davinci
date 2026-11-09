@@ -55,7 +55,7 @@ sha2 = "=0.11.0"
 clap = { version = "=4.5.23", features = ["derive"] }
 uuid = { version = "=1.29.0", features = ["v4", "v7", "serde"] }
 tempfile = "=3.27.0"
-thiserror = "=1.0.69"
+thiserror = "=2.0.21"
 ureq = { version = "=3.4.2", default-features = false, features = ["json", "rustls"] }
 url = "=2.5.8"
 rustls = { version = "=0.23.46", default-features = false, features = ["std", "tls12", "ring", "logging"] }
